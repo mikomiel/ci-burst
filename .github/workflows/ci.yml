@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  planning:
+    name: planning
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run check:spec
+
+  public-content:
+    name: public-content
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify pinned Gitleaks and scan history and messages
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/ci-burst-tools"
+          mkdir -p "$tools"
+          curl --fail --location --silent --show-error --max-time 60 \
+            --max-filesize 33554432 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$tools/gitleaks.tar.gz"
+          printf '%s  %s\n' \
+            '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' \
+            "$tools/gitleaks.tar.gz" | sha256sum --check -
+          tar --extract --gzip --file "$tools/gitleaks.tar.gz" \
+            --directory "$tools" gitleaks
+          "$tools/gitleaks" git --config .gitleaks.toml --redact \
+            --no-banner --log-opts='--all' .
+          git ls-tree --name-only -r -z HEAD | while IFS= read -r -d '' path; do
+            git show "HEAD:$path"
+            printf '\n'
+          done | "$tools/gitleaks" stdin \
+            --config .gitleaks.toml --redact --no-banner
+          git log --all --format=%B | "$tools/gitleaks" stdin \
+            --config .gitleaks.toml --redact --no-banner

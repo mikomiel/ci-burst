@@ -1,0 +1,23 @@
+schema: spec-driven
+
+context: |
+  ci-burst is a standalone public Forgejo queue-driven AWS Spot runner controller.
+  The first release has one repository scope, one controller and a durable local SQLite ledger.
+  The controller uses a pre-provisioned, version-pinned runner launch template.
+  It does not create networking, credentials, IAM roles or runner images.
+  Default execution is observation/dry-run; live provisioning is a separate explicit operation.
+  Runtime implementation is planned in Python 3.13+ with the official AWS SDK.
+  Public examples and tests are synthetic and self-contained.
+  All artifacts are English. Use MUST for requirements and distinguish planning from runtime evidence.
+
+rules:
+  proposal:
+    - Keep the MVP bounded and identify non-goals.
+  design:
+    - Record failure behavior, credential boundaries, alternatives and evidence gaps.
+    - Do not describe a cost estimate as an absolute AWS billing cap.
+  specs:
+    - Include refusal and recovery scenarios as well as the happy path.
+  tasks:
+    - Keep product source work separate from operator-specific live pilot approvals.
+    - Require API contract qualification before enabling live provisioning.

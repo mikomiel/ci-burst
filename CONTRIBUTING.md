@@ -22,16 +22,19 @@ is authorized by a source PR.
 
 After maintainer-controlled activation, main requires the exact-head
 `planning`, `public-content` and `review` checks. The `review` status comes
-from the trusted default-branch publisher, not from a native approval count
-that the configured App cannot satisfy. A maintainer can click Merge when
-these gates pass; repository automation can merge eligible ordinary PRs.
+from the trusted default-branch publisher and is distinct from its publisher
+job completing successfully. Native approval requirements remain additional
+constraints: a posted App approval is not proof that GitHub counted it.
+A human maintainer can click Merge only when all effective rules pass;
+repository automation can merge eligible ordinary PRs under the same rules.
 
 `scripts/pr_policy.py` is the shared rule owner. It accepts the pinned Gandalf
 bot identity or a different human reviewer whose write/maintain/admin access
-was verified through GitHub. It requires approval of the current head, rejects
-outstanding change requests, and treats dismissal or unreadable evidence as
-a refusal. Comments do not erase decisive reviews. There is no dependency-bot
-review exemption.
+was verified through GitHub. The verified-maintainer fallback serves the
+manual merge path; unattended merges still require Gandalf itself at the
+current head. Outstanding change requests from eligible reviewers block both
+paths. Dismissal or unreadable evidence is a refusal. Comments do not erase
+decisive reviews. There is no dependency-bot review exemption.
 
 The publisher and merger run only trusted default-branch scripts. Neither
 executes PR-head code or consumes PR-produced artifacts with a write token.
@@ -41,10 +44,15 @@ fresh refs/reviews/checks before a head-pinned squash merge. It admits at most
 one merge per run and verifies the remote result. A timeout is not permission
 to repeat a merge blindly.
 
-The sensitive-path list in `scripts/pr_policy.py` is enforced, not advisory:
-workflows, scripts, tests, agent instructions, security policy and dependency/
-packaging definitions need a human decision and are never auto-merged. Both
-sides of a rename count; an incomplete file list cannot clear the guard.
+The ordinary-path allowlist in `scripts/pr_policy.py` is enforced, not
+advisory. Unknown paths need a human decision; they are not implicitly safe.
+This pre-implementation repository initially admits only root README/changelog
+and the named OpenSpec proposal, design, tasks, metadata and capability-spec
+files. Arbitrary Markdown is not implicitly ordinary: new documentation areas
+and agent-instruction variants still require a human. Workflows, scripts
+wherever introduced, tests and dependency/packaging definitions are not
+admitted. New ordinary areas require a reviewed policy change and tests. Both
+rename endpoints count; an incomplete file list cannot clear the guard.
 
 ### Status freshness and failure behavior
 
@@ -53,7 +61,11 @@ Trusted lifecycle events, CI completion and a five-minute sweep refresh the
 `review` status. A human click relies on the last published evaluation; a
 withdrawal may take until the next successful sweep to appear. Automation
 independently reads the reviews again immediately before its merge request.
-An unreadable review snapshot revokes known heads and fails the job. If PR
+An unchanged draft keeps its own pending verdict without invalidating an
+unrelated ready PR. An unreadable snapshot revokes known heads and fails the
+job. Negative status updates are attempted before new successes, and one
+per-head publication failure does not suppress other known revocations. Any
+failed revocation fails the run without publishing new successes. If PR
 enumeration itself fails, unknown heads cannot be revoked; the job fails
 loudly rather than claiming a fresh evaluation.
 
@@ -66,15 +78,17 @@ Source tests do not establish an active merge gate. Use this order:
    path; an authoring agent does not self-merge or invent a green status.
 2. Verify the default-branch publisher runs successfully and posts `review`
    on the exact current PR head. Verify a changed or unapproved head is refused.
-3. Configure PR-only protection with zero native required approvals and require
-   `planning`, `public-content` and `review` from GitHub Actions (App 15368).
-   Keep strict up-to-date checks, administrator enforcement, conversation
-   resolution, and the bans on force pushes and branch deletion. A ruleset
-   requiring a pull request with zero approvals can retain PR-only enforcement.
+3. Require `planning`, `public-content` and the semantic `review` status from
+   GitHub Actions (App 15368). Preserve the configured native approval count,
+   stale-review dismissal, strict freshness, administrator enforcement,
+   conversation resolution and force-push/deletion bans. If the App approval
+   does not satisfy the native count, stop for a separate owner policy decision;
+   do not lower the count or broaden App permissions to work around it.
 4. Read the effective rules back. Check a valid owner-click path and one
    ordinary reviewed automation candidate; sensitive policy PRs remain human.
-   Keep GitHub's built-in standing auto-merge orders off: the workflow owns
-   its bounded, freshly checked merge request.
+   The repository's `allow_auto_merge` capability can be enabled without
+   arming a merge. An authoring agent must not place a standing `--auto` order;
+   this workflow owns its bounded, freshly checked merge request.
 
 If activation fails, retain or restore the native maintainer-review requirement
 and disable the automerge workflow. Preserve CI, state truth and published

@@ -16,16 +16,22 @@ for (const [file, mode, permission] of [
   test(`${file}: write token only runs trusted default-branch code`, () => {
     const w = workflow(file);
     assert.deepEqual(w.permissions, permission);
+    assert.equal(w.env, undefined);
+    assert.equal(w.defaults, undefined);
     assert.equal(w.concurrency['cancel-in-progress'], false);
     for (const job of Object.values(w.jobs)) {
       assert.equal(job.permissions, undefined);
+      assert.equal(job.env, undefined);
+      assert.equal(job.defaults, undefined);
+      assert.equal(job.container, undefined);
+      assert.equal(job.services, undefined);
+      assert.equal(job.environment, undefined);
       assert.equal(job['runs-on'], 'ubuntu-24.04');
       assert.ok(job['timeout-minutes'] <= 10);
       const [checkout, execute, ...unexpected] = job.steps;
       assert.deepEqual(unexpected, []); // A write-token job has this explicit execution allowlist.
       assert.match(checkout.uses, /^actions\/checkout@[a-f0-9]{40}$/);
-      assert.equal(checkout.with.ref, defaultBranch);
-      assert.equal(checkout.with['persist-credentials'], false);
+      assert.deepEqual(checkout.with, { ref: defaultBranch, 'persist-credentials': false });
       assert.equal(execute.run, `python3 scripts/github_pr_automation.py ${mode} --apply`);
       assert.equal(execute.env.GH_TOKEN, '${{ github.token }}');
     }

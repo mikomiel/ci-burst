@@ -199,8 +199,21 @@ def run_review(api, apply=False, event_head=None):
     for head in known - plan.keys():
         plan[head] = ("pending", "no_open_pull_carries_head")
     if apply:
-        for head, (state, reason) in sorted(plan.items()):
-            api.publish(head, state, reason)
+        # Revoke first, and isolate per-head failures. One exhausted/broken
+        # status context must not leave unrelated withdrawn approvals green.
+        for successes in (False, True):
+            failed = False
+            for head, (state, reason) in sorted(plan.items()):
+                if (state == "success") != successes:
+                    continue
+                try:
+                    api.publish(head, state, reason)
+                except ApiError:
+                    failed = True
+            if failed:
+                # Do not publish new successes while a required revocation
+                # failed. The run is incomplete even if other writes worked.
+                raise ApiError("review_publication_incomplete")
     return plan
 
 

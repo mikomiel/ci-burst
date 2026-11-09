@@ -95,6 +95,48 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result[HEAD][0], "pending")
         self.assertEqual(api.published[0][:2], (HEAD, "pending"))
 
+    def test_unchanged_draft_does_not_poison_a_ready_pr_on_another_head(self):
+        api = FakeGitHub()
+        draft = pull(1, OTHER)
+        draft["draft"] = True
+        api.prs = [draft, pull(2)]
+        result = driver.run_review(api, apply=True)
+        self.assertEqual(result[OTHER][0], "pending")
+        self.assertEqual(result[HEAD][0], "success")
+        self.assertEqual({x[:2] for x in api.published}, {(OTHER, "pending"), (HEAD, "success")})
+
+    def test_publication_failure_does_not_suppress_other_known_revocations(self):
+        api = FakeGitHub()
+        api.prs = [pull(1), pull(2, OTHER)]
+        attempts = []
+
+        def publish(head, state, reason):
+            attempts.append((head, state))
+            if head == HEAD:
+                raise driver.ApiError("one_head_write_failed")
+            api.published.append((head, state, reason))
+
+        with mock.patch.object(api, "reviews", return_value=[]), mock.patch.object(api, "publish", side_effect=publish):
+            with self.assertRaises(driver.ApiError):
+                driver.run_review(api, apply=True)
+        self.assertEqual(attempts, [(HEAD, "pending"), (OTHER, "pending")])
+        self.assertEqual([x[:2] for x in api.published], [(OTHER, "pending")])
+
+    def test_negative_publications_precede_new_successes(self):
+        api = FakeGitHub()
+        api.prs = [pull(1), pull(2, OTHER)]
+        driver.run_review(api, apply=True)
+        self.assertEqual([x[:2] for x in api.published], [(OTHER, "pending"), (HEAD, "success")])
+
+    def test_failed_negative_publication_does_not_publish_new_success(self):
+        api = FakeGitHub()
+        api.prs = [pull(1), pull(2, OTHER)]
+        with mock.patch.object(api, "publish", side_effect=driver.ApiError("write_failed")) as publish:
+            with self.assertRaises(driver.ApiError):
+                driver.run_review(api, apply=True)
+        self.assertEqual(publish.call_count, 1)
+        self.assertEqual(publish.call_args.args[:2], (OTHER, "pending"))
+
     def test_failed_snapshot_revokes_all_known_heads(self):
         api = FakeGitHub()
         api.prs = [pull(1), pull(2, OTHER)]

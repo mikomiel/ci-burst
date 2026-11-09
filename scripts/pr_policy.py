@@ -16,13 +16,8 @@ REQUIRED_CHECKS = ("planning", "public-content")
 GATE_CONTEXT = "review"
 DECISIVE = {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
 REVIEW_STATES = DECISIVE | {"COMMENTED", "PENDING"}
-SENSITIVE_FILES = {
-    "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "SECURITY.md", ".gitignore",
-    ".gitleaks.toml", "package.json", "package-lock.json", "pyproject.toml",
-    "uv.lock", "setup.py", "setup.cfg", "requirements.txt", "requirements-dev.txt",
-    "Dockerfile", "docker-compose.yml", "openspec/config.yaml",
-}
-SENSITIVE_PREFIXES = (".github/", "scripts/", "tests/", "deploy/")
+ORDINARY_ROOT_DOCS = {"README.md", "CHANGELOG.md"}
+ORDINARY_CHANGE_DOCS = {"proposal.md", "design.md", "tasks.md", ".openspec.yaml"}
 
 
 class Unusable(ValueError):
@@ -182,8 +177,20 @@ def changed_paths(comparison, declared, base):
 
 
 def sensitive(path):
-    return (path in SENSITIVE_FILES or path.startswith(SENSITIVE_PREFIXES)
-            or PurePosixPath(path).name in SENSITIVE_FILES)
+    """Unknown areas are human-only, not implicitly safe for automation.
+
+    This pre-implementation repository initially admits documentation only.
+    New ordinary code areas require a reviewed policy change and tests.
+    """
+    if path in ORDINARY_ROOT_DOCS:
+        return False
+    parts = PurePosixPath(path).parts
+    if parts[:2] == ("openspec", "changes"):
+        if len(parts) == 4 and parts[3] in ORDINARY_CHANGE_DOCS:
+            return False
+        if len(parts) == 6 and parts[3] == "specs" and parts[5] == "spec.md":
+            return False
+    return True
 
 
 def merge_decision(pr, reviews, runs, statuses, comparison, maintainers=()):
@@ -196,6 +203,10 @@ def merge_decision(pr, reviews, runs, statuses, comparison, maintainers=()):
         state, reason = review_verdict(reviews, pr["head"]["sha"], pr["user"]["login"], maintainers)
         if state != "success":
             return False, reason
+        # A verified maintainer can serve the manual-review fallback, but the
+        # operator requires Gandalf itself for unattended ordinary-area merges.
+        if review_verdict(reviews, pr["head"]["sha"], pr["user"]["login"])[0] != "success":
+            return False, "gandalf_required_for_automerge"
         green, reason = checks_green(runs, statuses, pr["head"]["sha"])
         if not green:
             return False, reason
@@ -208,7 +219,8 @@ def merge_decision(pr, reviews, runs, statuses, comparison, maintainers=()):
 
 
 def same_refs(before, after):
-    return (pull_scope(before) and pull_scope(after) and not after["draft"]
+    """Snapshot equality, not merge readiness: an unchanged draft is valid."""
+    return (pull_scope(before) and pull_scope(after) and before["draft"] == after["draft"]
             and before["number"] == after["number"]
             and before["head"]["sha"] == after["head"]["sha"]
             and before["base"]["sha"] == after["base"]["sha"])

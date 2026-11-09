@@ -194,6 +194,34 @@ class MergeTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.decide(compare=comparison(path))[1], "sensitive_paths")
 
+    def test_unknown_dependency_packaging_and_script_paths_need_a_person(self):
+        paths = (".npmrc", "requirements.in", "requirements-prod.txt", "Pipfile", "MANIFEST.in",
+                 "Dockerfile.worker", "tools/check.sh", "helper.py", "docs/check.sh", "docs/.npmrc",
+                 "docs/AGENTS.md", "docs/AGENTS.override.md", "docs/design.md", "new-area/script.py",
+                 "openspec/changes/queue-burst/AGENTS.override.md",
+                 "openspec/changes/queue-burst/specs/queue/AGENTS.override.md",
+                 "openspec/changes/queue-burst/unknown.md")
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual(self.decide(compare=comparison(path))[1], "sensitive_paths")
+
+    def test_only_explicit_ordinary_documentation_paths_are_autoeligible_initially(self):
+        paths = ("README.md", "CHANGELOG.md", "openspec/changes/queue-burst/proposal.md",
+                 "openspec/changes/queue-burst/design.md", "openspec/changes/queue-burst/tasks.md",
+                 "openspec/changes/queue-burst/.openspec.yaml",
+                 "openspec/changes/queue-burst/specs/queue/spec.md")
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual(self.decide(compare=comparison(path)), (True, "eligible"))
+
+    def test_manual_maintainer_fallback_does_not_replace_gandalf_for_automerge(self):
+        human = review(login="maintainer", user_id=9, kind="User")
+        state, _ = policy.review_verdict([human], HEAD, "contributor", maintainers={9})
+        self.assertEqual(state, "success")
+        allowed, reason = policy.merge_decision(pull(), [human], checks(), statuses(), comparison(), maintainers={9})
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "gandalf_required_for_automerge")
+
     def test_both_sides_of_rename_are_guarded(self):
         c = comparison("README.md")
         c["files"][0]["previous_filename"] = ".github/workflows/ci.yml"
@@ -211,6 +239,10 @@ class MergeTests(unittest.TestCase):
     def test_ref_change_or_close_aborts_final_recheck(self):
         before = pull()
         self.assertTrue(policy.same_refs(before, pull()))
+        draft = pull()
+        draft["draft"] = True
+        self.assertTrue(policy.same_refs(draft, copy.deepcopy(draft)))
+        self.assertFalse(policy.same_refs(before, draft))
         for modify in (lambda p: p["head"].update(sha=OTHER),
                        lambda p: p["base"].update(sha=OTHER),
                        lambda p: p.update(state="closed")):

@@ -145,7 +145,58 @@ class ObserverTests(unittest.TestCase):
         observation, _ = self.observe(body)
         self.assertEqual(observation.demand, 0)
         self.assertEqual(observation.incompatible, 1)
-        self.assertIn("h-30:job_without_labels", observation.notes)
+        self.assertIn("job_without_labels", observation.notes)
+
+    def test_missing_dependency_metadata_is_unavailable(self):
+        body = json.dumps(
+            [{"id": 40, "attempt": 1, "handle": "h-40", "status": "waiting", "runs_on": ["homelab"]}]
+        ).encode()
+        with self.assertRaises(ObservationRefusal) as raised:
+            self.observe(body)
+        self.assertEqual(raised.exception.reason, "FORGEJO_UNEXPECTED_SHAPE")
+
+    def test_null_dependency_metadata_means_no_dependencies(self):
+        body = json.dumps(
+            [
+                {
+                    "id": 41,
+                    "attempt": 1,
+                    "handle": "h-41",
+                    "status": "waiting",
+                    "runs_on": ["homelab"],
+                    "needs": None,
+                }
+            ]
+        ).encode()
+        observation, _ = self.observe(body)
+        self.assertEqual(observation.demand, 1)
+
+    def test_hostile_handle_is_not_echoed_in_the_plan(self):
+        body = json.dumps(
+            [
+                {
+                    "id": 43,
+                    "attempt": 1,
+                    "handle": "tok en/with spaces",
+                    "status": "waiting",
+                    "runs_on": ["homelab"],
+                    "needs": [],
+                }
+            ]
+        ).encode()
+        observation, _ = self.observe(body)
+        self.assertEqual(observation.demand, 1)
+        self.assertEqual(observation.as_dict()["demand_attempts"], ["<redacted>"])
+
+    def test_untrusted_values_are_not_echoed_in_refusals(self):
+        marker = "synthetic-secret-token"
+        body = json.dumps(
+            [{"id": 42, "attempt": 1, "handle": "h-42", "status": marker, "runs_on": ["homelab"], "needs": []}]
+        ).encode()
+        with self.assertRaises(ObservationRefusal) as raised:
+            self.observe(body)
+        self.assertEqual(raised.exception.reason, "FORGEJO_UNKNOWN_STATUS")
+        self.assertNotIn(marker, json.dumps(raised.exception.as_dict()))
 
     def test_unknown_status_makes_demand_unavailable(self):
         with self.assertRaises(ObservationRefusal) as raised:
@@ -161,6 +212,7 @@ class ObserverTests(unittest.TestCase):
         with self.assertRaises(ObservationRefusal) as raised:
             self.observe(fixture("jobs_inconsistent_attempt.json"))
         self.assertEqual(raised.exception.reason, "FORGEJO_INCONSISTENT_ATTEMPT")
+        self.assertNotIn("h-9-1", json.dumps(raised.exception.as_dict()))
 
     def test_invalid_json_is_refused(self):
         with self.assertRaises(ObservationRefusal) as raised:

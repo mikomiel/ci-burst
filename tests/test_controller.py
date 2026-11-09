@@ -6,6 +6,7 @@ from pathlib import Path
 from ci_burst.config import load
 from ci_burst.controller import Controller
 from ci_burst.errors import ConfigRefusal, ProviderRefusal
+from ci_burst.aws import SpotQuote
 from ci_burst.ledger import Ledger, current_window
 
 from support import (
@@ -120,11 +121,43 @@ class PlanTests(ControllerCase):
         self.assertIn("budget_allowance_exhausted", result["reasons"])
         self.assertEqual(result["budget"]["remaining_after"].startswith("-"), True)
 
+    def test_plan_refuses_a_template_pinned_to_another_zone(self):
+        aws = FakeAws(template_facts=template(placement_zone="us-east-1a"), spot_quote=quote(clock=self.clock))
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("template_placement_mismatch", result["reasons"])
+
+    def test_plan_refuses_a_quote_from_another_zone(self):
+        wrong = SpotQuote(
+            price_micros=20_000,
+            timestamp=self.clock.now,
+            price_display="0.020000",
+            instance_type="t4g.small",
+            availability_zone="us-east-1a",
+        )
+        result = self.build(observation=observation_demand(), aws=FakeAws(spot_quote=wrong)).plan()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("spot_price_wrong_scope", result["reasons"])
+
     def test_plan_refuses_template_without_bootstrap(self):
         aws = FakeAws(template_facts=template(has_user_data=False), spot_quote=quote(clock=self.clock))
         result = self.build(observation=observation_demand(), aws=aws).plan()
         self.assertEqual(result["decision"], "refused")
         self.assertIn("template_bootstrap_missing", result["reasons"])
+
+    def test_plan_does_not_initialize_an_empty_state_file(self):
+        import sqlite3
+
+        sqlite3.connect(self.config.state.database).close()
+        result = self.build(observation=observation_demand()).plan()
+        self.assertFalse(result["state"]["available"])
+        self.assertEqual(result["state"]["note"], "STATE_UNINITIALIZED")
+        probe = sqlite3.connect(self.config.state.database)
+        try:
+            self.assertEqual(probe.execute("PRAGMA user_version").fetchone()[0], 0)
+            self.assertIsNone(probe.execute("SELECT name FROM sqlite_master WHERE name='operations'").fetchone())
+        finally:
+            probe.close()
 
     def test_plan_reports_cost_residuals(self):
         result = self.build(observation=observation_demand()).plan()
@@ -215,16 +248,60 @@ class ApplyTests(ControllerCase):
         self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1)
         self.assertEqual(self.reopened().operation(operation.id).state, "running")
 
-    def test_uncertain_operation_is_resolved_to_not_created_after_grace(self):
+    def test_uncertain_operation_is_resumed_with_the_same_client_token(self):
         controller = self.build(observation=observation_demand())
         self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
         first = controller.apply()
-        self.clock.advance(self.config.aws.uncertainty_grace_seconds + 1)
+        self.assertEqual(first["decision"], "uncertain")
         self.aws.run_error = None
+        # A fresh controller and ledger model a restarted process.
+        second = self.build(observation=observation_demand(), aws=self.aws).apply()
+        self.assertEqual(second["decision"], "resumed")
+        runs = [call for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[0][1]["ClientToken"], runs[1][1]["ClientToken"])
+        self.assertEqual(second["operation"], first["operation"])
+        ledger = self.reopened()
+        self.assertEqual(len(ledger.operations()), 1)
+        self.assertEqual(ledger.operation(first["operation"]).state, "starting")
+
+    def test_shutting_down_instance_keeps_the_slot(self):
+        operation_id = self.seed(state="running")
+        controller = self.build(observation=observation_demand())
+        self.aws.instances_result = [instance(instance_id="i-seed", operation=operation_id, state="shutting-down")]
         result = controller.apply()
-        self.assertEqual(self.reopened().operation(first["operation"]).state, "terminal")
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("slot_busy", result["reasons"])
+        self.assertEqual(self.reopened().operation(operation_id).state, "terminating")
+        self.assertEqual(self.aws.terminated, [])
+
+    def test_terminal_operation_with_a_live_instance_blocks_admission(self):
+        operation_id = self.seed(state="terminal")
+        controller = self.build(observation=observation_demand())
+        self.aws.instances_result = [instance(operation=operation_id, state="running")]
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_lingering_terminated_record_does_not_block_the_next_launch(self):
+        self.seed(state="terminal", operation_id="old-operation")
+        controller = self.build(observation=observation_demand())
+        self.aws.instances_result = [instance(instance_id="i-gone", operation="old-operation", state="terminated")]
+        result = controller.apply()
         self.assertEqual(result["decision"], "launched")
-        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 2)
+
+    def test_duplicate_instances_for_one_operation_are_refused(self):
+        operation_id = self.seed(state="running")
+        controller = self.build(observation=observation_demand())
+        self.aws.instances_result = [
+            instance(instance_id="i-a", operation=operation_id),
+            instance(instance_id="i-b", operation=operation_id),
+        ]
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertEqual(self.aws.mutations(), [])
 
     def test_unrecorded_owned_instance_blocks_a_launch(self):
         controller = self.build(observation=observation_demand())
@@ -237,7 +314,9 @@ class ApplyTests(ControllerCase):
     def test_expired_instance_is_terminated_before_new_admission(self):
         operation_id = self.seed(state="running", expires_at=self.clock.now - 10)
         controller = self.build(observation=observation_demand())
-        self.aws.instances_result = [instance(instance_id="i-seed", operation=operation_id)]
+        self.aws.instances_result = [
+            instance(instance_id="i-seed", operation=operation_id, expires_at=self.clock.now - 10)
+        ]
         result = controller.apply()
         self.assertEqual(self.aws.terminated, ["i-seed"])
         self.assertEqual(self.reopened().operation(operation_id).state, "terminating")
@@ -247,7 +326,9 @@ class ApplyTests(ControllerCase):
     def test_denied_expiry_cleanup_stays_unresolved(self):
         operation_id = self.seed(state="running", expires_at=self.clock.now - 10)
         controller = self.build(observation=observation_demand())
-        self.aws.instances_result = [instance(instance_id="i-seed", operation=operation_id)]
+        self.aws.instances_result = [
+            instance(instance_id="i-seed", operation=operation_id, expires_at=self.clock.now - 10)
+        ]
         self.aws.terminate_error = ProviderRefusal("AWS_REFUSED", "UnauthorizedOperation")
         result = controller.apply()
         self.assertEqual(result["decision"], "cleanup_failed")
@@ -307,6 +388,15 @@ class ReapTests(ControllerCase):
         self.assertEqual(result["decision"], "termination_requested")
         self.assertEqual(self.aws.terminated, ["i-expired"])
         self.assertIn("not confirmed removal", result["confirmation"])
+
+    def test_reap_refuses_an_instance_without_an_operation_identity(self):
+        controller = self.build()
+        self.aws.instances_result = [
+            instance(instance_id="i-pending", operation="pending", expires_at=self.clock.now - 5)
+        ]
+        result = controller.reap()
+        self.assertEqual(result["refused_resources"][0]["reason"], "OPERATION_TAG_INVALID")
+        self.assertEqual(result["expired"], [])
 
     def test_reap_refuses_malformed_expiry(self):
         controller = self.build()

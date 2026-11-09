@@ -6,12 +6,14 @@ instances and request termination. The adapter never logs request parameters,
 user data or credential material; a provider failure is reported as its error
 code only.
 
-``boto3`` is imported on first use, so the population tests and the observation
-and planning code paths run on a checkout with no cloud SDK installed.
+``boto3`` is imported on first use, so the tests run on a checkout with no cloud
+SDK installed. A caller may inject a client, which the adapter-boundary tests
+use to exercise pagination and response parsing without any SDK.
 """
 
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .errors import ProviderRefusal
 from .money import parse_money
@@ -20,6 +22,8 @@ MANAGED_TAG = "ci-burst:managed"
 DEPLOYMENT_TAG = "ci-burst:deployment"
 OPERATION_TAG = "ci-burst:operation"
 EXPIRES_TAG = "ci-burst:expires-at"
+
+MAX_INVENTORY_PAGES = 20
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,7 @@ class Template:
     instance_type: str
     shutdown_behavior: str
     has_user_data: bool
+    placement_zone: str | None
 
     def as_dict(self):
         return {
@@ -43,6 +48,7 @@ class Template:
             "instance_type": self.instance_type,
             "shutdown_behavior": self.shutdown_behavior,
             "bootstrap_present": self.has_user_data,
+            "placement_zone": self.placement_zone,
         }
 
 
@@ -82,16 +88,16 @@ class Instance:
 class Aws:
     """Live adapter. Construct once per command."""
 
-    def __init__(self, config):
+    def __init__(self, config, client=None, clock=time.time):
         self._config = config
-        self._client_cache = None
+        self._client_cache = client
+        self._clock = clock
 
     def _client(self):
         if self._client_cache is not None:
             return self._client_cache
         try:
             import boto3
-            import botocore.exceptions  # noqa: F401  (availability check only)
         except ImportError:
             raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
         session = boto3.Session(profile_name=self._config.aws.profile)
@@ -99,16 +105,11 @@ class Aws:
         return self._client_cache
 
     def _call(self, method, **kwargs):
-        import botocore.exceptions as botocore
-
         client = self._client()
         try:
             return getattr(client, method)(**kwargs)
-        except botocore.ClientError as error:
-            code = error.response.get("Error", {}).get("Code", "Unknown")
-            raise ProviderRefusal("AWS_REFUSED", str(code)) from None
-        except botocore.BotoCoreError as error:
-            raise ProviderRefusal("AWS_UNCERTAIN", type(error).__name__, uncertain=True) from None
+        except Exception as error:  # noqa: BLE001 - classified below
+            raise _translate(error) from None
 
     # -- reads ----------------------------------------------------------
     def template(self, name, version):
@@ -136,6 +137,8 @@ class Aws:
                 "TEMPLATE_SHUTDOWN_NOT_TERMINATE", "InstanceInitiatedShutdownBehavior must be terminate"
             )
         has_user_data = bool(data.get("UserData"))
+        placement = data.get("Placement") or {}
+        placement_zone = placement.get("AvailabilityZone")
         return Template(
             name=name,
             template_id=entry.get("LaunchTemplateId", ""),
@@ -144,10 +147,11 @@ class Aws:
             instance_type=instance_type,
             shutdown_behavior=shutdown,
             has_user_data=has_user_data,
+            placement_zone=placement_zone if isinstance(placement_zone, str) and placement_zone else None,
         )
 
     def spot_quote(self, instance_type, availability_zone):
-        start = time.time() - self._config.aws.price_max_age_seconds
+        start = datetime.fromtimestamp(self._clock() - self._config.aws.price_max_age_seconds, timezone.utc)
         response = self._call(
             "describe_spot_price_history",
             InstanceTypes=[instance_type],
@@ -155,49 +159,31 @@ class Aws:
             ProductDescriptions=["Linux/UNIX"],
             StartTime=start,
         )
-        entries = response.get("SpotPriceHistory") or []
-        if not entries:
-            return None
-        latest = max(entries, key=lambda item: item.get("Timestamp", 0))
-        price = latest.get("SpotPrice")
-        if not isinstance(price, str):
-            return None
-        try:
-            micros = parse_money(price, "SpotPrice")
-        except ValueError:
-            return None
-        return SpotQuote(
-            price_micros=micros,
-            timestamp=float(latest.get("Timestamp", 0)),
-            price_display=price,
-            instance_type=instance_type,
-            availability_zone=availability_zone,
-        )
+        return _spot_quote(response.get("SpotPriceHistory") or [], instance_type, availability_zone)
 
     def owned_instances(self, deployment):
-        response = self._call(
-            "describe_instances",
-            Filters=[
-                {"Name": "tag:" + MANAGED_TAG, "Values": ["true"]},
-                {"Name": "tag:" + DEPLOYMENT_TAG, "Values": [deployment]},
-            ],
-        )
-        return _instances(response)
+        filters = [
+            {"Name": "tag:" + MANAGED_TAG, "Values": ["true"]},
+            {"Name": "tag:" + DEPLOYMENT_TAG, "Values": [deployment]},
+        ]
+        items, token, pages = [], None, 0
+        while True:
+            arguments = {"Filters": filters}
+            if token:
+                arguments["NextToken"] = token
+            response = self._call("describe_instances", **arguments)
+            items.extend(_instances(response))
+            token = response.get("NextToken")
+            pages += 1
+            if not token:
+                return items
+            if pages >= MAX_INVENTORY_PAGES:
+                raise ProviderRefusal("AWS_INVENTORY_INCOMPLETE", "DescribeInstances pagination limit reached")
 
     def instances(self, instance_ids):
         if not instance_ids:
             return []
-        import botocore.exceptions as botocore
-
-        client = self._client()
-        try:
-            response = client.describe_instances(InstanceIds=list(instance_ids))
-        except botocore.ClientError as error:
-            if error.response.get("Error", {}).get("Code") in ("InvalidInstanceID.NotFound",):
-                return []
-            raise ProviderRefusal("AWS_REFUSED", str(error.response.get("Error", {}).get("Code", "Unknown"))) from None
-        except botocore.BotoCoreError as error:
-            raise ProviderRefusal("AWS_UNCERTAIN", type(error).__name__, uncertain=True) from None
+        response = self._call("describe_instances", InstanceIds=list(instance_ids))
         return _instances(response)
 
     # -- mutations ------------------------------------------------------
@@ -215,6 +201,57 @@ class Aws:
         return self._call("terminate_instances", InstanceIds=list(instance_ids))
 
 
+def _translate(error):
+    """Map SDK failures to refusals without importing the SDK for tests."""
+    try:
+        import botocore.exceptions as botocore
+    except ImportError:
+        return ProviderRefusal("AWS_REFUSED", type(error).__name__)
+    if isinstance(error, botocore.ClientError):
+        code = error.response.get("Error", {}).get("Code", "Unknown")
+        return ProviderRefusal("AWS_REFUSED", str(code))
+    if isinstance(error, botocore.BotoCoreError):
+        return ProviderRefusal("AWS_UNCERTAIN", type(error).__name__, uncertain=True)
+    return ProviderRefusal("AWS_REFUSED", type(error).__name__)
+
+
+def _timestamp(value):
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _spot_quote(entries, instance_type, availability_zone):
+    """Pick the newest quote in the requested placement scope."""
+    scoped = [
+        entry
+        for entry in entries
+        if entry.get("AvailabilityZone") in (None, availability_zone)
+        and entry.get("InstanceType") in (None, instance_type)
+        and entry.get("ProductDescription") in (None, "Linux/UNIX")
+    ]
+    if not scoped:
+        return None
+    newest = max(scoped, key=lambda entry: _timestamp(entry.get("Timestamp")) or 0.0)
+    timestamp = _timestamp(newest.get("Timestamp"))
+    price = newest.get("SpotPrice")
+    if timestamp is None or not isinstance(price, str):
+        return None
+    try:
+        micros = parse_money(price, "SpotPrice")
+    except ValueError:
+        return None
+    return SpotQuote(
+        price_micros=micros,
+        timestamp=timestamp,
+        price_display=price,
+        instance_type=instance_type,
+        availability_zone=availability_zone,
+    )
+
+
 def _instances(response):
     result = []
     for reservation in response.get("Reservations") or []:
@@ -226,7 +263,7 @@ def _instances(response):
                     instance_id=item.get("InstanceId", ""),
                     state=(item.get("State") or {}).get("Name", "unknown"),
                     tags=tags,
-                    launch_time=launch_time.timestamp() if launch_time is not None else None,
+                    launch_time=_timestamp(launch_time),
                 )
             )
     return result

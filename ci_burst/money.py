@@ -35,8 +35,10 @@ def parse_money(value, field):
 
 def format_money(micros):
     """Render micros as a plain decimal string for display only."""
-    whole, fraction = divmod(int(micros), MICROS_PER_UNIT)
-    return f"{whole}.{fraction:06d}"
+    value = int(micros)
+    sign = "-" if value < 0 else ""
+    whole, fraction = divmod(abs(value), MICROS_PER_UNIT)
+    return f"{sign}{whole}.{fraction:06d}"
 
 
 def hourly_cost_micros(price_per_hour_micros, seconds):

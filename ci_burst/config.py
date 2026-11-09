@@ -61,7 +61,6 @@ class AwsConfig:
     max_spot_price: int
     max_lifetime_seconds: int
     price_max_age_seconds: int
-    uncertainty_grace_seconds: int
     profile: str | None
 
 
@@ -229,7 +228,6 @@ def load(path):
             "max_spot_price",
             "max_lifetime_seconds",
             "price_max_age_seconds",
-            "uncertainty_grace_seconds",
             "profile",
         ),
     )
@@ -253,10 +251,6 @@ def load(path):
             aws_table, "price_max_age_seconds", "aws", minimum=60, maximum=86_400, required=False
         )
         or 900,
-        uncertainty_grace_seconds=_integer(
-            aws_table, "uncertainty_grace_seconds", "aws", minimum=10, maximum=3_600, required=False
-        )
-        or 30,
         profile=profile,
     )
 

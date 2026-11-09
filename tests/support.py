@@ -33,6 +33,7 @@ def template(**overrides):
         "instance_type": "t4g.small",
         "shutdown_behavior": "terminate",
         "has_user_data": True,
+        "placement_zone": None,
     }
     values.update(overrides)
     return Template(**values)
@@ -168,7 +169,6 @@ def write_config(tmp_path, *, config=None):
             "launch_template_version": 3,
             "max_spot_price": "0.0400",
             "max_lifetime_seconds": 3600,
-            "uncertainty_grace_seconds": 30,
         },
         "budget": {"window_seconds": 86400, "allowance": "10.00", "non_compute_allowance": "0.50"},
         "state": {"database": "state.sqlite3"},

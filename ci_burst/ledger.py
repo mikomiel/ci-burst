@@ -68,13 +68,15 @@ class Ledger:
         self._in_transaction = False
 
     # -- lifecycle -----------------------------------------------------
-    def connect(self, create=True):
+    def connect(self, create=True, read_only=False):
         if self._connection is not None:
             return self
         if not self.path.exists():
             if not create:
                 return self
             self.path.parent.mkdir(parents=True, exist_ok=True)
+        if read_only:
+            return self._connect_read_only()
         connection = None
         try:
             connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -94,6 +96,23 @@ class Ledger:
             if connection is not None:
                 connection.close()
             raise
+        self._connection = connection
+        return self
+
+    def _connect_read_only(self):
+        """Open an existing ledger without creating, migrating or writing it."""
+        try:
+            connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=5)
+            connection.row_factory = sqlite3.Row
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        except sqlite3.DatabaseError as error:
+            raise StateRefusal("STATE_UNREADABLE", type(error).__name__) from None
+        if version == 0:
+            connection.close()
+            raise StateRefusal("STATE_UNINITIALIZED", str(self.path))
+        if version != SCHEMA_VERSION:
+            connection.close()
+            raise StateRefusal("STATE_VERSION_UNSUPPORTED", f"schema {version}")
         self._connection = connection
         return self
 

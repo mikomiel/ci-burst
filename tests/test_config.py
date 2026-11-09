@@ -19,7 +19,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.deployment, "test-deployment")
         self.assertEqual(config.worker.labels, ("ci-burst:host", "homelab:host"))
         self.assertEqual(config.aws.max_spot_price, 40_000)
-        self.assertEqual(config.aws.uncertainty_grace_seconds, 30)
         self.assertEqual(config.state.database, self.root / "state.sqlite3")
 
     def test_relative_state_path_resolves_against_config(self):

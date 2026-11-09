@@ -47,3 +47,4 @@ class FormatMoneyTests(unittest.TestCase):
     def test_display_only(self):
         self.assertEqual(format_money(42_500), "0.042500")
         self.assertEqual(format_money(10_000_000), "10.000000")
+        self.assertEqual(format_money(-340_000), "-0.340000")

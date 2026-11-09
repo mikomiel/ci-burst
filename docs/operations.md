@@ -54,8 +54,8 @@ database = "state.sqlite3"
 ```
 
 Optional keys: `forgejo.timeout_seconds` (10), `forgejo.max_response_bytes`
-(2,000,000), `aws.price_max_age_seconds` (900), `aws.uncertainty_grace_seconds`
-(30), `aws.profile`, `controller.max_instances` (only `1` is accepted).
+(2,000,000), `aws.price_max_age_seconds` (900), `aws.profile`,
+`controller.max_instances` (only `1` is accepted).
 Relative state paths resolve against the configuration file directory. Unknown
 keys, floating-point money, a template-version alias, a non-`https` Forgejo URL
 and a second instance are refused.
@@ -88,7 +88,8 @@ the operator's token, returning one JSON array of `ActionRunJob` records.
 A record is eligible demand only when:
 
 - its `status` is `waiting`;
-- its `needs` array is empty (dependency-blocked work is not demand);
+- its `needs` array is present and empty (dependency-blocked work is not
+  demand; absent dependency metadata makes the observation unavailable);
 - its complete `runs_on` set is supported by the configured worker labels;
 - its `handle` is present, and repeated records for that attempt agree.
 
@@ -101,7 +102,9 @@ use the server-side label filter because its semantics are not qualified.
 
 Attempts are deduplicated by `handle`. A retry is a new handle and remains
 distinguishable. ci-burst never assigns, requeues or reserves a job, and it does
-not promise exclusivity merely because it observed a record.
+not promise exclusivity merely because it observed a record. Untrusted response
+values (status, handle) are never echoed in refusal details; an echoed handle
+must match a bounded identifier shape or is reported as `<redacted>`.
 
 ### Qualifying live support
 
@@ -196,11 +199,23 @@ The lifecycle is `intent -> starting -> running -> terminating -> terminal`,
 with `uncertain` for a lost launch response and `failed` for a definite provider
 refusal. Intent is committed before the launch request. A lost response is
 resolved by discovering instances tagged with the operation id, never by
-allocating a replacement operation; an empty result must persist past
-`uncertainty_grace_seconds` before the operation is recorded as not created.
-An accepted termination request is not confirmed removal: the operation stays
-outstanding until the provider reports a terminal state or the instance record
-is gone.
+allocating a replacement operation. While an intent has no confirmed instance,
+the next apply resumes that **same** frozen request and client token; EC2
+idempotency makes the retry safe, and the 24-hour client-token validity bounds
+how long it is attempted. Beyond that the unresolved intent blocks and needs an
+operator decision.
+
+Termination is confirmed only by the provider reporting `terminated` (or by the
+instance record disappearing after the provider's visibility window).
+`shutting-down`, `stopping` and `stopped` keep the operation outstanding and the
+single slot occupied. Expiry cleanup terminates only an instance that is both
+present in the current owned inventory and carries a valid, expired expiry tag;
+a ledger id alone is not permission to terminate.
+
+The owned inventory is read across every `DescribeInstances` page. An inventory
+that cannot be completed, an instance whose operation is not in the ledger, a
+terminal operation that still owns a resource, and two instances for one
+operation all block new admission.
 
 Every launch carries `ci-burst:managed`, `ci-burst:deployment`,
 `ci-burst:operation` and `ci-burst:expires-at` tags. Discovery and cleanup

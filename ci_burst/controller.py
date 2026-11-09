@@ -4,6 +4,11 @@ The controller is a capacity decision, not a scheduler. It never assigns jobs,
 retries jobs or records a CI result. Forgejo remains the authority for work and
 results; AWS remains the authority for instances. Every mutating path requires
 an explicit apply call and a writable ledger.
+
+A launch intent is durable before the cloud request. While an intent has no
+confirmed instance, apply resumes that same frozen request and client token
+instead of allocating a replacement; EC2 idempotency makes the retry safe and
+the 24-hour client-token validity bounds how long that is attempted.
 """
 
 import hashlib
@@ -13,11 +18,15 @@ import time
 
 from .aws import DEPLOYMENT_TAG, EXPIRES_TAG, MANAGED_TAG, OPERATION_TAG, Aws
 from .errors import ProviderRefusal, Refusal, StateRefusal
-from .forgejo import CONTRACT, ForgejoObserver
+from .forgejo import ForgejoObserver
 from .ledger import Ledger, current_window
 from .money import format_money, hourly_cost_micros
 
 WRITER_TOPOLOGY = "one deployment, one controller host, one durable ledger, one writer"
+
+#: EC2 documents a client token as valid for 24 hours. Beyond that a retry is
+#: no longer idempotent, so the unresolved intent blocks and needs an operator.
+CLIENT_TOKEN_MAX_AGE_SECONDS = 24 * 60 * 60
 
 COST_SCOPE_NOTE = (
     "The reservation estimates compute at the configured maximum Spot price for the configured "
@@ -36,7 +45,7 @@ class Controller:
         self.config = config
         self.clock = clock
         self.observer = observer or ForgejoObserver(config)
-        self.aws = aws or Aws(config)
+        self.aws = aws or Aws(config, clock=clock)
         self.ledger = ledger or Ledger(config.state.database, clock=clock)
 
     # -- operation ------------------------------------------------------
@@ -49,11 +58,12 @@ class Controller:
 
     def _plan(self):
         result = self._base("plan")
+        result["inventory_note"] = "apply reconciles the cloud inventory; plan reads only durable state"
         state = self._read_state(required=False)
         result["state"] = state
-        observation = self._observe_or_refuse(result)
         slot = self._slot_from_state(state)
         result["slot"] = slot
+        observation = self._observe_or_refuse(result)
         if observation is None:
             result["decision"] = "refused"
             return result
@@ -61,7 +71,7 @@ class Controller:
         template = self._template_or_refuse(result)
         if template is not None:
             result["template"] = template.as_dict()
-        decision = self._decide(observation, slot, template, state)
+        decision = self._decide(observation, slot, template)
         result.update(decision)
         if result["decision"] == "launch_ready":
             result["decision"] = "would_launch"
@@ -77,20 +87,25 @@ class Controller:
             instances = self.aws.owned_instances(self.config.deployment)
             with self.ledger.transaction():
                 slot, discrepancies = self._reconcile(instances)
+            if discrepancies:
+                slot["discrepancies"] = discrepancies
             result["slot"] = slot
             if discrepancies:
-                result["slot"]["discrepancies"] = discrepancies
+                result["decision"] = "refused"
+                result.setdefault("reasons", []).append("owned_state_discrepancy")
+                return result
+            if self._resume(slot, result):
+                return result
             if self._expire(slot, instances, result):
                 return result
             observation = self._observe_or_refuse(result)
             if observation is None:
-                result["decision"] = "refused"
                 return result
             result["observation"] = observation.as_dict()
             template = self._template_or_refuse(result)
             if template is not None:
                 result["template"] = template.as_dict()
-            decision = self._decide(observation, slot, template, self._read_state(required=True))
+            decision = self._decide(observation, slot, template)
             result.update(decision)
             if decision["decision"] != "launch_ready":
                 result["decision"] = decision["decision"]
@@ -138,6 +153,10 @@ class Controller:
         for instance in instances:
             if instance.state in ("shutting-down", "terminated"):
                 continue
+            operation = instance.tags.get(OPERATION_TAG)
+            if not isinstance(operation, str) or not operation or operation == "pending":
+                refused.append({"instance_id": instance.instance_id, "reason": "OPERATION_TAG_INVALID"})
+                continue
             expiry = _expiry(instance)
             if expiry is None:
                 refused.append({"instance_id": instance.instance_id, "reason": "EXPIRY_TAG_INVALID"})
@@ -176,7 +195,13 @@ class Controller:
         }
 
     def _read_state(self, required):
-        self.ledger.connect(create=False)
+        if required:
+            self.ledger.connect(create=False)
+        else:
+            try:
+                self.ledger.connect(create=False, read_only=True)
+            except StateRefusal as refusal:
+                return {"available": False, "note": refusal.reason}
         if not self.ledger.available:
             if required:
                 raise StateRefusal("STATE_UNAVAILABLE")
@@ -207,7 +232,7 @@ class Controller:
             result["template_error"] = refusal.as_dict()
             return None
 
-    def _decide(self, observation, slot, template, state):
+    def _decide(self, observation, slot, template):
         """Return the decision block for this snapshot."""
         now = self.clock()
         reasons, notes = [], []
@@ -231,6 +256,10 @@ class Controller:
         if not template.has_user_data:
             decision["decision"] = "refused"
             reasons.append("template_bootstrap_missing")
+            return decision
+        if template.placement_zone is not None and template.placement_zone != self.config.aws.availability_zone:
+            decision["decision"] = "refused"
+            reasons.append("template_placement_mismatch")
             return decision
         window_start = current_window(now, self.config.budget.window_seconds)
         reservation = hourly_cost_micros(
@@ -261,6 +290,10 @@ class Controller:
             decision["decision"] = "refused"
             reasons.append("spot_price_stale")
             return decision
+        if quote.availability_zone != self.config.aws.availability_zone or quote.instance_type != template.instance_type:
+            decision["decision"] = "refused"
+            reasons.append("spot_price_wrong_scope")
+            return decision
         if quote.price_micros > self.config.aws.max_spot_price:
             decision["decision"] = "refused"
             reasons.append("spot_price_above_cap")
@@ -286,6 +319,7 @@ class Controller:
                 "LaunchTemplateId": template.template_id,
                 "Version": str(template.version),
             },
+            "Placement": {"AvailabilityZone": self.config.aws.availability_zone},
             "InstanceMarketOptions": {
                 "MarketType": "spot",
                 "SpotOptions": {
@@ -325,6 +359,29 @@ class Controller:
             )
         # Intent is committed, so a lost response is recoverable and never a
         # reason to allocate a second operation for the same demand.
+        self._send(operation, request, result, "launched")
+        return result
+
+    def _resume(self, slot, result):
+        """Retry the one unresolved launch intent instead of replacing it."""
+        pending = [operation for operation in slot["operations"] if not operation.get("instance_id")]
+        if not pending:
+            return False
+        if len(pending) > 1:
+            result["decision"] = "refused"
+            result.setdefault("reasons", []).append("unresolved_intent_conflict")
+            return True
+        operation_id = pending[0]["operation"]
+        operation = self.ledger.operation(operation_id)
+        if self.clock() - operation.created_at > CLIENT_TOKEN_MAX_AGE_SECONDS:
+            result["decision"] = "refused"
+            result.setdefault("reasons", []).append("unresolved_intent_expired")
+            result["operation"] = operation.id
+            return True
+        self._send(operation, operation.request(), result, "resumed")
+        return True
+
+    def _send(self, operation, request, result, success_decision):
         try:
             instance_ids = self.aws.run_spot(request)
         except ProviderRefusal as refusal:
@@ -333,20 +390,53 @@ class Controller:
             result["decision"] = "uncertain" if refusal.uncertain else "launch_failed"
             result["refusal"] = refusal.as_dict()
             result["operation"] = operation.id
-            return result
+            return
         self.ledger.set_state(operation.id, "starting", instance_id=instance_ids[0])
-        result["decision"] = "launched"
+        result["decision"] = success_decision
         result["operation"] = operation.id
         result["instance_id"] = instance_ids[0]
-        result["expires_at"] = decision["expires_at"]
-        result["reservation"] = format_money(decision["reservation_micros"])
-        return result
+        result["expires_at"] = operation.expires_at
+        result["reservation"] = format_money(operation.reservation_micros)
+
+    def _expire(self, slot, instances, result):
+        """Terminate only an expired instance whose current ownership is verified."""
+        now = self.clock()
+        expired = [operation for operation in slot["operations"] if operation["expires_at"] <= now]
+        if not expired:
+            return False
+        inventory = {instance.tags.get(OPERATION_TAG): instance for instance in instances}
+        targets, refused = [], []
+        for operation in expired:
+            instance = inventory.get(operation["operation"])
+            if instance is not None and instance.state in ("shutting-down", "terminated"):
+                instance = None
+            expiry = _expiry(instance) if instance is not None else None
+            if instance is None or expiry is None or expiry > now:
+                refused.append({"operation": operation["operation"], "reason": "EXPIRY_EVIDENCE_INVALID"})
+                continue
+            targets.append(instance.instance_id)
+        if refused:
+            result["expiry_refusals"] = refused
+        if not targets:
+            return False
+        try:
+            self.aws.terminate(targets)
+        except ProviderRefusal as refusal:
+            result["decision"] = "cleanup_failed"
+            result["refusal"] = refusal.as_dict()
+            return True
+        with self.ledger.transaction():
+            for operation in expired:
+                if operation["instance_id"] in targets:
+                    self.ledger.set_state(operation["operation"], "terminating", detail="expired")
+        result["expiry_cleanup"] = targets
+        return False
 
     def _reconcile(self, instances):
-        """Reconcile durable operations with owned cloud resources."""
+        """Reconcile durable operations with the complete owned inventory."""
         operations = {operation.id: operation for operation in self.ledger.operations()}
         nonterminal = {operation.id: operation for operation in self.ledger.nonterminal_operations()}
-        by_operation = {}
+        grouped = {}
         discrepancies = []
         for instance in instances:
             operation_id = instance.tags.get(OPERATION_TAG)
@@ -362,23 +452,38 @@ class Controller:
                     }
                 )
                 continue
-            if operation_id in nonterminal:
-                by_operation[operation_id] = instance
-        now = self.clock()
+            grouped.setdefault(operation_id, []).append(instance)
+        by_operation = {}
+        for operation_id, group in grouped.items():
+            live = [instance for instance in group if instance.state != "terminated"]
+            if len(live) > 1:
+                discrepancies.append(
+                    {
+                        "instance_id": live[1].instance_id,
+                        "operation": operation_id,
+                        "reason": "DUPLICATE_OPERATION_INSTANCES",
+                    }
+                )
+            chosen = (live or group)[0]
+            by_operation[operation_id] = chosen
+            if operation_id not in nonterminal and chosen.state != "terminated":
+                discrepancies.append(
+                    {
+                        "instance_id": chosen.instance_id,
+                        "operation": operation_id,
+                        "reason": "TERMINAL_OPERATION_STILL_OWNS_INSTANCE",
+                    }
+                )
         missing = [operation for operation in nonterminal.values() if operation.id not in by_operation]
-        by_id = {}
         identifiers = [operation.instance_id for operation in missing if operation.instance_id]
+        by_id = {}
         if identifiers:
             by_id = {instance.instance_id: instance for instance in self.aws.instances(identifiers)}
         for operation in missing:
             instance = by_id.get(operation.instance_id) if operation.instance_id else None
             if operation.instance_id and instance is not None:
-                if instance.state in ("shutting-down", "terminated"):
-                    self.ledger.set_state(
-                        operation.id, "terminal", instance_id=instance.instance_id, detail="instance_terminated"
-                    )
-                else:
-                    self._reconcile_present(operation, instance)
+                self._reconcile_present(operation, instance)
+                if instance.state != "terminated":
                     discrepancies.append(
                         {
                             "instance_id": instance.instance_id,
@@ -388,8 +493,8 @@ class Controller:
                     )
             elif operation.instance_id:
                 self.ledger.set_state(operation.id, "terminal", detail="instance_absent")
-            else:
-                self._reconcile_absent(operation, now)
+            # An operation without an instance id stays outstanding; apply
+            # resumes its frozen request instead of creating a replacement.
         for operation in nonterminal.values():
             instance = by_operation.get(operation.id)
             if instance is not None:
@@ -399,9 +504,9 @@ class Controller:
 
     def _reconcile_present(self, operation, instance):
         state = instance.state
-        if state in ("shutting-down", "terminated"):
+        if state == "terminated":
             self.ledger.set_state(operation.id, "terminal", instance_id=instance.instance_id, detail="instance_terminated")
-        elif state in ("stopping", "stopped"):
+        elif state in ("shutting-down", "stopping", "stopped"):
             self.ledger.set_state(operation.id, "terminating", instance_id=instance.instance_id)
         elif operation.state == "terminating":
             self.ledger.set_state(operation.id, "terminating", instance_id=instance.instance_id)
@@ -410,43 +515,38 @@ class Controller:
         else:
             self.ledger.set_state(operation.id, "starting", instance_id=instance.instance_id)
 
-    def _reconcile_absent(self, operation, now):
-        if operation.instance_id:
-            self.ledger.set_state(operation.id, "terminal", detail="instance_absent")
-            return
-        if operation.state == "uncertain":
-            if now - operation.updated_at >= self.config.aws.uncertainty_grace_seconds:
-                self.ledger.set_state(operation.id, "terminal", detail="not_created")
-            return
-        self.ledger.set_state(operation.id, "uncertain", detail="launch_response_not_received")
-
-    def _expire(self, slot, instances, result):
-        """Request termination for owned instances past their validated expiry."""
-        now = self.clock()
-        expired = [operation for operation in slot["operations"] if operation["expires_at"] <= now]
-        if not expired:
-            return False
-        identifiers = [operation["instance_id"] for operation in expired if operation.get("instance_id")]
-        if not identifiers:
-            return False
-        try:
-            self.aws.terminate(identifiers)
-        except ProviderRefusal as refusal:
-            result["decision"] = "cleanup_failed"
-            result["refusal"] = refusal.as_dict()
-            return True
-        for operation in expired:
-            self.ledger.set_state(operation["operation"], "terminating", detail="expired")
-        result["expiry_cleanup"] = identifiers
-        return False
-
     def _discrepancies(self, operations, instances):
-        known = {operation["operation"] for operation in operations}
+        known = {operation["operation"]: operation["state"] for operation in operations}
         discrepancies = []
+        seen_live = set()
         for instance in instances:
             operation_id = instance.tags.get(OPERATION_TAG)
-            if not operation_id or operation_id == "pending" or operation_id not in known:
-                discrepancies.append({"instance_id": instance.instance_id, "operation": operation_id})
+            if not operation_id or operation_id == "pending":
+                discrepancies.append(
+                    {"instance_id": instance.instance_id, "operation": operation_id, "reason": "OWNED_INSTANCE_WITHOUT_OPERATION"}
+                )
+                continue
+            if operation_id not in known:
+                discrepancies.append(
+                    {"instance_id": instance.instance_id, "operation": operation_id, "reason": "UNRECORDED_OWNED_INSTANCE"}
+                )
+                continue
+            if instance.state == "terminated":
+                continue
+            if operation_id in seen_live:
+                discrepancies.append(
+                    {"instance_id": instance.instance_id, "operation": operation_id, "reason": "DUPLICATE_OPERATION_INSTANCES"}
+                )
+                continue
+            seen_live.add(operation_id)
+            if known[operation_id] in ("terminal", "failed"):
+                discrepancies.append(
+                    {
+                        "instance_id": instance.instance_id,
+                        "operation": operation_id,
+                        "reason": "TERMINAL_OPERATION_STILL_OWNS_INSTANCE",
+                    }
+                )
         return discrepancies
 
 

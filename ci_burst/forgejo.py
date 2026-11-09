@@ -10,6 +10,7 @@ synthetic fixtures only.
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -60,7 +61,7 @@ class Observation:
         return {
             "contract": self.contract,
             "status": self.status,
-            "demand_attempts": [attempt.handle for attempt in self.attempts],
+            "demand_attempts": [_safe_identifier(attempt.handle) for attempt in self.attempts],
             "jobs_seen": self.seen,
             "blocked": self.blocked,
             "assigned_or_finished": self.assigned,
@@ -147,6 +148,14 @@ class ForgejoObserver:
         return frozenset(names)
 
 
+_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def _safe_identifier(value):
+    """Echo an opaque provider identifier only when its shape is bounded."""
+    return value if _IDENTIFIER.fullmatch(value) else "<redacted>"
+
+
 def _parse_records(body):
     try:
         payload = json.loads(body.decode("utf-8"))
@@ -166,7 +175,6 @@ def _record(record, index):
     job_id = record.get("id")
     attempt = record.get("attempt")
     runs_on = record.get("runs_on")
-    needs = record.get("needs")
     if not isinstance(handle, str) or not handle:
         raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", f"{where}.handle must be a non-empty string")
     if not isinstance(status, str) or not status:
@@ -177,12 +185,18 @@ def _record(record, index):
         raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", f"{where}.attempt must be an integer of at least one")
     if not isinstance(runs_on, list) or any(not isinstance(label, str) or not label for label in runs_on):
         raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", f"{where}.runs_on must be an array of labels")
+    if "needs" not in record:
+        raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", f"{where}.needs is absent")
+    needs = record["needs"]
+    # A Go nil slice marshals as null and means "no dependencies". An absent
+    # key is different: dependency metadata is unknown, so demand is not
+    # established. Neither may be confused with an unread empty queue.
     if needs is not None and (
         not isinstance(needs, list) or any(not isinstance(need, str) for need in needs)
     ):
         raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", f"{where}.needs must be an array of strings")
     if status != RUNNABLE_STATUS and status not in ASSIGNED_OR_TERMINAL_STATUSES:
-        raise ObservationRefusal("FORGEJO_UNKNOWN_STATUS", status)
+        raise ObservationRefusal("FORGEJO_UNKNOWN_STATUS", "unrecognized job status")
     return handle, job_id, attempt, status, tuple(runs_on), tuple(needs or ())
 
 
@@ -197,7 +211,7 @@ def _reduce(records, worker_labels):
         signature = (job_id, attempt, status, labels, needs)
         if handle in seen:
             if seen[handle] != signature:
-                raise ObservationRefusal("FORGEJO_INCONSISTENT_ATTEMPT", handle)
+                raise ObservationRefusal("FORGEJO_INCONSISTENT_ATTEMPT", "conflicting duplicate attempt")
             duplicates += 1
             continue
         seen[handle] = signature
@@ -209,7 +223,7 @@ def _reduce(records, worker_labels):
             continue
         if not labels:
             incompatible += 1
-            notes.append(f"{handle}:job_without_labels")
+            notes.append("job_without_labels")
             continue
         if not set(labels).issubset(worker_labels):
             incompatible += 1

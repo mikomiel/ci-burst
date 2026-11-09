@@ -18,14 +18,108 @@ maintainer decision. Keep that boundary intact; a green check alone is not
 permission to change it. No release, tag, package, image or cloud deployment
 is authorized by a source PR.
 
+## Review and merge
+
+After maintainer-controlled activation, main requires the exact-head
+`planning`, `public-content` and `review` checks. The `review` status comes
+from the trusted default-branch publisher and is distinct from its publisher
+job completing successfully. Native approval requirements remain additional
+constraints: a posted App approval is not proof that GitHub counted it.
+A human maintainer can click Merge only when all effective rules pass;
+repository automation can merge eligible ordinary PRs under the same rules.
+
+`scripts/pr_policy.py` is the shared rule owner. It accepts the pinned Gandalf
+bot identity or a different human reviewer whose write/maintain/admin access
+was verified through GitHub. The verified-maintainer fallback serves the
+manual merge path; unattended merges still require Gandalf itself at the
+current head. Outstanding change requests from eligible reviewers block both
+paths. Dismissal or unreadable evidence is a refusal. Comments do not erase
+decisive reviews. There is no dependency-bot review exemption.
+
+The publisher and merger run only trusted default-branch scripts. Neither
+executes PR-head code or consumes PR-produced artifacts with a write token.
+The merger checks complete API results, both CI checks from GitHub Actions,
+the official `review` status, the immutable base/head file comparison and
+fresh refs/reviews/checks before a head-pinned squash merge. It admits at most
+one merge per run and verifies the remote result. A timeout is not permission
+to repeat a merge blindly.
+
+The ordinary-path allowlist in `scripts/pr_policy.py` is enforced, not
+advisory. Unknown paths need a human decision; they are not implicitly safe.
+This pre-implementation repository initially admits only root README/changelog
+and the named OpenSpec proposal, design, tasks, metadata and capability-spec
+files. Arbitrary Markdown is not implicitly ordinary: new documentation areas
+and agent-instruction variants still require a human. Workflows, scripts
+wherever introduced, tests and dependency/packaging definitions are not
+admitted. New ordinary areas require a reviewed policy change and tests. Both
+rename endpoints count; an incomplete file list cannot clear the guard.
+
+### Status freshness and failure behavior
+
+A commit status is a stored assertion, not an atomic live review query.
+Trusted lifecycle events, CI completion and a five-minute sweep refresh the
+`review` status. A human click relies on the last published evaluation; a
+withdrawal may take until the next successful sweep to appear. Automation
+independently reads the reviews again immediately before its merge request.
+An unchanged draft keeps its own pending verdict without invalidating an
+unrelated ready PR. An unreadable snapshot revokes known heads and fails the
+job. Negative status updates are attempted before new successes, and one
+per-head publication failure does not suppress other known revocations. Any
+failed revocation fails the run without publishing new successes. If PR
+enumeration itself fails, unknown heads cannot be revoked; the job fails
+loudly rather than claiming a fresh evaluation.
+
+### Maintainer-controlled activation and rollback
+
+Source tests do not establish an active merge gate. Use this order:
+
+1. Keep existing protection while the policy PR receives green exact-head CI
+   and independent review. Land it through an authorised maintainer/bootstrap
+   path; an authoring agent does not self-merge or invent a green status.
+2. Verify the default-branch publisher runs successfully and posts `review`
+   on the exact current PR head. Verify a changed or unapproved head is refused.
+3. Require `planning`, `public-content` and the semantic `review` status from
+   GitHub Actions (App 15368). Preserve the configured native approval count,
+   stale-review dismissal, strict freshness, administrator enforcement,
+   conversation resolution and force-push/deletion bans. If the App approval
+   does not satisfy the native count, stop for a separate owner policy decision;
+   do not lower the count or broaden App permissions to work around it.
+4. Read the effective rules back. Check a valid owner-click path and one
+   ordinary reviewed automation candidate; sensitive policy PRs remain human.
+   The repository's `allow_auto_merge` capability can be enabled without
+   arming a merge. An authoring agent must not place a standing `--auto` order;
+   this workflow owns its bounded, freshly checked merge request.
+
+If activation fails, retain or restore the native maintainer-review requirement
+and disable the automerge workflow. Preserve CI, state truth and published
+history. Revert defective source through a reviewed PR. Never lower protection
+merely to get the policy PR merged.
+
+Local observation is safe and does not publish statuses or merge:
+
+```sh
+python3 scripts/github_pr_automation.py review
+python3 scripts/github_pr_automation.py merge
+```
+
+`--apply` is refused outside the expected default-branch GitHub workflow
+context. Do not use it from an authoring session. No policy operation creates
+a release, deployment or cloud resource.
+
 ## Checks
 
-Use Node.js 22.12+ and the committed planning lockfile:
+Use Node.js 22.12+, Python 3.12+ and the committed planning lockfile:
 
 ```sh
 npm ci --ignore-scripts
+npm run check:policy
 npm run check:spec
 ```
+
+Policy tests use synthetic API snapshots and transport substitutes, not a
+GitHub write token. The pinned YAML parser is a development-only dependency
+for semantic workflow tests; it was already present in the planning tool's
+locked dependency graph.
 
 The CI workflow pins the Gitleaks version and binary checksum. Before any
 public push, run that version against the full intended commit range and an

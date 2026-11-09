@@ -45,8 +45,13 @@ The planning tooling is pinned in `package-lock.json`. Run:
 
 ```sh
 npm ci --ignore-scripts
+npm run check:policy
 npm run check:spec
 ```
+
+Use Python 3.12+ for the standard-library policy tests. The policy automation
+CLI is observation-only in authoring sessions; do not invoke `--apply`.
+`CONTRIBUTING.md` owns the maintainer activation and rollback procedure.
 
 The CI workflow owns its secret-scan invocation. Run the same scan before
 publication. Read `CONTRIBUTING.md` and `SECURITY.md` for contributor and

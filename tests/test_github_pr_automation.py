@@ -273,12 +273,13 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(driver.ApiError):
                 api.pages("pulls")
 
-    def test_combined_status_response_must_name_the_requested_head(self):
+    def test_review_status_creator_is_read_from_the_status_list(self):
+        # The combined status document omits each status creator, so the
+        # trusted-status check must read the status list instead.
         api = driver.GitHub()
-        response = {"total_count": 1, "sha": OTHER, "statuses": statuses()}
-        with mock.patch.object(api, "request", return_value=response):
-            with self.assertRaises(driver.ApiError):
-                api.statuses(HEAD)
+        with mock.patch.object(api, "request", return_value=statuses()) as request:
+            self.assertEqual(api.statuses(HEAD), statuses())
+        self.assertEqual(request.call_args.args[0], f"commits/{HEAD}/statuses?per_page=100&page=1")
 
     def test_association_alone_does_not_grant_maintainer_authority(self):
         api = driver.GitHub()

@@ -509,6 +509,19 @@ class Controller:
                     }
                 )
             chosen = (live or group)[0]
+            operation = operations[operation_id]
+            if operation_id in nonterminal and operation.instance_id and chosen.instance_id != operation.instance_id:
+                # A different record carrying the operation tag cannot replace
+                # a confirmed instance identity; the recorded instance may
+                # still be running.
+                discrepancies.append(
+                    {
+                        "instance_id": chosen.instance_id,
+                        "operation": operation_id,
+                        "reason": "INSTANCE_ID_CONFLICT",
+                    }
+                )
+                continue
             by_operation[operation_id] = chosen
             if operation_id not in nonterminal and chosen.state != "terminated":
                 discrepancies.append(

@@ -117,21 +117,28 @@ class Aws:
         self._config = config
         self._client_cache = client
         self._clock = clock
+        self._session_cache = None
         # ``client`` and ``account`` let adapter-boundary tests supply the
         # provider identity without an SDK or network.
         self._account_cache = account
 
-    def _client(self):
-        if self._client_cache is not None:
-            return self._client_cache
+    def _session(self):
+        """One resolved credential identity for identity and EC2 calls."""
+        if self._session_cache is not None:
+            return self._session_cache
         try:
             import boto3
         except ImportError:
             raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
+        self._session_cache = boto3.Session(profile_name=self._config.aws.profile)
+        return self._session_cache
+
+    def _client(self):
+        if self._client_cache is not None:
+            return self._client_cache
         from botocore.config import Config
 
-        session = boto3.Session(profile_name=self._config.aws.profile)
-        self._client_cache = session.client(
+        self._client_cache = self._session().client(
             "ec2",
             region_name=self._config.aws.region,
             config=Config(retries=RETRY_POLICY),
@@ -149,14 +156,9 @@ class Aws:
         """Return the AWS account the configured credential route reaches."""
         if self._account_cache is not None:
             return self._account_cache
-        try:
-            import boto3
-        except ImportError:
-            raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
         from botocore.config import Config
 
-        session = boto3.Session(profile_name=self._config.aws.profile)
-        sts = session.client("sts", region_name=self._config.aws.region, config=Config(retries=RETRY_POLICY))
+        sts = self._session().client("sts", region_name=self._config.aws.region, config=Config(retries=RETRY_POLICY))
         try:
             response = sts.get_caller_identity()
         except Exception as error:  # noqa: BLE001 - classified below

@@ -285,6 +285,46 @@ class AdapterTests(unittest.TestCase):
 
         self.assertEqual(Aws(self.config, client=MissingClient()).instances(["i-old"]), [])
 
+    def test_identity_and_ec2_share_one_session(self):
+        import sys
+        import types
+        from unittest import mock
+
+        sessions = []
+
+        boto3_module = types.ModuleType("boto3")
+
+        class Session:
+            def __init__(self, profile_name=None):
+                sessions.append(profile_name)
+
+            def client(self, service, region_name=None, config=None):
+                if service == "sts":
+                    class STS:
+                        def get_caller_identity(self):
+                            return {"Account": "111122223333"}
+
+                    return STS()
+                return object()
+
+        boto3_module.Session = Session
+        config_module = types.ModuleType("botocore.config")
+
+        class Config:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        config_module.Config = Config
+        botocore_module = types.ModuleType("botocore")
+        botocore_module.config = config_module
+        with mock.patch.dict(
+            sys.modules, {"boto3": boto3_module, "botocore": botocore_module, "botocore.config": config_module}
+        ):
+            aws = Aws(self.config)
+            self.assertEqual(aws.account_id(), "111122223333")
+            aws._client()
+        self.assertEqual(len(sessions), 1)
+
     def test_no_read_is_made_for_an_empty_instance_list(self):
         self.assertEqual(self.aws().instances([]), [])
         self.assertEqual(self.client.calls, [])

@@ -232,8 +232,10 @@ outstanding until EC2's retained-visibility window has elapsed; a recent
 `InvalidInstanceID.NotFound` is not treated as immediate proof of termination.
 
 The scope is part of ownership. `apply` resolves the account with
-`sts:GetCallerIdentity` and refuses with `SCOPE_CHANGED` while any outstanding
-operation belongs to another Region or account; an inventory from a different
+`sts:GetCallerIdentity` over the **same SDK session** that reads and launches
+EC2, so identity and inventory cannot resolve different credentials; it refuses
+with `SCOPE_CHANGED` while any outstanding operation belongs to another Region
+or account; an inventory from a different
 scope can never establish that such an operation terminated. `plan` performs
 the same Region check without an AWS call. Resolve or clean up the outstanding
 operation in its original scope before changing the credential route.

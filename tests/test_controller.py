@@ -411,30 +411,53 @@ class ApplyTests(ControllerCase):
         operation_id = self.seed(state="running")
         controller = self.build(observation=observation_demand())
         self.aws.instances_result = []
+        self.clock.advance(3601)
         changed = load(write_config(self.root, config={"aws": {"region": "us-east-1", "availability_zone": "us-east-1a"}}))
         result = self.build(observation=observation_demand(), aws=self.aws, config=changed).apply()
         self.assertEqual(result["decision"], "refused")
         self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertEqual(result["slot"]["discrepancies"][0]["reason"], "SCOPE_CHANGED")
         self.assertEqual(self.aws.mutations(), [])
-        self.assertEqual(self.reopened().operation(operation_id).state, "running")
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "running")
+        self.assertEqual(operation.instance_id, "i-seed")
 
     def test_account_change_is_refused_while_an_operation_is_outstanding(self):
         operation_id = self.seed(state="running")
         controller = self.build(observation=observation_demand())
         self.aws.instances_result = []
+        self.clock.advance(3601)
         self.aws.account = "999988887777"
         result = controller.apply()
         self.assertEqual(result["decision"], "refused")
         self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertEqual(result["slot"]["discrepancies"][0]["reason"], "SCOPE_CHANGED")
         self.assertEqual(self.aws.mutations(), [])
         self.assertEqual(self.reopened().operation(operation_id).state, "running")
 
-    def test_plan_refuses_a_region_change(self):
-        self.seed(state="running")
+    def test_plan_refuses_a_region_change_and_retains_the_operation(self):
+        operation_id = self.seed(state="running")
         changed = load(write_config(self.root, config={"aws": {"region": "us-east-1", "availability_zone": "us-east-1a"}}))
         result = self.build(observation=observation_demand(), config=changed).plan()
         self.assertEqual(result["decision"], "refused")
         self.assertEqual(result["refusal"]["reason"], "SCOPE_CHANGED")
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(self.reopened().operation(operation_id).state, "running")
+
+    def test_tagged_record_cannot_replace_a_confirmed_instance(self):
+        operation_id = self.seed(state="running")
+        controller = self.build(observation=observation_demand())
+        self.aws.instances_result = [instance(instance_id="i-other", operation=operation_id, state="terminated")]
+        self.aws.instances_by_id = {
+            "i-seed": instance(instance_id="i-seed", operation=operation_id, state="running")
+        }
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertEqual(self.aws.mutations(), [])
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "running")
+        self.assertEqual(operation.instance_id, "i-seed")
 
     def test_shutting_down_instance_keeps_the_slot(self):
         operation_id = self.seed(state="running")
@@ -458,7 +481,7 @@ class ApplyTests(ControllerCase):
     def test_lingering_terminated_record_does_not_block_the_next_launch(self):
         self.seed(state="terminal", operation_id="old-operation")
         controller = self.build(observation=observation_demand())
-        self.aws.instances_result = [instance(instance_id="i-gone", operation="old-operation", state="terminated")]
+        self.aws.instances_result = [instance(instance_id="i-seed", operation="old-operation", state="terminated")]
         result = controller.apply()
         self.assertEqual(result["decision"], "launched")
 
@@ -519,7 +542,7 @@ class ApplyTests(ControllerCase):
     def test_terminated_instance_reconciles_to_terminal(self):
         operation_id = self.seed(state="running")
         controller = self.build(observation=observation_empty())
-        self.aws.instances_result = [instance(operation=operation_id, state="terminated")]
+        self.aws.instances_result = [instance(instance_id="i-seed", operation=operation_id, state="terminated")]
         controller.apply()
         self.assertEqual(self.reopened().operation(operation_id).state, "terminal")
 

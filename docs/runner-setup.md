@@ -33,15 +33,18 @@ to read the reusable registration token or mint new credentials.
 
 Two boundaries make that true here:
 
-1. the registration token exists on the host only in a root-only file and in
-   the root-only `forgejo-runner register` call, before any job code exists;
+1. the registration token is read into a root-only file and passed to
+   `forgejo-runner register`, which completes and exits before the runner
+   starts or any job is dispatched. On a stock Linux host `/proc/<pid>/cmdline`
+   is world-readable, so the protection is that no job code exists during that
+   window, not the root UID. Host root and exec auditing can observe it;
 2. jobs run as an unprivileged `runner` account whose access to the instance
    metadata service is blocked, so job code cannot use the instance profile to
    read SSM.
 
-Do not run the runner or its jobs as root. If you cannot accept that the token
-is briefly visible to root and to host-level exec auditing, use the
-pre-registered credential alternative in section 3 instead.
+Do not run the runner or its jobs as root. If a window visible to host root or
+exec auditing is unacceptable, use the pre-registered credential alternative in
+section 2.
 
 ## 1. Runner IAM role
 
@@ -195,9 +198,9 @@ Instance sizing is a deployment decision. A worker that runs the same checks as
 a 4-core, 6 GiB self-hosted runner should get at least that; a cheap burstable
 type is fine only for short or trivial jobs.
 
-If the template pins Spot (ci-burst also requests Spot), the account needs the
-Spot service-linked role. An identity with `iam:CreateServiceLinkedRole` can
-create it once with:
+ci-burst always requests Spot, whether or not the template pins it, so the
+account needs the Spot service-linked role. An identity with
+`iam:CreateServiceLinkedRole` can create it once with:
 
 ```sh
 aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
@@ -233,8 +236,9 @@ on_exit() {
   shutdown -h now
 }
 trap on_exit EXIT
-# Independent watchdog for a hung step.
-systemd-run --on-active=3600 --unit=runner-lifetime /sbin/shutdown -h now || true
+# Independent watchdog for a hung step. Do not ignore a failure: without it a
+# hung apt or download would never reach the exit trap.
+systemd-run --on-active=3600 --unit=runner-lifetime /sbin/shutdown -h now
 
 apt-get update -y
 apt-get install -y --no-install-recommends curl ca-certificates awscli iptables
@@ -261,6 +265,8 @@ runner:
 cache:
   enabled: false
 CFG
+chown root:runner /etc/forgejo-runner/config.yml
+chmod 0640 /etc/forgejo-runner/config.yml
 
 # Pin Forgejo's name only if your DNS does not already resolve it.
 # echo '192.0.2.10 forgejo.example.com' >> /etc/hosts
@@ -273,9 +279,9 @@ aws ssm get-parameter --region eu-central-1 --name "$PARAM" \
   --with-decryption --query Parameter.Value --output text > "$TOKEN_FILE"
 
 # The stock CLI accepts the registration token only as an argument, and only
-# non-interactive mode can set --ephemeral. This is the one place it is read;
-# it runs as root and finishes before any job code exists. Job code runs as
-# `runner` and cannot read a root process's arguments.
+# non-interactive mode can set --ephemeral. This is the one place it is read.
+# The registration finishes before the runner starts, so no job code exists
+# during that window; host root and exec auditing can still observe it.
 /usr/local/bin/forgejo-runner register --no-interactive \
   -c /etc/forgejo-runner/config.yml \
   --instance https://forgejo.example.com \

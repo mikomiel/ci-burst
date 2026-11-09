@@ -124,7 +124,9 @@ identifier, not a re-declaration.
 
 The image and template are operator-owned prerequisites. ci-burst launches a
 pinned template; it does not build images, configure networks or distribute
-registration credentials. The controller refuses a template that is not
+registration credentials. A complete setup guide, with the IAM role, SSM
+SecureString parameter, network choices and bootstrap, is
+[runner-setup.md](runner-setup.md). The controller refuses a template that is not
 usable:
 
 - numeric `launch_template_version`, never an alias;

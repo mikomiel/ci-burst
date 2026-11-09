@@ -192,7 +192,8 @@ alert in this project should be described as one.
 ## Durable state and ownership
 
 One SQLite ledger records operation identity, frozen request, request hash,
-client token, expiry, reservation and the instance id. A process-wide file lock
+client token, expiry, reservation, the instance id and the verified AWS scope
+(Region and account). A process-wide file lock
 admits exactly one writer; a second writer refuses before any cloud mutation.
 The supported topology is one deployment, one controller host and one ledger
 copy. Tags are ownership metadata, not a distributed lock.
@@ -229,6 +230,13 @@ a ledger id alone is not permission to terminate.
 If a confirmed instance disappears from a by-id read, the operation stays
 outstanding until EC2's retained-visibility window has elapsed; a recent
 `InvalidInstanceID.NotFound` is not treated as immediate proof of termination.
+
+The scope is part of ownership. `apply` resolves the account with
+`sts:GetCallerIdentity` and refuses with `SCOPE_CHANGED` while any outstanding
+operation belongs to another Region or account; an inventory from a different
+scope can never establish that such an operation terminated. `plan` performs
+the same Region check without an AWS call. Resolve or clean up the outstanding
+operation in its original scope before changing the credential route.
 An unclassified provider or response-parsing exception is uncertain, never a
 definite failure, because it can occur after the service accepted a request.
 

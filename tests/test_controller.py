@@ -59,6 +59,8 @@ class ControllerCase(unittest.TestCase):
                 expires_at=expires_at if expires_at is not None else self.clock.now + 3600,
                 reservation_micros=reservation,
                 window_start=current_window(self.clock.now, self.config.budget.window_seconds),
+                region=self.config.aws.region,
+                account="111122223333",
             )
         if state != "intent" or instance_id:
             ledger.set_state(operation_id, state, instance_id=instance_id)
@@ -389,7 +391,7 @@ class ApplyTests(ControllerCase):
 
         self_clock = self.clock
         client = FlakyClient()
-        aws = Aws(self.config, client=client, clock=self.clock)
+        aws = Aws(self.config, client=client, clock=self.clock, account="111122223333")
         controller = Controller(
             self.config,
             observer=FakeObserver(observation_demand()),
@@ -404,6 +406,35 @@ class ApplyTests(ControllerCase):
         self.assertEqual(second["operation"], first["operation"])
         self.assertEqual(len(client.tokens), 2)
         self.assertEqual(client.tokens[0], client.tokens[1])
+
+    def test_region_change_while_an_operation_is_outstanding_is_refused(self):
+        operation_id = self.seed(state="running")
+        controller = self.build(observation=observation_demand())
+        self.aws.instances_result = []
+        changed = load(write_config(self.root, config={"aws": {"region": "us-east-1", "availability_zone": "us-east-1a"}}))
+        result = self.build(observation=observation_demand(), aws=self.aws, config=changed).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(self.reopened().operation(operation_id).state, "running")
+
+    def test_account_change_is_refused_while_an_operation_is_outstanding(self):
+        operation_id = self.seed(state="running")
+        controller = self.build(observation=observation_demand())
+        self.aws.instances_result = []
+        self.aws.account = "999988887777"
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(self.reopened().operation(operation_id).state, "running")
+
+    def test_plan_refuses_a_region_change(self):
+        self.seed(state="running")
+        changed = load(write_config(self.root, config={"aws": {"region": "us-east-1", "availability_zone": "us-east-1a"}}))
+        result = self.build(observation=observation_demand(), config=changed).plan()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["refusal"]["reason"], "SCOPE_CHANGED")
 
     def test_shutting_down_instance_keeps_the_slot(self):
         operation_id = self.seed(state="running")

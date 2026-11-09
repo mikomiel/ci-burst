@@ -32,6 +32,8 @@ class Operation:
     expires_at: float
     reservation_micros: int
     reservation_window: float
+    region: str
+    account: str
     request_json: str
     request_sha256: str
     instance_id: str | None
@@ -44,6 +46,8 @@ class Operation:
         return {
             "operation": self.id,
             "state": self.state,
+            "region": self.region,
+            "account": self.account,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "reservation_micros": self.reservation_micros,
@@ -132,6 +136,8 @@ class Ledger:
                 expires_at REAL NOT NULL,
                 reservation_micros INTEGER NOT NULL,
                 reservation_window REAL NOT NULL,
+                region TEXT NOT NULL,
+                account TEXT NOT NULL,
                 request_json TEXT NOT NULL,
                 request_sha256 TEXT NOT NULL,
                 instance_id TEXT,
@@ -209,6 +215,8 @@ class Ledger:
         expires_at,
         reservation_micros,
         window_start,
+        region,
+        account,
         detail="",
     ):
         """Insert frozen intent; the caller owns the enclosing transaction."""
@@ -216,8 +224,8 @@ class Ledger:
         now = self._clock()
         connection.execute(
             "INSERT INTO operations (id, client_token, state, created_at, updated_at, expires_at,"
-            " reservation_micros, reservation_window, request_json, request_sha256, instance_id, detail)"
-            " VALUES (?, ?, 'intent', ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+            " reservation_micros, reservation_window, region, account, request_json, request_sha256,"
+            " instance_id, detail) VALUES (?, ?, 'intent', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
             (
                 operation_id,
                 client_token,
@@ -226,6 +234,8 @@ class Ledger:
                 expires_at,
                 reservation_micros,
                 window_start,
+                region,
+                account,
                 json.dumps(request, sort_keys=True, separators=(",", ":")),
                 request_sha256,
                 detail,
@@ -296,6 +306,8 @@ def _operation(row):
         expires_at=row["expires_at"],
         reservation_micros=row["reservation_micros"],
         reservation_window=row["reservation_window"],
+        region=row["region"],
+        account=row["account"],
         request_json=row["request_json"],
         request_sha256=row["request_sha256"],
         instance_id=row["instance_id"],

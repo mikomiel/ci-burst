@@ -113,10 +113,13 @@ class Instance:
 class Aws:
     """Live adapter. Construct once per command."""
 
-    def __init__(self, config, client=None, clock=time.time):
+    def __init__(self, config, client=None, clock=time.time, account=None):
         self._config = config
         self._client_cache = client
         self._clock = clock
+        # ``client`` and ``account`` let adapter-boundary tests supply the
+        # provider identity without an SDK or network.
+        self._account_cache = account
 
     def _client(self):
         if self._client_cache is not None:
@@ -141,6 +144,28 @@ class Aws:
             return getattr(client, method)(**kwargs)
         except Exception as error:  # noqa: BLE001 - classified below
             raise _translate(error) from None
+
+    def account_id(self):
+        """Return the AWS account the configured credential route reaches."""
+        if self._account_cache is not None:
+            return self._account_cache
+        try:
+            import boto3
+        except ImportError:
+            raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
+        from botocore.config import Config
+
+        session = boto3.Session(profile_name=self._config.aws.profile)
+        sts = session.client("sts", region_name=self._config.aws.region, config=Config(retries=RETRY_POLICY))
+        try:
+            response = sts.get_caller_identity()
+        except Exception as error:  # noqa: BLE001 - classified below
+            raise _translate(error) from None
+        account = response.get("Account")
+        if not isinstance(account, str) or not account:
+            raise ProviderRefusal("AWS_ACCOUNT_UNKNOWN", "get_caller_identity returned no account")
+        self._account_cache = account
+        return account
 
     # -- reads ----------------------------------------------------------
     def template(self, name, version):

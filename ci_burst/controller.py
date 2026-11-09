@@ -71,6 +71,12 @@ class Controller:
             result["decision"] = "refused"
             return result
         slot = self._slot_from_state(state)
+        if any(
+            operation["region"] != self.config.aws.region for operation in slot["operations"]
+        ):
+            result["refusal"] = {"reason": "SCOPE_CHANGED"}
+            result["decision"] = "refused"
+            return result
         result["slot"] = slot
         observation = self._observe_or_refuse(result)
         if observation is None:
@@ -93,9 +99,10 @@ class Controller:
         self.ledger.connect(create=True)
         self.ledger.acquire_writer()
         try:
+            account = self.aws.account_id()
             instances = self.aws.owned_instances(self.config.deployment)
             with self.ledger.transaction():
-                slot, discrepancies = self._reconcile(instances)
+                slot, discrepancies = self._reconcile(instances, account)
             if discrepancies:
                 slot["discrepancies"] = discrepancies
             result["slot"] = slot
@@ -119,7 +126,7 @@ class Controller:
             if decision["decision"] != "launch_ready":
                 result["decision"] = decision["decision"]
                 return result
-            return self._launch(result, decision, template)
+            return self._launch(result, decision, template, account)
         finally:
             self.ledger.close()
 
@@ -322,7 +329,7 @@ class Controller:
         decision["expires_at"] = now + self.config.aws.max_lifetime_seconds
         return decision
 
-    def _launch(self, result, decision, template):
+    def _launch(self, result, decision, template, account):
         import uuid
 
         now = self.clock()
@@ -373,6 +380,8 @@ class Controller:
                 expires_at=decision["expires_at"],
                 reservation_micros=decision["reservation_micros"],
                 window_start=decision["window_start"],
+                region=self.config.aws.region,
+                account=account,
                 detail=request_sha256,
             )
         # Intent is committed, so a lost response is recoverable and never a
@@ -467,7 +476,7 @@ class Controller:
         result.setdefault("reasons", []).append("expiry_cleanup_requested")
         return True
 
-    def _reconcile(self, instances):
+    def _reconcile(self, instances, account):
         """Reconcile durable operations with the complete owned inventory."""
         operations = {operation.id: operation for operation in self.ledger.operations()}
         nonterminal = {operation.id: operation for operation in self.ledger.nonterminal_operations()}
@@ -510,7 +519,20 @@ class Controller:
                     }
                 )
         now = self.clock()
-        missing = [operation for operation in nonterminal.values() if operation.id not in by_operation]
+        scoped = {}
+        for operation in nonterminal.values():
+            if operation.region != self.config.aws.region or operation.account != account:
+                discrepancies.append(
+                    {
+                        "operation": operation.id,
+                        "reason": "SCOPE_CHANGED",
+                        "region": operation.region,
+                        "account": operation.account,
+                    }
+                )
+                continue
+            scoped[operation.id] = operation
+        missing = [operation for operation in scoped.values() if operation.id not in by_operation]
         identifiers = [operation.instance_id for operation in missing if operation.instance_id]
         by_id = {}
         if identifiers:
@@ -534,7 +556,7 @@ class Controller:
                 # proof of termination: keep the slot occupied.
             # An operation without an instance id stays outstanding; apply
             # resumes its frozen request instead of creating a replacement.
-        for operation in nonterminal.values():
+        for operation in scoped.values():
             instance = by_operation.get(operation.id)
             if instance is not None:
                 self._reconcile_present(operation, instance)
@@ -555,7 +577,9 @@ class Controller:
             self.ledger.set_state(operation.id, "starting", instance_id=instance.instance_id)
 
     def _discrepancies(self, operations, instances):
-        known = {operation["operation"]: operation["state"] for operation in operations}
+        known = {
+            operation["operation"]: (operation["state"], operation["region"]) for operation in operations
+        }
         discrepancies = []
         seen_live = set()
         for instance in instances:
@@ -570,6 +594,11 @@ class Controller:
                     {"instance_id": instance.instance_id, "operation": operation_id, "reason": "UNRECORDED_OWNED_INSTANCE"}
                 )
                 continue
+            if known[operation_id][1] != self.config.aws.region:
+                discrepancies.append(
+                    {"instance_id": instance.instance_id, "operation": operation_id, "reason": "SCOPE_CHANGED"}
+                )
+                continue
             if instance.state == "terminated":
                 continue
             if operation_id in seen_live:
@@ -578,7 +607,7 @@ class Controller:
                 )
                 continue
             seen_live.add(operation_id)
-            if known[operation_id] in ("terminal", "failed"):
+            if known[operation_id][0] in ("terminal", "failed"):
                 discrepancies.append(
                     {
                         "instance_id": instance.instance_id,

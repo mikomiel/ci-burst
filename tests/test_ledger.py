@@ -28,6 +28,8 @@ class LedgerTestCase(unittest.TestCase):
             "expires_at": self.clock_now + 3600,
             "reservation_micros": 20_000_000,
             "window_start": current_window(self.clock_now, 86400),
+            "region": "eu-central-1",
+            "account": "111122223333",
         }
         values.update(overrides)
         with self.ledger.transaction():
@@ -38,6 +40,8 @@ class SchemaTests(LedgerTestCase):
     def test_round_trip(self):
         operation = self.add()
         self.assertEqual(operation.state, "intent")
+        self.assertEqual(operation.region, "eu-central-1")
+        self.assertEqual(operation.account, "111122223333")
         self.assertEqual(self.ledger.operation(operation.id).client_token, "ci-burst-op-0")
         self.assertEqual(self.ledger.operation_by_token("ci-burst-op-0").id, operation.id)
 
@@ -70,6 +74,8 @@ class SchemaTests(LedgerTestCase):
                 expires_at=self.clock_now + 60,
                 reservation_micros=1,
                 window_start=current_window(self.clock_now, 86400),
+                region="eu-central-1",
+                account="111122223333",
             )
         writable.close()
         reader = Ledger(path, clock=lambda: self.clock_now).connect(create=False, read_only=True)
@@ -88,6 +94,8 @@ class SchemaTests(LedgerTestCase):
                 expires_at=self.clock_now + 60,
                 reservation_micros=1,
                 window_start=current_window(self.clock_now, 86400),
+                region="eu-central-1",
+                account="111122223333",
             )
         writable.close()
         before = sorted(item.name for item in Path(self._directory.name).iterdir())

@@ -69,12 +69,18 @@ class FakeAws:
         self.terminate_error = None
         self.terminated = []
         self.instances_by_id = {}
+        self.account = "111122223333"
         self.on_run = None
         self.on_quote = None
 
     def _maybe_raise(self):
         if self.error is not None:
             raise self.error
+
+    def account_id(self):
+        self.calls.append(("account_id",))
+        self._maybe_raise()
+        return self.account
 
     def template(self, name, version):
         self.calls.append(("template", name, version))

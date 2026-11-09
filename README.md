@@ -35,7 +35,9 @@ python -m ci_burst reap   --config deployment.toml [--apply]
 
 A minimal configuration is in [docs/operations.md](docs/operations.md), which
 also owns the queue contract, the worker image/template contract, labels,
-reservation scope, identities, rollback and status semantics. The
+reservation scope, identities, rollback and status semantics. To build the
+operator-owned worker prerequisites, including the IAM role, SSM parameter and
+bootstrap, follow [docs/runner-setup.md](docs/runner-setup.md). The
 [pilot checklist](docs/pilot-checklist.md) is a preparation record, not
 authorization.
 

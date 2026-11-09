@@ -225,6 +225,41 @@ class AdapterTests(unittest.TestCase):
             self.aws().run_spot({"MinCount": 1, "MaxCount": 1})
         self.assertTrue(raised.exception.uncertain)
 
+    def test_client_is_built_without_sdk_internal_retries(self):
+        import sys
+        import types
+        from unittest import mock
+
+        recorded = {}
+
+        boto3_module = types.ModuleType("boto3")
+
+        class Session:
+            def __init__(self, profile_name=None):
+                recorded["profile"] = profile_name
+
+            def client(self, service, region_name=None, config=None):
+                recorded.update(service=service, region=region_name, config=config)
+                return object()
+
+        boto3_module.Session = Session
+        config_module = types.ModuleType("botocore.config")
+
+        class Config:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        config_module.Config = Config
+        botocore_module = types.ModuleType("botocore")
+        botocore_module.config = config_module
+        with mock.patch.dict(
+            sys.modules, {"boto3": boto3_module, "botocore": botocore_module, "botocore.config": config_module}
+        ):
+            Aws(self.config)._client()
+        self.assertEqual(recorded["config"].kwargs["retries"]["total_max_attempts"], 1)
+        self.assertEqual(recorded["service"], "ec2")
+        self.assertEqual(recorded["region"], "eu-central-1")
+
     def test_no_read_is_made_for_an_empty_instance_list(self):
         self.assertEqual(self.aws().instances([]), [])
         self.assertEqual(self.client.calls, [])

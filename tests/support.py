@@ -70,6 +70,7 @@ class FakeAws:
         self.terminated = []
         self.instances_by_id = {}
         self.on_run = None
+        self.on_quote = None
 
     def _maybe_raise(self):
         if self.error is not None:
@@ -84,6 +85,8 @@ class FakeAws:
 
     def spot_quote(self, instance_type, availability_zone):
         self.calls.append(("spot_quote", instance_type, availability_zone))
+        if self.on_quote is not None:
+            self.on_quote()
         self._maybe_raise()
         if isinstance(self.spot_quote_value, Exception):
             raise self.spot_quote_value

@@ -25,6 +25,11 @@ EXPIRES_TAG = "ci-burst:expires-at"
 
 MAX_INVENTORY_PAGES = 20
 
+#: The controller owns retries: an unresolved launch is resumed with its frozen
+#: client token. Botocore's transparent retries would hide that a launch may
+#: already have been sent, so the client is built without them.
+RETRY_POLICY = {"total_max_attempts": 1, "mode": "standard"}
+
 #: Only these client error codes prove that RunInstances did not create an
 #: instance. Everything else -- throttling, service errors, unknown codes --
 #: stays uncertain, because rejecting a retry does not prove the first request
@@ -120,8 +125,14 @@ class Aws:
             import boto3
         except ImportError:
             raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
+        from botocore.config import Config
+
         session = boto3.Session(profile_name=self._config.aws.profile)
-        self._client_cache = session.client("ec2", region_name=self._config.aws.region)
+        self._client_cache = session.client(
+            "ec2",
+            region_name=self._config.aws.region,
+            config=Config(retries=RETRY_POLICY),
+        )
         return self._client_cache
 
     def _call(self, method, **kwargs):

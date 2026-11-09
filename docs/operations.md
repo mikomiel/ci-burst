@@ -213,6 +213,12 @@ Two bounds refuse rather than launch: an unresolved intent older than the
 already elapsed. Both keep the unresolved ownership and block admission until
 an operator resolves them.
 
+The EC2 client is built without the SDK's transparent retries, so one recorded
+provider call is one HTTP attempt; the controller's own resume is the only
+retry of a launch. Admission, quote freshness and the lifetime are evaluated
+against the clock **after** the synchronous Spot-price read, so a slow provider
+call cannot commit an already-expired intent or extend stale price evidence.
+
 Termination is confirmed only by the provider reporting `terminated` (or by the
 instance record disappearing after the provider's visibility window).
 `shutting-down`, `stopping` and `stopped` keep the operation outstanding and the

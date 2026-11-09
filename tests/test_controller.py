@@ -121,6 +121,23 @@ class PlanTests(ControllerCase):
         self.assertIn("budget_allowance_exhausted", result["reasons"])
         self.assertEqual(result["budget"]["remaining_after"].startswith("-"), True)
 
+    def test_admission_recomputes_time_after_a_slow_quote_read(self):
+        config = load(write_config(self.root, config={"aws": {"max_lifetime_seconds": 60}}))
+        aws = FakeAws(spot_quote=quote(clock=self.clock))
+        aws.on_quote = lambda: self.clock.advance(70)
+        controller = self.build(observation=observation_demand(), aws=aws, config=config)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        operation = self.reopened().operation(result["operation"])
+        self.assertGreater(operation.expires_at, self.clock.now)
+
+    def test_a_slow_quote_read_cannot_keep_stale_price_evidence(self):
+        aws = FakeAws(spot_quote=quote(clock=self.clock))
+        aws.on_quote = lambda: self.clock.advance(1000)
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("spot_price_stale", result["reasons"])
+
     def test_plan_refuses_a_template_pinned_to_another_zone(self):
         aws = FakeAws(template_facts=template(placement_zone="us-east-1a"), spot_quote=quote(clock=self.clock))
         result = self.build(observation=observation_demand(), aws=aws).plan()

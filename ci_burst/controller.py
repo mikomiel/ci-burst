@@ -240,7 +240,6 @@ class Controller:
 
     def _decide(self, observation, slot, template):
         """Return the decision block for this snapshot."""
-        now = self.clock()
         reasons, notes = [], []
         decision = {"reasons": reasons, "notes": notes}
         if slot.get("discrepancies"):
@@ -267,19 +266,6 @@ class Controller:
             decision["decision"] = "refused"
             reasons.append("template_placement_mismatch")
             return decision
-        window_start = current_window(now, self.config.budget.window_seconds)
-        reservation = hourly_cost_micros(
-            self.config.aws.max_spot_price, self.config.aws.max_lifetime_seconds
-        ) + self.config.budget.non_compute_allowance
-        consumed = self.ledger.consumed_micros(window_start) if self.ledger.available else 0
-        decision["budget"] = {
-            "window_start": window_start,
-            "window_seconds": self.config.budget.window_seconds,
-            "allowance": format_money(self.config.budget.allowance),
-            "consumed": format_money(consumed),
-            "required_reservation": format_money(reservation),
-            "remaining_after": format_money(self.config.budget.allowance - consumed - reservation),
-        }
         try:
             quote = self.aws.spot_quote(template.instance_type, self.config.aws.availability_zone)
         except Refusal as refusal:
@@ -291,6 +277,10 @@ class Controller:
             decision["decision"] = "refused"
             reasons.append("spot_price_unavailable")
             return decision
+        # The quote read is synchronous and can be slow. Admission, freshness
+        # and the lifetime are evaluated against the clock after that read, so
+        # an expired intent cannot be committed by a long provider call.
+        now = self.clock()
         decision["price"] = quote.as_dict() | {"cap": format_money(self.config.aws.max_spot_price)}
         if now - quote.timestamp > self.config.aws.price_max_age_seconds:
             decision["decision"] = "refused"
@@ -304,6 +294,19 @@ class Controller:
             decision["decision"] = "refused"
             reasons.append("spot_price_above_cap")
             return decision
+        window_start = current_window(now, self.config.budget.window_seconds)
+        reservation = hourly_cost_micros(
+            self.config.aws.max_spot_price, self.config.aws.max_lifetime_seconds
+        ) + self.config.budget.non_compute_allowance
+        consumed = self.ledger.consumed_micros(window_start) if self.ledger.available else 0
+        decision["budget"] = {
+            "window_start": window_start,
+            "window_seconds": self.config.budget.window_seconds,
+            "allowance": format_money(self.config.budget.allowance),
+            "consumed": format_money(consumed),
+            "required_reservation": format_money(reservation),
+            "remaining_after": format_money(self.config.budget.allowance - consumed - reservation),
+        }
         if consumed + reservation > self.config.budget.allowance:
             decision["decision"] = "refused"
             reasons.append("budget_allowance_exhausted")
@@ -318,6 +321,10 @@ class Controller:
         import uuid
 
         now = self.clock()
+        if decision["expires_at"] <= now:
+            result["decision"] = "refused"
+            result.setdefault("reasons", []).append("admission_expired")
+            return result
         operation_id = uuid.uuid4().hex
         client_token = "ci-burst-" + uuid.uuid4().hex
         request = {

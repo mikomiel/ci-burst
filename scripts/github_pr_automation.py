@@ -41,7 +41,7 @@ class GitHub:
         except ValueError as exc:
             raise ApiError("github_response_not_json") from exc
 
-    def pages(self, path, key=None, head=None):
+    def pages(self, path, key=None):
         result = []
         expected_total = None
         separator = "&" if "?" in path else "?"
@@ -53,7 +53,7 @@ class GitHub:
                 if not isinstance(document, dict) or type(document.get("total_count")) is not int:
                     raise ApiError("pagination_count_unavailable")
                 total = document["total_count"]
-                if total < 0 or (head is not None and document.get("sha") != head):
+                if total < 0:
                     raise ApiError("pagination_identity_unusable")
                 if expected_total is not None and total != expected_total:
                     raise ApiError("pagination_changed")
@@ -114,7 +114,9 @@ class GitHub:
     def statuses(self, head):
         if not policy.valid_sha(head):
             raise ApiError("invalid_head")
-        return self.pages(f"commits/{head}/status", "statuses", head=head)
+        # The combined status document omits each status creator, which the
+        # trusted-status check needs. The status list carries it.
+        return self.pages(f"commits/{head}/statuses")
 
     def compare(self, base, head):
         if not policy.valid_sha(base) or not policy.valid_sha(head):

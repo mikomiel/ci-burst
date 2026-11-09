@@ -1,34 +1,52 @@
 # ci-burst
 
-A small Forgejo queue-driven AWS Spot runner controller — **currently in
-design, not implemented**. This is an original MIT-licensed public project.
+A small Forgejo queue-driven AWS Spot runner controller. This is an original
+MIT-licensed public project.
 
-## Intended first version
+## What it does
 
-- Observe runnable jobs for one Forgejo repository and explicit runner labels.
-- Add at most one Spot VM from an operator-prepared, pinned launch template.
-- Keep Forgejo as the only scheduler and job-result authority.
-- Persist launch intent, ownership and conservative cost reservations.
-- Default to dry-run; require explicit apply and independent expiry cleanup.
+- Observes runnable jobs for one Forgejo repository and explicit runner labels.
+- Adds at most one Spot instance from an operator-prepared, pinned launch
+  template while the queue has work and the budget allows it.
+- Keeps Forgejo as the only scheduler and job-result authority.
+- Persists launch intent, ownership and a conservative local reservation
+  before every cloud request.
+- Defaults to observation; requires an explicit apply to launch, and offers an
+  independent expiry-cleanup path that never launches.
 
-There is no controller CLI, qualified image, release or deployment in this
-bootstrap. AWS resources, IAM, networking, registration credentials and runner
-images remain operator-owned prerequisites. No cost-saving or absolute
-AWS-billing-cap claim has been established.
+The product source is implemented and covered by standard-library tests. There
+is still **no release, image, deployment or live-qualified Forgejo contract**:
+`qualification = "fixtures-only"` is the shipped default and blocks `apply`.
+AWS resources, IAM, networking, registration credentials and the runner image
+remain operator-owned prerequisites. No cost-saving or absolute AWS-billing-cap
+claim has been established.
+
+## Try it
+
+Requires Python 3.12 or newer. Live use needs the `boto3` runtime dependency
+(`pip install -e .`); tests need neither the SDK nor any credential.
+
+```sh
+python -m ci_burst plan   --config deployment.toml
+python -m ci_burst apply  --config deployment.toml
+python -m ci_burst status --config deployment.toml
+python -m ci_burst reap   --config deployment.toml [--apply]
+```
+
+A minimal configuration is in [docs/operations.md](docs/operations.md), which
+also owns the queue contract, the worker image/template contract, labels,
+reservation scope, identities, rollback and status semantics. The
+[pilot checklist](docs/pilot-checklist.md) is a preparation record, not
+authorization.
 
 ## Project stage
 
-The first product change is the [AWS Spot queue-burst proposal](openspec/changes/aws-spot-queue-burst/proposal.md),
+The product change is the [AWS Spot queue-burst proposal](openspec/changes/aws-spot-queue-burst/proposal.md),
 with its [design](openspec/changes/aws-spot-queue-burst/design.md),
 [acceptance specifications](openspec/changes/aws-spot-queue-burst/specs/) and
-[ordered tasks](openspec/changes/aws-spot-queue-burst/tasks.md). These describe
-proposed behavior, not implemented software. Independent design review must
-precede controller implementation.
+[task record](openspec/changes/aws-spot-queue-burst/tasks.md).
 
-The repository provides project guidance and pinned planning validation.
-Node is a planning-tool dependency, not the proposed controller runtime.
-
-## Planning checks
+## Checks
 
 Use Node.js 22.12+, Python 3.12+ and npm:
 
@@ -38,9 +56,9 @@ npm run check:policy
 npm run check:spec
 ```
 
+`check:policy` runs the Python source tests and the workflow-policy tests.
 Validation CI is read-only and uses no cloud credentials or billable
-operations. It tests merge policy, validates planning artifacts and scans
-public content; it does not prove a live Forgejo/AWS integration. Separate
+operations; it does not prove a live Forgejo/AWS integration. Separate
 trusted-default-branch workflows can publish the Gandalf-backed `review`
 status and merge eligible ordinary PRs after maintainer-controlled activation.
 They never execute PR-head code with a write token. See
@@ -49,9 +67,9 @@ They never execute PR-head code with a write token. See
 ## Contributing and security
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) and
-[SECURITY.md](SECURITY.md). GitHub is the sole source/PR surface. After the
-one-time bootstrap, changes use protected-main pull requests. Controlled
-automated merging is not active merely because this policy exists.
+[SECURITY.md](SECURITY.md). GitHub is the sole source/PR surface. Changes use
+protected-main pull requests; controlled automated merging is not active merely
+because this policy exists.
 
 License: [MIT](LICENSE). No affiliation with Forgejo or Amazon Web Services
 is implied.

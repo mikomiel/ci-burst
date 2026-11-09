@@ -18,9 +18,14 @@ AWS-billing-cap claim has been established.
 
 ## Project stage
 
-The initial OpenSpec proposal, design, acceptance scenarios and ordered tasks
-will be reviewed in a separate pull request before controller implementation.
-This bootstrap provides project guidance and pinned planning validation only.
+The first product change is the [AWS Spot queue-burst proposal](openspec/changes/aws-spot-queue-burst/proposal.md),
+with its [design](openspec/changes/aws-spot-queue-burst/design.md),
+[acceptance specifications](openspec/changes/aws-spot-queue-burst/specs/) and
+[ordered tasks](openspec/changes/aws-spot-queue-burst/tasks.md). These describe
+proposed behavior, not implemented software. Independent design review must
+precede controller implementation.
+
+The repository provides project guidance and pinned planning validation.
 Node is a planning-tool dependency, not the proposed controller runtime.
 
 ## Planning checks

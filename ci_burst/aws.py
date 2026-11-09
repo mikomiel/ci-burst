@@ -212,9 +212,22 @@ class Aws:
                 raise ProviderRefusal("AWS_INVENTORY_INCOMPLETE", "DescribeInstances pagination limit reached")
 
     def instances(self, instance_ids):
+        """Read the named instances; an aged-out record is an empty result.
+
+        `InvalidInstanceID.NotFound` is not proof that the instance never
+        existed or that it terminated at a particular time; the controller
+        applies its own retained-visibility window before treating absence as
+        terminal.
+        """
         if not instance_ids:
             return []
-        response = self._call("describe_instances", InstanceIds=list(instance_ids))
+        client = self._client()
+        try:
+            response = client.describe_instances(InstanceIds=list(instance_ids))
+        except Exception as error:  # noqa: BLE001 - classified below
+            if _error_code(error) == "InvalidInstanceID.NotFound":
+                return []
+            raise _translate(error) from None
         return _instances(response)
 
     # -- mutations ------------------------------------------------------
@@ -237,7 +250,7 @@ def _translate(error):
     try:
         import botocore.exceptions as botocore
     except ImportError:
-        return ProviderRefusal("AWS_REFUSED", type(error).__name__)
+        return ProviderRefusal("AWS_UNCERTAIN", type(error).__name__, uncertain=True)
     if isinstance(error, botocore.ClientError):
         code = str(error.response.get("Error", {}).get("Code", "Unknown"))
         if not _definite_launch_error(code):
@@ -245,7 +258,16 @@ def _translate(error):
         return ProviderRefusal("AWS_REFUSED", code)
     if isinstance(error, botocore.BotoCoreError):
         return ProviderRefusal("AWS_UNCERTAIN", type(error).__name__, uncertain=True)
-    return ProviderRefusal("AWS_REFUSED", type(error).__name__)
+    # A response-parser failure or another unclassified exception can occur
+    # after the service accepted the request. It is never proof of non-creation.
+    return ProviderRefusal("AWS_UNCERTAIN", type(error).__name__, uncertain=True)
+
+
+def _error_code(error):
+    response = getattr(error, "response", None)
+    if isinstance(response, dict):
+        return str(response.get("Error", {}).get("Code", ""))
+    return ""
 
 
 def _definite_launch_error(code):

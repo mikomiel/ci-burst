@@ -260,6 +260,31 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(recorded["service"], "ec2")
         self.assertEqual(recorded["region"], "eu-central-1")
 
+    def test_unclassified_client_exception_is_uncertain(self):
+        class RaisingClient:
+            def describe_instances(self, **kwargs):
+                raise RuntimeError("ResponseParserError")
+
+            def run_instances(self, **kwargs):
+                raise RuntimeError("ResponseParserError")
+
+        aws = Aws(self.config, client=RaisingClient())
+        for call in (lambda: aws.instances(["i-1"]), lambda: aws.run_spot({"MinCount": 1, "MaxCount": 1})):
+            with self.assertRaises(ProviderRefusal) as raised:
+                call()
+            self.assertTrue(raised.exception.uncertain)
+            self.assertEqual(raised.exception.reason, "AWS_UNCERTAIN")
+
+    def test_aged_out_instance_record_is_an_empty_result(self):
+        class NotFound(Exception):
+            response = {"Error": {"Code": "InvalidInstanceID.NotFound"}}
+
+        class MissingClient:
+            def describe_instances(self, **kwargs):
+                raise NotFound()
+
+        self.assertEqual(Aws(self.config, client=MissingClient()).instances(["i-old"]), [])
+
     def test_no_read_is_made_for_an_empty_instance_list(self):
         self.assertEqual(self.aws().instances([]), [])
         self.assertEqual(self.client.calls, [])

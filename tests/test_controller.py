@@ -329,6 +329,82 @@ class ApplyTests(ControllerCase):
         self.assertEqual(run["Placement"]["AvailabilityZone"], "eu-central-1a")
         self.assertEqual(len(self.reopened().operations()), 1)
 
+    def test_recently_absent_instance_keeps_the_slot(self):
+        operation_id = self.seed(state="running")
+        controller = self.build(observation=observation_empty())
+        self.aws.instances_result = []
+        result = controller.apply()
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("slot_busy", result["reasons"])
+        self.assertEqual(self.reopened().operation(operation_id).state, "running")
+
+    def test_response_parser_failure_keeps_the_operation_and_token(self):
+        import datetime as dt
+
+        from ci_burst.aws import Aws
+
+        class FlakyClient:
+            def __init__(self):
+                self.tokens = []
+                self.fail = True
+
+            def describe_instances(self, **kwargs):
+                return {"Reservations": []}
+
+            def describe_launch_template_versions(self, **kwargs):
+                return {
+                    "LaunchTemplateVersions": [
+                        {
+                            "LaunchTemplateId": "lt-1",
+                            "VersionNumber": 3,
+                            "LaunchTemplateData": {
+                                "ImageId": "ami-1",
+                                "InstanceType": "t4g.small",
+                                "InstanceInitiatedShutdownBehavior": "terminate",
+                                "UserData": "AAAA",
+                            },
+                        }
+                    ]
+                }
+
+            def describe_spot_price_history(self, **kwargs):
+                return {
+                    "SpotPriceHistory": [
+                        {
+                            "InstanceType": "t4g.small",
+                            "AvailabilityZone": "eu-central-1a",
+                            "ProductDescription": "Linux/UNIX",
+                            "SpotPrice": "0.020000",
+                            "Timestamp": dt.datetime.fromtimestamp(self_clock.now, dt.timezone.utc),
+                        }
+                    ]
+                }
+
+            def run_instances(self, **kwargs):
+                self.tokens.append(kwargs["ClientToken"])
+                if self.fail:
+                    self.fail = False
+                    raise RuntimeError("ResponseParserError")
+                return {"Instances": [{"InstanceId": "i-real"}]}
+
+        self_clock = self.clock
+        client = FlakyClient()
+        aws = Aws(self.config, client=client, clock=self.clock)
+        controller = Controller(
+            self.config,
+            observer=FakeObserver(observation_demand()),
+            aws=aws,
+            ledger=Ledger(self.config.state.database, clock=self.clock),
+            clock=self.clock,
+        )
+        first = controller.apply()
+        self.assertEqual(first["decision"], "uncertain")
+        second = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(second["decision"], "resumed")
+        self.assertEqual(second["operation"], first["operation"])
+        self.assertEqual(len(client.tokens), 2)
+        self.assertEqual(client.tokens[0], client.tokens[1])
+
     def test_shutting_down_instance_keeps_the_slot(self):
         operation_id = self.seed(state="running")
         controller = self.build(observation=observation_demand())
@@ -420,6 +496,7 @@ class ApplyTests(ControllerCase):
         operation_id = self.seed(state="running")
         controller = self.build(observation=observation_empty())
         self.aws.instances_result = []
+        self.clock.advance(3601)
         controller.apply()
         self.assertEqual(self.reopened().operation(operation_id).state, "terminal")
 

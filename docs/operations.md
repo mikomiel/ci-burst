@@ -226,6 +226,12 @@ single slot occupied. Expiry cleanup terminates only an instance that is both
 present in the current owned inventory and carries a valid, expired expiry tag;
 a ledger id alone is not permission to terminate.
 
+If a confirmed instance disappears from a by-id read, the operation stays
+outstanding until EC2's retained-visibility window has elapsed; a recent
+`InvalidInstanceID.NotFound` is not treated as immediate proof of termination.
+An unclassified provider or response-parsing exception is uncertain, never a
+definite failure, because it can occur after the service accepted a request.
+
 The owned inventory is read across every `DescribeInstances` page. An inventory
 that cannot be completed, an instance whose operation is not in the ledger, a
 terminal operation that still owns a live resource, and two live instances for

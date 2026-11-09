@@ -28,6 +28,11 @@ WRITER_TOPOLOGY = "one deployment, one controller host, one durable ledger, one 
 #: no longer idempotent, so the unresolved intent blocks and needs an operator.
 CLIENT_TOKEN_MAX_AGE_SECONDS = 24 * 60 * 60
 
+#: EC2 retains a terminated instance record for roughly an hour. Absence from a
+#: by-id read inside that window is not proof of termination; the operation
+#: stays outstanding until the record could have disappeared.
+INSTANCE_RETENTION_SECONDS = 60 * 60
+
 COST_SCOPE_NOTE = (
     "The reservation estimates compute at the configured maximum Spot price for the configured "
     "maximum lifetime, plus the configured non-compute allowance. It does not bound EBS, data "
@@ -504,6 +509,7 @@ class Controller:
                         "reason": "TERMINAL_OPERATION_STILL_OWNS_INSTANCE",
                     }
                 )
+        now = self.clock()
         missing = [operation for operation in nonterminal.values() if operation.id not in by_operation]
         identifiers = [operation.instance_id for operation in missing if operation.instance_id]
         by_id = {}
@@ -522,7 +528,10 @@ class Controller:
                         }
                     )
             elif operation.instance_id:
-                self.ledger.set_state(operation.id, "terminal", detail="instance_absent")
+                if now - operation.updated_at >= INSTANCE_RETENTION_SECONDS:
+                    self.ledger.set_state(operation.id, "terminal", detail="instance_not_retained")
+                # Inside the retained-visibility window, absence is not yet
+                # proof of termination: keep the slot occupied.
             # An operation without an instance id stays outstanding; apply
             # resumes its frozen request instead of creating a replacement.
         for operation in nonterminal.values():

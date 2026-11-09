@@ -25,16 +25,21 @@ Node is a planning-tool dependency, not the proposed controller runtime.
 
 ## Planning checks
 
-Use Node.js 22.12 or newer and npm:
+Use Node.js 22.12+, Python 3.12+ and npm:
 
 ```sh
 npm ci --ignore-scripts
+npm run check:policy
 npm run check:spec
 ```
 
-Public CI is read-only and uses no cloud credentials or billable operations.
-It validates planning artifacts and scans public content; it does not prove
-a live Forgejo/AWS integration.
+Validation CI is read-only and uses no cloud credentials or billable
+operations. It tests merge policy, validates planning artifacts and scans
+public content; it does not prove a live Forgejo/AWS integration. Separate
+trusted-default-branch workflows can publish the Gandalf-backed `review`
+status and merge eligible ordinary PRs after maintainer-controlled activation.
+They never execute PR-head code with a write token. See
+[review, merge and activation](CONTRIBUTING.md#review-and-merge).
 
 ## Contributing and security
 

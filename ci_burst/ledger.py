@@ -81,7 +81,10 @@ class Ledger:
         try:
             connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
             connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA journal_mode=WAL")
+            # Rollback-journal mode keeps read-only observation free of
+            # -wal/-shm side effects; the supported topology has one writer, so
+            # WAL's concurrent-reader benefit does not pay for that.
+            connection.execute("PRAGMA journal_mode=DELETE")
             connection.execute("PRAGMA foreign_keys=ON")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version == 0:
@@ -102,7 +105,8 @@ class Ledger:
     def _connect_read_only(self):
         """Open an existing ledger without creating, migrating or writing it."""
         try:
-            connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=5)
+            uri = Path(self.path).resolve().as_uri() + "?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=5)
             connection.row_factory = sqlite3.Row
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         except sqlite3.DatabaseError as error:

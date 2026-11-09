@@ -61,6 +61,10 @@ class Controller:
         result["inventory_note"] = "apply reconciles the cloud inventory; plan reads only durable state"
         state = self._read_state(required=False)
         result["state"] = state
+        if state.get("invalid"):
+            result["refusal"] = {"reason": state["invalid"]}
+            result["decision"] = "refused"
+            return result
         slot = self._slot_from_state(state)
         result["slot"] = slot
         observation = self._observe_or_refuse(result)
@@ -198,10 +202,12 @@ class Controller:
         if required:
             self.ledger.connect(create=False)
         else:
+            if not self.config.state.database.exists():
+                return {"available": False, "absent": True}
             try:
                 self.ledger.connect(create=False, read_only=True)
             except StateRefusal as refusal:
-                return {"available": False, "note": refusal.reason}
+                return {"available": False, "invalid": refusal.reason}
         if not self.ledger.available:
             if required:
                 raise StateRefusal("STATE_UNAVAILABLE")
@@ -373,21 +379,36 @@ class Controller:
             return True
         operation_id = pending[0]["operation"]
         operation = self.ledger.operation(operation_id)
-        if self.clock() - operation.created_at > CLIENT_TOKEN_MAX_AGE_SECONDS:
+        now = self.clock()
+        if now - operation.created_at > CLIENT_TOKEN_MAX_AGE_SECONDS:
             result["decision"] = "refused"
             result.setdefault("reasons", []).append("unresolved_intent_expired")
             result["operation"] = operation.id
             return True
-        self._send(operation, operation.request(), result, "resumed")
+        if operation.expires_at <= now:
+            # Sending an intent whose lifetime already elapsed would create an
+            # instance that is expired before it boots. Keep the unresolved
+            # ownership and block admission instead.
+            result["decision"] = "refused"
+            result.setdefault("reasons", []).append("unresolved_intent_lifetime_elapsed")
+            result["operation"] = operation.id
+            return True
+        self._send(operation, operation.request(), result, "resumed", first_attempt=False)
         return True
 
-    def _send(self, operation, request, result, success_decision):
+    def _send(self, operation, request, result, success_decision, first_attempt=True):
         try:
             instance_ids = self.aws.run_spot(request)
         except ProviderRefusal as refusal:
-            state = "uncertain" if refusal.uncertain else "failed"
-            self.ledger.set_state(operation.id, state, detail=refusal.reason)
-            result["decision"] = "uncertain" if refusal.uncertain else "launch_failed"
+            # A rejected retry does not prove the original request created
+            # nothing, so it keeps unresolved ownership. Only a definite
+            # rejection of the first attempt may release the slot.
+            if refusal.uncertain or not first_attempt:
+                self.ledger.set_state(operation.id, "uncertain", detail=refusal.reason)
+                result["decision"] = "uncertain"
+            else:
+                self.ledger.set_state(operation.id, "failed", detail=refusal.reason)
+                result["decision"] = "launch_failed"
             result["refusal"] = refusal.as_dict()
             result["operation"] = operation.id
             return
@@ -430,7 +451,9 @@ class Controller:
                 if operation["instance_id"] in targets:
                     self.ledger.set_state(operation["operation"], "terminating", detail="expired")
         result["expiry_cleanup"] = targets
-        return False
+        result["decision"] = "wait"
+        result.setdefault("reasons", []).append("expiry_cleanup_requested")
+        return True
 
     def _reconcile(self, instances):
         """Reconcile durable operations with the complete owned inventory."""

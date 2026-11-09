@@ -58,6 +58,44 @@ class SchemaTests(LedgerTestCase):
         self.assertFalse(ledger.available)
         self.assertFalse(path.exists())
 
+    def test_read_only_connection_uses_the_same_file_for_special_characters(self):
+        path = Path(self._directory.name) / "state#pilot.sqlite3"
+        writable = Ledger(path, clock=lambda: self.clock_now).connect()
+        with writable.transaction():
+            writable.new_operation(
+                operation_id="special",
+                client_token="ci-burst-special",
+                request={"seed": True},
+                request_sha256="0" * 64,
+                expires_at=self.clock_now + 60,
+                reservation_micros=1,
+                window_start=current_window(self.clock_now, 86400),
+            )
+        writable.close()
+        reader = Ledger(path, clock=lambda: self.clock_now).connect(create=False, read_only=True)
+        self.addCleanup(reader.close)
+        self.assertEqual([operation.id for operation in reader.operations()], ["special"])
+
+    def test_read_only_observation_writes_no_files(self):
+        path = Path(self._directory.name) / "existing.sqlite3"
+        writable = Ledger(path, clock=lambda: self.clock_now).connect()
+        with writable.transaction():
+            writable.new_operation(
+                operation_id="one",
+                client_token="ci-burst-one",
+                request={},
+                request_sha256="0" * 64,
+                expires_at=self.clock_now + 60,
+                reservation_micros=1,
+                window_start=current_window(self.clock_now, 86400),
+            )
+        writable.close()
+        before = sorted(item.name for item in Path(self._directory.name).iterdir())
+        reader = Ledger(path, clock=lambda: self.clock_now).connect(create=False, read_only=True)
+        reader.operations()
+        reader.close()
+        self.assertEqual(before, sorted(item.name for item in Path(self._directory.name).iterdir()))
+
     def test_corrupt_database_is_refused(self):
         bad = Path(self._directory.name) / "corrupt.sqlite3"
         bad.write_bytes(b"not a database")

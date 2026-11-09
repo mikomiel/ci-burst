@@ -174,7 +174,9 @@ reservation = ceil(max_spot_price * max_lifetime_seconds / 3600)
 A launch is refused unless a fresh Spot quote exists for the configured
 instance type and availability zone, is not older than
 `price_max_age_seconds`, is not above `max_spot_price`, and the current window
-still has `allowance` left after the reservation. The window is anchored at a
+still has `allowance` left after the reservation. The quote response must
+identify its own availability zone, instance type and `Linux/UNIX` product;
+missing metadata is not replaced with the requested scope. The window is anchored at a
 multiple of `window_seconds`. Outstanding operations carry their reservation
 into later windows; a completed operation is charged to the window it started
 in. Requesting termination does not refund consumed allowance, and a restart
@@ -196,14 +198,20 @@ The supported topology is one deployment, one controller host and one ledger
 copy. Tags are ownership metadata, not a distributed lock.
 
 The lifecycle is `intent -> starting -> running -> terminating -> terminal`,
-with `uncertain` for a lost launch response and `failed` for a definite provider
+with `uncertain` for a lost launch response and `failed` for a definite first
 refusal. Intent is committed before the launch request. A lost response is
 resolved by discovering instances tagged with the operation id, never by
 allocating a replacement operation. While an intent has no confirmed instance,
 the next apply resumes that **same** frozen request and client token; EC2
-idempotency makes the retry safe, and the 24-hour client-token validity bounds
-how long it is attempted. Beyond that the unresolved intent blocks and needs an
-operator decision.
+idempotency makes the retry safe. A rejected **retry** keeps the operation
+uncertain, because rejecting the retry does not prove the original request
+created nothing. Only a definite rejection of the first attempt may release the
+slot, and ambiguous provider errors stay uncertain.
+
+Two bounds refuse rather than launch: an unresolved intent older than the
+24-hour client-token validity, and an intent whose configured lifetime has
+already elapsed. Both keep the unresolved ownership and block admission until
+an operator resolves them.
 
 Termination is confirmed only by the provider reporting `terminated` (or by the
 instance record disappearing after the provider's visibility window).
@@ -214,8 +222,17 @@ a ledger id alone is not permission to terminate.
 
 The owned inventory is read across every `DescribeInstances` page. An inventory
 that cannot be completed, an instance whose operation is not in the ledger, a
-terminal operation that still owns a resource, and two instances for one
-operation all block new admission.
+terminal operation that still owns a live resource, and two live instances for
+one operation all block new admission. Lingering `terminated` records are not
+ownership claims and do not block.
+
+Observation opens the ledger read-only. It never creates, initializes or
+migrates the file; an existing but uninitialized, unsupported or corrupt ledger
+makes `plan` refuse instead of computing a free slot from zero consumption. The
+ledger uses a rollback journal so a read-only observation creates no
+`-wal`/`-shm` side files. The state path is converted to an escaped file URI
+before it is opened read-only, so a filename containing URI metacharacters
+cannot select another file.
 
 Every launch carries `ci-burst:managed`, `ci-burst:deployment`,
 `ci-burst:operation` and `ci-burst:expires-at` tags. Discovery and cleanup

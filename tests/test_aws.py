@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ci_burst.aws import Aws, _instances, _spot_quote
+from ci_burst.aws import Aws, _definite_launch_error, _instances, _spot_quote
 from ci_burst.config import load
 from ci_burst.errors import ProviderRefusal
 
@@ -39,12 +39,48 @@ class SpotQuoteTests(unittest.TestCase):
         self.assertIsNone(_spot_quote([history("0.020000", now, product="Windows")], "t4g.small", "eu-central-1a"))
 
     def test_missing_timestamp_or_price_is_refused(self):
-        self.assertIsNone(_spot_quote([{"SpotPrice": "0.02"}], "t4g.small", "eu-central-1a"))
+        now = datetime(2026, 11, 9, tzinfo=timezone.utc)
+        self.assertIsNone(_spot_quote([history(None, now)], "t4g.small", "eu-central-1a"))
         self.assertIsNone(
             _spot_quote(
-                [history(None, datetime(2026, 11, 9, tzinfo=timezone.utc))], "t4g.small", "eu-central-1a"
+                [
+                    {
+                        "SpotPrice": "0.02",
+                        "AvailabilityZone": "eu-central-1a",
+                        "InstanceType": "t4g.small",
+                        "ProductDescription": "Linux/UNIX",
+                    }
+                ],
+                "t4g.small",
+                "eu-central-1a",
             )
         )
+
+    def test_incomplete_response_metadata_is_not_accepted_as_scope(self):
+        now = datetime(2026, 11, 9, tzinfo=timezone.utc)
+        self.assertIsNone(_spot_quote([{"SpotPrice": "0.02", "Timestamp": now}], "t4g.small", "eu-central-1a"))
+        self.assertIsNone(
+            _spot_quote(
+                [
+                    {
+                        "SpotPrice": "0.02",
+                        "Timestamp": now,
+                        "AvailabilityZone": "eu-central-1a",
+                        "InstanceType": "t4g.small",
+                    }
+                ],
+                "t4g.small",
+                "eu-central-1a",
+            )
+        )
+
+
+class ErrorClassificationTests(unittest.TestCase):
+    def test_only_known_rejections_are_definite(self):
+        for code in ("InvalidParameterValue", "UnauthorizedOperation", "InvalidAMIID.NotFound"):
+            self.assertTrue(_definite_launch_error(code), code)
+        for code in ("InternalError", "Throttling", "RequestLimitExceeded", "ServiceUnavailable", "Unknown"):
+            self.assertFalse(_definite_launch_error(code), code)
 
 
 class InstanceParsingTests(unittest.TestCase):

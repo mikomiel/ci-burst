@@ -25,6 +25,26 @@ EXPIRES_TAG = "ci-burst:expires-at"
 
 MAX_INVENTORY_PAGES = 20
 
+#: Only these client error codes prove that RunInstances did not create an
+#: instance. Everything else -- throttling, service errors, unknown codes --
+#: stays uncertain, because rejecting a retry does not prove the first request
+#: created nothing.
+DEFINITE_LAUNCH_ERRORS = frozenset(
+    {
+        "InvalidParameterValue",
+        "InvalidParameterCombination",
+        "InvalidParameter",
+        "MissingParameter",
+        "UnauthorizedOperation",
+        "AuthFailure",
+        "InvalidAMIID.NotFound",
+        "InvalidAMIID.Malformed",
+        "InvalidLaunchTemplateId.NotFound",
+        "InvalidLaunchTemplateName.NotFoundException",
+        "InsufficientInstanceCapacity",
+    }
+)
+
 
 @dataclass(frozen=True)
 class Template:
@@ -208,11 +228,17 @@ def _translate(error):
     except ImportError:
         return ProviderRefusal("AWS_REFUSED", type(error).__name__)
     if isinstance(error, botocore.ClientError):
-        code = error.response.get("Error", {}).get("Code", "Unknown")
-        return ProviderRefusal("AWS_REFUSED", str(code))
+        code = str(error.response.get("Error", {}).get("Code", "Unknown"))
+        if not _definite_launch_error(code):
+            return ProviderRefusal("AWS_UNCERTAIN", code, uncertain=True)
+        return ProviderRefusal("AWS_REFUSED", code)
     if isinstance(error, botocore.BotoCoreError):
         return ProviderRefusal("AWS_UNCERTAIN", type(error).__name__, uncertain=True)
     return ProviderRefusal("AWS_REFUSED", type(error).__name__)
+
+
+def _definite_launch_error(code):
+    return code in DEFINITE_LAUNCH_ERRORS
 
 
 def _timestamp(value):
@@ -225,12 +251,15 @@ def _timestamp(value):
 
 def _spot_quote(entries, instance_type, availability_zone):
     """Pick the newest quote in the requested placement scope."""
+    # The response must identify its own scope. A missing field is not
+    # replaced with the value we asked for, because that would fabricate
+    # verification evidence the provider never supplied.
     scoped = [
         entry
         for entry in entries
-        if entry.get("AvailabilityZone") in (None, availability_zone)
-        and entry.get("InstanceType") in (None, instance_type)
-        and entry.get("ProductDescription") in (None, "Linux/UNIX")
+        if entry.get("AvailabilityZone") == availability_zone
+        and entry.get("InstanceType") == instance_type
+        and entry.get("ProductDescription") == "Linux/UNIX"
     ]
     if not scoped:
         return None

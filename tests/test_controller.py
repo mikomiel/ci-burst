@@ -145,13 +145,13 @@ class PlanTests(ControllerCase):
         self.assertEqual(result["decision"], "refused")
         self.assertIn("template_bootstrap_missing", result["reasons"])
 
-    def test_plan_does_not_initialize_an_empty_state_file(self):
+    def test_plan_refuses_an_invalid_state_instead_of_computing_from_zero(self):
         import sqlite3
 
         sqlite3.connect(self.config.state.database).close()
         result = self.build(observation=observation_demand()).plan()
-        self.assertFalse(result["state"]["available"])
-        self.assertEqual(result["state"]["note"], "STATE_UNINITIALIZED")
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["refusal"]["reason"], "STATE_UNINITIALIZED")
         probe = sqlite3.connect(self.config.state.database)
         try:
             self.assertEqual(probe.execute("PRAGMA user_version").fetchone()[0], 0)
@@ -259,11 +259,58 @@ class ApplyTests(ControllerCase):
         self.assertEqual(second["decision"], "resumed")
         runs = [call for call in self.aws.calls if call[0] == "run_spot"]
         self.assertEqual(len(runs), 2)
-        self.assertEqual(runs[0][1]["ClientToken"], runs[1][1]["ClientToken"])
+        self.assertEqual(runs[0][1], runs[1][1])
         self.assertEqual(second["operation"], first["operation"])
         ledger = self.reopened()
         self.assertEqual(len(ledger.operations()), 1)
         self.assertEqual(ledger.operation(first["operation"]).state, "starting")
+
+    def test_rejected_resume_keeps_unresolved_ownership(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        self.aws.run_error = ProviderRefusal("AWS_REFUSED", "Throttling")
+        second = controller.apply()
+        self.assertEqual(second["decision"], "uncertain")
+        self.assertEqual(second["operation"], first["operation"])
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation(first["operation"]).state, "uncertain")
+        self.assertEqual(len(ledger.operations()), 1)
+        self.aws.run_error = None
+        third = self.build(observation=observation_demand(), aws=self.aws).apply()
+        self.assertEqual(third["decision"], "resumed")
+        self.assertEqual(third["operation"], first["operation"])
+
+    def test_unresolved_intent_older_than_the_token_window_is_refused(self):
+        self.seed(state="intent", instance_id=None, expires_at=self.clock.now + 30 * 3600)
+        self.clock.advance(25 * 3600)
+        controller = self.build(observation=observation_demand())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("unresolved_intent_expired", result["reasons"])
+        self.assertEqual([call for call in self.aws.calls if call[0] == "run_spot"], [])
+
+    def test_unresolved_intent_past_its_lifetime_is_not_sent(self):
+        self.seed(state="intent", instance_id=None, expires_at=self.clock.now + 60)
+        self.clock.advance(120)
+        controller = self.build(observation=observation_demand())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("unresolved_intent_lifetime_elapsed", result["reasons"])
+        self.assertEqual([call for call in self.aws.calls if call[0] == "run_spot"], [])
+
+    def test_changed_placement_cannot_replace_an_unresolved_intent(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        self.aws.run_error = None
+        changed = load(write_config(self.root, config={"aws": {"availability_zone": "eu-central-1b"}}))
+        result = self.build(observation=observation_demand(), aws=self.aws, config=changed).apply()
+        self.assertEqual(result["decision"], "resumed")
+        self.assertEqual(result["operation"], first["operation"])
+        run = [call for call in self.aws.calls if call[0] == "run_spot"][-1][1]
+        self.assertEqual(run["Placement"]["AvailabilityZone"], "eu-central-1a")
+        self.assertEqual(len(self.reopened().operations()), 1)
 
     def test_shutting_down_instance_keeps_the_slot(self):
         operation_id = self.seed(state="running")

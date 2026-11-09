@@ -28,6 +28,12 @@ constraints: a posted App approval is not proof that GitHub counted it.
 A human maintainer can click Merge only when all effective rules pass;
 repository automation can merge eligible ordinary PRs under the same rules.
 
+Automation's merge scope is exactly the ordinary-path allowlist: `README.md`,
+`CHANGELOG.md` and the named OpenSpec documents. Changes under `ci_burst/`,
+`docs/`, `tests/`, `.github/` and dependency files such as `pyproject.toml`,
+`package.json` and `package-lock.json` are merged by a person. That is the
+intended scope, not a gap.
+
 `scripts/pr_policy.py` is the shared rule owner. It accepts the pinned Gandalf
 bot identity or a different human reviewer whose write/maintain/admin access
 was verified through GitHub. The verified-maintainer fallback serves the

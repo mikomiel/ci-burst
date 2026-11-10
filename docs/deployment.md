@@ -52,9 +52,11 @@ Follow [runner-setup.md](runner-setup.md) sections 1–4. You create:
 
 Two additions this walkthrough needs:
 
-- the bootstrap registers the label you chose, for example
-  `--labels cloud-ci:host`. The part before `:` is the label; `host` is the
-  executor. A job with `runs-on: cloud-ci` matches it.
+- the bootstrap registers the label you chose plus the image's architecture,
+  for example `--labels cloud-ci:host,linux-arm64:host`. The part before `:` is
+  the label; `host` is the executor. A job with `runs-on: cloud-ci` matches the
+  first, and a job with `runs-on: [cloud-ci, linux-arm64]` needs both.
+  `[worker].labels` below must list the same set.
 - record the template id, the numeric version, the subnet and the security
   group. Step 5 uses them.
 
@@ -166,7 +168,10 @@ contract = "forgejo-17.0.1-runners-jobs"
 qualification = "fixtures-only"
 
 [worker]
-labels = ["cloud-ci:host"]
+# Exactly what the bootstrap registers: the routing label plus the image's
+# architecture label. The controller matches a job's whole runs_on set against
+# this list.
+labels = ["cloud-ci:host", "linux-arm64:host"]
 
 [aws]
 region = "eu-central-1"

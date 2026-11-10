@@ -6,10 +6,14 @@ cloud account change or a pilot; [operations.md](operations.md) remains the
 product contract and [SECURITY.md](../SECURITY.md) remains the security
 boundary.
 
-The image and units are source artifacts. No image is published, no CI job
-builds one, and no deployment is performed here. A local build downloads the
-base image and `boto3`, so it needs network access and stays outside the
-credential-free validation CI.
+The image and units are source artifacts. CI builds the image from the
+repository root on every push to `main` and every pull request to prove the
+`Dockerfile` still builds, using the workflow's read-only token. That job
+publishes nothing: no registry login, no push, no release and no deployment.
+The only tag it creates is a local one inside the ephemeral runner, and a green
+build is neither a release nor a deployment. A local build downloads the base
+image and `boto3`, so it needs network access, as does the CI build; neither
+needs a credential.
 
 ## What the image is
 
@@ -520,7 +524,9 @@ outlive it. A manual `reap --apply` run does not replace the recurring schedule.
 
 ## Not included
 
-- Published image, registry push, image build in CI, and image signing.
+- A published or signed image, a registry push, a release tag, or an image
+  artifact that outlives the CI job. CI builds the image only to prove it still
+  builds.
 - A token-file option; the env-file route is inspect-visible by design today.
 - A daemon, published ports, a healthcheck, or readiness probing. One run, one
   exit code.

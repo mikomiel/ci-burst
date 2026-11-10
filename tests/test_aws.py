@@ -20,6 +20,9 @@ def history(price, timestamp, zone="eu-central-1a", instance_type="t4g.small", p
     }
 
 
+OBSERVED_AT = 1_800_000_000.0
+
+
 class SpotQuoteTests(unittest.TestCase):
     def test_newest_datetime_quote_is_selected(self):
         now = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
@@ -27,20 +30,24 @@ class SpotQuoteTests(unittest.TestCase):
             history("0.030000", now - timedelta(minutes=5)),
             history("0.020000", now),
         ]
-        quote = _spot_quote(entries, "t4g.small", "eu-central-1a")
+        quote = _spot_quote(entries, "t4g.small", "eu-central-1a", OBSERVED_AT)
         self.assertEqual(quote.price_micros, 20_000)
         self.assertEqual(quote.timestamp, now.timestamp())
         self.assertEqual(quote.availability_zone, "eu-central-1a")
+        # The provider timestamp is the price-change time; the observation is
+        # what a freshness bound uses.
+        self.assertEqual(quote.observed_at, OBSERVED_AT)
+        self.assertNotEqual(quote.timestamp, quote.observed_at)
 
     def test_quote_outside_the_requested_scope_is_not_used(self):
         now = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
-        self.assertIsNone(_spot_quote([history("0.020000", now, zone="us-east-1a")], "t4g.small", "eu-central-1a"))
-        self.assertIsNone(_spot_quote([history("0.020000", now, instance_type="m5.large")], "t4g.small", "eu-central-1a"))
-        self.assertIsNone(_spot_quote([history("0.020000", now, product="Windows")], "t4g.small", "eu-central-1a"))
+        self.assertIsNone(_spot_quote([history("0.020000", now, zone="us-east-1a")], "t4g.small", "eu-central-1a", OBSERVED_AT))
+        self.assertIsNone(_spot_quote([history("0.020000", now, instance_type="m5.large")], "t4g.small", "eu-central-1a", OBSERVED_AT))
+        self.assertIsNone(_spot_quote([history("0.020000", now, product="Windows")], "t4g.small", "eu-central-1a", OBSERVED_AT))
 
     def test_missing_timestamp_or_price_is_refused(self):
         now = datetime(2026, 11, 9, tzinfo=timezone.utc)
-        self.assertIsNone(_spot_quote([history(None, now)], "t4g.small", "eu-central-1a"))
+        self.assertIsNone(_spot_quote([history(None, now)], "t4g.small", "eu-central-1a", OBSERVED_AT))
         self.assertIsNone(
             _spot_quote(
                 [
@@ -53,12 +60,13 @@ class SpotQuoteTests(unittest.TestCase):
                 ],
                 "t4g.small",
                 "eu-central-1a",
+                OBSERVED_AT,
             )
         )
 
     def test_incomplete_response_metadata_is_not_accepted_as_scope(self):
         now = datetime(2026, 11, 9, tzinfo=timezone.utc)
-        self.assertIsNone(_spot_quote([{"SpotPrice": "0.02", "Timestamp": now}], "t4g.small", "eu-central-1a"))
+        self.assertIsNone(_spot_quote([{"SpotPrice": "0.02", "Timestamp": now}], "t4g.small", "eu-central-1a", OBSERVED_AT))
         self.assertIsNone(
             _spot_quote(
                 [
@@ -71,6 +79,7 @@ class SpotQuoteTests(unittest.TestCase):
                 ],
                 "t4g.small",
                 "eu-central-1a",
+                OBSERVED_AT,
             )
         )
 

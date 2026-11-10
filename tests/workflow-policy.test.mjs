@@ -77,3 +77,167 @@ test('validation CI stays read-only and checks policy alongside OpenSpec', () =>
   const checkout = w.jobs.planning.steps.find((step) => step.uses?.startsWith('actions/checkout@'));
   assert.equal(checkout.with['fetch-depth'], 0); // changelog release checks need tags
 });
+
+// The container image job is a build proof, not a publication path. These
+// checks read the effective YAML, so quoting, bracket access and defaults are
+// all resolved before they are judged; the Python suite keeps only the narrow
+// text shape of the committed job.
+const ciImageJob = 'container-image';
+const ciImageCommand = 'docker build --tag ci-burst:ci .';
+const credentialReference =
+  /\bsecrets\s*(?:\.\s*[A-Za-z_][A-Za-z0-9_]*|\[)|\bgithub\s*(?:\.\s*token\b|\[\s*['"]token['"]\s*\])/i;
+const publishOrLogin =
+  /(?:^|\/)(?:login-action|build-push-action)(?:@|$)|\b(?:docker|podman|buildah)\b[\s\S]*\b(?:push|login)\b|\s--push\b/i;
+
+function allStrings(value) {
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.flatMap(allStrings);
+  if (value && typeof value === 'object') {
+    return Object.entries(value).flatMap(([key, item]) => [key, ...allStrings(item)]);
+  }
+  return [];
+}
+
+function ciImageViolations(w) {
+  const violations = [];
+  const job = w.jobs?.[ciImageJob];
+  if (!job) return [`jobs.${ciImageJob} is missing`];
+
+  for (const value of allStrings(w)) {
+    if (credentialReference.test(value)) violations.push(`credential reference: ${value}`);
+    if (publishOrLogin.test(value)) violations.push(`publish or login operation: ${value}`);
+  }
+
+  const permissions = w.permissions ?? {};
+  if (permissions.contents !== 'read' || Object.keys(permissions).length !== 1) {
+    violations.push(`workflow permissions are not exactly contents: read: ${JSON.stringify(permissions)}`);
+  }
+  for (const [name, other] of Object.entries(w.jobs)) {
+    if (other.permissions !== undefined) violations.push(`job ${name} overrides permissions`);
+  }
+
+  if (w.defaults?.run?.['working-directory'] !== undefined) {
+    violations.push(`workflow defaults set working-directory: ${w.defaults.run['working-directory']}`);
+  }
+  if (job.defaults?.run?.['working-directory'] !== undefined) {
+    violations.push(`job defaults set working-directory: ${job.defaults.run['working-directory']}`);
+  }
+  for (const [index, step] of (job.steps ?? []).entries()) {
+    if (step['working-directory'] !== undefined) {
+      violations.push(`step ${index + 1} sets working-directory: ${step['working-directory']}`);
+    }
+  }
+
+  const buildStep = (job.steps ?? []).find((step) => step.run === ciImageCommand);
+  if (!buildStep) violations.push(`the image job must run exactly: ${ciImageCommand}`);
+
+  const checkout = (job.steps ?? []).find((step) => step.uses?.startsWith('actions/checkout@'));
+  if (checkout?.with?.path !== undefined && checkout.with.path !== '.') {
+    violations.push(`checkout path moves the repository root: ${checkout.with.path}`);
+  }
+
+  const buildRoot =
+    buildStep?.['working-directory'] ??
+    job.defaults?.run?.['working-directory'] ??
+    w.defaults?.run?.['working-directory'] ??
+    '.';
+  if (buildRoot !== '.') violations.push(`effective build working directory is ${buildRoot}`);
+  return violations;
+}
+
+test('container image CI job is credential-free and builds at the repository root', () => {
+  assert.deepEqual(ciImageViolations(workflow('ci.yml')), []);
+});
+
+test('container image CI checker rejects credential and working-directory spellings', () => {
+  const source = readFileSync(resolve(root, '.github/workflows/ci.yml'), 'utf8');
+  const jobHeader = '    name: container-image builds\n';
+  const withJobEnv = (entry) => source.replace(jobHeader, `    env:\n      ${entry}\n${jobHeader}`);
+  const mutations = [
+    [
+      'dot-access secret in the job env',
+      withJobEnv('CI_TEST_TOKEN: ${{ secrets.CI_TEST_TOKEN }}'),
+      /credential reference/,
+    ],
+    [
+      'bracket-access secret in the job env',
+      withJobEnv("CI_TEST_TOKEN: ${{ secrets['CI_TEST_TOKEN'] }}"),
+      /credential reference/,
+    ],
+    [
+      'double-quoted bracket secret in the job env',
+      withJobEnv('CI_TEST_TOKEN: ${{ secrets["CI_TEST_TOKEN"] }}'),
+      /credential reference/,
+    ],
+    [
+      'bracketed github token in the job env',
+      withJobEnv("CI_TEST_TOKEN: ${{ github['token'] }}"),
+      /credential reference/,
+    ],
+    [
+      'quoted working-directory on the build step',
+      source.replace(
+        `        run: ${ciImageCommand}`,
+        `        "working-directory": ci_burst\n        run: ${ciImageCommand}`,
+      ),
+      /working-directory/,
+    ],
+    [
+      'quoted workflow defaults working-directory',
+      source.replace(
+        'jobs:\n',
+        'defaults:\n  run:\n    "working-directory": elsewhere\njobs:\n',
+      ),
+      /working-directory/,
+    ],
+    [
+      'job defaults working-directory',
+      source.replace(
+        '    timeout-minutes: 10\n',
+        '    timeout-minutes: 10\n    defaults:\n      run:\n        working-directory: elsewhere\n',
+      ),
+      /working-directory/,
+    ],
+    [
+      'workflow-level package permission',
+      source.replace(
+        'permissions:\n  contents: read',
+        'permissions:\n  contents: read\n  packages: write',
+      ),
+      /permissions/,
+    ],
+    [
+      'job-level permission',
+      source.replace(
+        '    timeout-minutes: 10\n',
+        '    timeout-minutes: 10\n    permissions:\n      contents: write\n',
+      ),
+      /permissions/,
+    ],
+    [
+      'registry login action',
+      source.replace(
+        '      - name: Build the image from the repository root\n',
+        '      - uses: docker/login-action@v3\n      - name: Build the image from the repository root\n',
+      ),
+      /publish or login/,
+    ],
+    [
+      'registry push step',
+      source.replace(
+        '      - name: Build the image from the repository root\n',
+        '      - name: Publish the image\n        run: docker image push ci-burst:ci\n'
+          + '      - name: Build the image from the repository root\n',
+      ),
+      /publish or login/,
+    ],
+  ];
+  for (const [label, mutated, reason] of mutations) {
+    assert.notEqual(mutated, source, `${label}: the mutation must apply`);
+    const violations = ciImageViolations(parse(mutated));
+    assert.ok(
+      violations.some((violation) => reason.test(violation)),
+      `${label}: expected ${reason}, got ${JSON.stringify(violations)}`,
+    );
+  }
+});

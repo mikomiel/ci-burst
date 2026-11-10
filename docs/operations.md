@@ -240,6 +240,58 @@ A broad label can also accept jobs outside the intended class. Exclusive burst
 routing requires a label only the burst worker advertises, and the operator
 must qualify that label against the image and machine before relying on it.
 
+### The routing decision
+
+The worker advertises a burst-oriented label, `cloud-ci`, and the permanent
+fleet does not advertise it. The alternative — reusing a label the permanent
+runners also carry — was rejected because Forgejo hands a waiting job to
+whichever runner takes it first: a launch meant to add capacity could instead
+absorb work the warm pool would have finished sooner, and "how much work ran on
+cloud capacity" would stop being measurable.
+
+Two different lists decide two different things, and they are configured to the
+same set:
+
+- `[worker].labels` in the deployment decides which waiting jobs the controller
+  counts as demand. A job is eligible only when its complete `runs_on` set is a
+  subset of this list.
+- the labels the bootstrap registers decide which jobs Forgejo may **assign**
+  to a launched worker. Once the instance exists, the controller does not
+  choose the job.
+
+Because the match is a subset check, exclusivity is a property of the label
+sets in use, not of the word "exclusive":
+
+- a job whose `runs_on` is exactly `[cloud-ci]` is eligible and assignable;
+- a job whose `runs_on` additionally requires something the worker advertises
+  (for example `[cloud-ci, linux-arm64]`) is also eligible, which is why the
+  worker advertises the image's architecture label at all;
+- a job whose `runs_on` is a subset of the worker's labels **without**
+  `cloud-ci` (for example `[linux-arm64]` alone) would be eligible too, and
+  Forgejo could assign it to the burst worker.
+
+So the routing rule is: every workflow that could run on this worker must name
+`cloud-ci`, and no workflow may request only the worker's other labels. Check
+that whenever a label is added to the worker or a workflow starts using one.
+The workflows that matter are the ones in the repository this deployment
+observes, not this repository's own CI: in the pilot that is one Forgejo
+repository whose architecture jobs pair the architecture label with a fleet
+label, which is why no job there can match this worker on the architecture
+label alone.
+
+Accepted risk, stated without the comfort of "it just fails":
+
+- a job that names a label the worker does not advertise is not assigned to it,
+  and stays waiting for another runner;
+- a job that names only labels the worker advertises, and needs a capability
+  the image lacks, may fail at run time **or may appear to succeed while
+  producing the wrong artifact** — a host-architecture selection is the obvious
+  example, and labels cannot detect it. Qualification of the image for the job
+  class, and assertions inside the job, are the mitigations; neither the label
+  match nor the controller verifies what a job produces;
+- a workflow that asks for only the worker's non-routing labels can take cloud
+  capacity for fleet work, which is what the check above prevents.
+
 ## Budget and reservations
 
 Before a launch, ci-burst computes an exact reservation in micro-units:
@@ -250,8 +302,11 @@ reservation = ceil(max_spot_price * max_lifetime_seconds / 3600)
 ```
 
 A launch is refused unless the selected candidate has a fresh Spot quote for the
-configured instance type and its availability zone, is not older than
-`price_max_age_seconds`, and is not above `max_spot_price`. Every configured
+configured instance type and its availability zone, was observed no longer ago
+than `price_max_age_seconds`, and is not above `max_spot_price`. Freshness is the
+age of the **observation**: a Spot price records when it last *changed*, and a
+price that has been stable for hours is still current, so the provider's own
+timestamp is carried as evidence rather than used as the bound. Every configured
 candidate is priced in order; one whose quote is missing, stale, out of scope or
 above the ceiling is skipped and the next candidate is considered, so one
 expensive zone does not refuse a launch another configured zone can serve. The
@@ -261,8 +316,10 @@ The reservation is computed from `max_spot_price`, never from an observed quote,
 and the current window must still have `allowance` left after it. The window is
 anchored at a multiple of `window_seconds`. Outstanding operations carry their
 reservation into later windows; a completed operation is charged to the window
-it started in. Requesting termination does not refund consumed allowance, and a
-restart does not reset it.
+it started in. A **definite** provider rejection releases the reservation,
+because the provider proved that no instance was created; an uncertain outcome,
+or a rejected retry, keeps it until the intent is resolved. Requesting
+termination does not refund consumed allowance, and a restart does not reset it.
 
 The reservation estimates compute at the configured maximum price for the
 configured lifetime, plus the configured non-compute allowance. It does not

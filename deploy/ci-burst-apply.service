@@ -1,0 +1,29 @@
+# One bounded apply per invocation. The image is a one-shot CLI, not a daemon:
+# the process exits with the controller's exit code (0 completed decision,
+# 2 refusal, 1 provider or cleanup failure), and the timer decides when the next
+# run starts.
+#
+# The state DIRECTORY is the only writable host path: the SQLite ledger, its
+# .lock and its rollback journal must stay together in one directory. Do not
+# point this unit at a copied ledger file.
+#
+# The Forgejo token comes from an env-file, which is visible in
+# `podman inspect`; a token-file option is a follow-up, not part of this unit.
+# The deployment TOML and the cloud credentials are mounted read-only.
+[Unit]
+Description=ci-burst apply (one bounded AWS Spot capacity decision)
+Documentation=https://github.com/mikomiel/ci-burst/blob/main/docs/container.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=300
+ExecStart=/usr/bin/podman run --rm \
+    --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+    --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \
+    --volume /var/lib/ci-burst:/var/lib/ci-burst:rw \
+    --volume /etc/ci-burst/aws-scaling:/etc/ci-burst/aws:ro \
+    --env-file /etc/ci-burst/forgejo.env \
+    localhost/ci-burst:latest apply --config /etc/ci-burst/deployment.toml

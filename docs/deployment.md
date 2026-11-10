@@ -320,31 +320,48 @@ label, or wait for one, to see the priced decision.
 
 ### Prove the cleanup identity terminates something
 
-The controller terminates its own expired instance on the next `apply` tick, so
-a cleanup identity that is never observed terminating can still be correct — and
-a reap that reports nothing is indistinguishable from a reap that would be
-denied. To see it work, take the controller out of the picture:
+The controller terminates its own expired instance on the next `apply` tick, so a
+cleanup identity that is never observed terminating can still be correct — and a
+reap that reports nothing is indistinguishable from a reap that would be denied.
+To see it work, arrange for the reaper to be the only actor that may act:
 
-1. stop the admission schedule on the scaler
-   (`systemctl disable --now ci-burst-apply.timer`) so nothing else can terminate
-   the canary first;
-2. launch one instance carrying the ownership tags and an `ci-burst:expires-at`
-   in the past. The reaper reads tags, not the ledger, so a tagged canary is
-   exactly its production input. Put a no-op bootstrap in the launch so it
-   registers no runner and takes no job;
-3. run `reap --apply` on the cleanup host. The answer must name the instance in
-   `termination_requested` with an empty `refused_resources`. A
-   `reason: AWS_REFUSED` with `UnauthorizedOperation` means the policy's
-   `ec2:ResourceTag/ci-burst:deployment` condition does not match the canary's
-   tag, or the instance is not tagged `ci-burst:managed=true`;
+1. stop admission on the scaler. On a fresh installation it was never enabled:
+   leave it stopped and enable it only at Step 8, because a scheduled tick before
+   qualification can launch capacity. On an existing installation follow the
+   admission-stop procedure in Step 9 rather than disabling the timer alone,
+   which does not stop an active service or a surviving manual container;
+2. launch one instance carrying **all** the ownership tags: `ci-burst:managed=true`,
+   `ci-burst:deployment` equal to the TOML's value, a `ci-burst:operation` value
+   that is non-empty and not `pending`, and a positive Unix-epoch
+   `ci-burst:expires-at` in the past. Discovery selects on the managed and
+   deployment tags, so an instance missing either is invisible to the reaper
+   rather than refused; and an instance whose operation tag is missing, empty or
+   `pending` blocks admission even after it terminates, which makes it the wrong
+   canary. Give it a no-op bootstrap so it registers no runner and takes no job.
+   The reaper reads tags, not the ledger, so a tagged canary is exactly its
+   production input;
+3. observe the termination. The reap timer is already enabled here, so it may act
+   before a manual command does, and either answer is evidence: a scheduled
+   `ci-burst-reap` journal entry naming the instance counts. If no scheduled run
+   has happened yet, run `reap --apply` by hand; its `termination_requested` must
+   name the instance with an empty `refused_resources`;
 4. confirm the instance reaches `terminated` with `status` or
    `describe-instances`: a termination request is not confirmed removal;
-5. re-enable the scaler timer.
+5. re-enable admission only if it was enabled before this test **and** the
+   deployment has completed qualification (Step 8).
 
-EC2 keeps listing a terminated instance for about an hour. While it is listed, an
-unrecorded owned instance is reported in `status` under
-`slot.ignored_discrepancies` and does not block admission; a **live** unrecorded
-instance still does, because it may be spending money nothing accounts for.
+Two failures look alike and are not. An instance absent from the reaper's
+inventory — no `ci-burst:managed`, or a `ci-burst:deployment` that differs from
+the TOML — is excluded by discovery and never refused. A refusal with
+`reason: AWS_REFUSED` and `UnauthorizedOperation` means the call was attempted
+and denied, which can come from a missing termination grant, a resource scope
+that excludes the instance, an explicit deny, or denied inventory access; the
+deployment-tag condition is one cause among them.
+
+EC2 keeps listing a terminated instance for about an hour. A terminated
+unrecorded instance whose operation tag is a real id the ledger does not know is
+reported in `status` under `slot.ignored_discrepancies` and does not block
+admission; one whose operation tag is missing, empty or `pending` still blocks.
 
 ## 7. Qualify live support
 

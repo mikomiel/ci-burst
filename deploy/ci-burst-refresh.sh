@@ -72,7 +72,7 @@ fi
 # install download far more than one segment, and a container bridge whose
 # MTU is larger than the host path MTU stalls those transfers with no error.
 # The smoke run below uses the same named network as the scheduled units, so it
-# networking the scheduled units use.
+# exercises exactly the networking they use.
 if ! podman build --quiet --network=host --tag "$IMAGE:candidate" "$work/src" >/dev/null; then
     log "build_failed: $want"
     exit 2

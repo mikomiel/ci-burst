@@ -50,19 +50,25 @@ _TEMPLATE_DRIFT = {
 }
 
 #: EC2 error codes that definitively mean the template or version does not
-#: exist. Only these become drift; denied, throttled and unknown errors stay
-#: unavailable because they do not prove absence.
+#: exist. The adapter may translate one of these to ``AWS_REFUSED`` or
+#: ``AWS_UNCERTAIN`` depending on its retry classification, so the detail code
+#: alone decides. Denied, throttled and unknown codes stay unavailable.
 _TEMPLATE_NOT_FOUND_CODES = frozenset(
-    {"InvalidLaunchTemplateId.NotFound", "InvalidLaunchTemplateName.NotFoundException"}
+    {
+        "InvalidLaunchTemplateId.NotFound",
+        "InvalidLaunchTemplateId.VersionNotFound",
+        "InvalidLaunchTemplateName.NotFoundException",
+    }
 )
 
 #: Bound on the best-effort ``DescribeParameters`` pagination. Reaching it is
 #: an incomplete check, not proof that the parameter is absent.
 MAX_PARAMETER_PAGES = 100
 
-#: Expected boto3/botocore credential or session failures. A failure is
-#: reported by class name only: an exception message can contain a profile
-#: name, a file path or other setup detail that must not reach the output.
+#: Expected boto3/botocore credential, session or session-configuration
+#: failures. A failure is reported by class name only: an exception message can
+#: contain a profile name, a file path or other setup detail that must not
+#: reach the output.
 _CREDENTIAL_FAILURES = frozenset(
     {
         "ProfileNotFound",
@@ -72,6 +78,8 @@ _CREDENTIAL_FAILURES = frozenset(
         "SSOTokenLoadError",
         "SSOError",
         "TokenRetrievalError",
+        "ConfigParseError",
+        "InvalidConfigError",
     }
 )
 
@@ -214,10 +222,12 @@ def _template_refusal_reason(refusal):
     reason = _TEMPLATE_DRIFT.get(refusal.reason)
     if reason is not None:
         return reason
-    # The adapter collapses definite launch errors into ``AWS_REFUSED``; only
-    # a definitive not-found code proves the template is absent. A denied,
-    # throttled or unknown error stays unavailable.
-    if refusal.reason == "AWS_REFUSED" and refusal.detail in _TEMPLATE_NOT_FOUND_CODES:
+    # The adapter may translate a client error to ``AWS_REFUSED`` (definite
+    # launch errors) or ``AWS_UNCERTAIN`` (everything else), depending on its
+    # retry classification. The provider detail code decides: only an exact,
+    # definitive not-found code proves absence; a denied, throttled or unknown
+    # code stays unavailable.
+    if refusal.detail in _TEMPLATE_NOT_FOUND_CODES:
         return "template_not_found"
     return None
 

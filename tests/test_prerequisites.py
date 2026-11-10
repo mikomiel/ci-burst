@@ -397,6 +397,26 @@ class PrerequisiteTests(unittest.TestCase):
             result = self.check()
         self.assert_drift(result, "template_not_found")
 
+    def test_missing_template_version_error_is_drift_via_adapter_translation(self):
+        modules, ClientError = botocore_error_modules()
+        with mock.patch.dict(sys.modules, modules):
+            # The adapter classifies this code as AWS_UNCERTAIN, not
+            # AWS_REFUSED; the not-found detail still proves absence.
+            self.ec2.errors["describe_launch_template_versions"] = ClientError(
+                "InvalidLaunchTemplateId.VersionNotFound"
+            )
+            result = self.check()
+        self.assert_drift(result, "template_not_found")
+        self.assertEqual(self.records(result, "template")[0]["status"], "drift")
+
+    def test_throttled_template_read_is_unavailable_not_drift(self):
+        modules, ClientError = botocore_error_modules()
+        with mock.patch.dict(sys.modules, modules):
+            self.ec2.errors["describe_launch_template_versions"] = ClientError("Throttling")
+            result = self.check()
+        self.assert_unavailable(result, "template_read_unavailable")
+        self.assertNotIn("template_not_found", result["reasons"])
+
     def test_denied_template_read_is_unavailable_not_drift(self):
         modules, ClientError = botocore_error_modules()
         with mock.patch.dict(sys.modules, modules):
@@ -639,6 +659,35 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(document["error"]["reason"], "AWS_CREDENTIALS_UNAVAILABLE")
         self.assertEqual(document["error"]["detail"], "ProfileNotFound")
         self.assertNotIn("profile example", output.getvalue())
+
+    def run_with_session_error(self, error_name):
+        boto3_module = types.ModuleType("boto3")
+        error_class = type(error_name, (Exception,), {})
+
+        class Session:
+            def __init__(self, profile_name=None):
+                raise error_class("malformed shared config at /example/secret-path")
+
+        boto3_module.Session = Session
+        output = io.StringIO()
+        with mock.patch.dict(sys.modules, {"boto3": boto3_module}):
+            with redirect_stdout(output):
+                code = prerequisites.main(["--config", str(self.config_path)])
+        return code, json.loads(output.getvalue()), output.getvalue()
+
+    def assert_session_configuration_unavailable(self, error_name):
+        code, document, text = self.run_with_session_error(error_name)
+        self.assertEqual(code, 3)
+        self.assertEqual(document["decision"], "unavailable")
+        self.assertEqual(document["error"]["reason"], "AWS_CREDENTIALS_UNAVAILABLE")
+        self.assertEqual(document["error"]["detail"], error_name)
+        self.assertNotIn("malformed shared config", text)
+
+    def test_config_parse_error_exits_three(self):
+        self.assert_session_configuration_unavailable("ConfigParseError")
+
+    def test_invalid_config_error_exits_three(self):
+        self.assert_session_configuration_unavailable("InvalidConfigError")
 
     def test_missing_configuration_exits_three(self):
         output = io.StringIO()

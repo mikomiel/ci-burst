@@ -244,9 +244,9 @@ check passed, `2` means drift, and `3` means the check could not run
 completely. An incomplete check takes precedence over drift: if any check is
 unavailable the command exits `3`, while the drift reasons are still listed in
 `reasons`. A missing `ec2:DescribeSubnets`, `ssm:DescribeParameters` or
-`iam:GetInstanceProfile` permission, and an expected credential or session
-failure such as `ProfileNotFound`, are reported as `unavailable` and exit `3`;
-they are neither a pass nor drift.
+`iam:GetInstanceProfile` permission, and an expected credential, session or
+session-configuration failure such as `ProfileNotFound` or `ConfigParseError`,
+are reported as `unavailable` and exit `3`; they are neither a pass nor drift.
 
 What it does not prove: nothing about a worker's runtime behaviour — boot,
 registration, job execution or termination; network reachability (security

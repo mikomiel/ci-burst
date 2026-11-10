@@ -22,10 +22,12 @@ cleanup bounds.
 ## 2. Labels
 
 - [ ] Every advertised label is qualified against the image and machine.
-- [ ] The burst label is not advertised by the persistent fleet, or the
-      operator accepts the routing overlap explicitly.
-- [ ] A test job with the burst label completes; a job without it does not
-      land on the burst worker.
+- [ ] The routing decision is recorded in `operations.md` § "The routing
+      decision", including which labels the worker shares with the persistent
+      fleet and the accepted risk of that overlap.
+- [ ] A job with the burst label completes on the burst worker, a job with the
+      shared pool label can be assigned to it, and a job requiring a label the
+      worker does not advertise does not.
 
 ## 3. Forgejo contract
 

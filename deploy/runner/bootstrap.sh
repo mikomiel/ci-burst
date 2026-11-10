@@ -12,7 +12,7 @@
 #
 #   RUNNER_SHA     sha256 of the pinned release binary for ARCH; copy it from
 #                  the release page, never from a copy of this file
-#   RUNNER_LABELS  replace the `cloud-ci` routing label with the label your
+#   RUNNER_LABELS  replace the label set with the one your deployment uses
 #                  deployment configures in [worker].labels; the linux-arm64
 #                  label is fixed by the arm64 image the template boots
 #   AWS_REGION     your Region
@@ -106,7 +106,7 @@ aws ssm get-parameter --region "$AWS_REGION" --name "$TOKEN_PARAM" \
 # by the arm64 image and changes only with the image. Every advertised label is
 # a routing claim to qualify against the image and machine before a job relies
 # on it (docs/operations.md § Labels owns the rule).
-RUNNER_LABELS="cloud-ci:host,linux-arm64:host"
+RUNNER_LABELS="cloud-ci:host,strong-ci:host,linux-arm64:host"
 
 # The stock CLI accepts the registration token only as an argument, and only
 # non-interactive mode can set --ephemeral. This is the one place it is read.

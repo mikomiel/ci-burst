@@ -127,6 +127,53 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(observation.blocked, 1)
         self.assertEqual(observation.notes, ())
 
+    def test_the_shared_pool_label_makes_fleet_jobs_demand(self):
+        # The deployment advertises its routing label, the heavy pool's label and
+        # the architecture: a strong-ci job is demand for cloud capacity, and so
+        # is one that also names the architecture.
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "worker": {
+                        "labels": ["cloud-ci:host", "strong-ci:host", "linux-arm64:host"]
+                    }
+                },
+            )
+        )
+
+        def observe(runs_on):
+            body = json.dumps(
+                [
+                    {
+                        "id": 7,
+                        "attempt": 1,
+                        "handle": "h-7-1",
+                        "status": "waiting",
+                        "runs_on": runs_on,
+                        "needs": [],
+                    }
+                ]
+            ).encode()
+            observer = ForgejoObserver(
+                config, transport=StubTransport(body=body), environ={"CI_BURST_TEST_TOKEN": "secret"}
+            )
+            return observer.observe()
+
+        with self.subTest(runs_on="strong-ci alone"):
+            observation = observe(["strong-ci"])
+            self.assertEqual(observation.demand, 1)
+            self.assertEqual(observation.incompatible, 0)
+
+        with self.subTest(runs_on="strong-ci plus the architecture"):
+            observation = observe(["strong-ci", "linux-arm64"])
+            self.assertEqual(observation.demand, 1)
+
+        with self.subTest(runs_on="a label the worker does not advertise"):
+            observation = observe(["strong-ci", "linux-x86_64"])
+            self.assertEqual(observation.demand, 0)
+            self.assertEqual(observation.incompatible, 1)
+
     def test_waiting_job_with_static_needs_is_demand(self):
         # Measured on forgejo 17.0.1+gitea-1.22.0: a job waiting for a runner
         # still lists the dependency that already succeeded, so `needs` is

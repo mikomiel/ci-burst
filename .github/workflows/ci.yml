@@ -75,3 +75,17 @@ jobs:
             --config .gitleaks.toml --redact --no-banner
           git log --all --format=%B | "$tools/gitleaks" stdin \
             --config .gitleaks.toml --redact --no-banner
+
+  container-image:
+    # Build-only proof that the committed Dockerfile still builds. The job uses
+    # the workflow's read-only token: no registry login, no push, no secret.
+    name: container-image builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Build the image from the repository root
+        run: docker build --tag ci-burst:ci .

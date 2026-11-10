@@ -132,19 +132,28 @@ A record is eligible demand only when:
 - its `handle` is present, and repeated records for that attempt agree.
 
 Records with `running`, `success`, `failure`, `cancelled` or `skipped` do not
-contribute. A record with `status` `blocked` is dependency-blocked work: it is
-counted and never launched. Any other status, a missing required field, a
-non-array payload other than `null`, invalid JSON, a response above the size
-bound or an unreadable request makes demand unavailable rather than zero. The
-contract defines no pagination, so one response is the complete queue for that
+contribute, and a `blocked` record is counted but is never eligible demand. Any
+status outside those and `waiting`, a missing required field, a non-array
+payload other than `null`, invalid JSON, a response above the size bound or an
+unreadable request makes demand unavailable rather than zero. The contract
+defines no pagination, so one response is the complete queue for that
 repository.
 
 `needs` is metadata, not a dependency signal. The server fills it from the
 workflow and leaves it populated after the dependency has succeeded, so an
-empty-`needs` rule would hide every dependent job forever. The dependency
-signal is the `blocked` status. A record without the `needs` key is still
-refused: absent dependency metadata is an unexpected shape, and it is not an
-empty queue.
+empty-`needs` rule would hide every dependent job forever. A record without the
+`needs` key is still refused: absent dependency metadata is an unexpected
+shape, and it is not an empty queue.
+
+**Dependency-blocked work is not listed.** This endpoint answers with the jobs a
+runner with these labels may take and the ones already assigned; a job whose
+dependencies are unfinished is not in that set. Measured on `forgejo
+17.0.1+gitea-1.22.0` (`mikolajm/ai-agents` run 25399, 2026-11-10T20:33Z): the
+run reported three `blocked` jobs (`route`, `c1`, `c2`, all `homelab`), and the
+label-filtered response returned only one `running` record. `status` `blocked`
+is therefore accepted and counted defensively — a server that starts returning
+it is not treated as an unknown status — but no live record has been observed
+and a deployment cannot qualify against one.
 
 The `labels` query is mandatory, not an optimisation: the server answers JSON
 `null` when it is absent. The adapter sends the worker's bare label names (the
@@ -167,8 +176,9 @@ To qualify a deployment, the operator must, with an owner-scoped read token:
 
 1. confirm the endpoint returns the shape above for the repository, including
    the mandatory `labels` filter and `null` for no match;
-2. observe one known waiting job, one dependency-blocked job and one running
-   job, and verify the demand classification;
+2. observe one known waiting job and one running job, and verify the demand
+   classification. Dependency-blocked work cannot be part of this evidence: the
+   endpoint does not list it (see § Queue contract);
 3. record the evidence with the deployment;
 4. only then set `qualification = "live-verified"`.
 
@@ -229,6 +239,58 @@ worker label's name part before `:` is equal (for example `homelab` matches
 A broad label can also accept jobs outside the intended class. Exclusive burst
 routing requires a label only the burst worker advertises, and the operator
 must qualify that label against the image and machine before relying on it.
+
+### The routing decision
+
+The worker advertises a burst-oriented label, `cloud-ci`, and the permanent
+fleet does not advertise it. The alternative — reusing a label the permanent
+runners also carry — was rejected because Forgejo hands a waiting job to
+whichever runner takes it first: a launch meant to add capacity could instead
+absorb work the warm pool would have finished sooner, and "how much work ran on
+cloud capacity" would stop being measurable.
+
+Two different lists decide two different things, and they are configured to the
+same set:
+
+- `[worker].labels` in the deployment decides which waiting jobs the controller
+  counts as demand. A job is eligible only when its complete `runs_on` set is a
+  subset of this list.
+- the labels the bootstrap registers decide which jobs Forgejo may **assign**
+  to a launched worker. Once the instance exists, the controller does not
+  choose the job.
+
+Because the match is a subset check, exclusivity is a property of the label
+sets in use, not of the word "exclusive":
+
+- a job whose `runs_on` is exactly `[cloud-ci]` is eligible and assignable;
+- a job whose `runs_on` additionally requires something the worker advertises
+  (for example `[cloud-ci, linux-arm64]`) is also eligible, which is why the
+  worker advertises the image's architecture label at all;
+- a job whose `runs_on` is a subset of the worker's labels **without**
+  `cloud-ci` (for example `[linux-arm64]` alone) would be eligible too, and
+  Forgejo could assign it to the burst worker.
+
+So the routing rule is: every workflow that could run on this worker must name
+`cloud-ci`, and no workflow may request only the worker's other labels. Check
+that whenever a label is added to the worker or a workflow starts using one.
+The workflows that matter are the ones in the repository this deployment
+observes, not this repository's own CI: in the pilot that is one Forgejo
+repository whose architecture jobs pair the architecture label with a fleet
+label, which is why no job there can match this worker on the architecture
+label alone.
+
+Accepted risk, stated without the comfort of "it just fails":
+
+- a job that names a label the worker does not advertise is not assigned to it,
+  and stays waiting for another runner;
+- a job that names only labels the worker advertises, and needs a capability
+  the image lacks, may fail at run time **or may appear to succeed while
+  producing the wrong artifact** — a host-architecture selection is the obvious
+  example, and labels cannot detect it. Qualification of the image for the job
+  class, and assertions inside the job, are the mitigations; neither the label
+  match nor the controller verifies what a job produces;
+- a workflow that asks for only the worker's non-routing labels can take cloud
+  capacity for fleet work, which is what the check above prevents.
 
 ## Budget and reservations
 

@@ -11,7 +11,10 @@ could silently remove:
   only the cleanup credential mount, so it stays runnable when admission stops;
 * each timer drives its own unit at the documented interval;
 * the image has no daemon surface, uses file credentials only, and the build
-  context admits only the declared build inputs.
+  context admits only the declared build inputs;
+* credential-free CI builds the image from the repository root, keeps the
+  workflow's read-only token and publishes nothing; the semantic workflow
+  checks live in ``tests/workflow-policy.test.mjs``.
 
 The live lifecycle itself, including stopping an active invocation and keeping
 cleanup running, is exercised by ``tests/test_container_lifecycle.py`` and the
@@ -553,6 +556,43 @@ class ImageTests(unittest.TestCase):
         self.assertIn("AWS_EC2_METADATA_DISABLED=true", self.dockerfile)
         self.assertIn("AWS_SHARED_CREDENTIALS_FILE=/etc/ci-burst/aws/credentials", self.dockerfile)
         self.assertIn("AWS_CONFIG_FILE=/etc/ci-burst/aws/config", self.dockerfile)
+
+
+class ContainerImageCITests(unittest.TestCase):
+    """The committed job text: its own timeout and the exact build command.
+
+    Workflow semantics — credential references, permissions, registry use and
+    the effective working directory — are pinned in
+    ``tests/workflow-policy.test.mjs`` with the pinned ``yaml`` parser. This
+    test keeps only the narrow text shape the Python suite can state without a
+    second workflow reader.
+    """
+
+    TEXT = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    def job_body(self):
+        match = re.search(r"(?ms)^  container-image:\n(.*?)(?=^  \S|\Z)", self.TEXT)
+        self.assertIsNotNone(match, "container-image must be a job in ci.yml")
+        return match.group(1)
+
+    def test_the_job_exists_with_its_own_name_and_timeout(self):
+        body = self.job_body()
+        self.assertRegex(body, r"(?m)^    name: .*image.*builds?$")
+        timeout = re.search(r"(?m)^    timeout-minutes: (\d+)$", body)
+        self.assertIsNotNone(timeout, "the job needs its own timeout")
+        self.assertLessEqual(int(timeout.group(1)), 10)
+
+    def test_it_runs_the_exact_build_command(self):
+        commands = re.findall(r"(?m)^        run: (.+)$", self.job_body())
+        self.assertEqual(commands, ["docker build --tag ci-burst:ci ."])
+
+    def test_the_workflow_grants_only_the_read_token(self):
+        grants = re.search(r"(?m)^permissions:\n((?:  [^\n]*\n)+)", self.TEXT)
+        self.assertIsNotNone(grants, "the workflow needs a top-level permissions block")
+        self.assertEqual(grants.group(1).strip(), "contents: read")
+        for forbidden in ("packages:", "id-token:", "contents: write"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.TEXT)
 
 
 def _dockerignore_rules():

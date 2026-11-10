@@ -30,7 +30,8 @@ cleanup bounds.
 ## 3. Forgejo contract
 
 - [ ] An owner-scoped read token can call the runner-jobs endpoint.
-- [ ] One waiting, one dependency-blocked and one running job classify
+- [ ] One waiting and one running job classify correctly in a `plan` run
+  (dependency-blocked work is not listed by the endpoint)
       correctly in a `plan` run.
 - [ ] `qualification = "live-verified"` is set only after that evidence is
       recorded with the deployment.

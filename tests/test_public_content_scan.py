@@ -4,13 +4,16 @@ The CI `public-content` job runs pinned Gitleaks over the whole fetched history 
 `.gitleaks.toml`, so a false positive on any pushed branch fails every check. The standard
 dotenv filename trips the rule: its match is the dot-prefixed filename. The rule's
 allowlist exempts exactly that dot-prefixed match, while the same word used as a real
-hostname (in a URL, a HOST assignment, or bare) is still flagged.
+hostname (in a URL, a HOST assignment, or bare) is still flagged. Commit messages are
+scanned as anonymous text, so a second allowlist exempts the prose line that quotes the
+filename in backticks.
 
 This test is structural and hermetic: it replays the rule's regex plus its allowlists over
 synthetic samples the way Gitleaks applies them -- allowlist regexes are searched against
-the configured target, not full-matched -- without needing the scanner binary. Every
-sample is assembled at runtime from parts, so this fixture file contains no literal that
-the rule itself would flag.
+the configured target, not full-matched, `\\b` is ASCII as in Go's regexp, and commit
+allowlists are identity-based so they are not part of the text replay. Every sample is
+assembled at runtime from parts, so this fixture file contains no literal that the rule
+itself would flag.
 """
 
 import re
@@ -38,18 +41,35 @@ def rule(rule_id):
     raise AssertionError(f"rule {rule_id} is missing from .gitleaks.toml")
 
 
+def line_at(sample, start):
+    begin = sample.rfind("\n", 0, start) + 1
+    end = sample.find("\n", start)
+    return sample[begin:end if end != -1 else len(sample)]
+
+
 def findings(sample: str, rule_id: str):
     """Replay the rule regex and its allowlists like Gitleaks does."""
     entry = rule(rule_id)
-    pattern = re.compile(entry["regex"])
+    # Go's regexp treats only ASCII word characters for `\b`; Python's default
+    # is Unicode-aware, so the explicit flag is what makes this oracle faithful.
+    pattern = re.compile(entry["regex"], re.ASCII)
     secret_group = entry.get("secretGroup")
     results = []
     for match in pattern.finditer(sample):
         secret = match.group(secret_group) if secret_group else match.group(0)
         suppressed = False
         for allowlist in entry.get("allowlists", []):
-            target = match.group(0) if allowlist.get("regexTarget") == "match" else secret
-            if any(re.search(regex, target) for regex in allowlist.get("regexes", [])):
+            if allowlist.get("commits"):
+                # Identity-scoped: a text replay has no commit to compare.
+                continue
+            target = allowlist.get("regexTarget", "secret")
+            if target == "match":
+                text = match.group(0)
+            elif target == "line":
+                text = line_at(sample, match.start())
+            else:
+                text = secret
+            if any(re.search(regex, text, re.ASCII) for regex in allowlist.get("regexes", [])):
                 suppressed = True
         if not suppressed:
             results.append(match.group(0))
@@ -72,6 +92,22 @@ class PrivateDnsNameTests(unittest.TestCase):
         for sample in samples:
             self.assertEqual(findings(sample, "private-dns-name"), [HOSTNAME],
                              f"{sample!r} must still be flagged")
+
+    def test_prose_line_quoting_the_filename_is_exempt(self):
+        # Commit messages are scanned as anonymous text; the prose that
+        # describes this false positive quotes the filename in backticks.
+        prose = f"the rule matches the bare word `{HOSTNAME}` inside the dotenv filename"
+        self.assertEqual(findings(prose, "private-dns-name"), [])
+        # The same word on a line without backticks is still hostname-shaped
+        # text and is still flagged.
+        self.assertEqual(findings(f"the rule matches {HOSTNAME} inside the line", "private-dns-name"),
+                         [HOSTNAME])
+
+    def test_ascii_word_boundary_matches_go(self):
+        # Go's regexp uses ASCII word characters for `\b`, so a non-ASCII
+        # letter before the name is still a boundary; Python's Unicode default
+        # would hide the finding, which is why the replay passes re.ASCII.
+        self.assertEqual(findings("\u00e9" + HOSTNAME, "private-dns-name"), [HOSTNAME])
 
     def test_other_internal_names_still_flag(self):
         samples = (
@@ -99,13 +135,14 @@ class PrivateDnsNameTests(unittest.TestCase):
 
     def test_superseded_fix_commit_allowlist_is_one_exact_sha(self):
         # The orphaned first attempt of this fix is exempted by commit SHA only,
-        # so the rule stays fully armed for every other commit.
+        # so the rule stays fully armed for every other commit. The SHA is
+        # pinned: this entry was audited as false positives of this rule in that
+        # commit's test comments, and a different commit would need its own audit.
         entry = rule("private-dns-name")
         commit_allowlists = [a for a in entry.get("allowlists", []) if a.get("commits")]
         self.assertEqual(len(commit_allowlists), 1)
-        commits = commit_allowlists[0]["commits"]
-        self.assertEqual(len(commits), 1)
-        self.assertRegex(commits[0], r"^[0-9a-f]{40}$")
+        self.assertEqual(commit_allowlists[0]["commits"],
+                         ["9858491a18f662fb27f551fe81f355b25f38d220"])
 
     def test_private_ipv4_rule_is_untouched(self):
         entry = rule("private-ipv4")

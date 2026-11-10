@@ -20,6 +20,16 @@ regex = '''(?i)(?:\.)?\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:internal|lan|lo
   description = "The dotenv filename (dot-prefixed match) is not a private DNS name"
   regexTarget = "match"
   regexes = ['''^\.env\.local$''']
+  # Commit messages are scanned as anonymous text (`git log --format=%B |
+  # gitleaks stdin`), so a finding there carries no commit identity and the
+  # commit allowlist below cannot reach it. The prose that describes this false
+  # positive quotes the filename in backticks; a quoted filename is not a
+  # published hostname. The same word in a URL, a HOST assignment or bare text
+  # still matches the rule and is still flagged.
+  [[rules.allowlists]]
+  description = "Prose that quotes the dotenv filename in backticks is not a hostname"
+  regexTarget = "line"
+  regexes = ['''`env\.local`''']
   # The superseded first attempt of this same fix, still reachable from
   # feature branches that merged it before it was reworked; the literals it
   # flags are false positives of this rule in that commit's test comments.

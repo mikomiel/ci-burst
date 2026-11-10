@@ -127,17 +127,24 @@ the operator's token, returning one JSON array of `ActionRunJob` records.
 
 A record is eligible demand only when:
 
-- its `status` is `waiting`;
-- its `needs` array is present and empty (dependency-blocked work is not
-  demand; absent dependency metadata makes the observation unavailable);
+- its `status` is `waiting`, whatever its `needs` array says;
 - its complete `runs_on` set is supported by the configured worker labels;
 - its `handle` is present, and repeated records for that attempt agree.
 
 Records with `running`, `success`, `failure`, `cancelled` or `skipped` do not
-contribute. Any other status, a missing required field, a non-array payload
-other than `null`, invalid JSON, a response above the size bound or an unreadable
-request makes demand unavailable rather than zero. The contract defines no
-pagination, so one response is the complete queue for that repository.
+contribute. A record with `status` `blocked` is dependency-blocked work: it is
+counted and never launched. Any other status, a missing required field, a
+non-array payload other than `null`, invalid JSON, a response above the size
+bound or an unreadable request makes demand unavailable rather than zero. The
+contract defines no pagination, so one response is the complete queue for that
+repository.
+
+`needs` is metadata, not a dependency signal. The server fills it from the
+workflow and leaves it populated after the dependency has succeeded, so an
+empty-`needs` rule would hide every dependent job forever. The dependency
+signal is the `blocked` status. A record without the `needs` key is still
+refused: absent dependency metadata is an unexpected shape, and it is not an
+empty queue.
 
 The `labels` query is mandatory, not an optimisation: the server answers JSON
 `null` when it is absent. The adapter sends the worker's bare label names (the
@@ -168,8 +175,12 @@ To qualify a deployment, the operator must, with an owner-scoped read token:
 Observed on `forgejo 17.0.1+gitea-1.22.0`: `runs_on` holds bare label names
 (`strong-ci`, `homelab`), an absent `labels` parameter returns `null`, a
 non-matching filter also returns `null`, and the filter is a union over the job's
-labels. A changed response shape or a different Forgejo version needs a new
-contract identifier, not a re-declaration.
+labels. Statuses observed in one run (`mikolajm/ai-agents` run 25336,
+2026-11-10): a job waiting for a runner reports `waiting` and still lists the
+dependency that already succeeded, while a dependent job reports `blocked`
+until it does. A changed response shape or a different Forgejo version needs a
+new contract identifier, not a re-declaration; correcting how the adapter reads
+an unchanged shape does not.
 
 ## Worker image and launch template
 

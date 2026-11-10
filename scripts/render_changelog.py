@@ -45,10 +45,13 @@ CATEGORY = {"feat": "Added", "fix": "Fixed", "docs": "Documentation", "ci": "CI"
 CATEGORY_ORDER = ("Added", "Changed", "Fixed", "Documentation", "CI")
 _SUBJECT = re.compile(r"^(feat|fix|docs|ci)(?:\([^)]*\))?!?:\s+(?P<text>\S.*)$")
 _PULL_REQUEST = re.compile(r"\s+\(#(?P<number>[0-9]+)\)$")
-_RELEASE_TAG = re.compile(r"^v(?P<version>[0-9]+\.[0-9]+\.[0-9]+)$")
+_VERSION = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+_RELEASE_TAG = re.compile(rf"^v(?P<version>{_VERSION})$")
 _H2 = re.compile(r"^ {0,3}##[ \t]+")
-_RELEASED_HEADING = re.compile(r"^## \[(?P<version>[0-9]+\.[0-9]+\.[0-9]+)\]")
-_RELEASE_PENDING = re.compile(r"<!-- release-pending: v(?P<version>[0-9]+\.[0-9]+\.[0-9]+) -->")
+_RELEASED_HEADING = re.compile(
+    rf"^## \[(?P<version>{_VERSION})\] - [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$"
+)
+_RELEASE_PENDING = re.compile(rf"<!-- release-pending: v(?P<version>{_VERSION}) -->")
 
 HEADER = f"""# Changelog
 
@@ -153,15 +156,28 @@ def _reachable(name, root=ROOT):
     return True
 
 
+def _tag_has_section(name, root=ROOT):
+    """True when CHANGELOG.md at the tag carries the matching released heading."""
+    try:
+        text = git(root, "show", f"{name}:CHANGELOG.md")
+    except subprocess.CalledProcessError:
+        return False
+    version = name[1:]
+    for line in text.splitlines():
+        match = _RELEASED_HEADING.match(line)
+        if match is not None and match.group("version") == version:
+            return True
+    return False
+
+
 def applicable_tags(root=ROOT):
-    """Reachable annotated ``vX.Y.Z`` tag names; the only release evidence accepted."""
-    return {
-        name
-        for name, kind in tag_types(root).items()
-        if kind == "tag"
-        and _RELEASE_TAG.match(name) is not None
-        and _reachable(name, root)
-    }
+    """Reachable annotated vX.Y.Z tags, mapped to whether their commit has the section."""
+    found = {}
+    for name, kind in tag_types(root).items():
+        if kind != "tag" or _RELEASE_TAG.match(name) is None or not _reachable(name, root):
+            continue
+        found[name] = _tag_has_section(name, root)
+    return found
 
 
 def _tag_error(version):
@@ -246,8 +262,9 @@ def pending_versions(text):
 def _reconcile(text, tags, allow_preparation):
     """Reconcile released sections and applicable tags in both directions.
 
-    ``tags`` is the set of applicable tag names from :func:`applicable_tags`.
-    A preparation-marked section may lack its tag only when the caller allows
+    ``tags`` maps tag names from :func:`applicable_tags` to whether
+    ``CHANGELOG.md`` at that tag contains the matching section. A
+    preparation-marked section may lack its tag only when the caller allows
     preparation; every applicable tag still needs its section.
     """
     try:
@@ -280,6 +297,10 @@ def _reconcile(text, tags, allow_preparation):
             continue
         if f"v{version}" not in tags:
             errors.append(_tag_error(version))
+        elif not tags[f"v{version}"]:
+            errors.append(
+                f"annotated tag v{version} does not contain the released section [{version}]"
+            )
     for name in tags:
         if name[1:] not in sections:
             errors.append(

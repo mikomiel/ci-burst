@@ -25,6 +25,7 @@ and the validation step that binds it to that tag.
 - Fail closed when release evidence is unavailable.
 - Tighten the changelog release checks.
 - Reconcile release tags and sections both ways.
+- Verify the release tag contains its changelog section.
 
 ### Documentation
 

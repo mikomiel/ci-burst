@@ -134,16 +134,19 @@ A release uses two changelog states:
   that heading. The marker is the explicit preparation state; `check:policy`
   accepts the heading without its tag only while that marker is present. Merge
   the preparation pull request.
-- **Published**, after the tag: create the annotated `vX.Y.Z` tag on the merge
-  commit and the GitHub Release from that section, then remove the marker in a
-  follow-up change. `python3 scripts/render_changelog.py --validate-release`
-  verifies that every released heading has its annotated `vX.Y.Z` tag and that
-  no marker remains.
+- **Published**, after the tag: create the annotated `vX.Y.Z` tag on the
+  preparation merge commit; `CHANGELOG.md` at that commit must already contain
+  the released section. Create the GitHub Release from that section, then
+  remove the marker in a follow-up change.
+  `python3 scripts/render_changelog.py --validate-release` verifies that every
+  released heading has its annotated `vX.Y.Z` tag, that the tag's own
+  `CHANGELOG.md` contains the section, and that no marker remains.
 
 The tag must be `v`-prefixed and annotated; a lightweight or unprefixed tag is
 not a release and the checks reject it. A released heading without either the
-preparation marker or its tag is a defect, and so is an annotated release tag
-without its released section.
+preparation marker or its tag is a defect, and so are an annotated release tag
+without its released section and a tag created before its section. Lead zeroes
+and headings that are not exactly `## [X.Y.Z] - YYYY-MM-DD` are rejected.
 
 `CHANGELOG.md` records merged source history, never deployment or runtime
 evidence. Its Unreleased section is generated from merged `feat:`, `fix:`,
@@ -158,10 +161,10 @@ exist; do not regenerate between cutting the section and tagging it.
 
 Regeneration fails closed rather than guessing the boundary: the renderer
 refuses a shallow checkout, a released section that cannot be reconciled with
-a local reachable annotated tag (for example a `--no-tags` clone or a tag on
-an unrelated branch), a malformed, noncanonical or duplicate release heading,
-and a preparation marker whose tag does not exist. Fetch tags or the full
-history instead of bypassing the check.
+a local reachable annotated tag (for example a `--no-tags` clone, a tag on an
+unrelated branch, or a tag created before the section), a malformed,
+noncanonical or duplicate release heading, and a preparation marker whose tag
+does not exist. Fetch tags or the full history instead of bypassing the check.
 
 ## Checks
 

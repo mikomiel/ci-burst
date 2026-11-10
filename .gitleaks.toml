@@ -11,4 +11,20 @@ regex = '''\b(?:10\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,
 [[rules]]
 id = "private-dns-name"
 description = "Do not publish internal deployment DNS names"
-regex = '''(?i)\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:internal|lan|local)\b'''
+# The optional leading `(?:\.)?` lets a dot-prefixed name (a filename such as
+# the dotenv file) be matched including its dot, so the allowlist below can
+# exempt exactly that filename without exempting the same word when it is used
+# as a real hostname (a HOST assignment, a URL, or bare).
+regex = '''(?i)(?:\.)?\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:internal|lan|local)\b'''
+  [[rules.allowlists]]
+  description = "The dotenv filename (dot-prefixed match) is not a private DNS name"
+  regexTarget = "match"
+  regexes = ['''^\.env\.local$''']
+  # The superseded first attempt of this same fix, still reachable from
+  # feature branches that merged it before it was reworked; the literals it
+  # flags are false positives of this rule in that commit's test comments.
+  # Scoped to the exact commit SHA so the rule stays fully armed everywhere
+  # else. Drop this entry once those branches rebase off the reworked fix.
+  [[rules.allowlists]]
+  description = "Superseded reworked-away commit of this fix; false positives only"
+  commits = ['''9858491a18f662fb27f551fe81f355b25f38d220''']

@@ -22,6 +22,9 @@ import configparser
 import fnmatch
 import re
 import shlex
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -133,6 +136,318 @@ class TimerTests(unittest.TestCase):
             with self.subTest(service=service):
                 self.assertTrue((DEPLOY / f"{service}.service").is_file())
                 self.assertTrue((DEPLOY / f"{service}.timer").is_file())
+
+
+class RefreshTests(unittest.TestCase):
+    """Merged main is deployed by a poll-and-build; it must never publish or discard."""
+
+    def setUp(self):
+        self.service = unit("ci-burst-refresh.service")
+        self.timer = unit("ci-burst-refresh.timer")
+        self.script = (DEPLOY / "ci-burst-refresh.sh").read_text(encoding="utf-8")
+
+    def test_is_a_one_shot_that_runs_the_installed_script(self):
+        self.assertEqual(self.service["Service"]["type"], "oneshot")
+        self.assertEqual(
+            self.service["Service"]["execstart"], "/usr/local/sbin/ci-burst-refresh"
+        )
+        self.assertGreaterEqual(int(self.service["Service"]["timeoutstartsec"]), 900)
+
+    def test_timer_runs_at_boot_and_after_each_finished_run(self):
+        self.assertEqual(self.timer["Timer"]["unit"], "ci-burst-refresh.service")
+        self.assertEqual(self.timer["Timer"]["onbootsec"], "2min")
+        self.assertEqual(self.timer["Timer"]["onunitinactivesec"], "5min")
+        self.assertEqual(self.timer["Install"]["wantedby"], "timers.target")
+
+    def test_compares_origin_main_before_building_anything(self):
+        self.assertIn("fetch --quiet --depth=1 origin main", self.script)
+        self.assertLess(
+            self.script.index("deployed-sha"), self.script.index("podman build")
+        )
+
+    def test_builds_an_archive_of_the_exact_commit(self):
+        # The build context is a tar archive of the fetched commit, so an edited
+        # or untracked file in the clone can never enter the image.
+        self.assertIn("archive --format=tar", self.script)
+        self.assertIn('tar -xf "$work/tree.tar" -C "$work/src"', self.script)
+        for avoid in ("reset --hard", "clean -", "push --force", 'git -C "$SOURCE" checkout'):
+            with self.subTest(avoid=avoid):
+                self.assertNotIn(avoid, self.script)
+
+    def test_builds_with_host_networking_but_smokes_on_the_default_network(self):
+        # A container bridge MTU above the host path MTU stalls large downloads;
+        # the build needs the network, the smoke must mirror the scheduled units.
+        self.assertIn("podman build --quiet --network=host --tag", self.script)
+        smoke = self.script[self.script.index("podman run --rm") :]
+        smoke = smoke[: smoke.index("plan --config")]
+        self.assertNotIn("--network=host", smoke)
+
+    def test_smoke_tests_the_candidate_before_promoting_it(self):
+        smoke = self.script.index("plan --config")
+        self.assertLess(self.script.index("podman build"), smoke)
+        self.assertLess(smoke, self.script.index('"$IMAGE:latest"'))
+        # A completed decision is required, not "any document": a config refusal
+        # is exit 2 and must fail the smoke.
+        self.assertIn('if [ "$attempt" -ge 2 ]', self.script)
+        self.assertIn('document.get("decision") not in ("wait", "would_launch")', self.script)
+        self.assertIn("--name ci-burst-refresh-smoke", self.script)
+
+    def test_retries_the_smoke_once_and_only_once(self):
+        self.assertIn('if [ "$attempt" -ge 2 ]', self.script)
+        self.assertIn("smoke_retry", self.script)
+        self.assertIn("CI_BURST_SMOKE_RETRY_SECONDS", self.script)
+
+    def test_promotes_latest_and_both_rollback_handles(self):
+        self.assertIn('"$IMAGE:sha-$short"', self.script)
+        self.assertIn('"$IMAGE:previous"', self.script)
+        self.assertIn("deployed-sha", self.script)
+
+    def test_holds_a_lock_so_two_runs_never_build_together(self):
+        self.assertIn("flock -n 9", self.script)
+
+    def test_carries_no_credential_of_its_own(self):
+        for marker in ("aws_secret", "AWS_SECRET", "aws_access_key_id", "password"):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, self.script)
+
+
+class RefreshBehaviourTests(unittest.TestCase):
+    """Run the script with fake `git` and `podman`, and no host state.
+
+    The static assertions above pin the shape; these pin the behaviour a
+    promotion must have or refuse.
+    """
+
+    want = "0123456789abcdef0123456789abcdef01234567"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="ci-burst-refresh-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.calls = self.root / "calls.log"
+        self.calls.touch()
+        self.state = self.root / "state"
+        for name in ("source", "aws"):
+            (self.root / name).mkdir()
+        (self.root / "deployment.toml").write_text("", encoding="utf-8")
+        (self.root / "forgejo.env").write_text("", encoding="utf-8")
+        self._fake(
+            "git",
+            'case "$*" in\n'
+            '  *" rev-parse "*) printf "%s\\n" "$CI_BURST_TEST_WANT"; exit 0 ;;\n'
+            '  *" archive "*) out= ; prev= ;\n'
+            '    for a in "$@"; do [ "$prev" = "--output" ] && out=$a; prev=$a; done\n'
+            '    tar -cf "$out" -T /dev/null; exit 0 ;;\n'
+            "  *) exit 0 ;;\n"
+            "esac",
+        )
+        self._fake(
+            "podman",
+            'case "$*" in\n'
+            '  "run "*" plan --config "*) printf "%s" "$CI_BURST_TEST_SMOKE"\n'
+            '    if [ -n "${CI_BURST_TEST_SMOKE_SEQUENCE:-}" ]; then\n'
+            '      n=$(( $(cat "$CI_BURST_TEST_SMOKE_SEQUENCE.count" 2>/dev/null || echo 0) + 1 ))\n'
+            '      printf "%s" "$n" > "$CI_BURST_TEST_SMOKE_SEQUENCE.count"\n'
+            '      exit "$(sed -n "${n}p" "$CI_BURST_TEST_SMOKE_SEQUENCE")"\n'
+            '    fi\n'
+            '    exit "$CI_BURST_TEST_SMOKE_RC" ;;\n'
+            '  "build "*) ctx= ; for a in "$@"; do ctx=$a; done\n'
+            '    { find "$ctx" -type f | sort; echo marker:; cat "$ctx/ci_burst/marker.py" 2>/dev/null; } '
+            '> "$CI_BURST_TEST_CONTEXT"; exit 0 ;;\n'
+            '  "image exists "*) exit "${CI_BURST_TEST_EXISTS_RC:-0}" ;;\n'
+            '  "image inspect "*"latest"*) [ "${CI_BURST_TEST_INSPECT_RC:-0}" = "0" ] '
+            '|| exit "${CI_BURST_TEST_INSPECT_RC}"\n'
+            '    printf "%s\\n" sha256:old; exit 0 ;;\n'
+            '  "image inspect "*) printf "%s\\n" sha256:new; exit 0 ;;\n'
+            '  "tag "*) case "$*" in *"previous"*) exit "${CI_BURST_TEST_PREVIOUS_RC:-0}" ;; '
+            "*) exit 0 ;; esac ;;\n"
+            "  *) exit 0 ;;\n"
+            "esac",
+        )
+
+    def _fake(self, name, body):
+        path = self.bin / name
+        path.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$*\" >>{shlex.quote(str(self.calls))}\n" + body + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    def run_script(self, smoke='{"decision": "wait"}', smoke_rc="0", **extra):
+        environment = {
+            "PATH": f"{self.bin}:/usr/local/bin:/usr/bin:/bin",
+            "CI_BURST_SOURCE": str(self.root / "source"),
+            "CI_BURST_IMAGE_STATE": str(self.state),
+            "CI_BURST_CONFIG": str(self.root / "deployment.toml"),
+            "CI_BURST_AWS_DIR": str(self.root / "aws"),
+            "CI_BURST_TOKEN_ENV": str(self.root / "forgejo.env"),
+            "CI_BURST_TEST_WANT": self.want,
+            "CI_BURST_TEST_SMOKE": smoke,
+            "CI_BURST_TEST_SMOKE_RC": smoke_rc,
+            "CI_BURST_TEST_CONTEXT": str(self.root / "context.txt"),
+            "CI_BURST_SMOKE_RETRY_SECONDS": "0",
+        }
+        environment.update({name: str(value) for name, value in extra.items()})
+        return subprocess.run(
+            ["sh", str(DEPLOY / "ci-burst-refresh.sh")],
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_a_refusal_document_never_promotes(self):
+        completed = self.run_script(
+            smoke='{"error": {"reason": "CONFIG_INVALID"}}', smoke_rc="2"
+        )
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("latest", self.calls.read_text(encoding="utf-8"))
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_document_without_a_decision_never_promotes(self):
+        completed = self.run_script(smoke='{"other": true}')
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_refusal_decision_at_zero_exit_never_promotes(self):
+        # The gate may not depend on the CLI's exit code alone: a future CLI
+        # regression could exit 0 with a refusal document.
+        completed = self.run_script(
+            smoke='{"decision": "refused", "rejection": {"reason": "CONFIG_INVALID"}}'
+        )
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertNotIn("latest", calls)
+        # Exit zero is not retried: the document itself is the evidence.
+        self.assertEqual(calls.count("plan --config"), 1)
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_non_object_document_never_promotes(self):
+        completed = self.run_script(smoke='["decision"]')
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_an_inspection_failure_never_moves_latest(self):
+        # "Cannot inspect the serving image" is not "no serving image": without a
+        # confirmed handle the promotion must not happen.
+        completed = self.run_script(CI_BURST_TEST_INSPECT_RC="1")
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn(
+            "tag localhost/ci-burst:candidate localhost/ci-burst:latest",
+            self.calls.read_text(encoding="utf-8"),
+        )
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_an_existence_check_error_never_moves_latest(self):
+        # `podman image exists` uses 1 for absent and 125 for a storage error;
+        # only 1 may skip the rollback handle.
+        completed = self.run_script(CI_BURST_TEST_EXISTS_RC="125")
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn(
+            "tag localhost/ci-burst:candidate localhost/ci-burst:latest",
+            self.calls.read_text(encoding="utf-8"),
+        )
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_confirmed_absent_serving_image_still_promotes(self):
+        completed = self.run_script(CI_BURST_TEST_EXISTS_RC="1")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertNotIn("localhost/ci-burst:previous", calls)
+        self.assertIn("tag localhost/ci-burst:candidate localhost/ci-burst:latest", calls)
+        self.assertEqual(
+            (self.state / "deployed-sha").read_text(encoding="utf-8").strip(), self.want
+        )
+
+    def test_a_missing_previous_handle_never_moves_latest(self):
+        completed = self.run_script(CI_BURST_TEST_PREVIOUS_RC="1")
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertIn("tag sha256:old localhost/ci-burst:previous", calls)
+        self.assertNotIn("tag localhost/ci-burst:candidate localhost/ci-burst:latest", calls)
+
+    def test_builds_only_committed_files_at_the_fetched_commit(self):
+        # Real git, fake podman: the build context is the fetched commit's
+        # archive, so a dirty or untracked file in the clone cannot be deployed.
+        repository = self.root / "source"
+        (repository / "ci_burst").mkdir()
+        marker = repository / "ci_burst" / "marker.py"
+        marker.write_text("committed\n", encoding="utf-8")
+        self._git(repository, "init", "--quiet", "--initial-branch=main")
+        self._git(repository, "add", ".")
+        self._git(
+            repository,
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "seed",
+        )
+        self._git(repository, "remote", "add", "origin", str(repository))
+        marker.write_text("dirty\n", encoding="utf-8")
+        (repository / "ci_burst" / "untracked.py").write_text("untracked\n", encoding="utf-8")
+        (self.bin / "git").unlink()
+
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        context = (self.root / "context.txt").read_text(encoding="utf-8")
+        self.assertIn("ci_burst/marker.py", context)
+        self.assertIn("committed", context)
+        self.assertNotIn("untracked.py", context)
+        self.assertNotIn("dirty", context)
+
+    @staticmethod
+    def _git(repository, *args):
+        subprocess.run(
+            ["git", *args], cwd=repository, check=True, capture_output=True, text=True
+        )
+
+    def test_a_promotion_records_the_commit_and_both_rollback_handles(self):
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.calls.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            (self.state / "deployed-sha").read_text(encoding="utf-8").strip(), self.want
+        )
+        self.assertIn(
+            f"tag localhost/ci-burst:candidate localhost/ci-burst:sha-{self.want[:12]}",
+            calls,
+        )
+        self.assertLess(
+            calls.index("tag sha256:old localhost/ci-burst:previous"),
+            calls.index("tag localhost/ci-burst:candidate localhost/ci-burst:latest"),
+        )
+
+    def test_a_transient_smoke_failure_is_retried_once(self):
+        sequence = self.root / "smoke-sequence"
+        sequence.write_text("1\n0\n", encoding="utf-8")
+        completed = self.run_script(CI_BURST_TEST_SMOKE_SEQUENCE=str(sequence))
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("smoke_retry", completed.stdout)
+        self.assertEqual(
+            (self.state / "deployed-sha").read_text(encoding="utf-8").strip(), self.want
+        )
+
+    def test_a_repeated_smoke_failure_keeps_the_previous_image(self):
+        sequence = self.root / "smoke-sequence"
+        sequence.write_text("1\n1\n", encoding="utf-8")
+        completed = self.run_script(CI_BURST_TEST_SMOKE_SEQUENCE=str(sequence))
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            self.calls.read_text(encoding="utf-8").count("plan --config"), 2
+        )
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_an_unchanged_commit_builds_nothing(self):
+        self.state.mkdir(parents=True)
+        (self.state / "deployed-sha").write_text(self.want + "\n", encoding="utf-8")
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("build", self.calls.read_text(encoding="utf-8"))
 
 
 class ImageTests(unittest.TestCase):

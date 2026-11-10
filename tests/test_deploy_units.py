@@ -211,6 +211,15 @@ class RefreshTests(unittest.TestCase):
         self.assertIn('"$IMAGE:previous"', self.script)
         self.assertIn("deployed-sha", self.script)
 
+    def test_refreshes_the_scaler_units_and_never_the_reap_unit(self):
+        self.assertIn("ci-burst-apply.service", self.script)
+        self.assertIn("ci-burst-refresh.timer", self.script)
+        units_line = next(
+            line for line in self.script.splitlines() if line.startswith("UNITS=")
+        )
+        self.assertNotIn("reap", units_line)
+        self.assertIn("systemd-analyze verify", self.script)
+
     def test_holds_a_lock_so_two_runs_never_build_together(self):
         self.assertIn("flock -n 9", self.script)
 
@@ -241,15 +250,24 @@ class RefreshBehaviourTests(unittest.TestCase):
             (self.root / name).mkdir()
         (self.root / "deployment.toml").write_text("", encoding="utf-8")
         (self.root / "forgejo.env").write_text("", encoding="utf-8")
+        self.units = self.root / "units"
+        self.units.mkdir()
+        self.systemctl_calls = self.root / "systemctl.log"
+        self.systemctl_calls.touch()
         self._fake(
             "git",
             'case "$*" in\n'
             '  *" rev-parse "*) printf "%s\\n" "$CI_BURST_TEST_WANT"; exit 0 ;;\n'
             '  *" archive "*) out= ; prev= ;\n'
             '    for a in "$@"; do [ "$prev" = "--output" ] && out=$a; prev=$a; done\n'
-            '    tar -cf "$out" -T /dev/null; exit 0 ;;\n'
+            '    tar -cf "$out" -C "$CI_BURST_TEST_REPO" deploy; exit 0 ;;\n'
             "  *) exit 0 ;;\n"
             "esac",
+        )
+        self._fake("systemd-analyze", "exit \"${CI_BURST_TEST_VERIFY_RC:-0}\"")
+        self._fake(
+            "systemctl",
+            f"printf '%s\\n' \"$*\" >>{shlex.quote(str(self.systemctl_calls))}\nexit 0",
         )
         self._fake(
             "podman",
@@ -296,7 +314,10 @@ class RefreshBehaviourTests(unittest.TestCase):
             "CI_BURST_TEST_SMOKE": smoke,
             "CI_BURST_TEST_SMOKE_RC": smoke_rc,
             "CI_BURST_TEST_CONTEXT": str(self.root / "context.txt"),
+            "CI_BURST_TEST_REPO": str(ROOT),
             "CI_BURST_SMOKE_RETRY_SECONDS": "0",
+            "CI_BURST_UNIT_DIR": str(self.units),
+            "CI_BURST_SYSTEMCTL": str(self.bin / "systemctl"),
         }
         environment.update({name: str(value) for name, value in extra.items()})
         return subprocess.run(
@@ -381,6 +402,14 @@ class RefreshBehaviourTests(unittest.TestCase):
         # archive, so a dirty or untracked file in the clone cannot be deployed.
         repository = self.root / "source"
         (repository / "ci_burst").mkdir()
+        # The archive must carry the deploy directory too: a unit refresh reads
+        # its unit files from the same commit's tree.
+        (repository / "deploy").mkdir()
+        for unit in ("ci-burst-apply.service", "ci-burst-apply.timer",
+                     "ci-burst-refresh.service", "ci-burst-refresh.timer"):
+            (repository / "deploy" / unit).write_text(
+                (ROOT / "deploy" / unit).read_text(encoding="utf-8"), encoding="utf-8"
+            )
         marker = repository / "ci_burst" / "marker.py"
         marker.write_text("committed\n", encoding="utf-8")
         self._git(repository, "init", "--quiet", "--initial-branch=main")
@@ -448,6 +477,52 @@ class RefreshBehaviourTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(
             self.calls.read_text(encoding="utf-8").count("plan --config"), 2
+        )
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_installs_changed_units_and_reloads_the_daemon(self):
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("units_updated", completed.stdout)
+        for unit in ("ci-burst-apply.service", "ci-burst-refresh.timer"):
+            with self.subTest(unit=unit):
+                installed = self.units / unit
+                self.assertTrue(installed.is_file(), unit)
+                self.assertEqual(
+                    installed.read_text(encoding="utf-8"),
+                    (ROOT / "deploy" / unit).read_text(encoding="utf-8"),
+                )
+        self.assertIn("daemon-reload", self.systemctl_calls.read_text(encoding="utf-8"))
+        # The cleanup host owns the reap unit; a refresh on the scaler must not
+        # install a second reap scheduler here.
+        self.assertFalse((self.units / "ci-burst-reap.service").exists())
+
+    def test_keeps_the_previous_unit_beside_the_new_one(self):
+        (self.units / "ci-burst-apply.service").write_text("old unit\n", encoding="utf-8")
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        previous = (self.units / "ci-burst-apply.service.previous")
+        self.assertTrue(previous.is_file())
+        self.assertEqual(previous.read_text(encoding="utf-8"), "old unit\n")
+
+    def test_an_unchanged_unit_is_not_rewritten(self):
+        for unit in ("ci-burst-apply.service", "ci-burst-apply.timer",
+                     "ci-burst-refresh.service", "ci-burst-refresh.timer"):
+            (self.units / unit).write_text(
+                (ROOT / "deploy" / unit).read_text(encoding="utf-8"), encoding="utf-8"
+            )
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("units_unchanged", completed.stdout)
+        self.assertFalse((self.units / "ci-burst-apply.service.previous").exists())
+
+    def test_an_invalid_unit_blocks_the_promotion(self):
+        completed = self.run_script(CI_BURST_TEST_VERIFY_RC="1")
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("unit_invalid", completed.stdout)
+        self.assertNotIn(
+            "tag localhost/ci-burst:candidate localhost/ci-burst:latest",
+            self.calls.read_text(encoding="utf-8"),
         )
         self.assertFalse((self.state / "deployed-sha").exists())
 

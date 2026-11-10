@@ -1,11 +1,19 @@
 #!/bin/sh
-# Deploy the current ci-burst main to this host as the controller image.
+# Deploy the current ci-burst main to this host: the controller image and the
+# units that schedule it.
 #
 # One run compares the deployed commit with origin/main and does nothing when
 # they match. Otherwise it builds the image from a tar archive of exactly that
 # commit (never from the working tree, so an edited checkout cannot be deployed
-# under a clean commit's name), smoke-tests the candidate, and only then moves
-# the tag the scheduled units resolve.
+# under a clean commit's name), smoke-tests the candidate, installs the units
+# from the same archive, and only then moves the tag the units resolve.
+#
+# Refreshing the units keeps the host in step with the repository instead of
+# drifting from it: a merged change to a unit or a timer takes effect on the
+# next run, exactly like a merged change to the controller. The cleanup host has
+# no refresh loop by design (it must survive a scaler failure), so its reap unit
+# stays a manual install. Removal is manual too: this script installs and
+# updates, it never deletes a unit.
 #
 # The smoke run is a `plan` execution from the candidate against this host's own
 # configuration and scaling credentials. It must complete with a decision, not
@@ -33,6 +41,14 @@ AWS_CREDENTIALS=${CI_BURST_AWS_DIR:-/etc/ci-burst/aws-scaling}
 TOKEN_ENV=${CI_BURST_TOKEN_ENV:-/etc/ci-burst/forgejo.env}
 IMAGE=localhost/ci-burst
 SMOKE_RETRY_SECONDS=${CI_BURST_SMOKE_RETRY_SECONDS:-20}
+UNIT_DIR=${CI_BURST_UNIT_DIR:-/etc/systemd/system}
+SYSTEMCTL=${CI_BURST_SYSTEMCTL:-/usr/bin/systemctl}
+
+# The units this host schedules itself with. The reap unit is not here on
+# purpose: it belongs to the independent cleanup host, which has no refresh
+# loop, so installing it here would create a second, unintended scheduler on
+# this host.
+UNITS="ci-burst-apply.service ci-burst-apply.timer ci-burst-refresh.service ci-burst-refresh.timer"
 
 log() { printf 'ci-burst-refresh: %s\n' "$*"; }
 
@@ -127,6 +143,53 @@ fi
 short=$(printf '%s' "$want" | cut -c1-12)
 if ! podman tag "$IMAGE:candidate" "$IMAGE:sha-$short"; then
     log "tag_failed: $want"
+    exit 2
+fi
+
+# Units first, image second: a deployment advances both or neither. Each unit is
+# verified before it is installed, an unchanged unit is not rewritten, and the
+# previous file stays beside it so a rollback is a copy rather than a rebuild.
+install_units() {
+    updated=""
+    for unit in $UNITS; do
+        source_file="$work/src/deploy/$unit"
+        target_file="$UNIT_DIR/$unit"
+        if [ ! -f "$source_file" ]; then
+            log "unit_missing: $unit"
+            return 2
+        fi
+        if ! systemd-analyze verify "$source_file" >/dev/null 2>&1; then
+            log "unit_invalid: $unit"
+            return 2
+        fi
+        if [ -f "$target_file" ] && cmp -s "$source_file" "$target_file"; then
+            continue
+        fi
+        if [ -f "$target_file" ]; then
+            cp -p "$target_file" "$target_file.previous" || {
+                log "unit_backup_failed: $unit"
+                return 2
+            }
+        fi
+        install -o root -g root -m 0644 "$source_file" "$target_file" || {
+            log "unit_install_failed: $unit"
+            return 2
+        }
+        updated="$updated $unit"
+    done
+    if [ -n "$updated" ]; then
+        if ! "$SYSTEMCTL" daemon-reload; then
+            log "daemon_reload_failed"
+            return 2
+        fi
+        log "units_updated:$updated"
+    else
+        log "units_unchanged"
+    fi
+}
+
+if ! install_units; then
+    log "units_failed: $want"
     exit 2
 fi
 

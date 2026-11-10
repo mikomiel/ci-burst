@@ -304,12 +304,15 @@ A failed run does not stop the timers; the next scheduled run tries again. A
 persistent refusal is a signal to read the JSON reason code and `status`, not
 to raise the run frequency or remove the lock.
 
-## Keep the image current
+## Keep the image and the units current
 
 The image is a local tag, so a merged controller change reaches a host only when
-that host builds it. `ci-burst-refresh.timer` does that on the scaler host: one
-run compares the deployed commit with `origin/main` and does nothing when they
-match; otherwise it builds a candidate, smoke-tests it and only then promotes it.
+that host builds it, and the units are installed copies, so a merged change to a
+unit reaches a host only when that host installs it. `ci-burst-refresh.timer`
+does both on the scaler host: one run compares the deployed commit with
+`origin/main` and does nothing when they match; otherwise it builds a candidate,
+smoke-tests it, installs the units from the same commit and only then promotes
+the image. The image and its units advance together or not at all.
 
 Install it beside the apply unit, from a clone of this repository:
 
@@ -328,9 +331,12 @@ systemctl list-timers 'ci-burst-*'
 ```
 
 The script defaults to `/opt/ci-burst-src`, `/var/lib/ci-burst-image`,
-`/etc/ci-burst/deployment.toml`, `/etc/ci-burst/aws-scaling` and
-`/etc/ci-burst/forgejo.env`; `CI_BURST_SOURCE`, `CI_BURST_IMAGE_STATE`,
-`CI_BURST_CONFIG`, `CI_BURST_AWS_DIR` and `CI_BURST_TOKEN_ENV` override them.
+`/etc/ci-burst/deployment.toml`, `/etc/ci-burst/aws-scaling`,
+`/etc/ci-burst/forgejo.env` and `/etc/systemd/system`; `CI_BURST_SOURCE`,
+`CI_BURST_IMAGE_STATE`, `CI_BURST_CONFIG`, `CI_BURST_AWS_DIR`,
+`CI_BURST_TOKEN_ENV`, `CI_BURST_UNIT_DIR` and `CI_BURST_SYSTEMCTL` override them.
+This install is the bootstrap: after it, a merged unit reaches the host without
+another manual step.
 
 What a promotion does and does not do:
 
@@ -342,6 +348,20 @@ What a promotion does and does not do:
   refresh too, when the serving image is a hand-built one with no `sha-<12>` tag
   of its own;
 - it records the deployed commit in `/var/lib/ci-burst-image/deployed-sha`;
+- it installs the scaler's own units (`ci-burst-apply.service`,
+  `ci-burst-apply.timer`, `ci-burst-refresh.service`, `ci-burst-refresh.timer`)
+  after verifying each with `systemd-analyze verify`. An unchanged unit is not
+  rewritten, a changed one keeps its previous file as `<unit>.previous`, and a
+  unit that fails verification blocks the promotion instead of being installed.
+  It never installs the reap unit: that one belongs to the independent cleanup
+  host, which has no refresh loop, and installing it here would schedule a
+  second cleanup on the wrong host. Removal stays manual: this installs, it
+  never deletes;
+- the refresh **script** is installed by hand and is not refreshed by itself: a
+  process replacing the file it is running from is a bootstrapping hazard, so a
+  merged change to `deploy/ci-burst-refresh.sh` needs
+  `install -m 0755 deploy/ci-burst-refresh.sh /usr/local/sbin/ci-burst-refresh`
+  once. Everything else on the host follows the merge;
 - it publishes nothing: no registry, no git tag, no release, no announcement. A
   merge deploys the controller; [CONTRIBUTING.md](../CONTRIBUTING.md) § Releases
   owns the release boundary, and a merge is still neither a release nor a
@@ -355,11 +375,13 @@ What a promotion does and does not do:
   is above the host's path MTU stalls them the same way it stalls the
   controller's own responses. The smoke run uses the same `ci-burst` network as
   the scheduled units, so the gate exercises exactly the networking they use;
-- a fetch, archive, build or smoke failure keeps the previous image in place and
-  logs one line with a reason code (`fetch_failed`, `archive_failed`,
-  `unpack_failed`, `build_failed`, `smoke_failed`, `tag_failed`,
-  `inspect_failed`, `exists_failed`, `previous_tag_failed`, `promote_failed`) in
-  `journalctl -u ci-burst-refresh.service`. Only a confirmed absent
+- a fetch, archive, build, smoke or unit failure keeps the previous image and
+  the previous units in place and logs one line with a reason code
+  (`fetch_failed`, `archive_failed`, `unpack_failed`, `build_failed`,
+  `smoke_failed`, `tag_failed`, `unit_missing`, `unit_invalid`,
+  `unit_backup_failed`, `unit_install_failed`, `daemon_reload_failed`,
+  `units_failed`, `inspect_failed`, `exists_failed`, `previous_tag_failed`,
+  `promote_failed`) in `journalctl -u ci-burst-refresh.service`. Only a confirmed absent
   `localhost/ci-burst:latest` (podman's "absent" status) may skip the rollback
   handle; a failed inspection or a storage error fails the run instead;
 - the smoke run is a `plan` execution from the candidate against this host's own
@@ -384,6 +406,14 @@ systemctl disable --now ci-burst-refresh.timer   # no new runs, from here on
 systemctl stop ci-burst-refresh.service          # waits for a run in progress
 flock /var/lib/ci-burst-image/refresh.lock \
   podman tag localhost/ci-burst:previous localhost/ci-burst:latest
+```
+
+A unit rolled back with the image needs its file back too:
+
+```sh
+cp -p /etc/systemd/system/ci-burst-apply.service.previous \
+      /etc/systemd/system/ci-burst-apply.service
+systemctl daemon-reload
 ```
 
 `previous` is whatever `latest` pointed at before the last promotion, including

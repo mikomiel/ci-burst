@@ -146,14 +146,26 @@ if ! podman tag "$IMAGE:candidate" "$IMAGE:sha-$short"; then
     exit 2
 fi
 
-# Units first, image second: a deployment advances both or neither. Each unit is
-# verified before it is installed, an unchanged unit is not rewritten, and the
-# previous file stays beside it so a rollback is a copy rather than a rebuild.
-install_units() {
-    updated=""
+# --- units: stage, verify, install, restore on failure -----------------------
+#
+# A deployment advances the units and the image together or neither. Every unit
+# is staged and verified before anything on the host is touched; the set that is
+# installed before this deployment is snapshotted as the rollback generation;
+# admission is paused across the transition so a scheduled apply cannot run new
+# units against the old image; and any later failure restores the snapshot and
+# resumes admission.
+
+SNAPSHOT="$STATE/units"
+STAGE="$SNAPSHOT/$want"
+ROLLBACK="$SNAPSHOT/previous"
+APPLY_TIMER=ci-burst-apply.timer
+admission_was_active=no
+
+stage_units() {
+    rm -rf "$STAGE"
+    install -d -m 0700 "$STAGE" || { log 'unit_stage_failed'; return 2; }
     for unit in $UNITS; do
         source_file="$work/src/deploy/$unit"
-        target_file="$UNIT_DIR/$unit"
         if [ ! -f "$source_file" ]; then
             log "unit_missing: $unit"
             return 2
@@ -162,35 +174,109 @@ install_units() {
             log "unit_invalid: $unit"
             return 2
         fi
-        if [ -f "$target_file" ] && cmp -s "$source_file" "$target_file"; then
-            continue
-        fi
-        if [ -f "$target_file" ]; then
-            cp -p "$target_file" "$target_file.previous" || {
-                log "unit_backup_failed: $unit"
-                return 2
-            }
-        fi
-        install -o root -g root -m 0644 "$source_file" "$target_file" || {
-            log "unit_install_failed: $unit"
+        if ! install -m 0600 "$source_file" "$STAGE/$unit"; then
+            log "unit_stage_failed: $unit"
             return 2
-        }
-        updated="$updated $unit"
+        fi
     done
-    if [ -n "$updated" ]; then
-        if ! "$SYSTEMCTL" daemon-reload; then
-            log "daemon_reload_failed"
-            return 2
+}
+
+snapshot_installed() {
+    rm -rf "$SNAPSHOT/next"
+    install -d -m 0700 "$SNAPSHOT/next" || { log 'unit_snapshot_failed'; return 2; }
+    for unit in $UNITS; do
+        if [ -f "$UNIT_DIR/$unit" ]; then
+            if ! cp -p "$UNIT_DIR/$unit" "$SNAPSHOT/next/$unit"; then
+                log "unit_snapshot_failed: $unit"
+                return 2
+            fi
         fi
-        log "units_updated:$updated"
-    else
-        log "units_unchanged"
+    done
+    rm -rf "$ROLLBACK"
+    if ! mv "$SNAPSHOT/next" "$ROLLBACK"; then
+        log 'unit_snapshot_failed'
+        return 2
     fi
 }
 
-if ! install_units; then
+install_units() {
+    changed=""
+    for unit in $UNITS; do
+        if [ -f "$UNIT_DIR/$unit" ] && cmp -s "$STAGE/$unit" "$UNIT_DIR/$unit"; then
+            continue
+        fi
+        if ! install -o root -g root -m 0644 "$STAGE/$unit" "$UNIT_DIR/$unit"; then
+            log "unit_install_failed: $unit"
+            return 2
+        fi
+        changed="$changed $unit"
+    done
+    if [ -n "$changed" ]; then
+        if ! "$SYSTEMCTL" daemon-reload; then
+            log 'daemon_reload_failed'
+            return 2
+        fi
+        log "units_updated:$changed"
+    else
+        log 'units_unchanged'
+    fi
+}
+
+restore_units() {
+    restored=""
+    for unit in $UNITS; do
+        if [ -f "$ROLLBACK/$unit" ]; then
+            if ! install -o root -g root -m 0644 "$ROLLBACK/$unit" "$UNIT_DIR/$unit"; then
+                log "unit_restore_failed: $unit"
+                return 2
+            fi
+            restored="$restored $unit"
+        fi
+    done
+    if [ -n "$restored" ]; then
+        if ! "$SYSTEMCTL" daemon-reload; then
+            log 'daemon_reload_failed'
+            return 2
+        fi
+        log "units_restored:$restored"
+    fi
+}
+
+pause_admission() {
+    if "$SYSTEMCTL" is-active --quiet "$APPLY_TIMER"; then
+        admission_was_active=yes
+        if ! "$SYSTEMCTL" stop "$APPLY_TIMER"; then
+            log 'admission_stop_failed'
+        fi
+    fi
+}
+
+resume_admission() {
+    if [ "$admission_was_active" = yes ]; then
+        if ! "$SYSTEMCTL" start "$APPLY_TIMER"; then
+            log 'admission_start_failed'
+        fi
+    fi
+}
+
+abort_deployment() {
+    log "deploy_failed: $1"
+    restore_units || true
+    resume_admission
+    exit 2
+}
+
+if ! stage_units; then
     log "units_failed: $want"
     exit 2
+fi
+pause_admission
+if ! snapshot_installed; then
+    resume_admission
+    exit 2
+fi
+if ! install_units; then
+    abort_deployment "units $want"
 fi
 
 # The way back is captured before the serving tag moves, and captured from
@@ -198,12 +284,10 @@ fi
 # replaces an image that has no sha tag of its own. An inspection failure is
 # not "no image": only a confirmed absent tag may skip the handle.
 candidate=$(podman image inspect --format '{{.Id}}' "$IMAGE:candidate") || {
-    log "inspect_failed: $IMAGE:candidate"
-    exit 2
+    abort_deployment "inspect $IMAGE:candidate"
 }
 if [ -z "$candidate" ]; then
-    log "inspect_failed: $IMAGE:candidate"
-    exit 2
+    abort_deployment "inspect $IMAGE:candidate"
 fi
 current=
 exists_rc=0
@@ -211,12 +295,10 @@ podman image exists "$IMAGE:latest" || exists_rc=$?
 case "$exists_rc" in
     0)
         current=$(podman image inspect --format '{{.Id}}' "$IMAGE:latest") || {
-            log "inspect_failed: $IMAGE:latest"
-            exit 2
+            abort_deployment "inspect $IMAGE:latest"
         }
         if [ -z "$current" ]; then
-            log "inspect_failed: $IMAGE:latest"
-            exit 2
+            abort_deployment "inspect $IMAGE:latest"
         fi
         ;;
     1)
@@ -226,23 +308,22 @@ case "$exists_rc" in
         current=
         ;;
     *)
-        log "exists_failed: $IMAGE:latest exit $exists_rc"
-        exit 2
+        abort_deployment "exists $IMAGE:latest exit $exists_rc"
         ;;
 esac
 if [ -n "$current" ] && [ "$current" != "$candidate" ]; then
     if ! podman tag "$current" "$IMAGE:previous"; then
-        log "previous_tag_failed: $want"
-        exit 2
+        abort_deployment "previous_tag $want"
     fi
 fi
 
 if ! podman tag "$IMAGE:candidate" "$IMAGE:latest"; then
-    log "promote_failed: $want"
-    exit 2
+    abort_deployment "promote $want"
 fi
 podman rmi "$IMAGE:candidate" >/dev/null 2>&1 || true
 
-printf '%s\n' "$want" >"$STATE/deployed-sha.tmp"
-mv "$STATE/deployed-sha.tmp" "$STATE/deployed-sha"
+if ! printf '%s\n' "$want" >"$STATE/deployed-sha.tmp" || ! mv "$STATE/deployed-sha.tmp" "$STATE/deployed-sha"; then
+    abort_deployment "record $want"
+fi
+resume_admission
 log "promoted: $want"

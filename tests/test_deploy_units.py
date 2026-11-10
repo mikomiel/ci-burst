@@ -264,10 +264,29 @@ class RefreshBehaviourTests(unittest.TestCase):
             "  *) exit 0 ;;\n"
             "esac",
         )
-        self._fake("systemd-analyze", "exit \"${CI_BURST_TEST_VERIFY_RC:-0}\"")
+        self._fake(
+            "install",
+            'last= ; for a in "$@"; do last=$a; done\n'
+            'if [ "$1" = "-d" ]; then mkdir -p "$last"; exit 0; fi\n'
+            'prev= ; src= ; for a in "$@"; do if [ "$a" = "$last" ]; then src=$prev; break; fi; prev=$a; done\n'
+            'if [ -n "${CI_BURST_TEST_INSTALL_FAIL_UNIT:-}" ] && [ "$last" = "${CI_BURST_TEST_INSTALL_FAIL_UNIT}" ]; then exit 1; fi\n'
+            'cp "$src" "$last"',
+        )
+        self._fake(
+            "systemd-analyze",
+            'if [ -n "${CI_BURST_TEST_VERIFY_FAIL_UNIT:-}" ]; then\n'
+            '  case "$*" in *"$CI_BURST_TEST_VERIFY_FAIL_UNIT"*) exit 1 ;; esac\n'
+            "fi\n"
+            "exit 0",
+        )
         self._fake(
             "systemctl",
-            f"printf '%s\\n' \"$*\" >>{shlex.quote(str(self.systemctl_calls))}\nexit 0",
+            f"printf '%s\\n' \"$*\" >>{shlex.quote(str(self.systemctl_calls))}\n"
+            'case "$*" in\n'
+            '  is-active*) [ "${CI_BURST_TEST_TIMER_ACTIVE:-0}" = 1 ] && exit 0 || exit 3 ;;\n'
+            '  daemon-reload) exit "${CI_BURST_TEST_RELOAD_RC:-0}" ;;\n'
+            "  *) exit 0 ;;\n"
+            "esac",
         )
         self._fake(
             "podman",
@@ -480,6 +499,9 @@ class RefreshBehaviourTests(unittest.TestCase):
         )
         self.assertFalse((self.state / "deployed-sha").exists())
 
+    def _install_unit(self, unit, content="old unit\n"):
+        (self.units / unit).write_text(content, encoding="utf-8")
+
     def test_installs_changed_units_and_reloads_the_daemon(self):
         completed = self.run_script()
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -497,34 +519,134 @@ class RefreshBehaviourTests(unittest.TestCase):
         # install a second reap scheduler here.
         self.assertFalse((self.units / "ci-burst-reap.service").exists())
 
-    def test_keeps_the_previous_unit_beside_the_new_one(self):
-        (self.units / "ci-burst-apply.service").write_text("old unit\n", encoding="utf-8")
+    def test_keeps_the_previous_generation_for_rollback(self):
+        self._install_unit("ci-burst-apply.service")
         completed = self.run_script()
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        previous = (self.units / "ci-burst-apply.service.previous")
-        self.assertTrue(previous.is_file())
-        self.assertEqual(previous.read_text(encoding="utf-8"), "old unit\n")
+        snapshot = self.state / "units" / "previous" / "ci-burst-apply.service"
+        self.assertTrue(snapshot.is_file())
+        self.assertEqual(snapshot.read_text(encoding="utf-8"), "old unit\n")
 
     def test_an_unchanged_unit_is_not_rewritten(self):
         for unit in ("ci-burst-apply.service", "ci-burst-apply.timer",
                      "ci-burst-refresh.service", "ci-burst-refresh.timer"):
-            (self.units / unit).write_text(
-                (ROOT / "deploy" / unit).read_text(encoding="utf-8"), encoding="utf-8"
-            )
+            self._install_unit(unit, (ROOT / "deploy" / unit).read_text(encoding="utf-8"))
         completed = self.run_script()
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("units_unchanged", completed.stdout)
-        self.assertFalse((self.units / "ci-burst-apply.service.previous").exists())
+        self.assertNotIn("daemon-reload", self.systemctl_calls.read_text(encoding="utf-8"))
+        # The rollback generation still describes the set that is installed.
+        self.assertTrue(
+            (self.state / "units" / "previous" / "ci-burst-apply.service").is_file()
+        )
 
-    def test_an_invalid_unit_blocks_the_promotion(self):
-        completed = self.run_script(CI_BURST_TEST_VERIFY_RC="1")
+    def test_a_later_invalid_unit_installs_nothing(self):
+        self._install_unit("ci-burst-apply.service")
+        completed = self.run_script(CI_BURST_TEST_VERIFY_FAIL_UNIT="ci-burst-apply.timer")
         self.assertNotEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("unit_invalid", completed.stdout)
-        self.assertNotIn(
-            "tag localhost/ci-burst:candidate localhost/ci-burst:latest",
-            self.calls.read_text(encoding="utf-8"),
+        self.assertEqual(
+            (self.units / "ci-burst-apply.service").read_text(encoding="utf-8"), "old unit\n"
+        )
+        self.assertFalse((self.units / "ci-burst-refresh.timer").exists())
+        self.assertFalse((self.state / "deployed-sha").exists())
+        self.assertNotIn("daemon-reload", self.systemctl_calls.read_text(encoding="utf-8"))
+
+    def test_an_install_failure_restores_the_previous_set(self):
+        self._install_unit("ci-burst-apply.service")
+        # The second unit fails to install after the first has been replaced.
+        completed = self.run_script(
+            CI_BURST_TEST_INSTALL_FAIL_UNIT=str(self.units / "ci-burst-apply.timer")
+        )
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("unit_install_failed", completed.stdout)
+        self.assertIn("units_restored", completed.stdout)
+        self.assertEqual(
+            (self.units / "ci-burst-apply.service").read_text(encoding="utf-8"), "old unit\n"
         )
         self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_reload_failure_restores_the_previous_set(self):
+        self._install_unit("ci-burst-apply.service")
+        completed = self.run_script(CI_BURST_TEST_RELOAD_RC="1")
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("daemon_reload_failed", completed.stdout)
+        # The files are restored; the second reload fails too, which is why the
+        # run ends with an explicit deploy_failed rather than a success line.
+        self.assertIn("deploy_failed", completed.stdout)
+        self.assertEqual(
+            (self.units / "ci-burst-apply.service").read_text(encoding="utf-8"), "old unit\n"
+        )
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_promotion_failure_restores_the_units_and_resumes_admission(self):
+        self._install_unit("ci-burst-apply.service")
+        completed = self.run_script(
+            CI_BURST_TEST_TIMER_ACTIVE="1", CI_BURST_TEST_PREVIOUS_RC="1"
+        )
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("units_restored", completed.stdout)
+        self.assertEqual(
+            (self.units / "ci-burst-apply.service").read_text(encoding="utf-8"), "old unit\n"
+        )
+        calls = self.systemctl_calls.read_text(encoding="utf-8").splitlines()
+        self.assertIn("stop ci-burst-apply.timer", calls)
+        self.assertIn("start ci-burst-apply.timer", calls)
+        self.assertLess(
+            calls.index("stop ci-burst-apply.timer"),
+            calls.index("start ci-burst-apply.timer"),
+        )
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_admission_is_paused_across_the_transition_and_resumed(self):
+        completed = self.run_script(CI_BURST_TEST_TIMER_ACTIVE="1")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.systemctl_calls.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(calls[0], "is-active --quiet ci-burst-apply.timer")
+        self.assertIn("stop ci-burst-apply.timer", calls)
+        self.assertIn("start ci-burst-apply.timer", calls)
+        self.assertLess(
+            calls.index("stop ci-burst-apply.timer"), calls.index("daemon-reload")
+        )
+        self.assertGreater(
+            calls.index("start ci-burst-apply.timer"), calls.index("daemon-reload")
+        )
+
+    def test_an_inactive_schedule_is_not_started(self):
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.systemctl_calls.read_text(encoding="utf-8")
+        self.assertNotIn("stop ci-burst-apply.timer", calls)
+        self.assertNotIn("start ci-burst-apply.timer", calls)
+
+    def test_an_image_only_deployment_keeps_the_rollback_paired(self):
+        # Generation 1: units v1, then generation 2: units v2. A third run that
+        # changes only the fetched commit must leave the rollback generation as
+        # the set that belongs to the image `previous` now names.
+        repository = self.root / "source"
+        (repository / "deploy").mkdir()
+        for unit in ("ci-burst-apply.service", "ci-burst-apply.timer",
+                     "ci-burst-refresh.service", "ci-burst-refresh.timer"):
+            (repository / "deploy" / unit).write_text("v1\n", encoding="utf-8")
+        completed = self.run_script(CI_BURST_TEST_REPO=str(repository))
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        for unit in ("ci-burst-apply.service", "ci-burst-apply.timer",
+                     "ci-burst-refresh.service", "ci-burst-refresh.timer"):
+            (repository / "deploy" / unit).write_text("v2\n", encoding="utf-8")
+        completed = self.run_script(CI_BURST_TEST_REPO=str(repository), CI_BURST_TEST_WANT="1" * 40)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        rollback = self.state / "units" / "previous" / "ci-burst-apply.service"
+        self.assertEqual(rollback.read_text(encoding="utf-8"), "v1\n")
+
+        # Image-only deployment: same units, new commit.
+        completed = self.run_script(CI_BURST_TEST_REPO=str(repository), CI_BURST_TEST_WANT="2" * 40)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("units_unchanged", completed.stdout)
+        self.assertEqual(
+            (self.state / "units" / "previous" / "ci-burst-apply.service").read_text(encoding="utf-8"),
+            "v2\n",
+        )
 
     def test_an_unchanged_commit_builds_nothing(self):
         self.state.mkdir(parents=True)

@@ -350,9 +350,25 @@ What a promotion does and does not do:
 - it records the deployed commit in `/var/lib/ci-burst-image/deployed-sha`;
 - it installs the scaler's own units (`ci-burst-apply.service`,
   `ci-burst-apply.timer`, `ci-burst-refresh.service`, `ci-burst-refresh.timer`)
-  after verifying each with `systemd-analyze verify`. An unchanged unit is not
-  rewritten, a changed one keeps its previous file as `<unit>.previous`, and a
-  unit that fails verification blocks the promotion instead of being installed.
+  and does it as one generation with the image, not as a set of independent
+  edits:
+  - every unit is staged and verified with `systemd-analyze verify` **before**
+    anything on the host is touched, so an invalid or missing unit installs
+    nothing;
+  - the set that is installed before this deployment is snapshotted to
+    `<state>/units/previous/`, which is the unit half of the rollback
+    generation: it always belongs to the image `localhost/ci-burst:previous`
+    names, including when the deployment changed only the image;
+  - the apply schedule is paused while the generation changes and resumed
+    afterwards, and only if it was active, so a scheduled run cannot execute
+    new units against the old image or the other way round;
+  - an unchanged unit is not rewritten, and `daemon-reload` runs only when
+    something changed;
+  - a failure at any later step — image inspection, the previous tag, the
+    promotion, recording the deployed commit — restores the snapshot, reloads
+    and resumes admission, so a deployment either advances both halves or
+    leaves the host on the previous one.
+
   It never installs the reap unit: that one belongs to the independent cleanup
   host, which has no refresh loop, and installing it here would schedule a
   second cleanup on the wrong host. Removal stays manual: this installs, it
@@ -379,9 +395,13 @@ What a promotion does and does not do:
   the previous units in place and logs one line with a reason code
   (`fetch_failed`, `archive_failed`, `unpack_failed`, `build_failed`,
   `smoke_failed`, `tag_failed`, `unit_missing`, `unit_invalid`,
-  `unit_backup_failed`, `unit_install_failed`, `daemon_reload_failed`,
-  `units_failed`, `inspect_failed`, `exists_failed`, `previous_tag_failed`,
-  `promote_failed`) in `journalctl -u ci-burst-refresh.service`. Only a confirmed absent
+  `unit_stage_failed`, `unit_snapshot_failed`, `unit_install_failed`,
+  `unit_restore_failed`, `daemon_reload_failed`, `units_failed`,
+  `admission_stop_failed`, `admission_start_failed`, `deploy_failed`,
+  `inspect_failed`, `exists_failed`, `previous_tag_failed`, `promote_failed`)
+  in `journalctl -u ci-burst-refresh.service`. A `deploy_failed` line names the
+  step that failed after the units were installed; the snapshot is already
+  restored by then. Only a confirmed absent
   `localhost/ci-burst:latest` (podman's "absent" status) may skip the rollback
   handle; a failed inspection or a storage error fails the run instead;
 - the smoke run is a `plan` execution from the candidate against this host's own
@@ -408,12 +428,15 @@ flock /var/lib/ci-burst-image/refresh.lock \
   podman tag localhost/ci-burst:previous localhost/ci-burst:latest
 ```
 
-A unit rolled back with the image needs its file back too:
+A unit rolled back with the image needs its generation back too, and the
+snapshot holds the complete set:
 
 ```sh
-cp -p /etc/systemd/system/ci-burst-apply.service.previous \
-      /etc/systemd/system/ci-burst-apply.service
+stop_was_active=$(systemctl is-active --quiet ci-burst-apply.timer && echo yes || echo no)
+systemctl stop ci-burst-apply.timer
+cp -p /var/lib/ci-burst-image/units/previous/* /etc/systemd/system/
 systemctl daemon-reload
+[ "$stop_was_active" = yes ] && systemctl start ci-burst-apply.timer
 ```
 
 `previous` is whatever `latest` pointed at before the last promotion, including

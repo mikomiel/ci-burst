@@ -132,19 +132,28 @@ A record is eligible demand only when:
 - its `handle` is present, and repeated records for that attempt agree.
 
 Records with `running`, `success`, `failure`, `cancelled` or `skipped` do not
-contribute. A record with `status` `blocked` is dependency-blocked work: it is
-counted and never launched. Any other status, a missing required field, a
-non-array payload other than `null`, invalid JSON, a response above the size
-bound or an unreadable request makes demand unavailable rather than zero. The
-contract defines no pagination, so one response is the complete queue for that
+contribute, and a `blocked` record is counted but is never eligible demand. Any
+status outside those and `waiting`, a missing required field, a non-array
+payload other than `null`, invalid JSON, a response above the size bound or an
+unreadable request makes demand unavailable rather than zero. The contract
+defines no pagination, so one response is the complete queue for that
 repository.
 
 `needs` is metadata, not a dependency signal. The server fills it from the
 workflow and leaves it populated after the dependency has succeeded, so an
-empty-`needs` rule would hide every dependent job forever. The dependency
-signal is the `blocked` status. A record without the `needs` key is still
-refused: absent dependency metadata is an unexpected shape, and it is not an
-empty queue.
+empty-`needs` rule would hide every dependent job forever. A record without the
+`needs` key is still refused: absent dependency metadata is an unexpected
+shape, and it is not an empty queue.
+
+**Dependency-blocked work is not listed.** This endpoint answers with the jobs a
+runner with these labels may take and the ones already assigned; a job whose
+dependencies are unfinished is not in that set. Measured on `forgejo
+17.0.1+gitea-1.22.0` (`mikolajm/ai-agents` run 25399, 2026-11-10T20:33Z): the
+run reported three `blocked` jobs (`route`, `c1`, `c2`, all `homelab`), and the
+label-filtered response returned only one `running` record. `status` `blocked`
+is therefore accepted and counted defensively — a server that starts returning
+it is not treated as an unknown status — but no live record has been observed
+and a deployment cannot qualify against one.
 
 The `labels` query is mandatory, not an optimisation: the server answers JSON
 `null` when it is absent. The adapter sends the worker's bare label names (the
@@ -167,8 +176,9 @@ To qualify a deployment, the operator must, with an owner-scoped read token:
 
 1. confirm the endpoint returns the shape above for the repository, including
    the mandatory `labels` filter and `null` for no match;
-2. observe one known waiting job, one dependency-blocked job and one running
-   job, and verify the demand classification;
+2. observe one known waiting job and one running job, and verify the demand
+   classification. Dependency-blocked work cannot be part of this evidence: the
+   endpoint does not list it (see § Queue contract);
 3. record the evidence with the deployment;
 4. only then set `qualification = "live-verified"`.
 

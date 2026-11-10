@@ -324,8 +324,10 @@ live support"):
 
 1. confirm the endpoint returns the documented shape for your repository,
    including the mandatory `labels` filter and `null` for no match;
-2. observe one known waiting job, one dependency-blocked job and one running
-   job, and check that `plan` classifies them as demand, blocked and assigned;
+2. observe one known waiting job and one running job, and check that `plan`
+   classifies them as demand and assigned. Dependency-blocked work cannot be
+   part of this evidence: the endpoint does not list it
+   ([operations.md](operations.md) § Queue contract);
 3. record that evidence beside the deployment — timestamps, job names and the
    `plan` output — not in this repository;
 4. only then set `qualification = "live-verified"` and reinstall the TOML on

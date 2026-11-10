@@ -35,9 +35,9 @@ ci-burst launches at most one Spot instance per deployment.
 ## Prerequisites
 
 - Rootful podman with the `catatonit` init binary (the units run
-  `podman run --init`) and systemd on the controller host. The commands and
-  units assume the default podman user namespace: container UID/GID 10001 is
-  host UID/GID 10001.
+  `podman run --init`) and systemd on both the scaler host and the cleanup
+  host. The commands and units assume the default podman user namespace:
+  container UID/GID 10001 is host UID/GID 10001.
 - A deployment TOML prepared from [operations.md](operations.md), including
   the `forgejo.qualification` decision. `fixtures-only` still blocks `apply`.
 - A scaling identity and a separate cleanup identity, each provided as a
@@ -47,55 +47,70 @@ ci-burst launches at most one Spot instance per deployment.
 
 ## Build the image
 
-On the controller host, from a checkout of this repository:
+From a checkout of this repository:
 
 ```sh
 podman build --tag localhost/ci-burst:latest .
 ```
 
-The build context is default-deny: only `pyproject.toml`, `README.md` and
-`ci_burst/` enter it, and `pip install .` installs the CLI. The tag stays
-local; nothing is pushed.
+The build context is default-deny: only `pyproject.toml`, `README.md`,
+`LICENSE` and `ci_burst/` enter it, and `pip install .` installs the CLI. The
+tag stays local; nothing is pushed.
 
-If cleanup runs on a separate host, build the same tag there or copy the image
-with `podman save` and `podman load`. No registry is involved.
+Both hosts run the same local tag. Build it on each host, or build once and
+copy it with `podman save` and `podman load`. No registry is involved.
 
 ## Prepare the host paths
 
-All paths are fixed by the units. Create them before the first run.
+The scaler host runs `apply`; a separate cleanup host runs `reap --apply`.
+[operations.md](operations.md) requires cleanup outside the scaler's host
+failure boundary, so the two installs are separate. Both hosts need the image
+and the deployment TOML; only the scaler host needs the state directory, the
+scaling credentials and the token env-file; only the cleanup host needs the
+cleanup credentials.
 
-| Path | Access in container | Purpose |
-| --- | --- | --- |
-| `/etc/ci-burst/deployment.toml` | read-only file | deployment TOML |
-| `/var/lib/ci-burst` | writable directory | SQLite ledger, `.lock`, rollback journal |
-| `/etc/ci-burst/aws-scaling` | read-only directory | scaling credentials, launch-capable profile |
-| `/etc/ci-burst/aws-cleanup` | read-only directory | cleanup credentials, describe/terminate only |
-| `/etc/ci-burst/forgejo.env` | podman env-file, not mounted | Forgejo token |
+| Path | Host | Access in container | Purpose |
+| --- | --- | --- | --- |
+| `/etc/ci-burst/deployment.toml` | both | read-only file | deployment TOML |
+| `/var/lib/ci-burst` | scaler | writable directory | SQLite ledger, `.lock`, rollback journal |
+| `/etc/ci-burst/aws-scaling` | scaler | read-only directory | scaling credentials, launch-capable profile |
+| `/etc/ci-burst/aws-cleanup` | cleanup | read-only directory | cleanup credentials, describe/terminate only |
+| `/etc/ci-burst/forgejo.env` | scaler | podman env-file, not mounted | Forgejo token |
+
+Prepare the scaler host:
 
 ```sh
 install -d -o root -g root -m 0755 /etc/ci-burst
 install -o root -g root -m 0644 deployment.toml /etc/ci-burst/deployment.toml
-
 install -d -o 10001 -g 10001 -m 0700 /var/lib/ci-burst
-
-install -d -o root -g 10001 -m 0750 /etc/ci-burst/aws-scaling /etc/ci-burst/aws-cleanup
+install -d -o root -g 10001 -m 0750 /etc/ci-burst/aws-scaling
 install -o root -g 10001 -m 0640 scaling-credentials /etc/ci-burst/aws-scaling/credentials
-install -o root -g 10001 -m 0640 cleanup-credentials /etc/ci-burst/aws-cleanup/credentials
-
 install -o root -g root -m 0600 forgejo.env /etc/ci-burst/forgejo.env
 ```
+
+Prepare the independent cleanup host:
+
+```sh
+install -d -o root -g root -m 0755 /etc/ci-burst
+install -o root -g root -m 0644 deployment.toml /etc/ci-burst/deployment.toml
+install -d -o root -g 10001 -m 0750 /etc/ci-burst/aws-cleanup
+install -o root -g 10001 -m 0640 cleanup-credentials /etc/ci-burst/aws-cleanup/credentials
+```
+
+The cleanup host needs no state directory, no scaling credentials and no token
+env-file.
 
 The AWS SDK reads `/etc/ci-burst/aws/credentials` and, if present,
 `/etc/ci-burst/aws/config` inside the container. The mount target is
 `/etc/ci-burst/aws`; each unit mounts only its own source directory.
 
-The two `install` lines take different source files on purpose. Each destination
-is mounted into a different unit, so the scaling unit never sees the cleanup
-file and the cleanup unit never sees the scaling file. Both files must define
-the profile that `aws.profile` names, or `default` when that key is unset: the
-mount selects the file, not the profile, and the shared TOML names the same
-profile for both units. The scaling file holds the launch-capable scaling
-identity. The cleanup file holds the cleanup identity, which keeps
+The two credential installs take different source files on purpose. Each
+destination is mounted into a different unit, so the scaling unit never sees
+the cleanup file and the cleanup unit never sees the scaling file. Both files
+must define the profile that `aws.profile` names, or `default` when that key is
+unset: the mount selects the file, not the profile, and the shared TOML names
+the same profile for both units. The scaling file holds the launch-capable
+scaling identity. The cleanup file holds the cleanup identity, which keeps
 `DescribeInstances` and `TerminateInstances` without launch permission. Never
 copy the scaling file into the cleanup directory: cleanup would inherit launch
 permission, and a broken scaling identity would take cleanup with it.
@@ -105,10 +120,10 @@ credentials file fails instead of falling back to a reachable instance role.
 Override that variable only if you deliberately use an instance profile, which
 is not the two mounted identities this shape expects.
 
-Under rootless podman the mapping differs. Add
+Under rootless podman the mapping differs on both hosts. Add
 `--userns=keep-id:uid=10001,gid=10001` to the run command so container UID/GID
-10001 maps to your user, and make the state directory, credential files and
-env-file readable by that user instead of 10001.
+10001 maps to your user, and make the files and directories each host uses
+readable by that user instead of 10001.
 
 ### Deployment TOML for a container
 
@@ -133,7 +148,7 @@ loopback warning below.
 
 ### Forgejo token
 
-The token is supplied with an env-file, which is visible in
+The scaler host supplies the token with an env-file, which is visible in
 `podman inspect`:
 
 ```sh
@@ -148,8 +163,9 @@ change. Do not put AWS keys in this file; cloud credentials are mounted files.
 
 ## Run one command manually
 
-The scheduled units run the same shape with their fixed container name. To
-run `apply` by hand as root:
+The scheduled units run the same shape with their fixed container name. Run
+the `apply` invocation on the scaler host and the `reap` invocation on the
+cleanup host. To run `apply` by hand as root:
 
 ```sh
 podman run --rm --init --name ci-burst-manual \
@@ -189,9 +205,10 @@ If it does not exit after `Ctrl-C`, remove it by name with
 can still be inside a provider call.
 
 On a host with SELinux enforcing, add a relabel option to each bind mount. The
-deployment TOML is shared by both units and can be in use by two containers at
-the same time, so give it the shared label: `.../deployment.toml:ro,z`. Use the
-private label `:Z` only for a source one unit uses alone, such as
+deployment TOML is mounted by the timer and by manual runs, so it can be in use
+by two containers at the same time; give it the shared label:
+`.../deployment.toml:ro,z`. Use the private label `:Z` only for a source one
+unit uses alone, such as
 `/var/lib/ci-burst:rw,Z` or `/etc/ci-burst/aws-scaling:ro,Z`. `:Z` relabels the
 source to one container's private category and breaks any other container using
 it at that moment, so do not mix `:z` and `:Z` on one source. Where relabeling
@@ -200,18 +217,35 @@ is not permitted, apply a `container_file_t` label to the paths once with
 
 ## Scheduled operation with systemd
 
-Install the units and start both timers:
+Install only the apply unit and timer on the scaler host:
 
 ```sh
+# scaler host
 install -m 0644 \
   deploy/ci-burst-apply.service deploy/ci-burst-apply.timer \
-  deploy/ci-burst-reap.service deploy/ci-burst-reap.timer \
   /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now ci-burst-apply.timer
+systemctl list-timers 'ci-burst-*'
+```
+
+Install only the reap unit and timer on the independent cleanup host:
+
+```sh
+# independent cleanup host
+install -m 0644 \
+  deploy/ci-burst-reap.service deploy/ci-burst-reap.timer \
+  /etc/systemd/system/
+systemctl daemon-reload
 systemctl enable --now ci-burst-reap.timer
 systemctl list-timers 'ci-burst-*'
 ```
+
+The cleanup host must be outside the scaler's failure domain: a reboot, a
+failed upgrade or a full disk on the scaler must not stop expiry termination.
+[operations.md](operations.md) owns that rule. The reap unit needs no Forgejo
+token and no state directory, so it keeps working when admission is stopped,
+credentials for the scaler are broken, or the ledger is unavailable.
 
 `ci-burst-apply.timer` starts one `apply` run 60 seconds after the previous run
 finished; the effective period is the run duration plus about 60 seconds. The
@@ -222,19 +256,20 @@ inspected or moved. `systemctl is-active` describes the launcher only, never a
 surviving container.
 
 `ci-burst-reap.timer` runs `reap --apply` five minutes after the previous run
-finished, on its own unit.
-That separation is deliberate: cleanup must not share the scaler's failure
-domain. [operations.md](operations.md) states the rule; install the reap unit
-where a failing, hung or disabled scaler cannot stop it. The reap unit needs no
-Forgejo token and no state directory, so it keeps working when admission is
-stopped, credentials for the scaler are broken, or the ledger is unavailable.
+finished, on the cleanup host.
 
-Each run is recorded by systemd with its exit code. Read the JSON output with:
+Each run is recorded by systemd with its exit code. On the scaler host read:
 
 ```sh
 journalctl -u ci-burst-apply.service -n 50
-journalctl -u ci-burst-reap.service -n 50
 systemctl status ci-burst-apply.service
+```
+
+On the cleanup host read:
+
+```sh
+journalctl -u ci-burst-reap.service -n 50
+systemctl status ci-burst-reap.service
 ```
 
 A failed run does not stop the timers; the next scheduled run tries again. A
@@ -243,8 +278,8 @@ to raise the run frequency or remove the lock.
 
 ### Verify the container cleanup
 
-The lifecycle test is opt-in; it needs root, podman, systemd and a local
-`localhost/ci-burst:latest` image:
+The lifecycle test is opt-in; run it on the scaler host. It needs root,
+podman, systemd and a local `localhost/ci-burst:latest` image:
 
 ```sh
 CI_BURST_RUN_CONTAINER_TESTS=1 \
@@ -273,7 +308,8 @@ URL, and HTTPS verifies the certificate against that name.
 
 The SQLite ledger is one database file plus its `.lock` and its rollback
 journal, and those must stay together in the mounted state directory. One
-deployment, one controller host and one ledger copy is the supported topology.
+deployment, one controller (scaler) host and one ledger copy is the supported
+topology.
 
 - Do not copy `state.sqlite3`, or the directory, to run a second controller.
   A copied file is a second ledger with its own reservation budget: each copy
@@ -315,9 +351,9 @@ installed it becomes:
    crash. A container removed here may already have sent a launch request;
    reconcile it in step 4.
 
-2. Keep `ci-burst-reap.timer` enabled and running. Stopping cleanup is not
-   part of rollback; expiry termination is the path that removes expired
-   instances while admission is off.
+2. Keep `ci-burst-reap.timer` enabled and running on the cleanup host.
+   Stopping cleanup is not part of rollback; expiry termination is the path
+   that removes expired instances while admission is off.
 3. Inspect what remains with a manual `status` run using the apply mounts, then
    the ledger if needed: `state`, `slot` and `cloud` in the JSON.
 4. Reconcile a launch request that may already have been sent. `apply` commits
@@ -333,8 +369,26 @@ installed it becomes:
 5. Revert the source change through a reviewed pull request. Do not rewrite
    published history.
 
-Run the manual `reap --apply` invocation above if the cleanup host itself is
-being retired; otherwise leave its timer in place.
+### Retiring the cleanup host
+
+Do not remove the last cleanup scheduler on the strength of one manual
+`reap --apply` run. `reap` terminates only instances whose expiry tag has
+already passed, so that run can succeed without terminating an instance that is
+still inside its lifetime. Retiring the host then leaves the instance without
+recurring expiry enforcement, for example when its bootstrap failed and it
+cannot shut itself down.
+
+Before the cleanup host is retired, do one of these:
+
+- install `ci-burst-reap.service` and `ci-burst-reap.timer` on the replacement
+  host, start them, and verify the timer fires and a run succeeds there before
+  stopping the old host's timer; or
+- resolve every outstanding launch request and confirm with `status` that every
+  owned instance is `terminated` (or has aged out of the provider's retained
+  visibility) and no operation is unresolved, then remove the last scheduler.
+
+Removing the last cleanup scheduler is safe only when no owned instance can
+outlive it. A manual `reap --apply` run does not replace the recurring schedule.
 
 ## Not included
 
@@ -344,6 +398,6 @@ being retired; otherwise leave its timer in place.
   exit code.
 - Signal-driven shutdown as the cleanup guarantee. The units force-remove their
   named container; `--init` only makes a stop quicker.
-- Backups, ledger replication, multi-host coordination or a distributed lock.
+- Ledger replication, coordinated failover or a distributed lock.
 - Forgejo TLS termination or reverse-proxy configuration. The container only
   needs a name it can resolve and a certificate it can verify.

@@ -31,7 +31,7 @@ RUN useradd --create-home --uid 10001 --user-group ci-burst \
  && install -d -o root -g root -m 0755 /etc/ci-burst
 
 WORKDIR /srv/ci-burst
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md LICENSE ./
 COPY ci_burst ./ci_burst
 RUN pip install --no-cache-dir .
 

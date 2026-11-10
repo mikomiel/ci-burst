@@ -143,6 +143,9 @@ class ImageTests(unittest.TestCase):
         self.assertIn("FROM python:3.12-slim", self.dockerfile)
         self.assertIn("pip install --no-cache-dir .", self.dockerfile)
 
+    def test_carries_the_license_into_the_image(self):
+        self.assertRegex(self.dockerfile, r"(?m)^COPY .*\bLICENSE\b")
+
     def test_runs_as_a_non_root_one_shot_command(self):
         self.assertIn("USER 10001:10001", self.dockerfile)
         self.assertIn('ENTRYPOINT ["ci-burst"]', self.dockerfile)
@@ -216,6 +219,7 @@ class BuildContextTests(unittest.TestCase):
     ALLOWED = (
         "pyproject.toml",
         "README.md",
+        "LICENSE",
         "ci_burst/__init__.py",
         "ci_burst/sub/mod.py",
     )

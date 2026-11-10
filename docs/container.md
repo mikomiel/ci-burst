@@ -324,8 +324,10 @@ What a promotion does and does not do:
 - a fetch, archive, build or smoke failure keeps the previous image in place and
   logs one line with a reason code (`fetch_failed`, `archive_failed`,
   `unpack_failed`, `build_failed`, `smoke_failed`, `tag_failed`,
-  `inspect_failed`, `previous_tag_failed`, `promote_failed`) in
-  `journalctl -u ci-burst-refresh.service`;
+  `inspect_failed`, `exists_failed`, `previous_tag_failed`, `promote_failed`) in
+  `journalctl -u ci-burst-refresh.service`. Only a confirmed absent
+  `localhost/ci-burst:latest` (podman's "absent" status) may skip the rollback
+  handle; a failed inspection or a storage error fails the run instead;
 - the smoke run is a `plan` execution from the candidate against this host's own
   configuration and scaling credentials. It writes nothing and launches nothing.
   It must **complete with a decision** — a `wait` or `would_launch` plan result —

@@ -316,6 +316,27 @@ class RefreshBehaviourTests(unittest.TestCase):
         )
         self.assertFalse((self.state / "deployed-sha").exists())
 
+    def test_an_existence_check_error_never_moves_latest(self):
+        # `podman image exists` uses 1 for absent and 125 for a storage error;
+        # only 1 may skip the rollback handle.
+        completed = self.run_script(CI_BURST_TEST_EXISTS_RC="125")
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn(
+            "tag localhost/ci-burst:candidate localhost/ci-burst:latest",
+            self.calls.read_text(encoding="utf-8"),
+        )
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_confirmed_absent_serving_image_still_promotes(self):
+        completed = self.run_script(CI_BURST_TEST_EXISTS_RC="1")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertNotIn("localhost/ci-burst:previous", calls)
+        self.assertIn("tag localhost/ci-burst:candidate localhost/ci-burst:latest", calls)
+        self.assertEqual(
+            (self.state / "deployed-sha").read_text(encoding="utf-8").strip(), self.want
+        )
+
     def test_a_missing_previous_handle_never_moves_latest(self):
         completed = self.run_script(CI_BURST_TEST_PREVIOUS_RC="1")
         self.assertNotEqual(completed.returncode, 0, completed.stderr)

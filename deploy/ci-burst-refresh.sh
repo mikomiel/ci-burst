@@ -125,16 +125,30 @@ if [ -z "$candidate" ]; then
     exit 2
 fi
 current=
-if podman image exists "$IMAGE:latest"; then
-    current=$(podman image inspect --format '{{.Id}}' "$IMAGE:latest") || {
-        log "inspect_failed: $IMAGE:latest"
+exists_rc=0
+podman image exists "$IMAGE:latest" || exists_rc=$?
+case "$exists_rc" in
+    0)
+        current=$(podman image inspect --format '{{.Id}}' "$IMAGE:latest") || {
+            log "inspect_failed: $IMAGE:latest"
+            exit 2
+        }
+        if [ -z "$current" ]; then
+            log "inspect_failed: $IMAGE:latest"
+            exit 2
+        fi
+        ;;
+    1)
+        # `podman image exists` documents 1 as "absent"; that is the only status
+        # that may skip the handle. Anything else is a storage error, and a
+        # storage error is not an absent image.
+        current=
+        ;;
+    *)
+        log "exists_failed: $IMAGE:latest exit $exists_rc"
         exit 2
-    }
-    if [ -z "$current" ]; then
-        log "inspect_failed: $IMAGE:latest"
-        exit 2
-    fi
-fi
+        ;;
+esac
 if [ -n "$current" ] && [ "$current" != "$candidate" ]; then
     if ! podman tag "$current" "$IMAGE:previous"; then
         log "previous_tag_failed: $want"

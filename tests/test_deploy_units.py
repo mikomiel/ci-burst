@@ -211,6 +211,17 @@ class RefreshTests(unittest.TestCase):
         self.assertIn('"$IMAGE:previous"', self.script)
         self.assertIn("deployed-sha", self.script)
 
+    def test_compares_the_scaler_units_and_schedules_nothing(self):
+        units_line = next(
+            line for line in self.script.splitlines() if line.startswith("UNITS=")
+        )
+        self.assertNotIn("reap", units_line)
+        self.assertIn("cmp -s", self.script)
+        self.assertIn("units_drift", self.script)
+        # The refresh loop reports drift; it never installs, reloads or restarts.
+        self.assertNotIn("daemon-reload", self.script)
+        self.assertNotIn("systemctl ", self.script)
+
     def test_holds_a_lock_so_two_runs_never_build_together(self):
         self.assertIn("flock -n 9", self.script)
 
@@ -237,6 +248,8 @@ class RefreshBehaviourTests(unittest.TestCase):
         self.calls = self.root / "calls.log"
         self.calls.touch()
         self.state = self.root / "state"
+        self.units = self.root / "units"
+        self.units.mkdir()
         for name in ("source", "aws"):
             (self.root / name).mkdir()
         (self.root / "deployment.toml").write_text("", encoding="utf-8")
@@ -247,7 +260,7 @@ class RefreshBehaviourTests(unittest.TestCase):
             '  *" rev-parse "*) printf "%s\\n" "$CI_BURST_TEST_WANT"; exit 0 ;;\n'
             '  *" archive "*) out= ; prev= ;\n'
             '    for a in "$@"; do [ "$prev" = "--output" ] && out=$a; prev=$a; done\n'
-            '    tar -cf "$out" -T /dev/null; exit 0 ;;\n'
+            '    tar -cf "$out" -C "$CI_BURST_TEST_REPO" deploy; exit 0 ;;\n'
             "  *) exit 0 ;;\n"
             "esac",
         )
@@ -296,7 +309,9 @@ class RefreshBehaviourTests(unittest.TestCase):
             "CI_BURST_TEST_SMOKE": smoke,
             "CI_BURST_TEST_SMOKE_RC": smoke_rc,
             "CI_BURST_TEST_CONTEXT": str(self.root / "context.txt"),
+            "CI_BURST_TEST_REPO": str(ROOT),
             "CI_BURST_SMOKE_RETRY_SECONDS": "0",
+            "CI_BURST_UNIT_DIR": str(self.units),
         }
         environment.update({name: str(value) for name, value in extra.items()})
         return subprocess.run(
@@ -450,6 +465,42 @@ class RefreshBehaviourTests(unittest.TestCase):
             self.calls.read_text(encoding="utf-8").count("plan --config"), 2
         )
         self.assertFalse((self.state / "deployed-sha").exists())
+
+    def _installed_unit(self, unit, content=None):
+        source = ROOT / "deploy" / unit
+        target = self.units / unit
+        target.write_text(
+            content if content is not None else source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+    def test_reports_drift_between_the_repository_and_the_installed_units(self):
+        self._installed_unit("ci-burst-apply.service", "older unit\n")
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("units_drift:", completed.stdout)
+        self.assertIn("ci-burst-apply.service", completed.stdout)
+        self.assertIn("units_not_installed:", completed.stdout)
+
+    def test_reports_units_current_when_they_match(self):
+        for unit in ("ci-burst-apply.service", "ci-burst-apply.timer",
+                     "ci-burst-refresh.service", "ci-burst-refresh.timer"):
+            self._installed_unit(unit)
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("units_current", completed.stdout)
+        self.assertNotIn("units_drift", completed.stdout)
+
+    def test_never_writes_a_unit(self):
+        self._installed_unit("ci-burst-apply.service", "older unit\n")
+        before = {path.name: path.read_text(encoding="utf-8") for path in self.units.iterdir()}
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        after = {path.name: path.read_text(encoding="utf-8") for path in self.units.iterdir()}
+        self.assertEqual(before, after)
+        self.assertNotIn("ci-burst-reap.service", after)
+        # A drift report is a report: nothing is reloaded or restarted.
+        self.assertNotIn("daemon-reload", self.calls.read_text(encoding="utf-8"))
 
     def test_an_unchanged_commit_builds_nothing(self):
         self.state.mkdir(parents=True)

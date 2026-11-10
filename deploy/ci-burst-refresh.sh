@@ -33,6 +33,12 @@ AWS_CREDENTIALS=${CI_BURST_AWS_DIR:-/etc/ci-burst/aws-scaling}
 TOKEN_ENV=${CI_BURST_TOKEN_ENV:-/etc/ci-burst/forgejo.env}
 IMAGE=localhost/ci-burst
 SMOKE_RETRY_SECONDS=${CI_BURST_SMOKE_RETRY_SECONDS:-20}
+UNIT_DIR=${CI_BURST_UNIT_DIR:-/etc/systemd/system}
+
+# The units this deployment installs by hand. They are compared, never written:
+# installing scheduler units unattended needs atomic generations and admission
+# control that are disproportionate to how rarely a unit changes.
+UNITS="ci-burst-apply.service ci-burst-apply.timer ci-burst-refresh.service ci-burst-refresh.timer"
 
 log() { printf 'ci-burst-refresh: %s\n' "$*"; }
 
@@ -173,6 +179,34 @@ if [ -n "$current" ] && [ "$current" != "$candidate" ]; then
         exit 2
     fi
 fi
+
+# Report unit drift without touching a unit. A merged change to a unit is
+# installed by hand (docs/container.md § "Scheduled operation with systemd"); the
+# one thing this run must not do is let that difference stay invisible.
+report_unit_drift() {
+    drifted=""
+    missing=""
+    for unit in $UNITS; do
+        source_file="$work/src/deploy/$unit"
+        target_file="$UNIT_DIR/$unit"
+        if [ ! -f "$source_file" ]; then
+            continue
+        fi
+        if [ ! -f "$target_file" ]; then
+            missing="$missing $unit"
+        elif ! cmp -s "$source_file" "$target_file"; then
+            drifted="$drifted $unit"
+        fi
+    done
+    if [ -n "$drifted" ] || [ -n "$missing" ]; then
+        log "units_drift:${drifted}${missing:+ missing:${missing}}"
+        log "units_not_installed: run the install step in docs/container.md"
+    else
+        log 'units_current'
+    fi
+}
+
+report_unit_drift
 
 if ! podman tag "$IMAGE:candidate" "$IMAGE:latest"; then
     log "promote_failed: $want"

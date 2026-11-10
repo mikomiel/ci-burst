@@ -342,6 +342,14 @@ What a promotion does and does not do:
   refresh too, when the serving image is a hand-built one with no `sha-<12>` tag
   of its own;
 - it records the deployed commit in `/var/lib/ci-burst-image/deployed-sha`;
+- it **reports** unit drift instead of installing it: the repository's
+  `deploy/` units are compared with the installed ones, and a difference logs
+  `units_drift: <names>` (or `units_current`). Installing a changed unit stays
+  the manual `install` step in § "Scheduled operation with systemd", because
+  installing scheduler units unattended needs atomic generations, rollback
+  pairing and admission control — a transaction whose failure modes cost more
+  than the rare manual step it would remove. The report exists so the
+  difference never grows silently;
 - it publishes nothing: no registry, no git tag, no release, no announcement. A
   merge deploys the controller; [CONTRIBUTING.md](../CONTRIBUTING.md) § Releases
   owns the release boundary, and a merge is still neither a release nor a
@@ -358,8 +366,9 @@ What a promotion does and does not do:
 - a fetch, archive, build or smoke failure keeps the previous image in place and
   logs one line with a reason code (`fetch_failed`, `archive_failed`,
   `unpack_failed`, `build_failed`, `smoke_failed`, `tag_failed`,
-  `inspect_failed`, `exists_failed`, `previous_tag_failed`, `promote_failed`) in
-  `journalctl -u ci-burst-refresh.service`. Only a confirmed absent
+  `inspect_failed`, `exists_failed`, `previous_tag_failed`, `promote_failed`,
+  plus the informational `units_drift`, `units_not_installed` and
+  `units_current`) in `journalctl -u ci-burst-refresh.service`. Only a confirmed absent
   `localhost/ci-burst:latest` (podman's "absent" status) may skip the rollback
   handle; a failed inspection or a storage error fails the run instead;
 - the smoke run is a `plan` execution from the candidate against this host's own

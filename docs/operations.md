@@ -262,9 +262,12 @@ sets in use, not of the word "exclusive":
 
 So the routing rule is: every workflow that could run on this worker must name
 `cloud-ci`, and no workflow may request only the worker's other labels. Check
-that whenever a label is added to the worker or a workflow starts using one —
-the repository's own CI does, and its architecture jobs always pair the
-architecture with a fleet label.
+that whenever a label is added to the worker or a workflow starts using one.
+The workflows that matter are the ones in the repository this deployment
+observes, not this repository's own CI: in the pilot that is one Forgejo
+repository whose architecture jobs pair the architecture label with a fleet
+label, which is why no job there can match this worker on the architecture
+label alone.
 
 Accepted risk, stated without the comfort of "it just fails":
 

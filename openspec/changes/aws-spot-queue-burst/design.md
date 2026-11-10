@@ -58,13 +58,22 @@ an empty queue. Unknown required fields, an unexpected response or an incomplete
 read make demand unavailable rather than zero.
 
 The schema alone does **not** prove which status values are runnable or what
-token permission the endpoint requires. Contract qualification must include
-an independently ready job, a dependency-blocked job, a dependency-satisfied
-job, an assigned job and a retry. Until that contract is established for a
-supported server, live provisioning is disabled. There is no fallback to
-workflow age, aggregate queue counts or assumptions about `needs` being empty.
-If qualification fails, the implementation reports unsupported behavior;
-it does not invent another scheduler.
+token permission the endpoint requires. Live contract qualification must
+include an independently ready job, a dependency-satisfied job, an assigned job
+and a retry. Until that contract is established for a supported server, live
+provisioning is disabled. There is no fallback to workflow age, aggregate queue
+counts or assumptions about `needs` being empty. If qualification fails, the
+implementation reports unsupported behavior; it does not invent another
+scheduler.
+
+Dependency-blocked work is **not** part of live qualification: the endpoint
+answers with the jobs a runner may take and the ones already assigned, and a job
+whose dependencies are unfinished is not in that set (measured on `forgejo
+17.0.1+gitea-1.22.0`: a run with three blocked jobs returned none of them from
+the label-filtered endpoint). `blocked` stays covered by the fixture and the
+unit tests as defensive behavior — a server that starts returning it is counted,
+never launched, and never mistaken for an unknown status — and it is never a
+qualification requirement, because it cannot be observed.
 
 Use the smallest token scope accepted by the qualified endpoint. A GET request
 does not establish that its credential is narrowly privileged. Follow HTTPS

@@ -132,8 +132,9 @@ A record is eligible demand only when:
 - its `handle` is present, and repeated records for that attempt agree.
 
 Records with `running`, `success`, `failure`, `cancelled` or `skipped` do not
-contribute. Any other status, a missing required field, a non-array payload
-other than `null`, invalid JSON, a response above the size bound or an
+contribute, and a `blocked` record is counted but is never eligible demand. Any
+status outside those and `waiting`, a missing required field, a non-array
+payload other than `null`, invalid JSON, a response above the size bound or an
 unreadable request makes demand unavailable rather than zero. The contract
 defines no pagination, so one response is the complete queue for that
 repository.

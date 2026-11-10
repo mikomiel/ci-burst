@@ -266,8 +266,9 @@ terminated instance before it replaces the pin.
 ### Labels choose an executor
 
 The bootstrap is the single owner of the advertised label set. It advertises a
-deployment-specific routing label and the architecture label of the image, each
-in the runner's `name:executor` form:
+deployment-specific routing label, the heavy pool's label when the burst shares
+that pool, and the architecture label of the image, each in the runner's
+`name:executor` form:
 
 - the part before `:` is the label the controller matches;
 - the part after `:` names the executor. A bare label silently means the

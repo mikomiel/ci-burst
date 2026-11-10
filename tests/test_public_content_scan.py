@@ -40,9 +40,14 @@ def rule(rule_id):
 
 
 def findings(sample: str, rule_id: str):
-    """Replay the rule regex and its match/secret allowlists like Gitleaks does."""
+    """Replay the rule regex and its match/secret allowlists like Gitleaks does.
+
+    Gitleaks' Go engine treats \\w and \\b as ASCII-only, so the patterns are
+    compiled with re.ASCII to keep the oracle faithful (a Unicode letter before
+    a hostname is a non-word prefix character, exactly as in Go).
+    """
     entry = rule(rule_id)
-    pattern = re.compile(entry["regex"])
+    pattern = re.compile(entry["regex"], re.ASCII)
     secret_group = entry.get("secretGroup")
     results = []
     for match in pattern.finditer(sample):
@@ -50,7 +55,7 @@ def findings(sample: str, rule_id: str):
         suppressed = False
         for allowlist in entry.get("allowlists", []):
             target = match.group(0) if allowlist.get("regexTarget") == "match" else secret
-            if any(re.search(regex, target) for regex in allowlist.get("regexes", [])):
+            if any(re.search(regex, target, re.ASCII) for regex in allowlist.get("regexes", [])):
                 suppressed = True
         if not suppressed:
             results.append(match.group(0))
@@ -78,6 +83,14 @@ class PrivateDnsNameTests(unittest.TestCase):
         self.assertEqual(findings(f"SERVICE_URL=http://{WORD}:8080", "private-dns-name"),
                          ["/" + WORD])
         self.assertEqual(findings(f"HOST={WORD}", "private-dns-name"), ["=" + WORD])
+
+    def test_unicode_letter_prefix_still_flags(self):
+        # Go's regex engine treats only ASCII as word characters, so a leading
+        # Unicode letter is a non-word prefix and the hostname still matches.
+        # Python's default Unicode \\w would hide this; the helper compiles
+        # with re.ASCII to stay faithful to the scanner.
+        sample = "é" + WORD
+        self.assertEqual(findings(sample, "private-dns-name"), [sample])
 
     def test_other_internal_names_still_flag(self):
         samples = (

@@ -7,7 +7,7 @@
     "index": 1,
     "attempt": 1,
     "handle": "h-2-1",
-    "status": "waiting",
+    "status": "blocked",
     "runs_on": [
       "homelab"
     ],

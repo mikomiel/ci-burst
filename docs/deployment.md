@@ -82,7 +82,10 @@ Replace the placeholders in both files before attaching them: account id,
 Region, launch-template id, subnet id, security-group id and the worker role
 name. The policies are deliberately small:
 
-- `RunInstances` names exactly one template, one subnet and one security group;
+- `RunInstances` names exactly one launch template, the subnets the deployment
+  may use — one for the single-zone form, one per zone candidate — and one
+  security group. Step 5 owns that rule: a candidate whose subnet is missing
+  from the policy is a denied launch, not a fallback;
 - `TerminateInstances` carries an `ec2:ResourceTag/ci-burst:managed = true`
   condition, so an instance the controller did not tag cannot be terminated;
 - the reaper has no `RunInstances` at all, and the scaler cannot create users,

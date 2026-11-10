@@ -190,7 +190,10 @@ class Controller:
                 "available": True,
                 "instances": [instance.as_dict() for instance in instances],
             }
-            result["slot"]["discrepancies"] = self._discrepancies(state.get("operations", []), instances)
+            discrepancies, ignored = self._discrepancies(state.get("operations", []), instances)
+            result["slot"]["discrepancies"] = discrepancies
+            if ignored:
+                result["slot"]["ignored_discrepancies"] = ignored
             result["runner_readiness"] = {
                 "known": False,
                 "detail": "an EC2 running state is not proof of runner registration or readiness",
@@ -654,19 +657,25 @@ class Controller:
         nonterminal = {operation.id: operation for operation in self.ledger.nonterminal_operations()}
         grouped = {}
         discrepancies = []
+        ignored = []
         for instance in instances:
             operation_id = instance.tags.get(OPERATION_TAG)
             if not operation_id or operation_id == "pending":
                 discrepancies.append({"instance_id": instance.instance_id, "reason": "OWNED_INSTANCE_WITHOUT_OPERATION"})
                 continue
             if operation_id not in operations:
-                discrepancies.append(
-                    {
-                        "instance_id": instance.instance_id,
-                        "operation": operation_id,
-                        "reason": "UNRECORDED_OWNED_INSTANCE",
-                    }
-                )
+                entry = {
+                    "instance_id": instance.instance_id,
+                    "operation": operation_id,
+                    "reason": "UNRECORDED_OWNED_INSTANCE",
+                }
+                if instance.state == "terminated":
+                    # Inventory noise: the record is gone from EC2's world
+                    # except for its retained visibility, it holds no capacity
+                    # and costs nothing. Report it, never let it stop launches.
+                    ignored.append(entry)
+                else:
+                    discrepancies.append(entry)
                 continue
             grouped.setdefault(operation_id, []).append(instance)
         by_operation = {}
@@ -746,6 +755,8 @@ class Controller:
             if instance is not None:
                 self._reconcile_present(operation, instance)
         slot = self._slot_from_state(self._read_state(required=True))
+        if ignored:
+            slot["ignored_discrepancies"] = ignored
         return slot, discrepancies
 
     def _reconcile_present(self, operation, instance):
@@ -766,6 +777,7 @@ class Controller:
             operation["operation"]: (operation["state"], operation["region"]) for operation in operations
         }
         discrepancies = []
+        ignored = []
         seen_live = set()
         for instance in instances:
             operation_id = instance.tags.get(OPERATION_TAG)
@@ -775,9 +787,17 @@ class Controller:
                 )
                 continue
             if operation_id not in known:
-                discrepancies.append(
-                    {"instance_id": instance.instance_id, "operation": operation_id, "reason": "UNRECORDED_OWNED_INSTANCE"}
-                )
+                entry = {
+                    "instance_id": instance.instance_id,
+                    "operation": operation_id,
+                    "reason": "UNRECORDED_OWNED_INSTANCE",
+                }
+                # A terminated record is inventory noise: report it without
+                # presenting it as a reason the deployment cannot launch.
+                if instance.state == "terminated":
+                    ignored.append(entry)
+                else:
+                    discrepancies.append(entry)
                 continue
             if known[operation_id][1] != self.config.aws.region:
                 discrepancies.append(
@@ -800,7 +820,7 @@ class Controller:
                         "reason": "TERMINAL_OPERATION_STILL_OWNS_INSTANCE",
                     }
                 )
-        return discrepancies
+        return discrepancies, ignored
 
 
 def _expiry(instance):

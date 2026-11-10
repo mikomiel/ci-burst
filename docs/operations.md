@@ -486,8 +486,16 @@ cannot select another file.
 Every launch carries `ci-burst:managed`, `ci-burst:deployment`,
 `ci-burst:operation` and `ci-burst:expires-at` tags. Discovery and cleanup
 select only that scope; an instance with missing, foreign or contradictory
-ownership is reported, never terminated. An owned instance that cannot be
-reconciled with the ledger blocks new launches.
+ownership is reported, never terminated. A **live** owned instance whose
+`ci-burst:operation` tag names no ledger operation blocks new launches: it may
+be spending money nothing accounts for, and an operator has to look. A
+**terminated** instance in that same position — a real operation id the ledger
+never recorded — is reported under `slot.ignored_discrepancies` and blocks
+nothing: EC2 keeps listing a terminated instance for about an hour, and
+refusing launches until then would disable the burst after every legitimate
+termination the ledger did not record. An instance whose operation tag is
+missing or `pending` is a different case and still blocks, terminated or not,
+because nothing says which operation owned it.
 
 ## Identities
 

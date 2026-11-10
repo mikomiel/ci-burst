@@ -556,6 +556,83 @@ class ApplyTests(ControllerCase):
         self.assertIn("owned_state_discrepancy", result["reasons"])
         self.assertEqual(self.aws.mutations(), [])
 
+    def test_a_terminated_unrecorded_instance_does_not_block_admission(self):
+        # A tagged instance that the ledger never recorded, already terminated:
+        # EC2 keeps listing it for a while, but it holds nothing. Report it and
+        # launch, instead of refusing until the provider prunes the record.
+        controller = self.build(observation=observation_demand())
+        self.aws.instances_result = [
+            instance(instance_id="i-gone", operation="unknown-operation", state="terminated")
+        ]
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched", result)
+        self.assertNotIn("owned_state_discrepancy", result.get("reasons", []))
+        self.assertEqual(
+            result["slot"]["ignored_discrepancies"][0]["reason"], "UNRECORDED_OWNED_INSTANCE"
+        )
+        self.assertEqual(result["slot"]["ignored_discrepancies"][0]["instance_id"], "i-gone")
+
+    def test_a_terminated_unrecorded_instance_is_reported_by_status(self):
+        controller = self.build()
+        self.aws.instances_result = [
+            instance(instance_id="i-gone", operation="unknown-operation", state="terminated")
+        ]
+        result = controller.status()
+        self.assertEqual(result["decision"], "reported")
+        self.assertEqual(result["slot"]["discrepancies"], [])
+        self.assertEqual(
+            result["slot"]["ignored_discrepancies"][0]["instance_id"], "i-gone"
+        )
+
+    def test_an_unusable_operation_tag_blocks_in_any_state(self):
+        # The exception is narrow on purpose: a real operation id the ledger
+        # never recorded, on a terminated instance. A missing, empty or
+        # `pending` tag says nothing about ownership, so it blocks whichever
+        # state the instance is in.
+        for operation in (None, "", "pending"):
+            for state in ("running", "terminated"):
+                with self.subTest(operation=operation, state=state):
+                    controller = self.build(observation=observation_demand())
+                    self.aws.instances_result = [
+                        instance(instance_id="i-odd", operation=operation, state=state)
+                    ]
+                    result = controller.apply()
+                    self.assertEqual(result["decision"], "refused", result)
+                    self.assertIn("owned_state_discrepancy", result["reasons"])
+                    self.assertEqual(
+                        result["slot"]["discrepancies"][0]["reason"],
+                        "OWNED_INSTANCE_WITHOUT_OPERATION",
+                    )
+                    self.assertNotIn("ignored_discrepancies", result["slot"])
+                    self.assertEqual(self.aws.mutations(), [])
+
+    def test_status_reports_an_unusable_operation_tag_as_blocking(self):
+        controller = self.build()
+        self.aws.instances_result = [instance(instance_id="i-odd", operation="pending", state="terminated")]
+        result = controller.status()
+        self.assertEqual(
+            result["slot"]["discrepancies"][0]["reason"], "OWNED_INSTANCE_WITHOUT_OPERATION"
+        )
+        self.assertNotIn("ignored_discrepancies", result["slot"])
+
+    def test_a_live_unrecorded_instance_still_blocks_beside_a_terminated_one(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.instances_result = [
+            instance(instance_id="i-gone", operation="unknown-gone", state="terminated"),
+            instance(instance_id="i-live", operation="unknown-live", state="running"),
+        ]
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertEqual(
+            [entry["instance_id"] for entry in result["slot"]["discrepancies"]], ["i-live"]
+        )
+        self.assertEqual(
+            [entry["instance_id"] for entry in result["slot"]["ignored_discrepancies"]],
+            ["i-gone"],
+        )
+        self.assertEqual(self.aws.mutations(), [])
+
     def test_expired_instance_is_terminated_before_new_admission(self):
         operation_id = self.seed(state="running", expires_at=self.clock.now - 10)
         controller = self.build(observation=observation_demand())

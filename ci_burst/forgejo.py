@@ -1,17 +1,18 @@
 """Qualified, read-only observation of one Forgejo repository job queue.
 
 The adapter knows exactly one interface: a JSON array of ``ActionRunJob``
-records from the repository runner-jobs endpoint. It performs no mutation, sets
-no job fields, and never treats an unreadable or unexpected response as an empty
-queue. Live provisioning additionally requires the operator to declare
-``live-verified`` in configuration; the bundled contract is validated against
-synthetic fixtures only.
+records from the repository runner-jobs endpoint, filtered by the labels the
+worker advertises. It performs no mutation, sets no job fields, and never treats
+an unreadable or unexpected response as an empty queue. Live provisioning
+additionally requires the operator to declare ``live-verified`` in
+configuration; the bundled contract is validated against synthetic fixtures.
 """
 
 import json
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -123,7 +124,22 @@ class ForgejoObserver:
 
     def endpoint(self):
         owner, repository = self._config.forgejo.repository.split("/", 1)
-        return f"{self._config.forgejo.base_url}/api/v1/repos/{owner}/{repository}/actions/runners/jobs"
+        query = urllib.parse.urlencode({"labels": self._label_filter()})
+        return (
+            f"{self._config.forgejo.base_url}/api/v1/repos/{owner}/{repository}"
+            f"/actions/runners/jobs?{query}"
+        )
+
+    def _label_filter(self):
+        """The bare label names the worker advertises, as the server expects.
+
+        The endpoint answers ``null`` when ``labels`` is absent, so the filter is
+        mandatory rather than an optimisation. It is only a prefilter: the
+        complete ``runs_on`` comparison in ``_reduce`` still decides eligibility,
+        so a job selected by one shared label remains incompatible when it also
+        requires a label the worker does not advertise.
+        """
+        return ",".join(sorted({label.split(":", 1)[0] for label in self._config.worker.labels}))
 
     def observe(self):
         token = self._environ.get(self._config.forgejo.token_env)
@@ -161,6 +177,11 @@ def _parse_records(body):
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ObservationRefusal("FORGEJO_INVALID_JSON") from None
+    if payload is None:
+        # The server marshals its Go nil slice as JSON null when the label
+        # filter matches nothing. That is a verified empty queue, not a shape
+        # error: the request succeeded and the server answered.
+        return []
     if not isinstance(payload, list):
         raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", "expected a JSON array of action run jobs")
     return payload

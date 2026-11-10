@@ -292,8 +292,11 @@ reservation = ceil(max_spot_price * max_lifetime_seconds / 3600)
 ```
 
 A launch is refused unless the selected candidate has a fresh Spot quote for the
-configured instance type and its availability zone, is not older than
-`price_max_age_seconds`, and is not above `max_spot_price`. Every configured
+configured instance type and its availability zone, was observed no longer ago
+than `price_max_age_seconds`, and is not above `max_spot_price`. Freshness is the
+age of the **observation**: a Spot price records when it last *changed*, and a
+price that has been stable for hours is still current, so the provider's own
+timestamp is carried as evidence rather than used as the bound. Every configured
 candidate is priced in order; one whose quote is missing, stale, out of scope or
 above the ceiling is skipped and the next candidate is considered, so one
 expensive zone does not refuse a launch another configured zone can serve. The
@@ -303,8 +306,10 @@ The reservation is computed from `max_spot_price`, never from an observed quote,
 and the current window must still have `allowance` left after it. The window is
 anchored at a multiple of `window_seconds`. Outstanding operations carry their
 reservation into later windows; a completed operation is charged to the window
-it started in. Requesting termination does not refund consumed allowance, and a
-restart does not reset it.
+it started in. A **definite** provider rejection releases the reservation,
+because the provider proved that no instance was created; an uncertain outcome,
+or a rejected retry, keeps it until the intent is resolved. Requesting
+termination does not refund consumed allowance, and a restart does not reset it.
 
 The reservation estimates compute at the configured maximum price for the
 configured lifetime, plus the configured non-compute allowance. It does not

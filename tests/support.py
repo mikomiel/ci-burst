@@ -39,13 +39,15 @@ def template(**overrides):
     return Template(**values)
 
 
-def quote(price_micros=20_000, timestamp=None, clock=None):
+def quote(price_micros=20_000, timestamp=None, clock=None, observed_at=None):
+    observed = observed_at if observed_at is not None else (clock.now if clock else 1_800_000_000.0)
     return SpotQuote(
         price_micros=price_micros,
-        timestamp=timestamp if timestamp is not None else (clock.now if clock else 1_800_000_000.0),
+        timestamp=timestamp if timestamp is not None else observed,
         price_display=f"{price_micros / 1_000_000:.6f}",
         instance_type="t4g.small",
         availability_zone="eu-central-1a",
+        observed_at=observed,
     )
 
 

@@ -11,7 +11,9 @@ could silently remove:
   only the cleanup credential mount, so it stays runnable when admission stops;
 * each timer drives its own unit at the documented interval;
 * the image has no daemon surface, uses file credentials only, and the build
-  context admits only the declared build inputs.
+  context admits only the declared build inputs;
+* credential-free CI builds the image from the repository root, keeps the
+  workflow's read-only token and publishes nothing.
 
 The live lifecycle itself, including stopping an active invocation and keeping
 cleanup running, is exercised by ``tests/test_container_lifecycle.py`` and the
@@ -502,6 +504,87 @@ class ImageTests(unittest.TestCase):
         self.assertIn("AWS_EC2_METADATA_DISABLED=true", self.dockerfile)
         self.assertIn("AWS_SHARED_CREDENTIALS_FILE=/etc/ci-burst/aws/credentials", self.dockerfile)
         self.assertIn("AWS_CONFIG_FILE=/etc/ci-burst/aws/config", self.dockerfile)
+
+
+class ContainerImageCITests(unittest.TestCase):
+    """The committed workflow builds the image and publishes nothing.
+
+    The build proves the ``Dockerfile`` still builds; it is not a publication
+    path. These tests read the committed workflow, so they fail when the job is
+    removed, when a push or a login is added to it, or when the workflow gains
+    a write or registry token. They do not run Docker or GitHub Actions.
+    """
+
+    TEXT = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    JOB = "container-image"
+
+    def job_lines(self):
+        lines = self.TEXT.splitlines()
+        header = f"  {self.JOB}:"
+        self.assertIn(header, lines, f"{self.JOB} must be a job in ci.yml")
+        block = []
+        for line in lines[lines.index(header) + 1 :]:
+            if line.strip() and not line.startswith("    "):
+                break
+            block.append(line)
+        return block
+
+    def steps(self):
+        steps = []
+        for line in self.job_lines():
+            if line.startswith("      - "):
+                steps.append([line[8:]])
+            elif steps and line.startswith("        "):
+                steps[-1].append(line[8:])
+        return ["\n".join(step) for step in steps]
+
+    def grants(self):
+        lines = self.TEXT.splitlines()
+        self.assertIn("permissions:", lines)
+        block = {}
+        for line in lines[lines.index("permissions:") + 1 :]:
+            if line.strip() and not line.startswith("  "):
+                break
+            match = re.fullmatch(r"  ([a-z-]+): (\S+)", line)
+            if match:
+                block[match.group(1)] = match.group(2)
+        return block
+
+    def test_the_job_exists_with_its_own_name_and_timeout(self):
+        block = "\n".join(self.job_lines())
+        # The name states the proof, so a reader sees this is not a publish job.
+        self.assertRegex(block, r"(?m)^    name: .*image.*build")
+        self.assertRegex(block, r"(?m)^    runs-on: ubuntu-24\.04$")
+        timeout = re.search(r"(?m)^    timeout-minutes: (\d+)$", block)
+        self.assertIsNotNone(timeout, "the job needs its own timeout")
+        self.assertLessEqual(int(timeout.group(1)), 10)
+
+    def test_it_runs_only_the_build_on_the_repository_root(self):
+        steps = self.steps()
+        self.assertEqual(len(steps), 2, "one checkout and one build, nothing else")
+        self.assertRegex(steps[0], r"(?m)^uses: actions/checkout@[0-9a-f]{40}(?:\s+#.*)?$")
+        self.assertIn("persist-credentials: false", steps[0])
+        commands = [
+            line for step in steps for line in step.splitlines() if line.startswith("run:")
+        ]
+        self.assertEqual(commands, ["run: docker build --tag ci-burst:ci ."])
+
+    def test_the_job_carries_no_credential_or_publish_step(self):
+        # The job comment names what it avoids; this checks the steps themselves.
+        steps = self.steps()
+        self.assertTrue(steps, f"{self.JOB} must be a job in ci.yml")
+        steps = "\n".join(steps).lower()
+        for forbidden in ("docker push", "login-action", "registry", "secrets"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, steps)
+
+    def test_the_workflow_grants_only_the_read_token(self):
+        self.assertEqual(self.grants(), {"contents": "read"})
+        for forbidden in ("packages:", "id-token:", "contents: write"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.TEXT)
+        # The job keeps the workflow-level token; no job-level override widens it.
+        self.assertNotRegex("\n".join(self.job_lines()), r"(?m)^    permissions:")
 
 
 def _dockerignore_rules():

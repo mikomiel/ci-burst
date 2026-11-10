@@ -23,11 +23,11 @@ class RunnerBootstrapTests(unittest.TestCase):
     def setUp(self):
         self.script = BOOTSTRAP.read_text(encoding="utf-8")
 
-    def test_advertises_the_routing_label_and_the_arm64_label(self):
+    def test_advertises_the_routing_label_the_pool_label_and_the_arch_label(self):
         match = re.search(r'^RUNNER_LABELS="([^"]*)"$', self.script, re.MULTILINE)
         self.assertIsNotNone(match, "the bootstrap must declare RUNNER_LABELS")
         labels = match.group(1).split(",")
-        self.assertEqual(labels, ["cloud-ci:host", "linux-arm64:host"])
+        self.assertEqual(labels, ["cloud-ci:host", "strong-ci:host", "linux-arm64:host"])
         for label in labels:
             with self.subTest(label=label):
                 self.assertRegex(label, r"^[a-z0-9][a-z0-9-]*:host$")

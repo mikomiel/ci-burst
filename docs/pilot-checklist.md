@@ -37,8 +37,9 @@ cleanup bounds.
 
 ## 4. Capacity, quota and network
 
-- [ ] The Region and availability zone have the chosen instance type and Spot
-      capacity; the account's Spot quota covers one instance.
+- [ ] The Region and every configured availability-zone candidate have the
+      chosen instance type and Spot capacity; the account's Spot quota covers
+      one instance.
 - [ ] The worker reaches the Forgejo endpoint over the approved path; TLS
       verification is on and no redirect is followed.
 - [ ] Egress from the worker is limited to what the queue needs; the worker
@@ -57,7 +58,8 @@ cleanup bounds.
 
 ## 6. Ownership and cleanup evidence
 
-- [ ] A plan reports the exact template, Region, zone and reservation.
+- [ ] A plan reports the exact template, Region, ordered candidates, selected
+      zone and reservation.
 - [ ] One owned instance readback shows all four ownership tags and the expiry.
 - [ ] A refused or denied cleanup stays visible and does not free the slot.
 - [ ] The operator knows that an accepted termination request is not confirmed

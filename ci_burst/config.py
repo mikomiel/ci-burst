@@ -5,6 +5,10 @@ private host, credential or account. Every value is validated once, here, so a
 typo cannot silently widen scope. Unknown keys and sections are refused rather
 than ignored -- an unrecognized setting is far more likely to be a mistake than
 an extension point.
+
+Placement is configured as an ordered list of availability-zone candidates. The
+original single-zone key remains supported and is normalized to a one-candidate
+list, so no consumer chooses between two placement shapes.
 """
 
 import re
@@ -34,6 +38,10 @@ _REGION = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d$")
 _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$")
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _TEMPLATE_NAME = re.compile(r"^[A-Za-z0-9()\\./_ -]{3,128}$")
+_SUBNET = re.compile(r"^subnet-[0-9a-f]{8,17}$")
+
+#: Keys accepted inside one ``[[aws.availability_zones]]`` table.
+_ZONE_CANDIDATE_KEYS = ("zone", "subnet_id", "launch_template_version")
 
 
 @dataclass(frozen=True)
@@ -53,9 +61,24 @@ class WorkerConfig:
 
 
 @dataclass(frozen=True)
+class ZoneCandidate:
+    """One entry in the ordered placement list.
+
+    ``subnet_id`` is ``None`` only for the legacy single-zone form, where the
+    network choice stays in the launch template. A configured candidate list
+    always names a subnet, because the fallback needs a placement the template
+    does not already pin.
+    """
+
+    availability_zone: str
+    subnet_id: str | None
+    launch_template_version: int
+
+
+@dataclass(frozen=True)
 class AwsConfig:
     region: str
-    availability_zone: str
+    zones: tuple
     launch_template_name: str
     launch_template_version: int
     max_spot_price: int
@@ -168,6 +191,76 @@ def _labels(table, where):
     return tuple(value)
 
 
+def _zone_candidate_refusal(where, message):
+    """Refuse a malformed ordered placement list with its own stable reason."""
+    raise ConfigRefusal("ZONE_CANDIDATES_INVALID", f"{where}: {message}")
+
+
+def _zone_candidates(aws_table, region, default_version):
+    """Return the ordered launch candidates for either supported input form.
+
+    ``aws.availability_zone`` (the original setting) becomes one candidate with
+    no subnet override. ``aws.availability_zones`` is an ordered array of
+    tables; each entry needs a zone and a subnet and may pin its own template
+    version. The two forms are mutually exclusive because one deployment cannot
+    have both an implicit and an explicit order.
+    """
+    listed = aws_table.get("availability_zones")
+    single = aws_table.get("availability_zone")
+    if listed is not None and single is not None:
+        _zone_candidate_refusal(
+            "aws",
+            "availability_zone and availability_zones are mutually exclusive; "
+            "use the ordered list to configure fallback",
+        )
+    if listed is None:
+        if single is None:
+            _fail("aws", "availability_zone or availability_zones is required")
+        zone = _string(aws_table, "availability_zone", "aws")
+        if not re.fullmatch(re.escape(region) + r"[a-z]", zone):
+            _fail("aws.availability_zone", "must be a zone letter suffix of the configured Region")
+        return (ZoneCandidate(availability_zone=zone, subnet_id=None, launch_template_version=default_version),)
+    if not isinstance(listed, list):
+        _zone_candidate_refusal("aws.availability_zones", "must be an array of tables")
+    if not listed:
+        _zone_candidate_refusal("aws.availability_zones", "must contain at least one candidate")
+    seen = set()
+    candidates = []
+    for index, entry in enumerate(listed):
+        where = f"aws.availability_zones[{index}]"
+        if not isinstance(entry, dict):
+            _zone_candidate_refusal(where, "must be a table")
+        unknown = sorted(set(entry) - set(_ZONE_CANDIDATE_KEYS))
+        if unknown:
+            _zone_candidate_refusal(where, "unknown key(s) " + ", ".join(unknown))
+        zone = entry.get("zone")
+        if not isinstance(zone, str) or not zone:
+            _zone_candidate_refusal(f"{where}.zone", "must be a non-empty string")
+        if not re.fullmatch(re.escape(region) + r"[a-z]", zone):
+            _zone_candidate_refusal(f"{where}.zone", "must be a zone letter suffix of the configured Region")
+        if zone in seen:
+            _zone_candidate_refusal(f"{where}.zone", "must be unique across candidates")
+        seen.add(zone)
+        subnet = entry.get("subnet_id")
+        if not isinstance(subnet, str) or not _SUBNET.fullmatch(subnet):
+            _zone_candidate_refusal(
+                f"{where}.subnet_id", 'must be a subnet id such as "subnet-0123456789abcdef0"'
+            )
+        version = entry.get("launch_template_version", default_version)
+        if type(version) is not int or not 1 <= version <= 10_000:
+            _zone_candidate_refusal(
+                f"{where}.launch_template_version", "must be an integer between 1 and 10000"
+            )
+        candidates.append(
+            ZoneCandidate(
+                availability_zone=zone,
+                subnet_id=subnet,
+                launch_template_version=version,
+            )
+        )
+    return tuple(candidates)
+
+
 def load(path):
     """Load and validate a configuration file, or raise ``ConfigRefusal``."""
     config_path = Path(path)
@@ -223,6 +316,7 @@ def load(path):
         (
             "region",
             "availability_zone",
+            "availability_zones",
             "launch_template_name",
             "launch_template_version",
             "max_spot_price",
@@ -232,19 +326,18 @@ def load(path):
         ),
     )
     region = _string(aws_table, "region", "aws", pattern=_REGION, pattern_name="an AWS Region name")
-    availability_zone = _string(aws_table, "availability_zone", "aws")
-    if not re.fullmatch(re.escape(region) + r"[a-z]", availability_zone):
-        _fail("aws.availability_zone", "must be a zone letter suffix of the configured Region")
+    launch_template_version = _integer(aws_table, "launch_template_version", "aws", minimum=1, maximum=10_000)
+    zones = _zone_candidates(aws_table, region, launch_template_version)
     profile = aws_table.get("profile")
     if profile is not None and (not isinstance(profile, str) or not profile):
         _fail("aws.profile", "must be a non-empty string when set")
     aws = AwsConfig(
         region=region,
-        availability_zone=availability_zone,
+        zones=zones,
         launch_template_name=_string(
             aws_table, "launch_template_name", "aws", pattern=_TEMPLATE_NAME, pattern_name="a launch template name"
         ),
-        launch_template_version=_integer(aws_table, "launch_template_version", "aws", minimum=1, maximum=10_000),
+        launch_template_version=launch_template_version,
         max_spot_price=_money(aws_table, "max_spot_price", "aws"),
         max_lifetime_seconds=_integer(aws_table, "max_lifetime_seconds", "aws", minimum=60, maximum=86_400),
         price_max_age_seconds=_integer(

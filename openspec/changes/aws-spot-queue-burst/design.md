@@ -97,22 +97,41 @@ a turnkey image or a bootstrap service.
 ### 4. Persist intent before AWS, and freeze the request
 
 Use EC2 `RunInstances` with one-time Spot market options, `MinCount=MaxCount=1`,
-a fixed template version, fixed placement inputs and a stable `ClientToken`.
-There is no On-Demand fallback or automatic Region/AZ substitution.
+a template version fixed per candidate, fixed placement inputs and a stable
+`ClientToken`.
+Placement is the first eligible entry of the operator's ordered
+availability-zone candidate list. There is no On-Demand fallback and no
+automatic Region or AZ substitution: the only permitted placement change is the
+configured order, followed after a proved capacity rejection.
 
 Before the request, one SQLite transaction stores the deployment and operation
 identities. It records the frozen request parameters, their hash and the stable
 launch-request identifier. It also records creation and expiry times with the
 cost reservation. Required ownership and expiry tags are part of the launch
-request, not a later best-effort tag step.
+request, not a later best-effort tag step. The frozen request names the candidate
+being attempted. The candidate subnet is a top-level `RunInstances` parameter,
+so a template used with a candidate list must leave network interfaces to the
+request; the single-zone form sends no subnet override and keeps the template's
+network choice.
 
 The durable lifecycle is conceptually `intent -> starting -> running ->
 terminating -> terminal`; uncertain creation/cleanup remains outstanding.
 A lost response can occur after AWS created the instance. Recovery discovers
 by client token and ownership, and retries only the same operation. It does
 not assume that an immediately empty eventual-consistency read proves that
-a launch never occurred. A changed request requires a different, separately
-admitted operation after the old one is resolved.
+a launch never occurred. A changed request outside the proved-non-creating
+capacity case requires a different, separately admitted operation after the old
+one is resolved.
+
+A definite `InsufficientInstanceCapacity` rejection is the one case that may
+replace a frozen request: the provider proved no instance was created, so the
+same operation may attempt the next configured candidate in order. The
+replacement keeps the operation identity, admission window and reservation, and
+replaces the request, its hash and its own idempotency token; one token cannot
+describe two placements. That happens at most once per candidate and never for a
+throttled, unclassified or other definite failure. A resumed intent is retried
+exactly as frozen and never falls through, because a rejected retry does not
+prove the earlier request created nothing.
 
 A supported deployment has one host, one local ledger and an OS-backed writer
 lock held through scaling operations. A second writer fails before mutation.
@@ -125,11 +144,15 @@ A distributed lock/store is unnecessary for the supported topology.
 
 ### 5. Reserve conservatively; do not pretend to control the AWS bill
 
-Live admission needs a fresh compatible Spot quote below a configured hourly
-cap, maximum lifetime, a configured reservation window and sufficient allowance.
-Quote identity includes Region, placement/product and instance type; missing
-or mismatched data refuses a launch. Set the Spot request's maximum price as
-well, rather than treating the observed price as a guarantee.
+Live admission prices every configured candidate in order and needs at least one
+candidate with a fresh compatible Spot quote below a configured hourly cap. A
+candidate whose quote is missing, stale, out of scope or above the cap is
+skipped, not fatal; the first eligible candidate is selected. Quote identity
+includes Region, placement/product and instance type; missing or mismatched data
+is never replaced with the requested scope. The maximum lifetime, reservation
+window, required allowance and the Spot request's maximum price apply to the
+admission as a whole, and the reservation uses the configured cap rather than
+the observed quote, so an observation is never treated as a guarantee.
 
 Reserve the conservative maximum compute exposure for the lifetime, plus an
 explicit operator-configured allowance for known non-compute charges. Use
@@ -179,10 +202,34 @@ Do not log authorization headers, credentials, user data, raw API responses or
 complete configuration/environment dumps. Tests use synthetic secrets to
 verify error paths without publishing real credentials.
 
+### 8. Fall back only on proved capacity rejection, within one admission
+
+A single frozen zone leaves the queue unserved while capacity is absent there
+even though another configured zone could serve the demand. Price and order an
+explicit candidate list, launch in the first eligible candidate, and treat an
+`InsufficientInstanceCapacity` rejection as evidence that this placement cannot
+serve the request. That error is the only observed failure that both proves no
+instance was created and suggests another configured placement may succeed, so
+it is the only trigger to advance within the same admission. The operation,
+reservation, expiry and single slot stay; only the frozen request, its hash and
+its own idempotency token move to the next candidate, once per candidate and in
+the configured order.
+
+Alternatives: retrying the same zone cannot help while capacity is absent;
+falling through on throttling or an unclassified error could create a second
+instance, because those outcomes may already have launched one; discovering
+zones or instance types at runtime would let the controller place work outside
+the operator's declared configuration and is excluded. Exhausting the list ends
+as a reported failure with a free slot and a stable reason, never as a
+manufactured success or an On-Demand replacement.
+
 ## Risks / Trade-offs
 
 - Spot can disappear without notice -> reconcile actual instance state; leave
   CI result/retry decisions with Forgejo and the workflow owner.
+- Every configured zone can lack capacity at once -> the queue stays unserved,
+  the operation ends `failed` with a free slot and the failure is reported; the
+  operator owns zone choice and any capacity beyond the configured list.
 - A job can be claimed by another runner during boot -> accept possible idle
   startup and expire the unused instance; no exclusive job reservation claim.
 - Broad labels can accept unintended jobs -> qualify the complete advertised

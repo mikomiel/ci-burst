@@ -21,16 +21,30 @@ Execution without an explicit apply operation MUST remain read-only toward Forge
 - **THEN** it does not call RunInstances or TerminateInstances even with an AWS dry-run parameter
 
 ### Requirement: Positive live admission
-A live launch MUST require explicit apply, fresh qualified demand, reconciled ownership, writable durable state, the free supported slot, valid lifetime settings, a fresh usable price and a sufficient configured reservation allowance. Missing or contradictory inputs MUST deny the launch.
+A live launch MUST require explicit apply, fresh qualified demand, reconciled ownership, writable durable state, the free supported slot, valid lifetime settings, at least one eligible configured placement candidate with a fresh usable price, and a sufficient configured reservation allowance. Missing or contradictory inputs MUST deny the launch.
 
 #### Scenario: Complete live prerequisites
 - **WHEN** every live-admission condition holds for the same decision snapshot
 - **THEN** the controller can commit one bounded launch intent before requesting the instance
 
 #### Scenario: Unknown or over-limit price
-- **WHEN** a price is missing, stale, in the wrong scope or above its configured cap
-- **THEN** the launch is refused
+- **WHEN** a candidate's price is missing, stale, in the wrong scope or above its configured cap
+- **THEN** that candidate is not eligible
 - **AND** zero or an unrelated historical price is not substituted
+- **AND** the launch is refused only when no configured candidate is eligible
+
+### Requirement: Plan reports ordered placement candidates
+The plan MUST report every configured availability-zone candidate in order with the Spot price used for it, or an explicit null when no price was read, and MUST identify the selected candidate. A candidate above the configured price ceiling MUST be skipped rather than treated as a fatal error while another candidate remains eligible.
+
+#### Scenario: One candidate exceeds the price ceiling
+- **WHEN** a configured candidate has a fresh quote above the configured maximum price
+- **THEN** that candidate is reported as skipped with a stable reason
+- **AND** the first eligible candidate in order is reported as selected
+
+#### Scenario: No candidate is eligible
+- **WHEN** no configured candidate has a usable price or placement prerequisite
+- **THEN** the plan is refused
+- **AND** every candidate's skip reason is reported
 
 ### Requirement: Conservative persistent reservations
 The controller MUST commit the required monetary reservation before requesting a launch and preserve it through restart and uncertain cleanup. Reservation accounting MUST use exact units rather than floating-point currency. Instance termination MUST NOT automatically refund already consumed budget allowance.

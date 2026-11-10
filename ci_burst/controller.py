@@ -5,6 +5,13 @@ retries jobs or records a CI result. Forgejo remains the authority for work and
 results; AWS remains the authority for instances. Every mutating path requires
 an explicit apply call and a writable ledger.
 
+Placement is an ordered list of availability-zone candidates. Admission prices
+every candidate and selects the first eligible one; a candidate above the price
+ceiling is skipped rather than fatal. The launch still admits at most one
+instance: one operation, one reservation and one slot. Only a definite,
+capacity-related provider rejection may advance the same operation to the next
+candidate, in order, because that rejection proves no instance was created.
+
 A launch intent is durable before the cloud request. While an intent has no
 confirmed instance, apply resumes that same frozen request and client token
 instead of allocating a replacement; EC2 idempotency makes the retry safe and
@@ -15,8 +22,20 @@ import hashlib
 import json
 import math
 import time
+import uuid
+from dataclasses import dataclass, replace
 
-from .aws import DEPLOYMENT_TAG, EXPIRES_TAG, MANAGED_TAG, OPERATION_TAG, Aws
+from .aws import (
+    DEPLOYMENT_TAG,
+    EXPIRES_TAG,
+    MANAGED_TAG,
+    OPERATION_TAG,
+    Aws,
+    SpotQuote,
+    Template,
+    is_capacity_failure,
+)
+from .config import ZoneCandidate
 from .errors import ProviderRefusal, Refusal, StateRefusal
 from .forgejo import ForgejoObserver
 from .ledger import Ledger, current_window
@@ -43,6 +62,32 @@ COST_SCOPE_NOTE = (
 
 def _sha256(payload):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class CandidatePlan:
+    """One ordered placement candidate and the evidence gathered for it."""
+
+    candidate: ZoneCandidate
+    template: Template
+    quote: SpotQuote | None
+    reason: str | None
+
+    @property
+    def eligible(self):
+        return self.reason is None
+
+    def as_dict(self):
+        data = {
+            "zone": self.candidate.availability_zone,
+            "subnet_id": self.candidate.subnet_id,
+            "launch_template_version": self.candidate.launch_template_version,
+            "status": "eligible" if self.eligible else "skipped",
+            "price": self.quote.as_dict() if self.quote is not None else None,
+        }
+        if self.reason is not None:
+            data["reason"] = self.reason
+        return data
 
 
 class Controller:
@@ -83,10 +128,7 @@ class Controller:
             result["decision"] = "refused"
             return result
         result["observation"] = observation.as_dict()
-        template = self._template_or_refuse(result)
-        if template is not None:
-            result["template"] = template.as_dict()
-        decision = self._decide(observation, slot, template)
+        decision, _ = self._decide(observation, slot)
         result.update(decision)
         if result["decision"] == "launch_ready":
             result["decision"] = "would_launch"
@@ -118,15 +160,12 @@ class Controller:
             if observation is None:
                 return result
             result["observation"] = observation.as_dict()
-            template = self._template_or_refuse(result)
-            if template is not None:
-                result["template"] = template.as_dict()
-            decision = self._decide(observation, slot, template)
+            decision, plans = self._decide(observation, slot)
             result.update(decision)
             if decision["decision"] != "launch_ready":
                 result["decision"] = decision["decision"]
                 return result
-            return self._launch(result, decision, template, account)
+            return self._launch(result, decision, plans, account)
         finally:
             self.ledger.close()
 
@@ -243,69 +282,99 @@ class Controller:
             result["decision"] = "refused"
             return None
 
-    def _template_or_refuse(self, result):
-        try:
-            return self.aws.template(self.config.aws.launch_template_name, self.config.aws.launch_template_version)
-        except Refusal as refusal:
-            result["template_error"] = refusal.as_dict()
-            return None
+    def _templates(self, decision):
+        """Read each distinct configured template version once."""
+        templates = {}
+        for candidate in self.config.aws.zones:
+            version = candidate.launch_template_version
+            if version in templates:
+                continue
+            try:
+                templates[version] = self.aws.template(self.config.aws.launch_template_name, version)
+            except Refusal as refusal:
+                decision["template_error"] = refusal.as_dict()
+                return None
+        return templates
 
-    def _decide(self, observation, slot, template):
-        """Return the decision block for this snapshot."""
+    def _candidate_plans(self, templates):
+        """Price every candidate in order, before any time-sensitive check."""
+        plans = []
+        for candidate in self.config.aws.zones:
+            template = templates[candidate.launch_template_version]
+            if not template.has_user_data:
+                plans.append(CandidatePlan(candidate, template, None, "template_bootstrap_missing"))
+                continue
+            if template.placement_zone is not None and template.placement_zone != candidate.availability_zone:
+                plans.append(CandidatePlan(candidate, template, None, "template_placement_mismatch"))
+                continue
+            # A provider error here is not a candidate property: the price
+            # evidence itself is unavailable, so the whole plan refuses rather
+            # than silently dropping a configured candidate.
+            quote = self.aws.spot_quote(template.instance_type, candidate.availability_zone)
+            if quote is None:
+                plans.append(CandidatePlan(candidate, template, None, "spot_price_unavailable"))
+                continue
+            plans.append(CandidatePlan(candidate, template, quote, None))
+        return plans
+
+    def _decide(self, observation, slot):
+        """Return the decision block and the ordered candidate plans behind it."""
         reasons, notes = [], []
         decision = {"reasons": reasons, "notes": notes}
         if slot.get("discrepancies"):
             decision["decision"] = "refused"
             reasons.append("owned_state_discrepancy")
-            return decision
+            return decision, ()
         if slot["busy"]:
             decision["decision"] = "wait"
             reasons.append("slot_busy")
-            return decision
+            return decision, ()
         if observation.demand == 0:
             decision["decision"] = "wait"
             reasons.append("no_runnable_demand")
-            return decision
-        if template is None:
+            return decision, ()
+        templates = self._templates(decision)
+        if templates is None:
             decision["decision"] = "refused"
             reasons.append("template_unusable")
-            return decision
-        if not template.has_user_data:
-            decision["decision"] = "refused"
-            reasons.append("template_bootstrap_missing")
-            return decision
-        if template.placement_zone is not None and template.placement_zone != self.config.aws.availability_zone:
-            decision["decision"] = "refused"
-            reasons.append("template_placement_mismatch")
-            return decision
+            return decision, ()
         try:
-            quote = self.aws.spot_quote(template.instance_type, self.config.aws.availability_zone)
+            plans = self._candidate_plans(templates)
         except Refusal as refusal:
             decision["decision"] = "refused"
             decision["refusal"] = refusal.as_dict()
             reasons.append("spot_price_unavailable")
-            return decision
-        if quote is None:
-            decision["decision"] = "refused"
-            reasons.append("spot_price_unavailable")
-            return decision
-        # The quote read is synchronous and can be slow. Admission, freshness
-        # and the lifetime are evaluated against the clock after that read, so
-        # an expired intent cannot be committed by a long provider call.
+            return decision, ()
+        # Every quote read is synchronous and can be slow. Freshness, scope,
+        # the cap, admission and the lifetime are evaluated against the clock
+        # after the last read, so a slow provider cannot keep stale evidence
+        # fresh or commit an already expired intent.
         now = self.clock()
-        decision["price"] = quote.as_dict() | {"cap": format_money(self.config.aws.max_spot_price)}
-        if now - quote.timestamp > self.config.aws.price_max_age_seconds:
+        judged = []
+        for plan in plans:
+            if plan.reason is not None:
+                judged.append(plan)
+            elif now - plan.quote.timestamp > self.config.aws.price_max_age_seconds:
+                judged.append(replace(plan, reason="spot_price_stale"))
+            elif (
+                plan.quote.availability_zone != plan.candidate.availability_zone
+                or plan.quote.instance_type != plan.template.instance_type
+            ):
+                judged.append(replace(plan, reason="spot_price_wrong_scope"))
+            elif plan.quote.price_micros > self.config.aws.max_spot_price:
+                judged.append(replace(plan, reason="spot_price_above_cap"))
+            else:
+                judged.append(plan)
+        plans = judged
+        decision["candidates"] = [plan.as_dict() for plan in plans]
+        eligible = [plan for plan in plans if plan.eligible]
+        if not eligible:
             decision["decision"] = "refused"
-            reasons.append("spot_price_stale")
-            return decision
-        if quote.availability_zone != self.config.aws.availability_zone or quote.instance_type != template.instance_type:
-            decision["decision"] = "refused"
-            reasons.append("spot_price_wrong_scope")
-            return decision
-        if quote.price_micros > self.config.aws.max_spot_price:
-            decision["decision"] = "refused"
-            reasons.append("spot_price_above_cap")
-            return decision
+            for plan in plans:
+                if plan.reason is not None and plan.reason not in reasons:
+                    reasons.append(plan.reason)
+            reasons.append("no_eligible_candidate")
+            return decision, plans
         window_start = current_window(now, self.config.budget.window_seconds)
         reservation = hourly_cost_micros(
             self.config.aws.max_spot_price, self.config.aws.max_lifetime_seconds
@@ -322,29 +391,25 @@ class Controller:
         if consumed + reservation > self.config.budget.allowance:
             decision["decision"] = "refused"
             reasons.append("budget_allowance_exhausted")
-            return decision
+            return decision, plans
+        selected = eligible[0]
+        decision["price"] = selected.quote.as_dict() | {"cap": format_money(self.config.aws.max_spot_price)}
+        decision["selected"] = selected.as_dict()
+        decision["template"] = selected.template.as_dict()
         decision["decision"] = "launch_ready"
         decision["reservation_micros"] = reservation
         decision["window_start"] = window_start
         decision["expires_at"] = now + self.config.aws.max_lifetime_seconds
-        return decision
+        return decision, plans
 
-    def _launch(self, result, decision, template, account):
-        import uuid
-
-        now = self.clock()
-        if decision["expires_at"] <= now:
-            result["decision"] = "refused"
-            result.setdefault("reasons", []).append("admission_expired")
-            return result
-        operation_id = uuid.uuid4().hex
-        client_token = "ci-burst-" + uuid.uuid4().hex
+    def _request(self, plan, expires_at, operation_id):
+        """Build the one launch request for a candidate."""
         request = {
             "LaunchTemplate": {
-                "LaunchTemplateId": template.template_id,
-                "Version": str(template.version),
+                "LaunchTemplateId": plan.template.template_id,
+                "Version": str(plan.template.version),
             },
-            "Placement": {"AvailabilityZone": self.config.aws.availability_zone},
+            "Placement": {"AvailabilityZone": plan.candidate.availability_zone},
             "InstanceMarketOptions": {
                 "MarketType": "spot",
                 "SpotOptions": {
@@ -356,7 +421,7 @@ class Controller:
             "MinCount": 1,
             "MaxCount": 1,
             "InstanceInitiatedShutdownBehavior": "terminate",
-            "ClientToken": client_token,
+            "ClientToken": "ci-burst-" + uuid.uuid4().hex,
             "TagSpecifications": [
                 {
                     "ResourceType": "instance",
@@ -364,17 +429,33 @@ class Controller:
                         {"Key": MANAGED_TAG, "Value": "true"},
                         {"Key": DEPLOYMENT_TAG, "Value": self.config.deployment},
                         {"Key": OPERATION_TAG, "Value": operation_id},
-                        {"Key": EXPIRES_TAG, "Value": str(int(decision["expires_at"]))},
+                        {"Key": EXPIRES_TAG, "Value": str(int(expires_at))},
                         {"Key": "Name", "Value": f"{self.config.deployment}-spot"},
                     ],
                 }
             ],
         }
+        # RunInstances takes the subnet as a top-level parameter; Placement has
+        # no SubnetId member. The legacy single-zone form sends none and keeps
+        # the network choice in the launch template.
+        if plan.candidate.subnet_id is not None:
+            request["SubnetId"] = plan.candidate.subnet_id
+        return request
+
+    def _launch(self, result, decision, plans, account):
+        now = self.clock()
+        if decision["expires_at"] <= now:
+            result["decision"] = "refused"
+            result.setdefault("reasons", []).append("admission_expired")
+            return result
+        eligible = [plan for plan in plans if plan.eligible]
+        operation_id = uuid.uuid4().hex
+        request = self._request(eligible[0], decision["expires_at"], operation_id)
         request_sha256 = _sha256(request)
         with self.ledger.transaction():
             operation = self.ledger.new_operation(
                 operation_id=operation_id,
-                client_token=client_token,
+                client_token=request["ClientToken"],
                 request=request,
                 request_sha256=request_sha256,
                 expires_at=decision["expires_at"],
@@ -386,8 +467,66 @@ class Controller:
             )
         # Intent is committed, so a lost response is recoverable and never a
         # reason to allocate a second operation for the same demand.
-        self._send(operation, request, result, "launched")
+        self._send_candidates(operation, eligible, result, decision)
         return result
+
+    def _send_candidates(self, operation, plans, result, decision):
+        """Attempt the ordered candidates within one admission.
+
+        Only a definite capacity rejection, which proves that no instance was
+        created, advances to the next candidate. The operation identity,
+        reservation, expiry and admission window stay; the frozen request, its
+        hash and its own idempotency token advance with the placement, so the
+        same demand is never admitted twice.
+        """
+        attempts = []
+        for index, plan in enumerate(plans):
+            if index:
+                now = self.clock()
+                if decision["expires_at"] <= now:
+                    # The next candidate would create an instance that is
+                    # expired before it boots. Nothing was created, so the slot
+                    # is released.
+                    self.ledger.set_state(operation.id, "failed", detail="admission_expired")
+                    result["decision"] = "refused"
+                    result.setdefault("reasons", []).append("admission_expired")
+                    result["operation"] = operation.id
+                    result["attempts"] = attempts
+                    return
+                request = self._request(plan, decision["expires_at"], operation.id)
+                with self.ledger.transaction():
+                    self.ledger.advance_operation(
+                        operation.id,
+                        request=request,
+                        request_sha256=_sha256(request),
+                        client_token=request["ClientToken"],
+                        detail="capacity_fallback:" + plans[index - 1].candidate.availability_zone,
+                    )
+                operation = self.ledger.operation(operation.id)
+            else:
+                request = operation.request()
+            outcome, refusal = self._send(operation, request, result, "launched", defer_capacity=True)
+            if outcome == "accepted":
+                attempts.append({"zone": plan.candidate.availability_zone, "outcome": "accepted"})
+                result["attempts"] = attempts
+                return
+            attempt = {
+                "zone": plan.candidate.availability_zone,
+                "outcome": {"capacity": "capacity_rejected", "refused": "rejected"}.get(outcome, outcome),
+            }
+            attempt.update(refusal.as_dict())
+            attempts.append(attempt)
+            if outcome != "capacity":
+                result["attempts"] = attempts
+                return
+            if index + 1 == len(plans):
+                self.ledger.set_state(operation.id, "failed", detail=refusal.reason)
+                result["decision"] = "launch_failed"
+                result["refusal"] = refusal.as_dict()
+                result["operation"] = operation.id
+                result["attempts"] = attempts
+                result.setdefault("reasons", []).append("capacity_exhausted")
+                return
 
     def _resume(self, slot, result):
         """Retry the one unresolved launch intent instead of replacing it."""
@@ -417,7 +556,13 @@ class Controller:
         self._send(operation, operation.request(), result, "resumed", first_attempt=False)
         return True
 
-    def _send(self, operation, request, result, success_decision, first_attempt=True):
+    def _send(self, operation, request, result, success_decision, first_attempt=True, *, defer_capacity=False):
+        """Send one frozen request and report what it proved.
+
+        Returns an outcome string and, for a deferred capacity rejection, the
+        refusal the caller may still act on. Every other outcome is already
+        final in ``result``.
+        """
         try:
             instance_ids = self.aws.run_spot(request)
         except ProviderRefusal as refusal:
@@ -427,18 +572,23 @@ class Controller:
             if refusal.uncertain or not first_attempt:
                 self.ledger.set_state(operation.id, "uncertain", detail=refusal.reason)
                 result["decision"] = "uncertain"
+                outcome = "uncertain"
+            elif defer_capacity and is_capacity_failure(refusal):
+                return "capacity", refusal
             else:
                 self.ledger.set_state(operation.id, "failed", detail=refusal.reason)
                 result["decision"] = "launch_failed"
+                outcome = "refused"
             result["refusal"] = refusal.as_dict()
             result["operation"] = operation.id
-            return
+            return outcome, refusal
         self.ledger.set_state(operation.id, "starting", instance_id=instance_ids[0])
         result["decision"] = success_decision
         result["operation"] = operation.id
         result["instance_id"] = instance_ids[0]
         result["expires_at"] = operation.expires_at
         result["reservation"] = format_money(operation.reservation_micros)
+        return "accepted", None
 
     def _expire(self, slot, instances, result):
         """Terminate only an expired instance whose current ownership is verified."""

@@ -47,6 +47,9 @@ _SUBJECT = re.compile(r"^(feat|fix|docs|ci)(?:\([^)]*\))?!?:\s+(?P<text>\S.*)$")
 _PULL_REQUEST = re.compile(r"\s+\(#(?P<number>[0-9]+)\)$")
 _VERSION = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 _RELEASE_TAG = re.compile(rf"^v(?P<version>{_VERSION})$")
+# Anything a human would read as a release tag, so an invalid one can be
+# rejected instead of silently ignored.
+_RELEASE_SHAPED = re.compile(r"^v?[0-9]+\.[0-9]+\.[0-9]+$")
 _H2 = re.compile(r"^ {0,3}##[ \t]+")
 _RELEASED_HEADING = re.compile(
     rf"^## \[(?P<version>{_VERSION})\] - [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$"
@@ -180,6 +183,22 @@ def applicable_tags(root=ROOT):
     return found
 
 
+def invalid_release_refs(root=ROOT):
+    """Reachable release-shaped refs that cannot serve as a release boundary.
+
+    ``applicable_tags`` admits only annotated ``vX.Y.Z`` tags, so without this
+    the validators call a repository consistent while the renderer rejects the
+    same ref: a lightweight tag, an unprefixed tag, or a leading-zero version.
+    """
+    found = []
+    for name, kind in tag_types(root).items():
+        if _RELEASE_SHAPED.match(name) is None or not _reachable(name, root):
+            continue
+        if kind != "tag" or _RELEASE_TAG.match(name) is None:
+            found.append(name)
+    return tuple(sorted(found))
+
+
 def _tag_error(version):
     return (
         f"released heading [{version}] needs an annotated tag v{version} "
@@ -259,7 +278,7 @@ def pending_versions(text):
     return _pending(released_sections(text))
 
 
-def _reconcile(text, tags, allow_preparation):
+def _reconcile(text, tags, allow_preparation, invalid=()):
     """Reconcile released sections and applicable tags in both directions.
 
     ``tags`` maps tag names from :func:`applicable_tags` to whether
@@ -271,7 +290,10 @@ def _reconcile(text, tags, allow_preparation):
         sections = released_sections(text)
     except ValueError as error:
         return [str(error)]
-    errors = []
+    errors = [
+        f"release tag {name} must be an annotated vMAJOR.MINOR.PATCH tag reachable from HEAD"
+        for name in invalid
+    ]
     pending = _pending(sections)
     if len(pending) > 1:
         errors.append(
@@ -316,14 +338,14 @@ def _reconcile(text, tags, allow_preparation):
     return errors
 
 
-def binding_errors(text, tags):
+def binding_errors(text, tags, invalid=()):
     """Pre-merge errors: sections and tags reconcile, preparation is explicit."""
-    return _reconcile(text, tags, allow_preparation=True)
+    return _reconcile(text, tags, allow_preparation=True, invalid=invalid)
 
 
-def release_validation_errors(text, tags):
+def release_validation_errors(text, tags, invalid=()):
     """Published-state errors: no marker, and sections and tags reconcile."""
-    return _reconcile(text, tags, allow_preparation=False)
+    return _reconcile(text, tags, allow_preparation=False, invalid=invalid)
 
 
 def boundary_problem(text, root=ROOT):
@@ -338,7 +360,9 @@ def boundary_problem(text, root=ROOT):
             "shallow history cannot establish the release boundary; "
             "run git fetch --unshallow"
         )
-    errors = _reconcile(text, applicable_tags(root), allow_preparation=True)
+    errors = _reconcile(
+        text, applicable_tags(root), allow_preparation=True, invalid=invalid_release_refs(root)
+    )
     return errors[0] if errors else None
 
 
@@ -409,7 +433,9 @@ def main(argv=None):
     text = CHANGELOG.read_text(encoding="utf-8") if CHANGELOG.exists() else HEADER + "\n"
 
     if args.validate_release:
-        errors = release_validation_errors(text, applicable_tags())
+        errors = release_validation_errors(
+            text, applicable_tags(), invalid_release_refs()
+        )
         for error in errors:
             print(f"error: {error}", file=sys.stderr)
         if errors:

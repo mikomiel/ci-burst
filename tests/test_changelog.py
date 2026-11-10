@@ -301,6 +301,44 @@ class ReleaseBoundaryTests(unittest.TestCase):
         self.git("tag", "-a", "v0.1.0", "-m", "v0.1.0")
         self.assertEqual(changelog.applicable_tags(self.root), {"v0.1.0": False})
 
+    def test_invalid_release_tags_are_rejected_not_ignored(self):
+        text = "# Changelog\n\n## [Unreleased]\n\n"
+        self.commit("feat: add the controller")
+        self.add_renderer()
+        cases = {
+            "v0.1.0": ("tag", "v0.1.0"),
+            "0.1.0": ("tag", "-a", "0.1.0", "-m", "0.1.0"),
+            "v01.2.3": ("tag", "-a", "v01.2.3", "-m", "v01.2.3"),
+        }
+        for name, command in cases.items():
+            with self.subTest(tag=name):
+                self.git(*command)
+                try:
+                    invalid = changelog.invalid_release_refs(self.root)
+                    tags = changelog.applicable_tags(self.root)
+                    self.assertIn(name, invalid)
+                    self.assertEqual({}, tags)
+                    for errors in (
+                        changelog.binding_errors(text, tags, invalid),
+                        changelog.release_validation_errors(text, tags, invalid),
+                    ):
+                        self.assertTrue(
+                            any(name in error for error in errors), errors
+                        )
+                    self.assertIn(name, changelog.boundary_problem(text, self.root))
+
+                    completed = subprocess.run(
+                        (sys.executable, "scripts/render_changelog.py", "--validate-release"),
+                        cwd=self.root,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(1, completed.returncode, completed.stdout)
+                    self.assertIn(name, completed.stderr)
+                finally:
+                    self.git("tag", "-d", name)
+
     def test_release_checks_reject_a_tag_on_an_unrelated_branch(self):
         published = (
             "# Changelog\n\n## [Unreleased]\n\n"

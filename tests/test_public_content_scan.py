@@ -46,7 +46,7 @@ def line_at(sample, start):
     return sample[begin:end if end != -1 else len(sample)]
 
 
-def findings(sample: str, rule_id: str):
+def findings(sample: str, rule_id: str, path: str | None = None):
     """Replay the rule regex and its allowlists like Gitleaks does."""
     entry = rule(rule_id)
     # Go's regexp treats only ASCII word characters for `\b`; Python's default
@@ -60,6 +60,9 @@ def findings(sample: str, rule_id: str):
         for allowlist in entry.get("allowlists", []):
             if allowlist.get("commits"):
                 # Identity-scoped: a text replay has no commit to compare.
+                continue
+            paths = allowlist.get("paths", [])
+            if paths and (path is None or not any(re.search(p, path, re.ASCII) for p in paths)):
                 continue
             target = allowlist.get("regexTarget", "secret")
             if target == "match":
@@ -82,28 +85,29 @@ class PrivateDnsNameTests(unittest.TestCase):
         self.assertEqual(findings(f'"{DOTENV}",', "private-dns-name"), [])
         self.assertEqual(findings(DOTENV + "\n", "private-dns-name"), [])
 
+    def test_filename_forms_are_exempt(self):
+        # The three forms the filename takes: backticked in prose, dot-prefixed
+        # in a tuple, and a path. The leading quote, dot or slash is part of
+        # the matched secret, which is what lets the allowlist tell them apart
+        # from the same word used as a hostname.
+        self.assertEqual(findings(f"`{HOSTNAME}`", "private-dns-name"), [])
+        self.assertEqual(findings(f"config/{HOSTNAME}", "private-dns-name"), [])
+
     def test_same_word_as_hostname_still_flags(self):
-        samples = (
-            f"SERVICE_URL=http://{HOSTNAME}:8080",
-            f"HOST={HOSTNAME}",
-            f"bare {HOSTNAME} here",
-        )
-        for sample in samples:
-            self.assertEqual(findings(sample, "private-dns-name"), [HOSTNAME],
+        # A URL authority keeps both slashes in the match, so it is not the
+        # single-slash path form and stays reported.
+        cases = {
+            f"SERVICE_URL=http://{HOSTNAME}:8080": "//" + HOSTNAME,
+            f"HOST={HOSTNAME}": HOSTNAME,
+            f"bare {HOSTNAME} here": HOSTNAME,
+        }
+        for sample, expected in cases.items():
+            self.assertEqual(findings(sample, "private-dns-name"), [expected],
                              f"{sample!r} must still be flagged")
 
-    def test_quoted_or_dotted_filename_is_exempt(self):
-        # The two forms the filename takes: backticked in prose and dot-prefixed
-        # in a path tuple. Both are exempt; the quote or dot is part of the
-        # matched secret, which is what lets the allowlist tell them apart from
-        # the same word used as a hostname.
-        self.assertEqual(findings(f"`{HOSTNAME}`", "private-dns-name"), [])
-        self.assertEqual(findings(DOTENV, "private-dns-name"), [])
-
-    def test_quoted_finding_must_start_with_the_quote(self):
-        # A finding whose match does not begin with the quote or dot is a bare
+    def test_bare_hostname_is_not_laundered_by_a_quoted_filename(self):
+        # A finding whose match does not begin with a filename prefix is a
         # hostname and stays flagged, even on a line that also quotes the file.
-        self.assertEqual(findings(HOSTNAME, "private-dns-name"), [HOSTNAME])
         combined = f"Rename `{HOSTNAME}`; HOST={dns('db', 'internal')}"
         self.assertEqual(findings(combined, "private-dns-name"), [dns("db", "internal")])
 
@@ -112,6 +116,10 @@ class PrivateDnsNameTests(unittest.TestCase):
         # letter before the name is still a boundary; Python's Unicode default
         # would hide the finding, which is why the replay passes re.ASCII.
         self.assertEqual(findings("\u00e9" + HOSTNAME, "private-dns-name"), [HOSTNAME])
+        # A word character before the name is not a boundary, so it is not a
+        # finding at that position.
+        self.assertEqual(findings("x" + HOSTNAME, "private-dns-name"), ["x" + HOSTNAME])
+        self.assertEqual(findings(dns("db", "internal") + "9", "private-dns-name"), [])
 
     def test_other_internal_names_still_flag(self):
         samples = (
@@ -121,6 +129,7 @@ class PrivateDnsNameTests(unittest.TestCase):
             dns("db", "local"),
             dns("", "db", "internal"),
             f"`{dns('db', 'local')}`",
+            f"config/{dns('db', 'internal')}",
         )
         for sample in samples:
             self.assertTrue(findings(sample, "private-dns-name"),
@@ -128,36 +137,43 @@ class PrivateDnsNameTests(unittest.TestCase):
 
     def test_allowlists_exempt_only_the_filename_secrets(self):
         secret_allowlists = [a for a in rule("private-dns-name").get("allowlists", [])
-                             if a.get("regexTarget") == "secret"]
+                             if a.get("regexTarget") == "secret" and not a.get("paths")]
         self.assertEqual(len(secret_allowlists), 1)
         regexes = secret_allowlists[0]["regexes"]
         for regex in regexes:
             self.assertTrue(regex.startswith("^") and regex.endswith("$"),
                             f"allowlist regex {regex!r} must be anchored so it cannot broaden")
-        # Exactly the two filename secrets, and nothing else.
+        # Exactly the three filename secrets, and nothing else.
         self.assertEqual(set(regexes),
-                         {r"^\.env\.local$", r"^`env\.local$", r"^`\.env\.local$"})
+                         {r"^\.env\.local$", r"^`env\.local$", r"^/env\.local$"})
         for regex in regexes:
             self.assertFalse(re.search(regex, HOSTNAME))
+            self.assertFalse(re.search(regex, "//" + HOSTNAME))
             self.assertFalse(re.search(regex, dns("db", "internal")))
-        # The rule reports the leading dot or quote as part of the secret.
+        # The rule reports the leading prefix as part of the secret.
         entry = rule("private-dns-name")
         self.assertEqual(entry.get("secretGroup"), 1)
         pattern = re.compile(entry["regex"], re.ASCII)
         for sample, expected in ((DOTENV, DOTENV), (f"`{HOSTNAME}`", "`" + HOSTNAME),
-                                 (f"`{DOTENV}`", "`" + DOTENV), (HOSTNAME, HOSTNAME)):
+                                 (f"config/{HOSTNAME}", "/" + HOSTNAME),
+                                 (f"http://{HOSTNAME}", "//" + HOSTNAME),
+                                 (HOSTNAME, HOSTNAME)):
             self.assertEqual(pattern.search(sample).group(1), expected)
 
-    def test_superseded_fix_commit_allowlist_is_one_exact_sha(self):
-        # The orphaned first attempt of this fix is exempted by commit SHA only,
-        # so the rule stays fully armed for every other commit. The SHA is
-        # pinned: this entry was audited as false positives of this rule in that
-        # commit's test comments, and a different commit would need its own audit.
-        entry = rule("private-dns-name")
-        commit_allowlists = [a for a in entry.get("allowlists", []) if a.get("commits")]
-        self.assertEqual(len(commit_allowlists), 1)
-        self.assertEqual(commit_allowlists[0]["commits"],
-                         ["9858491a18f662fb27f551fe81f355b25f38d220"])
+    def test_placeholder_literal_is_exempt_only_in_its_own_test_file(self):
+        # The historical revision of the rule's own test file carries the bare
+        # placeholder literal. The exemption is path AND secret, so the same
+        # word in any other file is still a finding.
+        self.assertEqual(findings(HOSTNAME, "private-dns-name"), [HOSTNAME])
+        self.assertEqual(findings(HOSTNAME, "private-dns-name",
+                                  path="tests/test_public_content_scan.py"), [])
+        self.assertEqual(findings(HOSTNAME, "private-dns-name", path="src/other.py"),
+                         [HOSTNAME])
+        entry = [a for a in rule("private-dns-name").get("allowlists", []) if a.get("paths")]
+        self.assertEqual(len(entry), 1)
+        self.assertEqual(entry[0].get("condition"), "AND")
+        self.assertEqual(entry[0].get("regexTarget"), "secret")
+        self.assertEqual(entry[0]["regexes"], [r"^env\.local$"])
 
     def test_private_ipv4_rule_is_untouched(self):
         entry = rule("private-ipv4")

@@ -32,6 +32,7 @@ CONFIG=${CI_BURST_CONFIG:-/etc/ci-burst/deployment.toml}
 AWS_CREDENTIALS=${CI_BURST_AWS_DIR:-/etc/ci-burst/aws-scaling}
 TOKEN_ENV=${CI_BURST_TOKEN_ENV:-/etc/ci-burst/forgejo.env}
 IMAGE=localhost/ci-burst
+SMOKE_RETRY_SECONDS=${CI_BURST_SMOKE_RETRY_SECONDS:-20}
 
 log() { printf 'ci-burst-refresh: %s\n' "$*"; }
 
@@ -77,18 +78,30 @@ if ! podman build --quiet --network=host --tag "$IMAGE:candidate" "$work/src" >/
     exit 2
 fi
 
-smoke_rc=0
-smoke=$(podman run --rm --init --replace --name ci-burst-refresh-smoke \
-    --read-only \
-    --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
-    --volume "$CONFIG:/etc/ci-burst/deployment.toml:ro" \
-    --volume "$AWS_CREDENTIALS:/etc/ci-burst/aws:ro" \
-    --env-file "$TOKEN_ENV" \
-    "$IMAGE:candidate" plan --config /etc/ci-burst/deployment.toml 2>/dev/null) || smoke_rc=$?
-if [ "$smoke_rc" -ne 0 ]; then
-    log "smoke_failed: $want exit $smoke_rc"
-    exit 2
-fi
+attempt=1
+while :; do
+    smoke_rc=0
+    smoke=$(podman run --rm --init --replace --name ci-burst-refresh-smoke \
+        --read-only \
+        --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+        --volume "$CONFIG:/etc/ci-burst/deployment.toml:ro" \
+        --volume "$AWS_CREDENTIALS:/etc/ci-burst/aws:ro" \
+        --env-file "$TOKEN_ENV" \
+        "$IMAGE:candidate" plan --config /etc/ci-burst/deployment.toml 2>/dev/null) || smoke_rc=$?
+    if [ "$smoke_rc" -eq 0 ]; then
+        break
+    fi
+    if [ "$attempt" -ge 2 ]; then
+        log "smoke_failed: $want exit $smoke_rc"
+        exit 2
+    fi
+    # One retry, and only for the run itself: an unreachable Forgejo or AWS is
+    # not evidence about this image, and it is exactly the case a second look a
+    # few seconds later resolves. A second failure still keeps the old image.
+    log "smoke_retry: $want exit $smoke_rc"
+    attempt=$((attempt + 1))
+    sleep "$SMOKE_RETRY_SECONDS"
+done
 # The smoke gate accepts only a completed, non-refusal plan decision. A refusal
 # document (`decision: refused`, or `error`) means the candidate cannot read this
 # host's configuration, which is exactly what the next scheduled apply would hit.

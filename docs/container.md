@@ -340,7 +340,10 @@ What a promotion does and does not do:
   configuration, which is exactly what the next scheduled `apply` would hit. A
   new plan decision is rejected until the script's accepted set is extended
   deliberately. The document is validated with the host's `python3`, which the
-  lifecycle test below already requires.
+  lifecycle test below already requires. One transient failure retries the run
+  once after 20 seconds (`CI_BURST_SMOKE_RETRY_SECONDS`), because an unreachable
+  Forgejo or AWS is not evidence about the image; a second failure keeps the
+  previous image.
 
 Rollback retags a previous image, and it must not race a refresh: the timer only
 schedules, and a run that started before the operator acted would move `latest`

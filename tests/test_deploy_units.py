@@ -188,9 +188,14 @@ class RefreshTests(unittest.TestCase):
         self.assertLess(smoke, self.script.index('"$IMAGE:latest"'))
         # A completed decision is required, not "any document": a config refusal
         # is exit 2 and must fail the smoke.
-        self.assertIn('if [ "$smoke_rc" -ne 0 ]', self.script)
+        self.assertIn('if [ "$attempt" -ge 2 ]', self.script)
         self.assertIn('document.get("decision") not in ("wait", "would_launch")', self.script)
         self.assertIn("--name ci-burst-refresh-smoke", self.script)
+
+    def test_retries_the_smoke_once_and_only_once(self):
+        self.assertIn('if [ "$attempt" -ge 2 ]', self.script)
+        self.assertIn("smoke_retry", self.script)
+        self.assertIn("CI_BURST_SMOKE_RETRY_SECONDS", self.script)
 
     def test_promotes_latest_and_both_rollback_handles(self):
         self.assertIn('"$IMAGE:sha-$short"', self.script)
@@ -240,7 +245,13 @@ class RefreshBehaviourTests(unittest.TestCase):
         self._fake(
             "podman",
             'case "$*" in\n'
-            '  "run "*" plan --config "*) printf "%s" "$CI_BURST_TEST_SMOKE"; exit "$CI_BURST_TEST_SMOKE_RC" ;;\n'
+            '  "run "*" plan --config "*) printf "%s" "$CI_BURST_TEST_SMOKE"\n'
+            '    if [ -n "${CI_BURST_TEST_SMOKE_SEQUENCE:-}" ]; then\n'
+            '      n=$(( $(cat "$CI_BURST_TEST_SMOKE_SEQUENCE.count" 2>/dev/null || echo 0) + 1 ))\n'
+            '      printf "%s" "$n" > "$CI_BURST_TEST_SMOKE_SEQUENCE.count"\n'
+            '      exit "$(sed -n "${n}p" "$CI_BURST_TEST_SMOKE_SEQUENCE")"\n'
+            '    fi\n'
+            '    exit "$CI_BURST_TEST_SMOKE_RC" ;;\n'
             '  "build "*) ctx= ; for a in "$@"; do ctx=$a; done\n'
             '    { find "$ctx" -type f | sort; echo marker:; cat "$ctx/ci_burst/marker.py" 2>/dev/null; } '
             '> "$CI_BURST_TEST_CONTEXT"; exit 0 ;;\n'
@@ -276,6 +287,7 @@ class RefreshBehaviourTests(unittest.TestCase):
             "CI_BURST_TEST_SMOKE": smoke,
             "CI_BURST_TEST_SMOKE_RC": smoke_rc,
             "CI_BURST_TEST_CONTEXT": str(self.root / "context.txt"),
+            "CI_BURST_SMOKE_RETRY_SECONDS": "0",
         }
         environment.update({name: str(value) for name, value in extra.items()})
         return subprocess.run(
@@ -406,6 +418,26 @@ class RefreshBehaviourTests(unittest.TestCase):
             calls.index("tag sha256:old localhost/ci-burst:previous"),
             calls.index("tag localhost/ci-burst:candidate localhost/ci-burst:latest"),
         )
+
+    def test_a_transient_smoke_failure_is_retried_once(self):
+        sequence = self.root / "smoke-sequence"
+        sequence.write_text("1\n0\n", encoding="utf-8")
+        completed = self.run_script(CI_BURST_TEST_SMOKE_SEQUENCE=str(sequence))
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("smoke_retry", completed.stdout)
+        self.assertEqual(
+            (self.state / "deployed-sha").read_text(encoding="utf-8").strip(), self.want
+        )
+
+    def test_a_repeated_smoke_failure_keeps_the_previous_image(self):
+        sequence = self.root / "smoke-sequence"
+        sequence.write_text("1\n1\n", encoding="utf-8")
+        completed = self.run_script(CI_BURST_TEST_SMOKE_SEQUENCE=str(sequence))
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            self.calls.read_text(encoding="utf-8").count("plan --config"), 2
+        )
+        self.assertFalse((self.state / "deployed-sha").exists())
 
     def test_an_unchanged_commit_builds_nothing(self):
         self.state.mkdir(parents=True)

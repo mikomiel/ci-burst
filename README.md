@@ -53,6 +53,10 @@ with its [design](openspec/changes/aws-spot-queue-burst/design.md),
 [acceptance specifications](openspec/changes/aws-spot-queue-burst/specs/) and
 [task record](openspec/changes/aws-spot-queue-burst/tasks.md).
 
+There is no release yet. [CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the
+boundary: an annotated semver tag on `main` plus a GitHub Release whose notes
+are that [CHANGELOG.md](CHANGELOG.md) section.
+
 ## Checks
 
 Use Node.js 22.12+, Python 3.12+ and npm:

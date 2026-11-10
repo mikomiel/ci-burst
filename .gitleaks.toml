@@ -12,3 +12,10 @@ regex = '''\b(?:10\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,
 id = "private-dns-name"
 description = "Do not publish internal deployment DNS names"
 regex = '''(?i)\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:internal|lan|local)\b'''
+  # The dotenv filename `.env.local` is not a private DNS name: the rule's
+  # match on it is the bare word `env.local`. Other hostnames under these
+  # TLDs still match and are still flagged.
+  [[rules.allowlists]]
+  description = "The dotenv filename `.env.local` is not a private DNS name"
+  regexTarget = "secret"
+  regexes = ['''^env\.local$''']

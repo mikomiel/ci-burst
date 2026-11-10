@@ -106,7 +106,7 @@ On both hosts:
 ```sh
 git clone https://github.com/<owner>/ci-burst.git /opt/ci-burst-src
 cd /opt/ci-burst-src
-podman build --tag localhost/ci-burst:latest .
+podman build --network=host --tag localhost/ci-burst:latest .
 ```
 
 Then follow [container.md](container.md) § "Prepare the host paths". On the
@@ -258,9 +258,12 @@ satisfied result is not a substitute for the recorded live evidence in
 
 ## 6. Install the units
 
-From the checkout, on the scaler:
+From the checkout, on the scaler. The units run on a named container network, so
+create it first with the MTU the host's path supports —
+[container.md](container.md) § "The container network" explains why:
 
 ```sh
+podman network create --opt mtu=1300 ci-burst
 install -o root -g root -m 0644 deploy/ci-burst-apply.service /etc/systemd/system/
 install -o root -g root -m 0644 deploy/ci-burst-apply.timer   /etc/systemd/system/
 systemctl daemon-reload
@@ -271,9 +274,10 @@ enabled timer also starts at boot (`OnBootSec=30s`), so enabling it before the
 supervised burst would let a reboot begin unsupervised admission as soon as
 Step 7 sets `live-verified`. Step 8 enables it only after that burst.
 
-On the reaper host:
+On the reaper host, with the same network created first:
 
 ```sh
+podman network create --opt mtu=1300 ci-burst
 install -o root -g root -m 0644 deploy/ci-burst-reap.service /etc/systemd/system/
 install -o root -g root -m 0644 deploy/ci-burst-reap.timer   /etc/systemd/system/
 systemctl daemon-reload
@@ -287,7 +291,7 @@ Run one command by hand before trusting the timer. The shape is in
 [container.md](container.md) § "Run one command manually":
 
 ```sh
-podman run --rm --init --name ci-burst-manual --read-only \
+podman run --rm --init --network ci-burst --name ci-burst-manual --read-only \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
   --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \
   --volume /var/lib/ci-burst:/var/lib/ci-burst:rw \

@@ -71,8 +71,8 @@ fi
 # Host networking is for the build only: the base image and the package
 # install download far more than one segment, and a container bridge whose
 # MTU is larger than the host path MTU stalls those transfers with no error.
-# The smoke run below keeps the default network, so it exercises the same
-# networking the scheduled units use.
+# The smoke run below uses the same named network as the scheduled units, so it
+# exercises exactly the networking they use.
 if ! podman build --quiet --network=host --tag "$IMAGE:candidate" "$work/src" >/dev/null; then
     log "build_failed: $want"
     exit 2
@@ -81,7 +81,7 @@ fi
 attempt=1
 while :; do
     smoke_rc=0
-    smoke=$(podman run --rm --init --replace --name ci-burst-refresh-smoke \
+    smoke=$(podman run --rm --init --replace --network ci-burst --name ci-burst-refresh-smoke \
         --read-only \
         --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
         --volume "$CONFIG:/etc/ci-burst/deployment.toml:ro" \

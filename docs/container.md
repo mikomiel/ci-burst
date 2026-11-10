@@ -63,19 +63,20 @@ responses come back. That asymmetry is the dangerous part — `plan` can look
 healthy while `apply` times out against the provider and the Forgejo API, which
 is what happened on the first live host before the network was named here.
 Nothing clamps MSS on such a path, so the container's own limit has to match it.
-`1300` is the value used in these examples; measure the path where it differs or
-where 1500 works, and create the network without `--opt mtu` in that case.
+`1300` is the value used in these examples. Measure the path on the host: use
+the measured value when it is lower than 1500, and omit `--opt mtu` only when
+the path carries the default 1500.
 
 Do not work around it with `--network=host`: the units keep their own network
-namespace so the loopback warning below stays true and the container cannot
-reach host-local services.
+namespace, so the loopback warning below stays true and a loopback address in
+the deployment TOML still names the container, not the Forgejo server.
 
 ## Build the image
 
 From a checkout of this repository:
 
 ```sh
-podman build --tag localhost/ci-burst:latest .
+podman build --network=host --tag localhost/ci-burst:latest .
 ```
 
 The build context is default-deny: only `pyproject.toml`, `README.md`,
@@ -193,7 +194,7 @@ the `apply` invocation on the scaler host and the `reap` invocation on the
 cleanup host. To run `apply` by hand as root:
 
 ```sh
-podman run --rm --init --name ci-burst-manual \
+podman run --rm --init --network ci-burst --name ci-burst-manual \
   --read-only \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
   --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \
@@ -212,7 +213,7 @@ To request expiry termination by hand, use the cleanup identity and drop the
 token and the state directory, which `reap` does not need:
 
 ```sh
-podman run --rm --init --name ci-burst-reap-manual \
+podman run --rm --init --network ci-burst --name ci-burst-reap-manual \
   --read-only \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
   --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \
@@ -421,7 +422,7 @@ credential-free CI job, which has no such host.
 ## Loopback is not the Forgejo server
 
 Inside the container, `localhost` and `127.0.0.1` name the container itself.
-The units publish no port and use podman's default network, so
+The units publish no port and use the named `ci-burst` network, so
 `https://localhost` in `forgejo.base_url` makes the controller call itself and
 fail. It does not reach the Forgejo server on the host, even when both run on
 the same machine.

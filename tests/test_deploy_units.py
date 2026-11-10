@@ -463,10 +463,21 @@ class ImageTests(unittest.TestCase):
     def setUp(self):
         self.dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
-    def test_the_guide_creates_the_network_every_host_needs(self):
-        guide = (ROOT / "docs/container.md").read_text(encoding="utf-8")
-        self.assertIn("podman network create --opt mtu=1300 ci-burst", guide)
-        self.assertIn("### The container network", guide)
+    def test_the_guides_create_the_network_and_use_it(self):
+        container = (ROOT / "docs/container.md").read_text(encoding="utf-8")
+        walkthrough = (ROOT / "docs/deployment.md").read_text(encoding="utf-8")
+        create = "podman network create --opt mtu=1300 ci-burst"
+        self.assertIn("### The container network", container)
+        self.assertIn(create, container)
+        # Every install block in the end-to-end walkthrough creates it too, on
+        # the scaler and on the reaper host.
+        self.assertEqual(walkthrough.count(create), 2)
+        # A manual run or build that omits the network reproduces the stall this
+        # change fixes, so both guides' commands name it.
+        for name, guide in (("container.md", container), ("deployment.md", walkthrough)):
+            with self.subTest(guide=name):
+                self.assertIn("podman run --rm --init --network ci-burst --name", guide)
+                self.assertIn("podman build --network=host --tag localhost/ci-burst:latest", guide)
 
     def test_uses_the_python_slim_base_and_installs_the_package(self):
         self.assertIn("FROM python:3.12-slim", self.dockerfile)

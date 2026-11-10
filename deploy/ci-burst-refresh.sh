@@ -2,17 +2,28 @@
 # Deploy the current ci-burst main to this host as the controller image.
 #
 # One run compares the deployed commit with origin/main and does nothing when
-# they match. Otherwise it builds a candidate, smoke-tests it with a `plan` run
-# (which writes nothing, allocates nothing and launches nothing), and only then
-# promotes the tag the scheduled units resolve. A fetch, build or smoke failure
-# leaves the previous image in place: every scheduled run resolves
-# localhost/ci-burst:latest fresh, and an in-flight container keeps the layer it
-# started with, so nothing needs restarting after a promotion.
+# they match. Otherwise it builds the image from a tar archive of exactly that
+# commit (never from the working tree, so an edited checkout cannot be deployed
+# under a clean commit's name), smoke-tests the candidate, and only then moves
+# the tag the scheduled units resolve.
+#
+# The smoke run is a `plan` execution from the candidate against this host's own
+# configuration and scaling credentials. It must complete: exit 0 with a
+# decision document. A refusal (exit 2) is a failed smoke, because a candidate
+# that cannot read this host's configuration is exactly what the schedule would
+# hit on its next tick. `plan` writes nothing, allocates nothing and launches
+# nothing.
+#
+# Rollback handles are created before the serving tag moves, so a failure never
+# leaves the host with no working image and no way back:
+#   * localhost/ci-burst:sha-<12>  the promoted commit, immutable;
+#   * localhost/ci-burst:previous  whatever `latest` pointed at before this
+#                                 promotion, including the hand-built image a
+#                                 fresh install starts with.
 #
 # No credential is stored by or passed to this script: the clone is a public
-# HTTPS clone. The smoke run mounts this host's own deployment TOML and scaling
-# credentials read-only, exactly as the apply unit does, so a broken mount or a
-# configuration the new image cannot read is caught before the schedule sees it.
+# HTTPS clone. Host python3 is required to validate the smoke document, as it
+# already is for the documented lifecycle test in docs/container.md.
 #
 # Installed from the checkout:
 #   install -m 0755 deploy/ci-burst-refresh.sh /usr/local/sbin/ci-burst-refresh
@@ -47,47 +58,69 @@ if [ "$want" = "$recorded" ]; then
     exit 0
 fi
 
-if ! git -C "$SOURCE" checkout --quiet --detach "$want"; then
-    log "checkout_failed: $want"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT INT TERM
+mkdir "$work/src"
+if ! git -C "$SOURCE" archive --format=tar --output "$work/tree.tar" "$want"; then
+    log "archive_failed: $want"
+    exit 2
+fi
+if ! tar -xf "$work/tree.tar" -C "$work/src"; then
+    log "unpack_failed: $want"
     exit 2
 fi
 
-if ! podman build --quiet --tag "$IMAGE:candidate" "$SOURCE" >/dev/null; then
+if ! podman build --quiet --tag "$IMAGE:candidate" "$work/src" >/dev/null; then
     log "build_failed: $want"
     exit 2
 fi
 
-# Every controller run prints one JSON document and exits 0 for a completed
-# decision or 2 for a refusal with nothing mutated, so either exit is accepted
-# as long as the document is there. A crash exits 1 and prints nothing, which is
-# the case this gate exists to catch. `plan` is the safe command: it is an
-# observation path.
 smoke_rc=0
-smoke=$(podman run --rm --read-only \
+smoke=$(podman run --rm --init --replace --name ci-burst-refresh-smoke \
+    --read-only \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
     --volume "$CONFIG:/etc/ci-burst/deployment.toml:ro" \
     --volume "$AWS_CREDENTIALS:/etc/ci-burst/aws:ro" \
     --env-file "$TOKEN_ENV" \
     "$IMAGE:candidate" plan --config /etc/ci-burst/deployment.toml 2>/dev/null) || smoke_rc=$?
-case "$smoke_rc" in
-    0 | 2) ;;
-    *)
-        log "smoke_failed: $want exit $smoke_rc"
-        exit 2
-        ;;
-esac
-case "$smoke" in
-    '{'*) ;;
-    *)
-        log "smoke_failed: $want printed no decision document"
-        exit 2
-        ;;
-esac
+if [ "$smoke_rc" -ne 0 ]; then
+    log "smoke_failed: $want exit $smoke_rc"
+    exit 2
+fi
+if ! printf '%s' "$smoke" | python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+if "error" in document or "decision" not in document:
+    raise SystemExit(1)
+' 2>/dev/null; then
+    log "smoke_failed: $want did not print a plan decision"
+    exit 2
+fi
 
 short=$(printf '%s' "$want" | cut -c1-12)
-podman tag "$IMAGE:candidate" "$IMAGE:latest" || { log "promote_failed: $want"; exit 2; }
-# The immutable tag is the rollback handle: `podman tag localhost/ci-burst:sha-<12> latest`.
-podman tag "$IMAGE:candidate" "$IMAGE:sha-$short" || { log "tag_failed: $want"; exit 2; }
+if ! podman tag "$IMAGE:candidate" "$IMAGE:sha-$short"; then
+    log "tag_failed: $want"
+    exit 2
+fi
+
+# The way back is captured before the serving tag moves, and captured from
+# `latest` rather than assumed: the first refresh after a manual install
+# replaces an image that has no sha tag of its own.
+current=$(podman image inspect --format '{{.Id}}' "$IMAGE:latest" 2>/dev/null || true)
+candidate=$(podman image inspect --format '{{.Id}}' "$IMAGE:candidate" 2>/dev/null || true)
+if [ -n "$current" ] && [ "$current" != "$candidate" ]; then
+    if ! podman tag "$current" "$IMAGE:previous"; then
+        log "previous_tag_failed: $want"
+        exit 2
+    fi
+fi
+
+if ! podman tag "$IMAGE:candidate" "$IMAGE:latest"; then
+    log "promote_failed: $want"
+    exit 2
+fi
 podman rmi "$IMAGE:candidate" >/dev/null 2>&1 || true
 
 printf '%s\n' "$want" >"$STATE/deployed-sha.tmp"

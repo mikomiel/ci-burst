@@ -308,25 +308,54 @@ What a promotion does and does not do:
 - it retags `localhost/ci-burst:latest`, which the scheduled units resolve on
   every run, plus an immutable `localhost/ci-burst:sha-<12>`. No run needs a
   restart, and a container already running keeps the layer it started with;
+- before `latest` moves, it tags whatever `latest` pointed at as
+  `localhost/ci-burst:previous`. That is the rollback handle for the first
+  refresh too, when the serving image is a hand-built one with no `sha-<12>` tag
+  of its own;
 - it records the deployed commit in `/var/lib/ci-burst-image/deployed-sha`;
 - it publishes nothing: no registry, no git tag, no release, no announcement. A
   merge deploys the controller; [CONTRIBUTING.md](../CONTRIBUTING.md) § Releases
   owns the release boundary, and a merge is still neither a release nor a
   deployment of a released artifact;
-- a fetch, build or smoke failure keeps the previous image in place and logs one
-  line with a reason code (`fetch_failed`, `build_failed`, `smoke_failed`,
-  `promote_failed`) in `journalctl -u ci-burst-refresh.service`;
+- the build context is a tar archive of the fetched commit, not the working
+  tree, so an edited or untracked file in the clone can never enter the image
+  under a clean commit's name. The clone is only a fetch cache and is never
+  reset, cleaned or checked out;
+- a fetch, archive, build or smoke failure keeps the previous image in place and
+  logs one line with a reason code (`fetch_failed`, `archive_failed`,
+  `unpack_failed`, `build_failed`, `smoke_failed`, `tag_failed`,
+  `previous_tag_failed`, `promote_failed`) in
+  `journalctl -u ci-burst-refresh.service`;
 - the smoke run is a `plan` execution from the candidate against this host's own
-  configuration and scaling credentials. It writes nothing and launches nothing,
-  and it is what stops an image that crashes at startup from reaching the
-  schedule.
+  configuration and scaling credentials. It writes nothing and launches nothing.
+  It must **complete** — exit 0 with a decision document — because a refusal
+  means the candidate cannot read this host's configuration, which is exactly
+  what the next scheduled `apply` would hit. The document is validated with the
+  host's `python3`, which the lifecycle test below already requires.
 
-Rollback is two commands: disable the timer, then retag a previous build.
+Rollback retags a previous image, and it must not race a refresh that is already
+running: the timer only schedules, so stopping the timer alone leaves an
+in-progress build free to move `latest` afterwards.
 
 ```sh
+systemctl stop ci-burst-refresh.service          # waits for a run in progress
 systemctl disable --now ci-burst-refresh.timer
+podman tag localhost/ci-burst:previous localhost/ci-burst:latest
+# or any promoted commit:
 podman tag localhost/ci-burst:sha-<12> localhost/ci-burst:latest
 ```
+
+A run started by hand with `systemctl start ci-burst-refresh.service` takes the
+same lock as the timer, so hold it while retagging if one might be active:
+
+```sh
+flock /var/lib/ci-burst-image/refresh.lock \
+  podman tag localhost/ci-burst:previous localhost/ci-burst:latest
+```
+
+`systemctl is-active ci-burst-refresh.service` reports the launcher, not a
+build: a promotion that already finished has moved `latest`, so roll back after
+it, not against it.
 
 The script is installed by hand from the checkout, so a change to the script
 needs that install step repeated; a change to the controller does not. The

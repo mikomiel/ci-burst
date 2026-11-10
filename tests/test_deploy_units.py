@@ -22,6 +22,9 @@ import configparser
 import fnmatch
 import re
 import shlex
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -162,19 +165,28 @@ class RefreshTests(unittest.TestCase):
             self.script.index("deployed-sha"), self.script.index("podman build")
         )
 
-    def test_moves_the_checkout_without_discarding_work(self):
-        self.assertIn("checkout --quiet --detach", self.script)
-        for destructive in ("reset --hard", "clean -", "push --force"):
-            with self.subTest(destructive=destructive):
-                self.assertNotIn(destructive, self.script)
+    def test_builds_an_archive_of_the_exact_commit(self):
+        # The build context is a tar archive of the fetched commit, so an edited
+        # or untracked file in the clone can never enter the image.
+        self.assertIn("archive --format=tar", self.script)
+        self.assertIn('tar -xf "$work/tree.tar" -C "$work/src"', self.script)
+        for avoid in ("reset --hard", "clean -", "push --force", 'git -C "$SOURCE" checkout'):
+            with self.subTest(avoid=avoid):
+                self.assertNotIn(avoid, self.script)
 
     def test_smoke_tests_the_candidate_before_promoting_it(self):
         smoke = self.script.index("plan --config")
         self.assertLess(self.script.index("podman build"), smoke)
         self.assertLess(smoke, self.script.index('"$IMAGE:latest"'))
+        # A completed decision is required, not "any document": a config refusal
+        # is exit 2 and must fail the smoke.
+        self.assertIn('if [ "$smoke_rc" -ne 0 ]', self.script)
+        self.assertIn('"decision" not in document', self.script)
+        self.assertIn("--name ci-burst-refresh-smoke", self.script)
 
-    def test_promotes_latest_and_an_immutable_rollback_tag(self):
+    def test_promotes_latest_and_both_rollback_handles(self):
         self.assertIn('"$IMAGE:sha-$short"', self.script)
+        self.assertIn('"$IMAGE:previous"', self.script)
         self.assertIn("deployed-sha", self.script)
 
     def test_holds_a_lock_so_two_runs_never_build_together(self):
@@ -184,6 +196,111 @@ class RefreshTests(unittest.TestCase):
         for marker in ("aws_secret", "AWS_SECRET", "aws_access_key_id", "password"):
             with self.subTest(marker=marker):
                 self.assertNotIn(marker, self.script)
+
+
+class RefreshBehaviourTests(unittest.TestCase):
+    """Run the script with fake `git` and `podman`, and no host state.
+
+    The static assertions above pin the shape; these pin the behaviour a
+    promotion must have or refuse.
+    """
+
+    want = "0123456789abcdef0123456789abcdef01234567"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="ci-burst-refresh-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.calls = self.root / "calls.log"
+        self.calls.touch()
+        self.state = self.root / "state"
+        for name in ("source", "aws"):
+            (self.root / name).mkdir()
+        (self.root / "deployment.toml").write_text("", encoding="utf-8")
+        (self.root / "forgejo.env").write_text("", encoding="utf-8")
+        self._fake(
+            "git",
+            'case "$*" in\n'
+            '  *" rev-parse "*) printf "%s\\n" "$CI_BURST_TEST_WANT"; exit 0 ;;\n'
+            '  *" archive "*) out= ; prev= ;\n'
+            '    for a in "$@"; do [ "$prev" = "--output" ] && out=$a; prev=$a; done\n'
+            '    tar -cf "$out" -T /dev/null; exit 0 ;;\n'
+            "  *) exit 0 ;;\n"
+            "esac",
+        )
+        self._fake(
+            "podman",
+            'case "$*" in\n'
+            '  "run "*" plan --config "*) printf "%s" "$CI_BURST_TEST_SMOKE"; exit "$CI_BURST_TEST_SMOKE_RC" ;;\n'
+            '  "image inspect "*"latest"*) printf "%s\\n" sha256:old; exit 0 ;;\n'
+            '  "image inspect "*) printf "%s\\n" sha256:new; exit 0 ;;\n'
+            "  *) exit 0 ;;\n"
+            "esac",
+        )
+
+    def _fake(self, name, body):
+        path = self.bin / name
+        path.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$*\" >>{shlex.quote(str(self.calls))}\n" + body + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    def run_script(self, smoke='{"decision": "wait"}', smoke_rc="0"):
+        return subprocess.run(
+            ["sh", str(DEPLOY / "ci-burst-refresh.sh")],
+            env={
+                "PATH": f"{self.bin}:/usr/local/bin:/usr/bin:/bin",
+                "CI_BURST_SOURCE": str(self.root / "source"),
+                "CI_BURST_IMAGE_STATE": str(self.state),
+                "CI_BURST_CONFIG": str(self.root / "deployment.toml"),
+                "CI_BURST_AWS_DIR": str(self.root / "aws"),
+                "CI_BURST_TOKEN_ENV": str(self.root / "forgejo.env"),
+                "CI_BURST_TEST_WANT": self.want,
+                "CI_BURST_TEST_SMOKE": smoke,
+                "CI_BURST_TEST_SMOKE_RC": smoke_rc,
+            },
+            capture_output=True,
+            text=True,
+        )
+
+    def test_a_refusal_document_never_promotes(self):
+        completed = self.run_script(
+            smoke='{"error": {"reason": "CONFIG_INVALID"}}', smoke_rc="2"
+        )
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("latest", self.calls.read_text(encoding="utf-8"))
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_document_without_a_decision_never_promotes(self):
+        completed = self.run_script(smoke='{"other": true}')
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_promotion_records_the_commit_and_both_rollback_handles(self):
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.calls.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            (self.state / "deployed-sha").read_text(encoding="utf-8").strip(), self.want
+        )
+        self.assertIn(
+            f"tag localhost/ci-burst:candidate localhost/ci-burst:sha-{self.want[:12]}",
+            calls,
+        )
+        self.assertLess(
+            calls.index("tag sha256:old localhost/ci-burst:previous"),
+            calls.index("tag localhost/ci-burst:candidate localhost/ci-burst:latest"),
+        )
+
+    def test_an_unchanged_commit_builds_nothing(self):
+        self.state.mkdir(parents=True)
+        (self.state / "deployed-sha").write_text(self.want + "\n", encoding="utf-8")
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("build", self.calls.read_text(encoding="utf-8"))
 
 
 class ImageTests(unittest.TestCase):

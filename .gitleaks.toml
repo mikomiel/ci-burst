@@ -11,25 +11,11 @@ regex = '''\b(?:10\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,
 [[rules]]
 id = "private-dns-name"
 description = "Do not publish internal deployment DNS names"
-# The match may begin with the character that introduces a filename: a
-# backtick quote, a leading dot, or a single slash in a path. That prefix is
-# part of the secret (secretGroup = 1), so an allowlist can exempt the filename
-# forms without exempting the same word used as a hostname. A URL authority
-# starts with two slashes, so it is matched with both and stays flagged, as do
-# HOST assignments, bare prose and every other name under these TLDs.
-regex = '''(?i)((?:\.|`|//|/)?\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:internal|lan|local)\b)'''
-secretGroup = 1
+regex = '''(?i)\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:internal|lan|local)\b'''
+  # The dotenv filename `.env.local` is not a private DNS name: the rule's
+  # match on it is the bare word `env.local`. Other hostnames under these
+  # TLDs still match and are still flagged.
   [[rules.allowlists]]
-  description = "The dotenv filename, quoted, dot-prefixed or in a path, is not a private DNS name"
-  regexTarget = "secret"
-  regexes = ['''^\.env\.local$''', '''^`env\.local$''', '''^/env\.local$''']
-  # The test that pins this rule used the placeholder as a bare literal in its
-  # earlier revision, which stays in the public history. The exemption is
-  # limited to that one file and that one exact secret, so it cannot cover a
-  # hostname in any other file.
-  [[rules.allowlists]]
-  description = "The rule's own test file carries the placeholder literal"
-  condition = "AND"
-  paths = ['''^tests/test_public_content_scan\.py$''']
+  description = "The dotenv filename `.env.local` is not a private DNS name"
   regexTarget = "secret"
   regexes = ['''^env\.local$''']

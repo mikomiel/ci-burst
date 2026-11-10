@@ -330,24 +330,39 @@ alert in this project should be described as one.
 
 ### Sizing the window
 
-`allowance` bounds a rolling window, and sharing a pool label changes what the
-number means. A dispatch-only deployment spends one reservation per manual run; a
-deployment that also counts pool demand spends one per congested launch, which on
-a busy day can be a dozen. Size the figure from launches per day × reservation,
-not from how often someone dispatches, and keep the window guard as the hard
-stop rather than raising it to match an unexpected day.
+Every launch the controller admits reserves the configured maximum price ×
+lifetime plus the non-compute allowance, and that reservation is charged to an
+**anchored** window: boundaries are floored from the epoch at a multiple of
+`window_seconds`, and outstanding operations carry into later windows. It is not
+a trailing period, so the end of one window and the start of the next are two
+budgets that can be spent back to back around the boundary. Size the allowance
+from launches per configured window; "per day" is the same statement only when
+`window_seconds` is 86400.
 
-A failed attempt does not always spend the allowance: a definite provider
-rejection is released, while an uncertain outcome keeps its reservation until it
-is resolved. Only a window that contains uncertain or partially resolved attempts
-can be exhausted without an instance ever running.
+"Per dispatch" is not a safe unit either. The controller admits a launch whenever
+eligible demand remains and the slot is free, so one dispatched workflow with
+several eligible jobs can spend several reservations as its one-job workers
+finish. Only a workload with an established one-launch-per-dispatch shape can be
+sized by dispatches; every other deployment is sized by admitted launches.
+
+Which attempts stop charging is narrow:
+
+- a **proven rejection before creation** releases its reservation;
+- an **accepted launch** keeps its reservation even if the instance never
+  reaches `running` or dies during startup, because the provider may have created
+  and billed something;
+- an uncertain outcome keeps it until the intent is resolved.
+
+So a window can be exhausted without a job ever running — accepted launches that
+failed to start, or attempts left uncertain. That is the guard being
+conservative on purpose rather than a defect.
 
 Worked example from the pilot: a `0.1200` maximum price with a one-hour lifetime
 and a `0.50` non-compute allowance reserves `0.62` per launch, so a `5.00` window
-admits eight. One evening of shared-pool launches plus five capacity rejections
-from before that release rule existed consumed `4.96`, and the next launch after
-that was refused with `budget_allowance_exhausted` until the window rolled.
-
+admits eight (`8 × 0.62 = 4.96`; a ninth would need `5.58`). One evening of
+shared-pool launches plus five capacity rejections from before the release rule
+consumed exactly that, and every cycle then refused with
+`budget_allowance_exhausted` until the window rolled.
 
 ## Launch decision and capacity fallback
 

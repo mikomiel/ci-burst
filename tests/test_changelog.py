@@ -398,6 +398,19 @@ class ReleaseBoundaryTests(unittest.TestCase):
             self.assertTrue(any("does not contain" in error for error in errors), errors)
         self.assertIn("does not contain", changelog.boundary_problem(published, self.root))
 
+        # The preparation marker waives only the tag's absence: an existing tag
+        # that predates the section must still fail closed.
+        with_marker = published.replace(
+            "## [0.1.0] - 2026-11-09",
+            "## [0.1.0] - 2026-11-09\n\n<!-- release-pending: v0.1.0 -->",
+        )
+        for errors in (
+            changelog.binding_errors(with_marker, tags),
+            changelog.release_validation_errors(with_marker, tags),
+        ):
+            self.assertTrue(any("does not contain" in error for error in errors), errors)
+        self.assertIn("does not contain", changelog.boundary_problem(with_marker, self.root))
+
         for arguments in (("--validate-release",), ("--write",)):
             with self.subTest(arguments=arguments):
                 completed = subprocess.run(

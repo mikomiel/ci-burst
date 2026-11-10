@@ -294,6 +294,12 @@ def _reconcile(text, tags, allow_preparation):
                     f"release-pending marker for v{version} remains; "
                     "remove it after creating the tag"
                 )
+            # The marker waives only tag *absence*: a tag that exists but
+            # predates the section still fails closed.
+            if f"v{version}" in tags and not tags[f"v{version}"]:
+                errors.append(
+                    f"annotated tag v{version} does not contain the released section [{version}]"
+                )
             continue
         if f"v{version}" not in tags:
             errors.append(_tag_error(version))

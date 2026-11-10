@@ -50,7 +50,7 @@ class ChangelogFileTests(unittest.TestCase):
         self.assertEqual(changelog.unreleased_section(TEXT).count(changelog.UNRELEASED), 1)
 
     def test_released_headings_are_prepared_or_tagged(self):
-        errors = changelog.binding_errors(TEXT, changelog.tag_types())
+        errors = changelog.binding_errors(TEXT, changelog.applicable_tags())
         self.assertEqual(
             errors,
             [],
@@ -66,30 +66,28 @@ class ReleaseStateTests(unittest.TestCase):
         self.assertTrue(changelog.binding_errors(PUBLISHED, {}))
 
     def test_published_heading_accepts_a_prefixed_annotated_tag(self):
-        self.assertEqual(changelog.binding_errors(PUBLISHED, {"v0.1.0": "tag"}), [])
+        self.assertEqual(changelog.binding_errors(PUBLISHED, {"v0.1.0"}), [])
 
-    def test_published_heading_rejects_lightweight_and_unprefixed_tags(self):
-        for tags in ({"v0.1.0": "commit"}, {"0.1.0": "tag"}, {}):
-            with self.subTest(tags=tags):
-                self.assertTrue(changelog.binding_errors(PUBLISHED, tags))
+    def test_published_heading_needs_an_applicable_tag(self):
+        self.assertTrue(changelog.binding_errors(PUBLISHED, set()))
 
     def test_preparation_marker_must_match_its_heading(self):
         text = PREPARED.replace("release-pending: v0.1.0", "release-pending: v0.2.0")
-        self.assertTrue(changelog.binding_errors(text, {}))
+        self.assertTrue(changelog.binding_errors(text, set()))
 
     def test_more_than_one_preparation_marker_fails(self):
         text = PREPARED.replace(
             "## [Unreleased]",
             "## [Unreleased]\n\n## [0.2.0] - 2026-11-10\n\n<!-- release-pending: v0.2.0 -->",
         )
-        errors = changelog.binding_errors(text, {})
+        errors = changelog.binding_errors(text, set())
         self.assertTrue(any("more than one release" in error for error in errors))
 
     def test_validation_rejects_a_remaining_preparation_marker(self):
-        self.assertTrue(changelog.release_validation_errors(PREPARED, {"v0.1.0": "tag"}))
+        self.assertTrue(changelog.release_validation_errors(PREPARED, {"v0.1.0"}))
 
     def test_validation_accepts_a_published_bound_heading(self):
-        self.assertEqual(changelog.release_validation_errors(PUBLISHED, {"v0.1.0": "tag"}), [])
+        self.assertEqual(changelog.release_validation_errors(PUBLISHED, {"v0.1.0"}), [])
 
     def test_write_is_blocked_while_the_preparation_tag_does_not_exist(self):
         self.assertIsNotNone(changelog.write_blocked(PREPARED, None))
@@ -98,13 +96,28 @@ class ReleaseStateTests(unittest.TestCase):
 
     def test_duplicate_release_headings_are_refused(self):
         text = PREPARED + "\n## [0.1.0] - 2026-11-10\n\n### Fixed\n\n- Again.\n"
-        errors = changelog.binding_errors(text, {})
+        errors = changelog.binding_errors(text, set())
         self.assertTrue(any("duplicate" in error for error in errors))
 
     def test_malformed_release_heading_is_refused(self):
         text = "# Changelog\n\n## [Unreleased]\n\n## [0.1] - 2026-11-09\n\n- One.\n"
-        errors = changelog.binding_errors(text, {})
-        self.assertTrue(any("malformed" in error for error in errors))
+        errors = changelog.binding_errors(text, set())
+        self.assertTrue(any("noncanonical" in error for error in errors))
+
+    def test_noncanonical_heading_cannot_bypass_validation_or_write_guard(self):
+        for heading in ("##  [0.1.0] - 2026-11-09", "##\t[0.1.0] - 2026-11-09", " ## [0.1.0] - 2026-11-09"):
+            with self.subTest(heading=heading):
+                text = (
+                    "# Changelog\n\n## [Unreleased]\n\n"
+                    f"{heading}\n\n<!-- release-pending: v0.1.0 -->\n\n- One.\n"
+                )
+                self.assertTrue(changelog.binding_errors(text, set()))
+                self.assertTrue(changelog.release_validation_errors(text, set()))
+                self.assertIsNotNone(changelog.write_blocked(text, None))
+                self.assertEqual(
+                    changelog.unreleased_section(text).strip(),
+                    changelog.UNRELEASED,
+                )
 
 
 class ReleaseBoundaryTests(unittest.TestCase):
@@ -170,7 +183,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
     def test_boundary_problem_refuses_a_released_section_without_its_tag(self):
         self.commit("feat: add the controller")
         released = "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-11-09\n\n- One.\n"
-        self.assertIn("no local tag", changelog.boundary_problem(released, self.root))
+        self.assertIn("reachable from HEAD", changelog.boundary_problem(released, self.root))
 
     def test_boundary_problem_refuses_a_tag_without_its_released_section(self):
         self.commit("feat: add the controller")
@@ -193,9 +206,10 @@ class ReleaseBoundaryTests(unittest.TestCase):
 
         clone = self.clone("no-tags", "--no-tags")
         self.assertEqual(changelog.tag_types(clone), {})
+        self.assertEqual(changelog.applicable_tags(clone), set())
         completed = self.run_write(clone)
         self.assertEqual(completed.returncode, 1, completed.stderr)
-        self.assertIn("release evidence is unavailable", completed.stderr)
+        self.assertIn("reachable from HEAD", completed.stderr)
         self.assertEqual((clone / "CHANGELOG.md").read_text(encoding="utf-8"), released)
 
     def test_write_refuses_a_shallow_clone(self):
@@ -249,6 +263,67 @@ class ReleaseBoundaryTests(unittest.TestCase):
         self.git("tag", "-a", "0.1.0", "-m", "0.1.0")
         with self.assertRaises(ValueError):
             changelog.release_tag(self.root)
+
+    def test_applicable_tags_require_annotated_reachable_prefixed_tags(self):
+        self.commit("feat: add the controller")
+        self.assertEqual(changelog.applicable_tags(self.root), set())
+        self.git("tag", "v0.1.0")
+        self.assertEqual(changelog.applicable_tags(self.root), set())
+        self.git("tag", "-d", "v0.1.0")
+        self.git("tag", "-a", "0.1.0", "-m", "0.1.0")
+        self.assertEqual(changelog.applicable_tags(self.root), set())
+        self.git("tag", "-d", "0.1.0")
+        self.git("tag", "-a", "v0.1.0", "-m", "v0.1.0")
+        self.assertEqual(changelog.applicable_tags(self.root), {"v0.1.0"})
+
+    def test_release_checks_reject_a_tag_on_an_unrelated_branch(self):
+        published = (
+            "# Changelog\n\n## [Unreleased]\n\n"
+            "## [0.1.0] - 2026-11-09\n\n### Added\n\n- Add the controller.\n"
+        )
+        self.commit("feat: add the controller")
+        self.git("checkout", "-q", "-b", "side")
+        self.commit("feat: side work", "side.txt")
+        self.git("tag", "-a", "v0.1.0", "-m", "v0.1.0")
+        self.git("checkout", "-q", "main")
+        (self.root / "CHANGELOG.md").write_text(published, encoding="utf-8")
+        self.add_renderer()
+
+        tags = changelog.applicable_tags(self.root)
+        self.assertEqual(tags, set())
+        self.assertTrue(changelog.binding_errors(published, tags))
+        self.assertTrue(changelog.release_validation_errors(published, tags))
+        self.assertIn("reachable from HEAD", changelog.boundary_problem(published, self.root))
+
+        completed = subprocess.run(
+            (sys.executable, "scripts/render_changelog.py", "--validate-release"),
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertIn("reachable from HEAD", completed.stderr)
+
+    def test_noncanonical_heading_cannot_bypass_the_checks(self):
+        text = (
+            "# Changelog\n\n## [Unreleased]\n\n"
+            "##  [0.1.0] - 2026-11-09\n\n<!-- release-pending: v0.1.0 -->\n\n- One.\n"
+        )
+        (self.root / "CHANGELOG.md").write_text(text, encoding="utf-8")
+        self.add_renderer()
+        for arguments in (("--validate-release",), ("--write",)):
+            with self.subTest(arguments=arguments):
+                completed = subprocess.run(
+                    (sys.executable, "scripts/render_changelog.py", *arguments),
+                    cwd=self.root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+                self.assertIn("noncanonical release heading", completed.stderr)
+        self.assertEqual((self.root / "CHANGELOG.md").read_text(encoding="utf-8"), text)
 
 
 class RenderTests(unittest.TestCase):

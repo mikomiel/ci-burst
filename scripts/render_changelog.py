@@ -46,6 +46,7 @@ CATEGORY_ORDER = ("Added", "Changed", "Fixed", "Documentation", "CI")
 _SUBJECT = re.compile(r"^(feat|fix|docs|ci)(?:\([^)]*\))?!?:\s+(?P<text>\S.*)$")
 _PULL_REQUEST = re.compile(r"\s+\(#(?P<number>[0-9]+)\)$")
 _RELEASE_TAG = re.compile(r"^v(?P<version>[0-9]+\.[0-9]+\.[0-9]+)$")
+_H2 = re.compile(r"^ {0,3}##[ \t]+")
 _RELEASED_HEADING = re.compile(r"^## \[(?P<version>[0-9]+\.[0-9]+\.[0-9]+)\]")
 _RELEASE_PENDING = re.compile(r"<!-- release-pending: v(?P<version>[0-9]+\.[0-9]+\.[0-9]+) -->")
 
@@ -152,6 +153,24 @@ def _reachable(name, root=ROOT):
     return True
 
 
+def applicable_tags(root=ROOT):
+    """Reachable annotated ``vX.Y.Z`` tag names; the only release evidence accepted."""
+    return {
+        name
+        for name, kind in tag_types(root).items()
+        if kind == "tag"
+        and _RELEASE_TAG.match(name) is not None
+        and _reachable(name, root)
+    }
+
+
+def _tag_error(version):
+    return (
+        f"released heading [{version}] needs an annotated tag v{version} "
+        "reachable from HEAD (missing, lightweight, or absent from this clone)"
+    )
+
+
 def release_tag(root=ROOT):
     """Latest release tag reachable from HEAD, or None when none is available.
 
@@ -182,8 +201,9 @@ def release_tag(root=ROOT):
 def released_sections(text):
     """Return version to section text for released ``## [x.y.z]`` headings.
 
-    A malformed ``## [...]`` heading or a duplicate version heading raises
-    ValueError, so a structural defect cannot silently disappear from a
+    A bracketed H2 heading that is not canonical (``## [x.y.z]`` with exactly
+    one space), a malformed version, or a duplicate version heading raises
+    ValueError, so a spacing or structural defect cannot disappear from the
     section map.
     """
     sections = {}
@@ -192,20 +212,19 @@ def released_sections(text):
     while index < len(lines):
         line = lines[index]
         index += 1
-        if not line.startswith("## "):
-            continue
-        if line == UNRELEASED:
+        heading = _H2.match(line)
+        if heading is None or line == UNRELEASED:
             continue
         match = _RELEASED_HEADING.match(line)
         if match is None:
-            if line.startswith("## ["):
-                raise ValueError(f"malformed release heading: {line!r}")
+            if line[heading.end():].startswith("["):
+                raise ValueError(f"noncanonical release heading: {line!r}")
             continue
         version = match.group("version")
         if version in sections:
             raise ValueError(f"duplicate release heading [{version}]")
         start = index
-        while index < len(lines) and not lines[index].startswith("## "):
+        while index < len(lines) and _H2.match(lines[index]) is None:
             index += 1
         sections[version] = "\n".join(lines[start:index]).strip()
     return sections
@@ -242,26 +261,13 @@ def boundary_problem(text, root=ROOT):
     except ValueError as error:
         return str(error)
     pending = _pending(sections)
-    tags = tag_types(root)
+    tags = applicable_tags(root)
     for version in sections:
         if version in pending:
             continue
-        name = f"v{version}"
-        kind = tags.get(name)
-        if kind is None:
-            return (
-                f"released heading [{version}] has no local tag {name}; "
-                "release evidence is unavailable (for example a --no-tags clone)"
-            )
-        if kind != "tag":
-            return f"released heading [{version}] has a non-annotated tag {name}"
-        if not _reachable(name, root):
-            return f"released heading [{version}] has tag {name} outside the current history"
-    for name, kind in tags.items():
-        if kind != "tag" or _RELEASE_TAG.match(name) is None:
-            continue
-        if not _reachable(name, root):
-            continue
+        if f"v{version}" not in tags:
+            return _tag_error(version)
+    for name in tags:
         if name[1:] not in sections:
             return (
                 f"annotated tag {name} has no released section; "
@@ -271,7 +277,10 @@ def boundary_problem(text, root=ROOT):
 
 
 def binding_errors(text, tags):
-    """State errors for ``check:policy``: prepared or tag-bound, never neither."""
+    """State errors for ``check:policy``: prepared or tag-bound, never neither.
+
+    ``tags`` is the set of applicable tag names from :func:`applicable_tags`.
+    """
     try:
         sections = released_sections(text)
     except ValueError as error:
@@ -292,13 +301,16 @@ def binding_errors(text, tags):
                     f"does not match heading [{version}]"
                 )
             continue
-        if tags.get(f"v{version}") != "tag":
-            errors.append(f"released heading [{version}] needs an annotated tag v{version}")
+        if f"v{version}" not in tags:
+            errors.append(_tag_error(version))
     return errors
 
 
 def release_validation_errors(text, tags):
-    """Published-state errors: every released heading is tag-bound, nothing pending."""
+    """Published-state errors: every released heading is tag-bound, nothing pending.
+
+    ``tags`` is the set of applicable tag names from :func:`applicable_tags`.
+    """
     try:
         sections = released_sections(text)
     except ValueError as error:
@@ -309,8 +321,8 @@ def release_validation_errors(text, tags):
             f"release-pending marker for v{version} remains; remove it after creating the tag"
         )
     for version in sections:
-        if tags.get(f"v{version}") != "tag":
-            errors.append(f"released heading [{version}] needs an annotated tag v{version}")
+        if f"v{version}" not in tags:
+            errors.append(_tag_error(version))
     return errors
 
 
@@ -337,7 +349,7 @@ def _section_bounds(lines):
     except ValueError:
         return None
     for index in range(start + 1, len(lines)):
-        if lines[index].startswith("## "):
+        if _H2.match(lines[index]) is not None:
             return start, index
     return start, len(lines)
 
@@ -381,7 +393,7 @@ def main(argv=None):
     text = CHANGELOG.read_text(encoding="utf-8") if CHANGELOG.exists() else HEADER + "\n"
 
     if args.validate_release:
-        errors = release_validation_errors(text, tag_types())
+        errors = release_validation_errors(text, applicable_tags())
         for error in errors:
             print(f"error: {error}", file=sys.stderr)
         if errors:

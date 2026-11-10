@@ -157,9 +157,10 @@ exist; do not regenerate between cutting the section and tagging it.
 
 Regeneration fails closed rather than guessing the boundary: the renderer
 refuses a shallow checkout, a released section that cannot be reconciled with
-a local reachable annotated tag (for example a `--no-tags` clone), a malformed
-or duplicate release heading, and a preparation marker whose tag does not
-exist. Fetch tags or the full history instead of bypassing the check.
+a local reachable annotated tag (for example a `--no-tags` clone or a tag on
+an unrelated branch), a malformed, noncanonical or duplicate release heading,
+and a preparation marker whose tag does not exist. Fetch tags or the full
+history instead of bypassing the check.
 
 ## Checks
 

@@ -23,6 +23,7 @@ and the validation step that binds it to that tag.
 - Read review status creators from the status list ([#3](https://github.com/mikomiel/ci-burst/pull/3)).
 - Bound the changelog at the release boundary.
 - Fail closed when release evidence is unavailable.
+- Tighten the changelog release checks.
 
 ### Documentation
 

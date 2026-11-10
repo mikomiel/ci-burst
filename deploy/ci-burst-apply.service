@@ -3,6 +3,17 @@
 # 2 refusal, 1 provider or cleanup failure), and the timer decides when the next
 # run starts.
 #
+# The service stays activating while the container runs, so `systemctl stop`
+# cancels the start job and does not run ExecStop. Cleanup uses a stable
+# container name and ExecStopPost, which systemd runs after a stop and after a
+# failed start, including a TimeoutStartSec expiry:
+#   * --init gives the container a minimal init, so SIGTERM can end the run;
+#     the CLI has no signal handler and would be container PID 1 without it;
+#   * KillMode=process stops the launcher without killing conmon first, so the
+#     cleanup command can still remove the container;
+#   * ExecStopPost force-removes the named container and is idempotent.
+# Forced removal is the guarantee; the signal path only makes it quick.
+#
 # The state DIRECTORY is the only writable host path: the SQLite ledger, its
 # .lock and its rollback journal must stay together in one directory. Do not
 # point this unit at a copied ledger file.
@@ -19,7 +30,9 @@ After=network-online.target
 [Service]
 Type=oneshot
 TimeoutStartSec=300
-ExecStart=/usr/bin/podman run --rm \
+TimeoutStopSec=15
+KillMode=process
+ExecStart=/usr/bin/podman run --rm --replace --init --name ci-burst-apply \
     --read-only \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
     --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \
@@ -27,3 +40,4 @@ ExecStart=/usr/bin/podman run --rm \
     --volume /etc/ci-burst/aws-scaling:/etc/ci-burst/aws:ro \
     --env-file /etc/ci-burst/forgejo.env \
     localhost/ci-burst:latest apply --config /etc/ci-burst/deployment.toml
+ExecStopPost=-/usr/bin/podman rm --force --ignore --time 5 ci-burst-apply

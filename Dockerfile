@@ -10,7 +10,9 @@
 #   * the state DIRECTORY is mounted writable. The SQLite ledger, its .lock and
 #     its rollback journal must stay in that one directory: a copied file is a
 #     second ledger and a second budget.
-#   * cloud credentials are mounted read-only; none is baked into this image.
+#   * cloud credentials are mounted read-only; none is baked into this image,
+#     and the SDK's instance-metadata fallback is disabled so a missing or
+#     unreadable file fails instead of using a host instance role.
 #   * the Forgejo token arrives in an --env-file, which is visible in
 #     `podman inspect`. A token-file option is a follow-up, not part of this
 #     change.
@@ -20,6 +22,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    AWS_EC2_METADATA_DISABLED=true \
     AWS_SHARED_CREDENTIALS_FILE=/etc/ci-burst/aws/credentials \
     AWS_CONFIG_FILE=/etc/ci-burst/aws/config
 

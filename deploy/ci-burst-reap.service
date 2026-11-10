@@ -8,6 +8,10 @@
 # It deliberately receives no Forgejo token, no env-file and no state mount:
 # `reap --apply` needs neither Forgejo nor the scaling ledger. It describes
 # owned instances and terminates only expired ones with the cleanup identity.
+#
+# Like the apply unit, it keeps a stable container name, runs with --init and
+# force-removes that container in ExecStopPost; a stop or start timeout must not
+# leave a run executing after the unit reports it stopped.
 [Unit]
 Description=ci-burst reap (expiry cleanup of owned AWS Spot instances)
 Documentation=https://github.com/mikomiel/ci-burst/blob/main/docs/container.md
@@ -17,9 +21,12 @@ After=network-online.target
 [Service]
 Type=oneshot
 TimeoutStartSec=300
-ExecStart=/usr/bin/podman run --rm \
+TimeoutStopSec=15
+KillMode=process
+ExecStart=/usr/bin/podman run --rm --replace --init --name ci-burst-reap \
     --read-only \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
     --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \
     --volume /etc/ci-burst/aws-cleanup:/etc/ci-burst/aws:ro \
     localhost/ci-burst:latest reap --apply --config /etc/ci-burst/deployment.toml
+ExecStopPost=-/usr/bin/podman rm --force --ignore --time 5 ci-burst-reap

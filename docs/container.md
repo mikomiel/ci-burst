@@ -23,15 +23,21 @@ credential-free validation CI.
 - The units run it with a read-only root filesystem and a tmpfs for `/tmp`.
   Every durable write belongs in the mounted state directory; the tmpfs covers
   transient files.
+- Each unit names its container (`ci-burst-apply`, `ci-burst-reap`) and
+  force-removes it in `ExecStopPost`. The image starts the CLI directly and the
+  CLI has no signal handler, so without an init it would run as container PID 1
+  and ignore SIGTERM; the units therefore pass `--init`, but a stopped or
+  timed-out unit is still not by itself proof that the run ended.
 
 The container is not a scheduler. Forgejo owns job assignment and results;
 ci-burst launches at most one Spot instance per deployment.
 
 ## Prerequisites
 
-- Rootful podman and systemd on the controller host. The commands and units
-  assume the default podman user namespace: container UID/GID 10001 is host
-  UID/GID 10001.
+- Rootful podman with the `catatonit` init binary (the units run
+  `podman run --init`) and systemd on the controller host. The commands and
+  units assume the default podman user namespace: container UID/GID 10001 is
+  host UID/GID 10001.
 - A deployment TOML prepared from [operations.md](operations.md), including
   the `forgejo.qualification` decision. `fixtures-only` still blocks `apply`.
 - A scaling identity and a separate cleanup identity, each provided as a
@@ -94,6 +100,11 @@ identity. The cleanup file holds the cleanup identity, which keeps
 copy the scaling file into the cleanup directory: cleanup would inherit launch
 permission, and a broken scaling identity would take cleanup with it.
 
+The image also sets `AWS_EC2_METADATA_DISABLED=true`, so a missing or unreadable
+credentials file fails instead of falling back to a reachable instance role.
+Override that variable only if you deliberately use an instance profile, which
+is not the two mounted identities this shape expects.
+
 Under rootless podman the mapping differs. Add
 `--userns=keep-id:uid=10001,gid=10001` to the run command so container UID/GID
 10001 maps to your user, and make the state directory, credential files and
@@ -137,10 +148,11 @@ change. Do not put AWS keys in this file; cloud credentials are mounted files.
 
 ## Run one command manually
 
-The scheduled units run the same invocation. To run `apply` by hand as root:
+The scheduled units run the same shape with their fixed container name. To
+run `apply` by hand as root:
 
 ```sh
-podman run --rm \
+podman run --rm --init --name ci-burst-manual \
   --read-only \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
   --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \
@@ -159,7 +171,7 @@ To request expiry termination by hand, use the cleanup identity and drop the
 token and the state directory, which `reap` does not need:
 
 ```sh
-podman run --rm \
+podman run --rm --init --name ci-burst-reap-manual \
   --read-only \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
   --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \
@@ -170,6 +182,11 @@ podman run --rm \
 Every run prints one JSON document with stable reason codes. There is no
 daemon to restart: each run reads the TOML, the credentials and the env-file
 fresh.
+
+A manual run is named `ci-burst-manual` (`ci-burst-reap-manual` for `reap`).
+If it does not exit after `Ctrl-C`, remove it by name with
+`podman rm --force ci-burst-manual`; a survivor blocks the next manual run and
+can still be inside a provider call.
 
 On a host with SELinux enforcing, add a relabel option to each bind mount. The
 deployment TOML is shared by both units and can be in use by two containers at
@@ -200,8 +217,9 @@ systemctl list-timers 'ci-burst-*'
 finished; the effective period is the run duration plus about 60 seconds. The
 timer never starts a second copy of the unit, and the ledger's writer lock would
 refuse one anyway. Disabling the timer does not stop a run that is already
-executing; the rollback procedure quiesces the service before state is
-inspected or moved.
+executing: stop the service and remove its named container before state is
+inspected or moved. `systemctl is-active` describes the launcher only, never a
+surviving container.
 
 `ci-burst-reap.timer` runs `reap --apply` five minutes after the previous run
 finished, on its own unit.
@@ -222,6 +240,20 @@ systemctl status ci-burst-apply.service
 A failed run does not stop the timers; the next scheduled run tries again. A
 persistent refusal is a signal to read the JSON reason code and `status`, not
 to raise the run frequency or remove the lock.
+
+### Verify the container cleanup
+
+The lifecycle test is opt-in; it needs root, podman, systemd and a local
+`localhost/ci-burst:latest` image:
+
+```sh
+CI_BURST_RUN_CONTAINER_TESTS=1 \
+  python3 -m unittest discover -s tests -p 'test_container_lifecycle.py' -v
+```
+
+It stops an activating unit, lets `TimeoutStartSec` expire, and requires the
+named container to be gone and the name to be reusable. It is skipped in the
+credential-free CI job, which has no such host.
 
 ## Loopback is not the Forgejo server
 
@@ -252,10 +284,10 @@ deployment, one controller host and one ledger copy is the supported topology.
 - `reap` never needs this directory, which is why cleanup keeps working when
   the ledger is unavailable.
 - To migrate hosts, stop admission as in rollback step 1, including the
-  in-flight run, and confirm no container is still running before moving the
-  whole directory instead of copying it. A process that still holds the ledger
-  can keep writing to it while it is moved. Start admission only on the new
-  host.
+  container, and confirm `podman ps -a --filter name=ci-burst-apply` lists
+  nothing before moving the whole directory instead of copying it. A process
+  that still holds the ledger can keep writing to it while it is moved. Start
+  admission only on the new host.
 
 ## Rollback
 
@@ -265,19 +297,23 @@ installed it becomes:
 
 1. Stop admission completely, including the run already in progress.
    Disabling the timer stops future triggers only; a run that is executing can
-   still reach the provider:
+   still reach the provider, and it can outlive its launcher:
 
    ```sh
    systemctl disable --now ci-burst-apply.timer
    systemctl stop ci-burst-apply.service
-   systemctl is-active ci-burst-apply.service              # never active/activating
-   podman ps --filter ancestor=localhost/ci-burst:latest   # must list no container
+   systemctl is-active ci-burst-apply.service          # launcher state only
+   podman rm --force --ignore --time 5 ci-burst-apply  # explicit, idempotent
+   podman ps -a --filter name=ci-burst-apply           # must list nothing
    ```
 
-   The service may report `inactive` or `failed`; both mean no invocation is
-   running. A run terminated while its provider request was in flight may
-   already have launched an instance, so do not treat the stop as proof that
-   nothing was created.
+   `inactive` or `failed` describes the launcher, not the container. The CLI
+   has no signal handler and would be container PID 1 without an init, so a
+   container can outlive a stopped or timed-out unit. The unit passes `--init`
+   and also runs the same `podman rm` in `ExecStopPost`, so the explicit command
+   is normally a no-op; keep it for a failed cleanup, a manual run, or a systemd
+   crash. A container removed here may already have sent a launch request;
+   reconcile it in step 4.
 
 2. Keep `ci-burst-reap.timer` enabled and running. Stopping cleanup is not
    part of rollback; expiry termination is the path that removes expired
@@ -306,6 +342,8 @@ being retired; otherwise leave its timer in place.
 - A token-file option; the env-file route is inspect-visible by design today.
 - A daemon, published ports, a healthcheck, or readiness probing. One run, one
   exit code.
+- Signal-driven shutdown as the cleanup guarantee. The units force-remove their
+  named container; `--init` only makes a stop quicker.
 - Backups, ledger replication, multi-host coordination or a distributed lock.
 - Forgejo TLS termination or reverse-proxy configuration. The container only
   needs a name it can resolve and a certificate it can verify.

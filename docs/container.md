@@ -276,6 +276,63 @@ A failed run does not stop the timers; the next scheduled run tries again. A
 persistent refusal is a signal to read the JSON reason code and `status`, not
 to raise the run frequency or remove the lock.
 
+## Keep the image current
+
+The image is a local tag, so a merged controller change reaches a host only when
+that host builds it. `ci-burst-refresh.timer` does that on the scaler host: one
+run compares the deployed commit with `origin/main` and does nothing when they
+match; otherwise it builds a candidate, smoke-tests it and only then promotes it.
+
+Install it beside the apply unit, from a clone of this repository:
+
+```sh
+# scaler host
+git clone https://github.com/mikomiel/ci-burst.git /opt/ci-burst-src
+install -d -m 0700 /var/lib/ci-burst-image
+install -m 0755 deploy/ci-burst-refresh.sh /usr/local/sbin/ci-burst-refresh
+install -m 0644 \
+  deploy/ci-burst-refresh.service deploy/ci-burst-refresh.timer \
+  /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now ci-burst-refresh.timer
+systemctl list-timers 'ci-burst-*'
+```
+
+The script defaults to `/opt/ci-burst-src`, `/var/lib/ci-burst-image`,
+`/etc/ci-burst/deployment.toml`, `/etc/ci-burst/aws-scaling` and
+`/etc/ci-burst/forgejo.env`; `CI_BURST_SOURCE`, `CI_BURST_IMAGE_STATE`,
+`CI_BURST_CONFIG`, `CI_BURST_AWS_DIR` and `CI_BURST_TOKEN_ENV` override them.
+
+What a promotion does and does not do:
+
+- it retags `localhost/ci-burst:latest`, which the scheduled units resolve on
+  every run, plus an immutable `localhost/ci-burst:sha-<12>`. No run needs a
+  restart, and a container already running keeps the layer it started with;
+- it records the deployed commit in `/var/lib/ci-burst-image/deployed-sha`;
+- it publishes nothing: no registry, no git tag, no release, no announcement. A
+  merge deploys the controller; [CONTRIBUTING.md](../CONTRIBUTING.md) § Releases
+  owns the release boundary, and a merge is still neither a release nor a
+  deployment of a released artifact;
+- a fetch, build or smoke failure keeps the previous image in place and logs one
+  line with a reason code (`fetch_failed`, `build_failed`, `smoke_failed`,
+  `promote_failed`) in `journalctl -u ci-burst-refresh.service`;
+- the smoke run is a `plan` execution from the candidate against this host's own
+  configuration and scaling credentials. It writes nothing and launches nothing,
+  and it is what stops an image that crashes at startup from reaching the
+  schedule.
+
+Rollback is two commands: disable the timer, then retag a previous build.
+
+```sh
+systemctl disable --now ci-burst-refresh.timer
+podman tag localhost/ci-burst:sha-<12> localhost/ci-burst:latest
+```
+
+The script is installed by hand from the checkout, so a change to the script
+needs that install step repeated; a change to the controller does not. The
+cleanup host runs no refresh timer: it needs the same image, and it is the
+scaler's job to prove a candidate starts before another host is pointed at it.
+
 ### Verify the container cleanup
 
 The lifecycle test is opt-in; run it on the scaler host. It needs root,

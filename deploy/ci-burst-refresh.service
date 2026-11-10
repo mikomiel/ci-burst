@@ -1,0 +1,23 @@
+# Build the current ci-burst main as the controller image and promote it.
+#
+# This unit deploys the controller, not a release: no image is published to a
+# registry, no tag is created and nothing is announced. It exists so a merged
+# change reaches the host that runs the controller without a human remembering
+# to rebuild.
+#
+# A failed run leaves the previous image in place and is visible in the journal
+# with a reason code (`fetch_failed`, `build_failed`, `smoke_failed`,
+# `promote_failed`). The next scheduled run retries; there is no backoff and no
+# retry inside a run, because a build that failed once for a network reason is
+# not evidence about the next attempt.
+[Unit]
+Description=Build the current ci-burst main as the controller image
+Documentation=https://github.com/mikomiel/ci-burst/blob/main/docs/container.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=900
+Nice=10
+ExecStart=/usr/local/sbin/ci-burst-refresh

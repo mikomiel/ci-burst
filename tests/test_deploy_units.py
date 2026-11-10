@@ -135,6 +135,57 @@ class TimerTests(unittest.TestCase):
                 self.assertTrue((DEPLOY / f"{service}.timer").is_file())
 
 
+class RefreshTests(unittest.TestCase):
+    """Merged main is deployed by a poll-and-build; it must never publish or discard."""
+
+    def setUp(self):
+        self.service = unit("ci-burst-refresh.service")
+        self.timer = unit("ci-burst-refresh.timer")
+        self.script = (DEPLOY / "ci-burst-refresh.sh").read_text(encoding="utf-8")
+
+    def test_is_a_one_shot_that_runs_the_installed_script(self):
+        self.assertEqual(self.service["Service"]["type"], "oneshot")
+        self.assertEqual(
+            self.service["Service"]["execstart"], "/usr/local/sbin/ci-burst-refresh"
+        )
+        self.assertGreaterEqual(int(self.service["Service"]["timeoutstartsec"]), 900)
+
+    def test_timer_runs_at_boot_and_after_each_finished_run(self):
+        self.assertEqual(self.timer["Timer"]["unit"], "ci-burst-refresh.service")
+        self.assertEqual(self.timer["Timer"]["onbootsec"], "2min")
+        self.assertEqual(self.timer["Timer"]["onunitinactivesec"], "5min")
+        self.assertEqual(self.timer["Install"]["wantedby"], "timers.target")
+
+    def test_compares_origin_main_before_building_anything(self):
+        self.assertIn("fetch --quiet --depth=1 origin main", self.script)
+        self.assertLess(
+            self.script.index("deployed-sha"), self.script.index("podman build")
+        )
+
+    def test_moves_the_checkout_without_discarding_work(self):
+        self.assertIn("checkout --quiet --detach", self.script)
+        for destructive in ("reset --hard", "clean -", "push --force"):
+            with self.subTest(destructive=destructive):
+                self.assertNotIn(destructive, self.script)
+
+    def test_smoke_tests_the_candidate_before_promoting_it(self):
+        smoke = self.script.index("plan --config")
+        self.assertLess(self.script.index("podman build"), smoke)
+        self.assertLess(smoke, self.script.index('"$IMAGE:latest"'))
+
+    def test_promotes_latest_and_an_immutable_rollback_tag(self):
+        self.assertIn('"$IMAGE:sha-$short"', self.script)
+        self.assertIn("deployed-sha", self.script)
+
+    def test_holds_a_lock_so_two_runs_never_build_together(self):
+        self.assertIn("flock -n 9", self.script)
+
+    def test_carries_no_credential_of_its_own(self):
+        for marker in ("aws_secret", "AWS_SECRET", "aws_access_key_id", "password"):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, self.script)
+
+
 class ImageTests(unittest.TestCase):
     def setUp(self):
         self.dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")

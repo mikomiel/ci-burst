@@ -11,9 +11,11 @@ value (not even a ciphertext), and never stores one. The template is read
 through the controller's own adapter, so its refusals and the reported image,
 instance type and shutdown behaviour are exactly what the controller uses.
 
-Exit codes: 0 satisfied, 2 drift, 3 the check could not run completely. A
-missing permission is reported as ``unavailable`` and exits 3; it is not drift
-and not a pass.
+Exit codes: 0 satisfied, 2 drift, 3 the check could not run completely. An
+incomplete check takes precedence over drift: when both occur, the decision is
+``unavailable`` and exits 3, while the drift reasons are still listed. A
+missing permission, a credential failure or a session configuration failure is
+reported as ``unavailable``; it is not drift and not a pass.
 """
 
 import argparse
@@ -46,6 +48,32 @@ _TEMPLATE_DRIFT = {
     "TEMPLATE_INSTANCE_TYPE_MISSING": "template_instance_type_missing",
     "TEMPLATE_SHUTDOWN_NOT_TERMINATE": "template_shutdown_not_terminate",
 }
+
+#: EC2 error codes that definitively mean the template or version does not
+#: exist. Only these become drift; denied, throttled and unknown errors stay
+#: unavailable because they do not prove absence.
+_TEMPLATE_NOT_FOUND_CODES = frozenset(
+    {"InvalidLaunchTemplateId.NotFound", "InvalidLaunchTemplateName.NotFoundException"}
+)
+
+#: Bound on the best-effort ``DescribeParameters`` pagination. Reaching it is
+#: an incomplete check, not proof that the parameter is absent.
+MAX_PARAMETER_PAGES = 100
+
+#: Expected boto3/botocore credential or session failures. A failure is
+#: reported by class name only: an exception message can contain a profile
+#: name, a file path or other setup detail that must not reach the output.
+_CREDENTIAL_FAILURES = frozenset(
+    {
+        "ProfileNotFound",
+        "NoCredentialsError",
+        "PartialCredentialsError",
+        "CredentialRetrievalError",
+        "SSOTokenLoadError",
+        "SSOError",
+        "TokenRetrievalError",
+    }
+)
 
 #: Provider error codes that mean the named object does not exist. Every other
 #: error -- including AccessDenied, throttling and an unclassified exception --
@@ -134,18 +162,27 @@ def _security_group_names(data):
     return [value for value in data.get("SecurityGroups") or [] if isinstance(value, str) and value]
 
 
-def _instance_profile_name(data):
+def _instance_profile_reference(data):
+    """Return ``(terminal_profile_name, reference_arn)`` from a template.
+
+    A template may reference the profile by ARN. IAM ARNs can carry a path
+    (``.../instance-profile/workers/example-runner``) while
+    ``GetInstanceProfile`` takes only the terminal name, so the lookup name and
+    the ARN reference are returned separately.
+    """
     profile = data.get("IamInstanceProfile")
     if not isinstance(profile, dict):
-        return None
+        return None, None
+    arn = profile.get("Arn")
+    reference = arn if isinstance(arn, str) and arn else None
     name = profile.get("Name")
     if isinstance(name, str) and name:
-        return name
-    arn = profile.get("Arn")
+        return name, reference
     marker = ":instance-profile/"
-    if isinstance(arn, str) and marker in arn:
-        return arn.split(marker, 1)[1] or None
-    return None
+    if reference and marker in reference:
+        path = reference.split(marker, 1)[1]
+        return (path.rsplit("/", 1)[-1] or None), reference
+    return None, reference
 
 
 def _network_pinned(data):
@@ -163,12 +200,26 @@ def _template_facts(template, data=None):
         "security_group_ids": [],
         "security_group_names": [],
         "instance_profile": None,
+        "instance_profile_arn": None,
     }
     if data is not None:
         facts["security_group_ids"] = _security_group_ids(data)
         facts["security_group_names"] = _security_group_names(data)
-        facts["instance_profile"] = _instance_profile_name(data)
+        facts["instance_profile"], facts["instance_profile_arn"] = _instance_profile_reference(data)
     return facts
+
+
+def _template_refusal_reason(refusal):
+    """Map a template-read refusal to drift, or ``None`` for unavailable."""
+    reason = _TEMPLATE_DRIFT.get(refusal.reason)
+    if reason is not None:
+        return reason
+    # The adapter collapses definite launch errors into ``AWS_REFUSED``; only
+    # a definitive not-found code proves the template is absent. A denied,
+    # throttled or unknown error stays unavailable.
+    if refusal.reason == "AWS_REFUSED" and refusal.detail in _TEMPLATE_NOT_FOUND_CODES:
+        return "template_not_found"
+    return None
 
 
 def _route_target(route):
@@ -217,7 +268,15 @@ class Prerequisites:
         unavailable = [
             reason for check in checks if check["status"] == "unavailable" for reason in check.get("reasons", [])
         ]
-        decision = "drift" if drift else ("unavailable" if unavailable else "satisfied")
+        # An incomplete check wins: a denied or unreadable read means the
+        # answer is not known, even when an independent drift reason was found.
+        # The drift reasons stay in ``reasons`` so they are not lost.
+        if unavailable:
+            decision = "unavailable"
+        elif drift:
+            decision = "drift"
+        else:
+            decision = "satisfied"
         return {
             "command": "check-prerequisites",
             "deployment": self._config.deployment,
@@ -240,7 +299,7 @@ class Prerequisites:
             try:
                 template = self._aws.template(name, version)
             except ProviderRefusal as refusal:
-                reason = _TEMPLATE_DRIFT.get(refusal.reason)
+                reason = _template_refusal_reason(refusal)
                 if reason:
                     checks.append(_record("template", target, status="drift", reasons=[reason], detail=refusal.detail))
                 else:
@@ -339,7 +398,7 @@ class Prerequisites:
         return checks
 
     def _instance_profile_check(self, data):
-        name = _instance_profile_name(data)
+        name, reference_arn = _instance_profile_reference(data)
         if not name:
             return None
         try:
@@ -355,18 +414,24 @@ class Prerequisites:
                 detail=error.code,
             )
         profile = response.get("InstanceProfile")
-        roles = profile.get("Roles") if isinstance(profile, dict) else None
-        role = next(
-            (
-                entry.get("RoleName")
-                for entry in roles or []
-                if isinstance(entry, dict) and entry.get("RoleName")
-            ),
-            None,
-        )
-        if not role:
-            return _record("instance_profile", name, status="drift", reasons=["instance_profile_role_missing"])
-        return _record("instance_profile", name, facts={"role": role})
+        facts = {"role": None, "reference_arn": reference_arn, "arn": None}
+        if isinstance(profile, dict):
+            facts["arn"] = profile.get("Arn") if isinstance(profile.get("Arn"), str) else None
+            roles = profile.get("Roles")
+            facts["role"] = next(
+                (
+                    entry.get("RoleName")
+                    for entry in roles or []
+                    if isinstance(entry, dict) and entry.get("RoleName")
+                ),
+                None,
+            )
+        reasons = []
+        if reference_arn is not None and facts["arn"] != reference_arn:
+            reasons.append("instance_profile_arn_mismatch")
+        if not facts["role"]:
+            reasons.append("instance_profile_role_missing")
+        return _record("instance_profile", name, status="drift" if reasons else "pass", facts=facts, reasons=reasons)
 
     # -- network placement ------------------------------------------------
     def _candidates(self, checks, templates):
@@ -495,30 +560,46 @@ class Prerequisites:
     # -- registration secret ----------------------------------------------
     def _registration_parameter_check(self):
         name = self._registration_parameter
-        try:
-            # ``DescribeParameters`` returns metadata only. The value is never
-            # requested, decrypted, compared, printed or stored.
-            response = _call(
-                self._clients.ssm,
-                "describe_parameters",
-                ParameterFilters=[{"Key": "Name", "Option": "Equals", "Values": [name]}],
-            )
-        except ProviderCallError as error:
-            return _record(
-                "registration_parameter",
-                name,
-                status="unavailable",
-                reasons=["registration_parameter_unavailable"],
-                detail=error.code,
-            )
-        names = [
-            parameter.get("Name")
-            for parameter in response.get("Parameters") or []
-            if isinstance(parameter, dict)
-        ]
-        if name in names:
-            return _record("registration_parameter", name)
-        return _record("registration_parameter", name, status="drift", reasons=["registration_parameter_missing"])
+        token = None
+        for _ in range(MAX_PARAMETER_PAGES):
+            arguments = {"ParameterFilters": [{"Key": "Name", "Option": "Equals", "Values": [name]}]}
+            if token:
+                arguments["NextToken"] = token
+            try:
+                # ``DescribeParameters`` returns metadata only. The value is
+                # never requested, decrypted, compared, printed or stored.
+                response = _call(self._clients.ssm, "describe_parameters", **arguments)
+            except ProviderCallError as error:
+                return _record(
+                    "registration_parameter",
+                    name,
+                    status="unavailable",
+                    reasons=["registration_parameter_unavailable"],
+                    detail=error.code,
+                )
+            names = [
+                parameter.get("Name")
+                for parameter in response.get("Parameters") or []
+                if isinstance(parameter, dict)
+            ]
+            if name in names:
+                return _record("registration_parameter", name)
+            token = response.get("NextToken")
+            if not token:
+                return _record(
+                    "registration_parameter",
+                    name,
+                    status="drift",
+                    reasons=["registration_parameter_missing"],
+                )
+        # An unexhausted listing is not proof that the parameter is absent.
+        return _record(
+            "registration_parameter",
+            name,
+            status="unavailable",
+            reasons=["registration_parameter_unavailable"],
+            detail="pagination limit reached",
+        )
 
 
 def _unique(values):
@@ -543,23 +624,35 @@ def build_parser():
     return parser
 
 
+def _is_credential_failure(error):
+    """True for an expected credential/session setup failure, by class name."""
+    return any(candidate.__name__ in _CREDENTIAL_FAILURES for candidate in type(error).__mro__)
+
+
 def build_clients(config):
     """Build one credential route for EC2, SSM and IAM.
 
     The EC2 client comes from the controller's own factory and the other
     clients share its resolved session, so the check reads the same account and
-    profile the controller would.
+    profile the controller would. Expected session and credential failures are
+    re-raised as ``AWS_CREDENTIALS_UNAVAILABLE`` with the exception class name
+    only: their messages can carry a profile name or a file path.
     """
-    aws = Aws(config)
-    # Resolve the session first: the adapter's lazy SDK import reports a
-    # missing boto3 as ``AWS_SDK_UNAVAILABLE`` instead of a bare ImportError.
-    session = aws._session()
-    ec2 = aws._client()
-    return Clients(
-        ec2=ec2,
-        ssm=session.client("ssm", region_name=config.aws.region),
-        iam=session.client("iam", region_name=config.aws.region),
-    )
+    try:
+        aws = Aws(config)
+        # Resolve the session first: the adapter's lazy SDK import reports a
+        # missing boto3 as ``AWS_SDK_UNAVAILABLE`` instead of a bare ImportError.
+        session = aws._session()
+        ec2 = aws._client()
+        return Clients(
+            ec2=ec2,
+            ssm=session.client("ssm", region_name=config.aws.region),
+            iam=session.client("iam", region_name=config.aws.region),
+        )
+    except Exception as error:
+        if _is_credential_failure(error):
+            raise ProviderRefusal("AWS_CREDENTIALS_UNAVAILABLE", type(error).__name__) from None
+        raise
 
 
 def check(config, clients, registration_parameter=DEFAULT_REGISTRATION_PARAMETER):

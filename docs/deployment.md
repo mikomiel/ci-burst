@@ -241,9 +241,12 @@ It checks, from read-only describe calls:
 
 The output is one JSON document with stable reason codes. Exit `0` means every
 check passed, `2` means drift, and `3` means the check could not run
-completely. A missing `ec2:DescribeSubnets`, `ssm:DescribeParameters` or
-`iam:GetInstanceProfile` permission is reported as `unavailable` and exits
-`3`; it is neither a pass nor drift.
+completely. An incomplete check takes precedence over drift: if any check is
+unavailable the command exits `3`, while the drift reasons are still listed in
+`reasons`. A missing `ec2:DescribeSubnets`, `ssm:DescribeParameters` or
+`iam:GetInstanceProfile` permission, and an expected credential or session
+failure such as `ProfileNotFound`, are reported as `unavailable` and exit `3`;
+they are neither a pass nor drift.
 
 What it does not prove: nothing about a worker's runtime behaviour — boot,
 registration, job execution or termination; network reachability (security

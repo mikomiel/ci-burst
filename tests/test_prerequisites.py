@@ -10,6 +10,7 @@ import io
 import json
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -26,6 +27,7 @@ from ci_burst.errors import ProviderRefusal  # noqa: E402
 PARAMETER = prerequisites.DEFAULT_REGISTRATION_PARAMETER
 PROFILE = "example-runner-profile"
 ROLE = "example-runner-role"
+PROFILE_ARN = "arn:aws:iam::000000000000:instance-profile/workers/example-runner"
 SUBNET_ID = "subnet-0123456789abcdef0"
 SG_ID = "sg-0123456789abcdef0"
 VPC_ID = "vpc-0123456789abcdef0"
@@ -171,8 +173,9 @@ class FakeEc2:
 
 
 class FakeSsm:
-    def __init__(self, names=()):
+    def __init__(self, names=(), pages=None):
         self.parameters = {name: {} for name in names}
+        self.pages = list(pages or [])
         self.error = None
         self.calls = []
 
@@ -180,6 +183,11 @@ class FakeSsm:
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
+        if self.pages:
+            page = self.pages.pop(0)
+            if isinstance(page, Exception):
+                raise page
+            return page
         names = set(self.parameters)
         for item in kwargs.get("ParameterFilters") or kwargs.get("Filters") or []:
             if item.get("Key") == "Name" and item.get("Option") == "Equals":
@@ -188,8 +196,9 @@ class FakeSsm:
 
 
 class FakeIam:
-    def __init__(self, profiles=None):
+    def __init__(self, profiles=None, arns=None):
         self.profiles = dict(profiles or {})
+        self.arns = dict(arns or {})
         self.error = None
         self.calls = []
 
@@ -202,7 +211,29 @@ class FakeIam:
             raise ClientError("NoSuchEntity")
         role = self.profiles[name]
         roles = [] if role is None else [{"RoleName": role}]
-        return {"InstanceProfile": {"InstanceProfileName": name, "Roles": roles}}
+        profile = {"InstanceProfileName": name, "Roles": roles}
+        if name in self.arns:
+            profile["Arn"] = self.arns[name]
+        return {"InstanceProfile": profile}
+
+
+def botocore_error_modules():
+    """A fake botocore so ``Aws._translate`` classifies a ClientError."""
+    exceptions = types.ModuleType("botocore.exceptions")
+
+    class ClientError(Exception):
+        def __init__(self, code):
+            super().__init__(code)
+            self.response = {"Error": {"Code": code}}
+
+    class BotoCoreError(Exception):
+        pass
+
+    exceptions.ClientError = ClientError
+    exceptions.BotoCoreError = BotoCoreError
+    botocore = types.ModuleType("botocore")
+    botocore.exceptions = exceptions
+    return {"botocore": botocore, "botocore.exceptions": exceptions}, ClientError
 
 
 def deployment_toml(root, *, version=3, zone="eu-central-1a", subnet_id=SUBNET_ID):
@@ -357,6 +388,23 @@ class PrerequisiteTests(unittest.TestCase):
         self.ec2.templates.clear()
         self.assert_drift(self.check(), "template_not_found")
 
+    def test_missing_template_name_error_is_drift(self):
+        modules, ClientError = botocore_error_modules()
+        with mock.patch.dict(sys.modules, modules):
+            self.ec2.errors["describe_launch_template_versions"] = ClientError(
+                "InvalidLaunchTemplateName.NotFoundException"
+            )
+            result = self.check()
+        self.assert_drift(result, "template_not_found")
+
+    def test_denied_template_read_is_unavailable_not_drift(self):
+        modules, ClientError = botocore_error_modules()
+        with mock.patch.dict(sys.modules, modules):
+            self.ec2.errors["describe_launch_template_versions"] = ClientError("UnauthorizedOperation")
+            result = self.check()
+        self.assert_unavailable(result, "template_read_unavailable")
+        self.assertNotIn("template_not_found", result["reasons"])
+
     def test_indirect_image_is_drift(self):
         self.ec2.templates[3] = template_data(ImageId="resolve:ssm:/example/image")
         self.assert_drift(self.check(), "template_image_not_literal")
@@ -404,9 +452,45 @@ class PrerequisiteTests(unittest.TestCase):
         self.iam.profiles[PROFILE] = None
         self.assert_drift(self.check(), "instance_profile_role_missing")
 
+    def test_path_qualified_profile_arn_uses_the_terminal_name(self):
+        self.ec2.templates[3] = template_data(IamInstanceProfile={"Arn": PROFILE_ARN})
+        self.iam.profiles = {"example-runner": ROLE}
+        self.iam.arns = {"example-runner": PROFILE_ARN}
+        result = self.check()
+        self.assertEqual(result["decision"], "satisfied")
+        self.assertEqual(self.iam.calls[0]["InstanceProfileName"], "example-runner")
+        profile = self.records(result, "instance_profile")[0]
+        self.assertEqual(profile["facts"]["arn"], PROFILE_ARN)
+        self.assertEqual(self.records(result, "template")[0]["facts"]["instance_profile"], "example-runner")
+
+    def test_instance_profile_arn_mismatch_is_drift(self):
+        returned = "arn:aws:iam::000000000000:instance-profile/other/example-runner"
+        self.ec2.templates[3] = template_data(IamInstanceProfile={"Arn": PROFILE_ARN})
+        self.iam.profiles = {"example-runner": ROLE}
+        self.iam.arns = {"example-runner": returned}
+        self.assert_drift(self.check(), "instance_profile_arn_mismatch")
+
     def test_missing_registration_parameter_is_drift(self):
         self.ssm.parameters.clear()
         self.assert_drift(self.check(), "registration_parameter_missing")
+
+    def test_parameter_pagination_finds_a_match_after_an_empty_page(self):
+        self.ssm.pages = [
+            {"Parameters": [], "NextToken": "page-2"},
+            {"Parameters": [{"Name": PARAMETER}]},
+        ]
+        result = self.check()
+        self.assertEqual(result["decision"], "satisfied")
+        self.assertEqual(self.ssm.calls[1]["NextToken"], "page-2")
+
+    def test_parameter_pagination_failure_is_unavailable_not_missing(self):
+        self.ssm.pages = [
+            {"Parameters": [], "NextToken": "page-2"},
+            ClientError("AccessDeniedException"),
+        ]
+        result = self.check()
+        self.assert_unavailable(result, "registration_parameter_unavailable")
+        self.assertNotIn("registration_parameter_missing", result["reasons"])
 
     # -- placement drift -------------------------------------------------
     def test_missing_subnet_is_drift(self):
@@ -474,6 +558,15 @@ class PrerequisiteTests(unittest.TestCase):
         self.assert_unavailable(result, "template_read_unavailable")
         self.assertEqual(self.records(result, "template")[0]["status"], "unavailable")
 
+    def test_incomplete_check_takes_precedence_over_drift(self):
+        self.ec2.templates[3] = template_data(UserData=None)
+        self.ssm.error = ClientError("AccessDeniedException")
+        result = self.check()
+        self.assertEqual(result["decision"], "unavailable")
+        self.assertIn("template_bootstrap_missing", result["reasons"])
+        self.assertIn("registration_parameter_unavailable", result["unavailable"])
+        self.assertEqual(prerequisites._exit_code(result["decision"]), 3)
+
 
 class CommandTests(unittest.TestCase):
     def setUp(self):
@@ -516,6 +609,37 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(document["decision"], "unavailable")
         self.assertIn("instance_profile_unavailable", document["unavailable"])
 
+    def test_drift_with_a_denied_permission_exits_three(self):
+        self.ec2.templates[3] = template_data(UserData=None)
+        self.ssm.error = ClientError("AccessDeniedException")
+        code, document = self.run_main()
+        self.assertEqual(code, 3)
+        self.assertEqual(document["decision"], "unavailable")
+        self.assertIn("template_bootstrap_missing", document["reasons"])
+        self.assertIn("registration_parameter_unavailable", document["unavailable"])
+
+    def test_profile_not_found_exits_three_with_sanitized_detail(self):
+        boto3_module = types.ModuleType("boto3")
+
+        class ProfileNotFound(Exception):
+            pass
+
+        class Session:
+            def __init__(self, profile_name=None):
+                raise ProfileNotFound("profile example is not configured")
+
+        boto3_module.Session = Session
+        output = io.StringIO()
+        with mock.patch.dict(sys.modules, {"boto3": boto3_module}):
+            with redirect_stdout(output):
+                code = prerequisites.main(["--config", str(self.config_path)])
+        document = json.loads(output.getvalue())
+        self.assertEqual(code, 3)
+        self.assertEqual(document["decision"], "unavailable")
+        self.assertEqual(document["error"]["reason"], "AWS_CREDENTIALS_UNAVAILABLE")
+        self.assertEqual(document["error"]["detail"], "ProfileNotFound")
+        self.assertNotIn("profile example", output.getvalue())
+
     def test_missing_configuration_exits_three(self):
         output = io.StringIO()
         with redirect_stdout(output):
@@ -537,9 +661,11 @@ class CommandTests(unittest.TestCase):
 
 
 class HelperTests(unittest.TestCase):
-    def test_instance_profile_name_can_be_derived_from_an_arn(self):
-        data = {"IamInstanceProfile": {"Arn": "arn:aws:iam::000000000000:instance-profile/example-role"}}
-        self.assertEqual(prerequisites._instance_profile_name(data), "example-role")
+    def test_instance_profile_reference_derives_the_terminal_name_from_a_path_arn(self):
+        arn = "arn:aws:iam::000000000000:instance-profile/workers/example-role"
+        name, reference = prerequisites._instance_profile_reference({"IamInstanceProfile": {"Arn": arn}})
+        self.assertEqual(name, "example-role")
+        self.assertEqual(reference, arn)
 
     def test_default_routes_ignore_non_default_and_inactive_destinations(self):
         tables = [

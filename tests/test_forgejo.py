@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 
 from ci_burst.config import load
@@ -94,8 +95,23 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(observation.attempts[0].handle, "h-1-1")
         self.assertEqual(observation.contract, "forgejo-17.0.1-runners-jobs")
         url, headers = transport.calls[0]
-        self.assertTrue(url.endswith("/api/v1/repos/owner/repo/actions/runners/jobs"))
+        parsed = urllib.parse.urlsplit(url)
+        self.assertEqual(parsed.path, "/api/v1/repos/owner/repo/actions/runners/jobs")
         self.assertEqual(headers["Authorization"], "token secret-token")
+
+    def test_label_filter_is_mandatory_and_bare(self):
+        # The endpoint answers null without `labels`; the configured executor
+        # suffix (`name:host`) is not a job label and must not be sent.
+        _, transport = self.observe(fixture("jobs_runnable.json"))
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(transport.calls[0][0]).query)
+        self.assertEqual(query, {"labels": ["ci-burst,homelab"]})
+
+    def test_null_payload_is_a_verified_empty_queue(self):
+        observation, _ = self.observe(b"null")
+        self.assertEqual(observation.demand, 0)
+        self.assertEqual(observation.status, "empty")
+        self.assertEqual(observation.seen, 0)
+        self.assertEqual(observation.notes, ())
 
     def test_empty_queue_is_verified_zero(self):
         observation, _ = self.observe(fixture("jobs_empty.json"))

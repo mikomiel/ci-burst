@@ -51,9 +51,11 @@ attempt. There is no need to copy an upstream implementation or support
 undocumented alternate envelopes.
 
 The API adapter validates the accepted shape and complete label requirements.
-The server-side label filter is an optimization, not proof of a full match.
-Unknown required fields, an unexpected response or an incomplete read make
-demand unavailable rather than zero.
+The server-side label filter is required by the live endpoint, which answers
+JSON `null` when `labels` is absent, and it is still only a prefilter: a job it
+selects is compared against its complete `runs_on` set. A `null` filter result is
+an empty queue. Unknown required fields, an unexpected response or an incomplete
+read make demand unavailable rather than zero.
 
 The schema alone does **not** prove which status values are runnable or what
 token permission the endpoint requires. Contract qualification must include

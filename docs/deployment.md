@@ -341,10 +341,23 @@ To see it work, arrange for the reaper to be the only actor that may act:
    The reaper reads tags, not the ledger, so a tagged canary is exactly its
    production input;
 3. observe the termination. The reap timer is already enabled here, so it may act
-   before a manual command does, and either answer is evidence: a scheduled
-   `ci-burst-reap` journal entry naming the instance counts. If no scheduled run
-   has happened yet, run `reap --apply` by hand; its `termination_requested` must
-   name the instance with an empty `refused_resources`;
+   before a manual command does, and either route is evidence — but only a
+   **successful** one. The same four conditions apply to a scheduled
+   `ci-burst-reap` journal entry and to a manual `reap --apply`:
+
+   - `"decision": "termination_requested"`;
+   - the canary's id in `termination_requested`;
+   - `"refused_resources": []`;
+   - **no top-level `refusal`**.
+
+   The last one is not redundant. `termination_requested` is filled in before the
+   provider call, so a denied termination returns `"decision": "cleanup_failed"`
+   with a top-level `refusal` and still lists the id with an empty
+   `refused_resources`, which describes tag validation rather than the call. A
+   Spot instance later reclaimed by the provider would then satisfy the terminal
+   check below without the cleanup identity ever having terminated anything. If
+   no scheduled run has happened, run `reap --apply` by hand and read all four
+   fields;
 4. confirm the instance reaches `terminated` with `status` or
    `describe-instances`: a termination request is not confirmed removal;
 5. re-enable admission only if it was enabled before this test **and** the

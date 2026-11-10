@@ -23,7 +23,12 @@
         "arn:aws:ec2:eu-central-1:123456789012:instance/*",
         "arn:aws:ec2:eu-central-1:123456789012:volume/*",
         "arn:aws:ec2:eu-central-1:123456789012:network-interface/*"
-      ]
+      ],
+      "Condition": {
+        "ArnEquals": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:eu-central-1:123456789012:launch-template/lt-0123456789abcdef0"
+        }
+      }
     },
     {
       "Sid": "TagOnlyWhatThisLaunchCreated",
@@ -31,7 +36,9 @@
       "Action": "ec2:CreateTags",
       "Resource": "arn:aws:ec2:eu-central-1:123456789012:instance/*",
       "Condition": {
-        "StringEquals": { "ec2:CreateAction": "RunInstances" }
+        "StringEquals": {
+          "ec2:CreateAction": "RunInstances"
+        }
       }
     },
     {
@@ -40,7 +47,10 @@
       "Action": "ec2:TerminateInstances",
       "Resource": "arn:aws:ec2:eu-central-1:123456789012:instance/*",
       "Condition": {
-        "StringEquals": { "ec2:ResourceTag/ci-burst:managed": "true" }
+        "StringEquals": {
+          "ec2:ResourceTag/ci-burst:managed": "true",
+          "ec2:ResourceTag/ci-burst:deployment": "example-ci-burst"
+        }
       }
     },
     {
@@ -49,7 +59,9 @@
       "Action": "iam:PassRole",
       "Resource": "arn:aws:iam::123456789012:role/forgejo-runner",
       "Condition": {
-        "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" }
+        "StringEquals": {
+          "iam:PassedToService": "ec2.amazonaws.com"
+        }
       }
     }
   ]

@@ -58,6 +58,12 @@ Two additions this walkthrough needs:
 - record the template id, the numeric version, the subnet and the security
   group. Step 5 uses them.
 
+A template that pins its network (`NetworkInterfaces` or a subnet) keeps that
+placement and cannot be used with the ordered zone-candidate list in Step 5:
+the controller then passes a top-level `SubnetId` and EC2 refuses both. Pin the
+network in the template only for the single-zone form. `operations.md` §
+"Availability-zone candidates" owns the rule.
+
 ## 3. Create the two control-plane identities
 
 The controller never launches as your human identity. Create two IAM users
@@ -169,10 +175,6 @@ profile = "default"
 zone = "eu-central-1a"
 subnet_id = "subnet-0123456789abcdef0"
 
-[[aws.availability_zones]]
-zone = "eu-central-1b"
-subnet_id = "subnet-0123456789abcdef1"
-
 [budget]
 window_seconds = 86400
 allowance = "10.00"
@@ -187,9 +189,12 @@ adapter sends the bare names (`cloud-ci`) as the queue filter. `[state]
 database` must be absolute and inside `/var/lib/ci-burst`. Keep
 `qualification = "fixtures-only"` until Step 7 is complete: it blocks `apply`.
 
-Use one `[[aws.availability_zones]]` table per candidate subnet, in priority
-order. A zone without a subnet cannot be used, so start with the subnets you
-have and add more when the VPC has them.
+Start with the one candidate the scaling policy authorizes. Add a
+`[[aws.availability_zones]]` table per further candidate, in priority order,
+and add that candidate's subnet to the policy's `RunInstances` resources in the
+same change: the policy — not the TOML — is what decides which placements are
+allowed, so a candidate the policy omits is a denied launch rather than a
+fallback. A zone without a subnet cannot be used at all.
 
 ## 6. Install the units
 
@@ -199,8 +204,12 @@ From the checkout, on the scaler:
 install -o root -g root -m 0644 deploy/ci-burst-apply.service /etc/systemd/system/
 install -o root -g root -m 0644 deploy/ci-burst-apply.timer   /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now ci-burst-apply.timer
+systemctl enable ci-burst-apply.timer
 ```
+
+`enable` without `--now` only links the timer for the next boot: admission stays
+off until Step 8. Enabling and starting it here would begin launching as soon
+as Step 7 sets `live-verified`, before the supervised first burst.
 
 On the reaper host:
 
@@ -261,12 +270,11 @@ command as Step 6, replacing `plan` with `apply`. Watch three things:
   `ci-burst:expires-at`) and terminates after its one job;
 - Forgejo, not ci-burst, reports the job result.
 
-Then enable the timer:
+Only after that burst is understood, turn admission on:
 
 ```sh
-systemctl start ci-burst-apply.service     # one run
-systemctl enable --now ci-burst-apply.timer
-journalctl -u ci-burst-apply.service -f    # one JSON line per run
+systemctl start ci-burst-apply.timer        # the timer is already enabled
+journalctl -u ci-burst-apply.service -f     # one JSON line per run
 ```
 
 Keep the `reap` timer running on its own host for the whole pilot. Its output
@@ -274,11 +282,21 @@ is the only expiry evidence.
 
 ## 9. Rollback and troubleshooting
 
-Stop admission without touching cleanup:
+Stop admission without touching cleanup. Disabling the timer stops future
+triggers; it does not stop a run that is already executing, so stop the unit and
+remove its container too:
 
 ```sh
 systemctl disable --now ci-burst-apply.timer
+systemctl stop ci-burst-apply.service
+podman rm --force --ignore ci-burst-apply
+podman ps --all --filter name=ci-burst-apply   # must print no container
 ```
+
+The unit's `ExecStopPost` removes the named container, and the second command
+is the verification, not a duplicate. A launch request already sent to AWS is
+not recalled by stopping the unit: run `status` to read the operation, and let
+the reaper (or the expiry) reconcile it before you re-enable admission.
 
 The ledger keeps the operation; the reaper still terminates expired instances.
 To stop cleanup as well, disable the reaper timer and terminate owned instances

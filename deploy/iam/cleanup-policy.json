@@ -13,7 +13,10 @@
       "Action": "ec2:TerminateInstances",
       "Resource": "arn:aws:ec2:eu-central-1:123456789012:instance/*",
       "Condition": {
-        "StringEquals": { "ec2:ResourceTag/ci-burst:managed": "true" }
+        "StringEquals": {
+          "ec2:ResourceTag/ci-burst:managed": "true",
+          "ec2:ResourceTag/ci-burst:deployment": "example-ci-burst"
+        }
       }
     }
   ]

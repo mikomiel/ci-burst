@@ -50,12 +50,48 @@ class ChangelogFileTests(unittest.TestCase):
         self.assertEqual(changelog.unreleased_section(TEXT).count(changelog.UNRELEASED), 1)
 
     def test_released_headings_are_prepared_or_tagged(self):
-        errors = changelog.binding_errors(TEXT, changelog.applicable_tags())
+        errors = changelog.binding_errors(
+            TEXT, changelog.applicable_tags(), changelog.invalid_release_refs()
+        )
         self.assertEqual(
             errors,
             [],
             "invalid release state; in a shallow checkout run `git fetch --tags` first",
         )
+
+
+class RepositoryStateValidationTests(unittest.TestCase):
+    """The CI assertion must use the same evidence as the CLI.
+
+    ``applicable_tags()`` filters invalid release-shaped refs out on purpose, so
+    the repository-state check has to pass ``invalid_release_refs()`` as well or
+    CI accepts a state the CLI rejects.
+    """
+
+    def test_the_ci_assertion_rejects_an_invalid_release_tag(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            git(root, "init", "-q", "-b", "main")
+            git(root, "config", "user.email", "changelog@example.com")
+            git(root, "config", "user.name", "Changelog Test")
+            (root / "file.txt").write_text("controller\n", encoding="utf-8")
+            git(root, "add", "file.txt")
+            git(root, "commit", "-q", "-m", "feat: add the controller")
+            prepared = (
+                "# Changelog\n\n## [Unreleased]\n\n"
+                "## [0.1.0] - 2026-11-09\n\n"
+                "<!-- release-pending: v0.1.0 -->\n\n### Added\n\n- Add the controller.\n"
+            )
+            (root / "CHANGELOG.md").write_text(prepared, encoding="utf-8")
+            git(root, "tag", "v0.1.0")
+
+            # Default arguments are bound at import, so pass the root explicitly.
+            errors = changelog.binding_errors(
+                prepared,
+                changelog.applicable_tags(root),
+                changelog.invalid_release_refs(root),
+            )
+            self.assertTrue(any("v0.1.0" in error for error in errors), errors)
 
 
 class ReleaseStateTests(unittest.TestCase):

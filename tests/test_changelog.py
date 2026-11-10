@@ -4,6 +4,7 @@ The test reads the committed CHANGELOG.md and local Git refs only. It does not
 prove a release, a deployment or runtime behavior.
 """
 
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -95,12 +96,22 @@ class ReleaseStateTests(unittest.TestCase):
         self.assertIsNone(changelog.write_blocked(PREPARED, "v0.1.0"))
         self.assertIsNone(changelog.write_blocked("# Changelog\n\n## [Unreleased]\n", None))
 
+    def test_duplicate_release_headings_are_refused(self):
+        text = PREPARED + "\n## [0.1.0] - 2026-11-10\n\n### Fixed\n\n- Again.\n"
+        errors = changelog.binding_errors(text, {})
+        self.assertTrue(any("duplicate" in error for error in errors))
+
+    def test_malformed_release_heading_is_refused(self):
+        text = "# Changelog\n\n## [Unreleased]\n\n## [0.1] - 2026-11-09\n\n- One.\n"
+        errors = changelog.binding_errors(text, {})
+        self.assertTrue(any("malformed" in error for error in errors))
+
 
 class ReleaseBoundaryTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.email", "changelog@example.com")
         self.git("config", "user.name", "Changelog Test")
@@ -113,9 +124,94 @@ class ReleaseBoundaryTests(unittest.TestCase):
         self.git("add", filename)
         self.git("commit", "-q", "-m", subject)
 
+    def add_renderer(self):
+        scripts = self.root / "scripts"
+        scripts.mkdir(exist_ok=True)
+        shutil.copyfile(
+            ROOT / "scripts" / "render_changelog.py",
+            scripts / "render_changelog.py",
+        )
+
+    def clone(self, name, *options):
+        target = Path(self.temporary.name) / name
+        subprocess.run(
+            ("git", "clone", "--quiet", *options, f"file://{self.root}", str(target)),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return target
+
+    def run_write(self, root):
+        return subprocess.run(
+            (sys.executable, "scripts/render_changelog.py", "--write"),
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     def test_no_release_tag_means_no_boundary(self):
         self.commit("feat: add the controller (#4)")
         self.assertIsNone(changelog.release_tag(self.root))
+
+    def test_boundary_problem_accepts_a_reconciled_published_section(self):
+        self.commit("feat: add the controller (#4)")
+        released = (
+            "# Changelog\n\n## [Unreleased]\n\n"
+            "## [0.1.0] - 2026-11-09\n\n### Added\n\n- Add the controller.\n"
+        )
+        (self.root / "CHANGELOG.md").write_text(released, encoding="utf-8")
+        self.git("add", "CHANGELOG.md")
+        self.git("commit", "-q", "-m", "docs: publish the 0.1.0 release")
+        self.git("tag", "-a", "v0.1.0", "-m", "v0.1.0")
+        self.assertIsNone(changelog.boundary_problem(released, self.root))
+
+    def test_boundary_problem_refuses_a_released_section_without_its_tag(self):
+        self.commit("feat: add the controller")
+        released = "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-11-09\n\n- One.\n"
+        self.assertIn("no local tag", changelog.boundary_problem(released, self.root))
+
+    def test_boundary_problem_refuses_a_tag_without_its_released_section(self):
+        self.commit("feat: add the controller")
+        self.git("tag", "-a", "v0.1.0", "-m", "v0.1.0")
+        self.assertIn(
+            "no released section",
+            changelog.boundary_problem("# Changelog\n\n## [Unreleased]\n", self.root),
+        )
+
+    def test_write_refuses_a_no_tags_clone_with_a_published_section(self):
+        released = (
+            "# Changelog\n\n## [Unreleased]\n\n"
+            "## [0.1.0] - 2026-11-09\n\n### Added\n\n- Add the controller.\n"
+        )
+        (self.root / "CHANGELOG.md").write_text(released, encoding="utf-8")
+        self.add_renderer()
+        self.git("add", "CHANGELOG.md", "scripts/render_changelog.py")
+        self.git("commit", "-q", "-m", "docs: publish the 0.1.0 release")
+        self.git("tag", "-a", "v0.1.0", "-m", "v0.1.0")
+
+        clone = self.clone("no-tags", "--no-tags")
+        self.assertEqual(changelog.tag_types(clone), {})
+        completed = self.run_write(clone)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("release evidence is unavailable", completed.stderr)
+        self.assertEqual((clone / "CHANGELOG.md").read_text(encoding="utf-8"), released)
+
+    def test_write_refuses_a_shallow_clone(self):
+        self.commit("feat: add the controller")
+        text = "# Changelog\n\n## [Unreleased]\n"
+        (self.root / "CHANGELOG.md").write_text(text, encoding="utf-8")
+        self.add_renderer()
+        self.git("add", "CHANGELOG.md", "scripts/render_changelog.py")
+        self.git("commit", "-q", "-m", "docs: add the changelog")
+
+        clone = self.clone("shallow", "--depth", "1")
+        self.assertTrue(changelog.is_shallow(clone))
+        completed = self.run_write(clone)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("shallow", completed.stderr)
+        self.assertEqual((clone / "CHANGELOG.md").read_text(encoding="utf-8"), text)
 
     def test_release_boundary_excludes_released_commits_from_unreleased(self):
         self.commit("feat: add the controller (#4)")

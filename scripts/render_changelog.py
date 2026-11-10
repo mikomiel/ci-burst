@@ -10,6 +10,10 @@ already has a released section is not rendered again. A release preparation
 marker defers that tag until the preparation commit is on `main`;
 `--validate-release` verifies the published state.
 
+Rendering fails closed when the history is shallow, when a released heading
+cannot be reconciled with a local reachable annotated tag (for example in a
+`--no-tags` clone), or while a release preparation marker has no tag yet.
+
 Standard library only, no network:
 
     python3 scripts/render_changelog.py                  # print the section
@@ -131,12 +135,31 @@ def tag_types(root=ROOT):
     return found
 
 
+def is_shallow(root=ROOT):
+    """True when the checkout may lack history, including when that is unknown."""
+    try:
+        return git(root, "rev-parse", "--is-shallow-repository").strip() == "true"
+    except (subprocess.CalledProcessError, OSError):
+        return True
+
+
+def _reachable(name, root=ROOT):
+    """True when ``name`` is an ancestor of HEAD."""
+    try:
+        git(root, "merge-base", "--is-ancestor", name, "HEAD")
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
 def release_tag(root=ROOT):
-    """Latest release tag reachable from HEAD, or None when no release exists.
+    """Latest release tag reachable from HEAD, or None when none is available.
 
     The boundary must be an annotated ``vMAJOR.MINOR.PATCH`` tag. A lightweight
     or unprefixed tag raises ValueError instead of being ignored, because
-    ignoring it would render already-released commits again.
+    ignoring it would render already-released commits again. None alone cannot
+    distinguish an absent release from missing release evidence; the caller
+    reconciles it with the released sections in the changelog.
     """
     try:
         name = git(
@@ -157,41 +180,110 @@ def release_tag(root=ROOT):
 
 
 def released_sections(text):
-    """Return version to section text for released ``## [x.y.z]`` headings."""
+    """Return version to section text for released ``## [x.y.z]`` headings.
+
+    A malformed ``## [...]`` heading or a duplicate version heading raises
+    ValueError, so a structural defect cannot silently disappear from a
+    section map.
+    """
     sections = {}
     lines = text.splitlines()
     index = 0
     while index < len(lines):
-        match = _RELEASED_HEADING.match(lines[index])
+        line = lines[index]
         index += 1
-        if match is None:
+        if not line.startswith("## "):
             continue
+        if line == UNRELEASED:
+            continue
+        match = _RELEASED_HEADING.match(line)
+        if match is None:
+            if line.startswith("## ["):
+                raise ValueError(f"malformed release heading: {line!r}")
+            continue
+        version = match.group("version")
+        if version in sections:
+            raise ValueError(f"duplicate release heading [{version}]")
         start = index
         while index < len(lines) and not lines[index].startswith("## "):
             index += 1
-        sections[match.group("version")] = "\n".join(lines[start:index]).strip()
+        sections[version] = "\n".join(lines[start:index]).strip()
     return sections
 
 
-def pending_versions(text):
-    """Release versions whose section carries a preparation marker."""
+def _pending(sections):
     return [
         version
-        for version, section in released_sections(text).items()
+        for version, section in sections.items()
         if _RELEASE_PENDING.search(section)
     ]
 
 
+def pending_versions(text):
+    """Release versions whose section carries a preparation marker."""
+    return _pending(released_sections(text))
+
+
+def boundary_problem(text, root=ROOT):
+    """Reason the Unreleased boundary cannot be trusted, or None.
+
+    A shallow checkout cannot render complete history, and a released section
+    whose annotated tag is unavailable or unreachable cannot establish where
+    Unreleased starts. An empty tag list is accepted only when the changelog
+    has no released section to reconcile.
+    """
+    if is_shallow(root):
+        return (
+            "shallow history cannot establish the release boundary; "
+            "run git fetch --unshallow"
+        )
+    try:
+        sections = released_sections(text)
+    except ValueError as error:
+        return str(error)
+    pending = _pending(sections)
+    tags = tag_types(root)
+    for version in sections:
+        if version in pending:
+            continue
+        name = f"v{version}"
+        kind = tags.get(name)
+        if kind is None:
+            return (
+                f"released heading [{version}] has no local tag {name}; "
+                "release evidence is unavailable (for example a --no-tags clone)"
+            )
+        if kind != "tag":
+            return f"released heading [{version}] has a non-annotated tag {name}"
+        if not _reachable(name, root):
+            return f"released heading [{version}] has tag {name} outside the current history"
+    for name, kind in tags.items():
+        if kind != "tag" or _RELEASE_TAG.match(name) is None:
+            continue
+        if not _reachable(name, root):
+            continue
+        if name[1:] not in sections:
+            return (
+                f"annotated tag {name} has no released section; "
+                "released history is not reconciled"
+            )
+    return None
+
+
 def binding_errors(text, tags):
     """State errors for ``check:policy``: prepared or tag-bound, never neither."""
+    try:
+        sections = released_sections(text)
+    except ValueError as error:
+        return [str(error)]
     errors = []
-    pending = pending_versions(text)
+    pending = _pending(sections)
     if len(pending) > 1:
         errors.append(
             "more than one release is marked pending: "
             + ", ".join(f"v{version}" for version in pending)
         )
-    for version, section in released_sections(text).items():
+    for version, section in sections.items():
         marker = _RELEASE_PENDING.search(section)
         if marker is not None:
             if marker.group("version") != version:
@@ -207,20 +299,27 @@ def binding_errors(text, tags):
 
 def release_validation_errors(text, tags):
     """Published-state errors: every released heading is tag-bound, nothing pending."""
+    try:
+        sections = released_sections(text)
+    except ValueError as error:
+        return [str(error)]
     errors = []
-    for version in pending_versions(text):
+    for version in _pending(sections):
         errors.append(
             f"release-pending marker for v{version} remains; remove it after creating the tag"
         )
-    for version in released_sections(text):
+    for version in sections:
         if tags.get(f"v{version}") != "tag":
             errors.append(f"released heading [{version}] needs an annotated tag v{version}")
     return errors
 
 
 def write_blocked(text, boundary):
-    """Reason why ``--write`` must not run, or None when the boundary is settled."""
-    pending = pending_versions(text)
+    """Reason why rendering must not run, or None when the boundary is settled."""
+    try:
+        pending = pending_versions(text)
+    except ValueError as error:
+        return str(error)
     if not pending:
         return None
     if len(pending) == 1 and boundary == f"v{pending[0]}":
@@ -290,19 +389,23 @@ def main(argv=None):
         print("release state is consistent")
         return 0
 
+    problem = boundary_problem(text)
+    if problem is not None:
+        print(f"error: {problem}", file=sys.stderr)
+        return 1
     try:
         boundary = release_tag()
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-    section = render_unreleased(merged_subjects(since=boundary))
-    if not args.write:
-        sys.stdout.write(section)
-        return 0
     blocked = write_blocked(text, boundary)
     if blocked is not None:
         print(f"error: {blocked}", file=sys.stderr)
         return 1
+    section = render_unreleased(merged_subjects(since=boundary))
+    if not args.write:
+        sys.stdout.write(section)
+        return 0
     CHANGELOG.write_text(replace_unreleased(text, section), encoding="utf-8")
     return 0
 

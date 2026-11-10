@@ -22,12 +22,14 @@ and the validation step that binds it to that tag.
 
 - Read review status creators from the status list ([#3](https://github.com/mikomiel/ci-burst/pull/3)).
 - Bound the changelog at the release boundary.
+- Fail closed when release evidence is unavailable.
 
 ### Documentation
 
 - Propose bounded AWS Spot queue burst ([#1](https://github.com/mikomiel/ci-burst/pull/1)).
 - Add a self-service AWS runner setup tutorial ([#5](https://github.com/mikomiel/ci-burst/pull/5)).
 - Add a changelog and the release boundary.
+- Add runner setup follow-ups from live testing ([#22](https://github.com/mikomiel/ci-burst/pull/22)).
 
 ### CI
 

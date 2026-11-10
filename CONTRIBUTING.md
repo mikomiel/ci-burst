@@ -155,6 +155,12 @@ python3 scripts/render_changelog.py --write
 `--write` refuses while a preparation marker is pending and its tag does not
 exist; do not regenerate between cutting the section and tagging it.
 
+Regeneration fails closed rather than guessing the boundary: the renderer
+refuses a shallow checkout, a released section that cannot be reconciled with
+a local reachable annotated tag (for example a `--no-tags` clone), a malformed
+or duplicate release heading, and a preparation marker whose tag does not
+exist. Fetch tags or the full history instead of bypassing the check.
+
 ## Checks
 
 Use Node.js 22.12+, Python 3.12+ and the committed planning lockfile:

@@ -584,6 +584,37 @@ class ApplyTests(ControllerCase):
             result["slot"]["ignored_discrepancies"][0]["instance_id"], "i-gone"
         )
 
+    def test_an_unusable_operation_tag_blocks_in_any_state(self):
+        # The exception is narrow on purpose: a real operation id the ledger
+        # never recorded, on a terminated instance. A missing, empty or
+        # `pending` tag says nothing about ownership, so it blocks whichever
+        # state the instance is in.
+        for operation in (None, "", "pending"):
+            for state in ("running", "terminated"):
+                with self.subTest(operation=operation, state=state):
+                    controller = self.build(observation=observation_demand())
+                    self.aws.instances_result = [
+                        instance(instance_id="i-odd", operation=operation, state=state)
+                    ]
+                    result = controller.apply()
+                    self.assertEqual(result["decision"], "refused", result)
+                    self.assertIn("owned_state_discrepancy", result["reasons"])
+                    self.assertEqual(
+                        result["slot"]["discrepancies"][0]["reason"],
+                        "OWNED_INSTANCE_WITHOUT_OPERATION",
+                    )
+                    self.assertNotIn("ignored_discrepancies", result["slot"])
+                    self.assertEqual(self.aws.mutations(), [])
+
+    def test_status_reports_an_unusable_operation_tag_as_blocking(self):
+        controller = self.build()
+        self.aws.instances_result = [instance(instance_id="i-odd", operation="pending", state="terminated")]
+        result = controller.status()
+        self.assertEqual(
+            result["slot"]["discrepancies"][0]["reason"], "OWNED_INSTANCE_WITHOUT_OPERATION"
+        )
+        self.assertNotIn("ignored_discrepancies", result["slot"])
+
     def test_a_live_unrecorded_instance_still_blocks_beside_a_terminated_one(self):
         controller = self.build(observation=observation_demand())
         self.aws.instances_result = [

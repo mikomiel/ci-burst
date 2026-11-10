@@ -487,8 +487,7 @@ class Controller:
                     # The next candidate would create an instance that is
                     # expired before it boots. Nothing was created, so the slot
                     # is released.
-                    self.ledger.set_state(operation.id, "failed", detail="admission_expired")
-                    self.ledger.release_reservation(operation.id)
+                    self.ledger.fail_without_reservation(operation.id, detail="admission_expired")
                     result["decision"] = "refused"
                     result.setdefault("reasons", []).append("admission_expired")
                     result["operation"] = operation.id
@@ -534,8 +533,7 @@ class Controller:
                 result["attempts"] = attempts
                 return
             if index + 1 == len(plans):
-                self.ledger.set_state(operation.id, "failed", detail=refusal.reason)
-                self.ledger.release_reservation(operation.id)
+                self.ledger.fail_without_reservation(operation.id, detail=refusal.reason)
                 result["decision"] = "launch_failed"
                 result["refusal"] = refusal.as_dict()
                 result["operation"] = operation.id
@@ -546,8 +544,7 @@ class Controller:
         # candidate was skipped because its price evidence expired during the
         # earlier attempt. Nothing was created, so release the slot instead of
         # leaving an intent that can only be sent on stale evidence.
-        self.ledger.set_state(operation.id, "failed", detail="spot_price_stale")
-        self.ledger.release_reservation(operation.id)
+        self.ledger.fail_without_reservation(operation.id, detail="spot_price_stale")
         result["decision"] = "refused"
         result.setdefault("reasons", []).append("spot_price_stale")
         result["operation"] = operation.id
@@ -601,8 +598,7 @@ class Controller:
             elif defer_capacity and is_capacity_failure(refusal):
                 return "capacity", refusal
             else:
-                self.ledger.set_state(operation.id, "failed", detail=refusal.reason)
-                self.ledger.release_reservation(operation.id)
+                self.ledger.fail_without_reservation(operation.id, detail=refusal.reason)
                 result["decision"] = "launch_failed"
                 outcome = "refused"
             result["refusal"] = refusal.as_dict()

@@ -274,6 +274,10 @@ class ApplyTests(ControllerCase):
         self.assertEqual(result["refusal"], {"reason": "AWS_REFUSED", "detail": "InsufficientInstanceCapacity"})
         operation = self.reopened().operation(result["operation"])
         self.assertEqual(operation.state, "failed")
+        # One write records the failure and the release together, so a restart
+        # between them cannot leave a failed operation still charging the window.
+        self.assertEqual(operation.reservation_micros, 0)
+        self.assertEqual(operation.detail, "AWS_REFUSED")
         window = current_window(self.clock.now, self.config.budget.window_seconds)
         self.assertEqual(self.reopened().consumed_micros(window), 0)
 
@@ -293,6 +297,7 @@ class ApplyTests(ControllerCase):
         result = controller.apply()
         self.assertEqual(result["decision"], "uncertain")
         operation = self.reopened().operation(result["operation"])
+        self.assertGreater(operation.reservation_micros, 0)
         window = current_window(self.clock.now, self.config.budget.window_seconds)
         self.assertEqual(
             self.reopened().consumed_micros(window), operation.reservation_micros

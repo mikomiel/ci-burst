@@ -308,9 +308,13 @@ not recalled by stopping the unit: run `status` to read the operation, and let
 the reaper (or the expiry) reconcile it before you re-enable admission.
 
 The ledger keeps the operation; the reaper still terminates expired instances.
-To stop cleanup as well, disable the reaper timer and terminate owned instances
-by hand from the tags. Reverting the source is a reviewed change, not a history
-rewrite.
+Do not disable the reaper to "finish" the rollback: an interrupted `RunInstances`
+request can still produce an instance after you stop looking, and stopping
+cleanup first leaves that instance without expiry enforcement. Keep the reaper
+enabled until every outstanding request is resolved and every owned instance is
+terminal, and retire the cleanup host only by the procedure in
+[container.md](container.md) (a verified replacement scheduler, or exactly those
+conditions). Reverting the source is a reviewed change, not a history rewrite.
 
 | Refusal | Meaning |
 | --- | --- |

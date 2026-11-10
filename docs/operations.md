@@ -248,7 +248,9 @@ is therefore extra capacity for the pool that actually backs up, not a separate
 island — a `runs-on: strong-ci` job can be picked up by the burst worker, which
 is the point of bursting. `cloud-ci` remains the explicit route: a workflow that
 asks for it is asking for cloud capacity specifically, which is what a manual
-dispatch uses to qualify a deployment without disturbing the pool.
+dispatch uses to qualify a deployment without adding work to the pool. It is not
+a guarantee that the qualification job is the one the worker runs — a shared
+label means the worker takes whichever matching job Forgejo assigns next.
 
 Both pools see `strong-ci` demand, and that is intended. It has consequences an
 operator must budget for:
@@ -285,10 +287,14 @@ Accepted risk, stated plainly:
 - a worker that dies mid-job takes that job down with it. That is a failed run,
   not a wrong result, and it is why the burst label stays available for
   workloads that should only ever run on cloud capacity;
-- if `cloud-ci` is ever removed from the worker or the deployment, the burst
-  stops being separately addressable and only pool congestion can trigger it.
-  That is a configuration change, not a silent one, because this section and the
-  deployment example are the owners of the label set.
+- removing a label is a coordinated change, not one edit. Taking `cloud-ci` out
+  of `[worker].labels` alone still lets Forgejo assign a cloud-only job to a
+  worker launched for pool congestion, because the worker keeps registering the
+  label; taking it out of the bootstrap alone leaves the controller counting
+  cloud-only demand and spending reservations on a worker that cannot take those
+  jobs. Both sets change together, with the new template version this repository
+  requires for any bootstrap change, and this section and the deployment example
+  are the owners that record it.
 
 ## Budget and reservations
 

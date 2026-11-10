@@ -112,6 +112,60 @@ python3 scripts/github_pr_automation.py merge
 context. Do not use it from an authoring session. No policy operation creates
 a release, deployment or cloud resource.
 
+## Releases
+
+A release exists only after both maintainer actions, in order:
+
+1. an annotated semantic version tag `vMAJOR.MINOR.PATCH` on `main`; and
+2. a GitHub Release for that tag whose notes are the matching `CHANGELOG.md`
+   section.
+
+Creating the tag is a maintainer decision. A merge, a green check, a changelog
+entry or a package build is not a release or a deployment, and none of them
+authorizes a tag, a package, an image, a deployment or a cloud change.
+
+Before 1.0, an observable behaviour change is a minor release and a fix is a
+patch; no other compatibility is promised.
+
+A release uses two changelog states:
+
+- **Preparation**, before the tag exists: move the Unreleased entries under
+  `## [X.Y.Z] - YYYY-MM-DD` and add `<!-- release-pending: vX.Y.Z -->` below
+  that heading. The marker is the explicit preparation state; `check:policy`
+  accepts the heading without its tag only while that marker is present. Merge
+  the preparation pull request.
+- **Published**, after the tag: create the annotated `vX.Y.Z` tag on the
+  preparation merge commit; `CHANGELOG.md` at that commit must already contain
+  the released section. Create the GitHub Release from that section, then
+  remove the marker in a follow-up change.
+  `python3 scripts/render_changelog.py --validate-release` verifies that every
+  released heading has its annotated `vX.Y.Z` tag, that the tag's own
+  `CHANGELOG.md` contains the section, and that no marker remains.
+
+The tag must be `v`-prefixed and annotated; a lightweight or unprefixed tag is
+not a release and the checks reject it. A released heading without either the
+preparation marker or its tag is a defect, and so are an annotated release tag
+without its released section and a tag created before its section. Lead zeroes
+and headings that are not exactly `## [X.Y.Z] - YYYY-MM-DD` are rejected.
+
+`CHANGELOG.md` records merged source history, never deployment or runtime
+evidence. Its Unreleased section is generated from merged `feat:`, `fix:`,
+`docs:` and `ci:` subjects after the latest release tag:
+
+```sh
+python3 scripts/render_changelog.py --write
+```
+
+`--write` refuses while a preparation marker is pending and its tag does not
+exist; do not regenerate between cutting the section and tagging it.
+
+Regeneration fails closed rather than guessing the boundary: the renderer
+refuses a shallow checkout, a released section that cannot be reconciled with
+a local reachable annotated tag (for example a `--no-tags` clone, a tag on an
+unrelated branch, or a tag created before the section), a malformed,
+noncanonical or duplicate release heading, and a preparation marker whose tag
+does not exist. Fetch tags or the full history instead of bypassing the check.
+
 ## Checks
 
 Use Node.js 22.12+, Python 3.12+ and the committed planning lockfile:

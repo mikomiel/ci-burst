@@ -17,6 +17,10 @@ queue or a general-purpose multicloud platform.
   provision at most one additional Spot VM in the first version.
 - Launch only an operator-prepared, version-pinned template whose image
   registers a one-job ephemeral runner and shuts down after that job.
+- Price an ordered list of configured availability-zone candidates, launch in
+  the first eligible one, and fall through to the next candidate only when the
+  provider definitely rejects the request for insufficient capacity. The
+  original single-zone setting remains supported as a one-candidate list.
 - Persist launch intent, idempotency data, resource ownership and conservative
   cost reservations in SQLite; reconcile those records with AWS after restart.
 - Refuse new launches when queue, ownership, price, budget or durable state
@@ -49,9 +53,11 @@ None. This is a new product with no existing capability specifications.
 Planned implementation: a Python 3.13+ CLI, standard-library HTTP/SQLite and
 the official AWS SDK. Development tooling includes a pinned OpenSpec CLI;
 Node is not a proposed controller runtime. Forgejo and EC2 remain the
-authorities for jobs and instances respectively. A launch template, qualified
-runner image, secure bootstrap, machine credentials and network connectivity
-are operator-owned prerequisites, not resources this change creates.
+authorities for jobs and instances respectively. Placement is operator-supplied
+ordered configuration; the controller never discovers zones. A launch template,
+qualified runner image, secure bootstrap, machine credentials and network
+connectivity are operator-owned prerequisites, not resources this change
+creates.
 
 Tests and public CI use synthetic data and cloud-boundary substitutes. This
 proposal does not establish working software, verified API compatibility,

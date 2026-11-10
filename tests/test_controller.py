@@ -704,6 +704,21 @@ class ReapTests(ControllerCase):
         self.assertEqual(self.aws.mutations(), [])
         self.assertEqual(self.observer.calls, 0)
 
+    def test_reap_reports_a_denied_termination_without_claiming_success(self):
+        # The documented failure shape: the ids are filled before the provider
+        # call, so a denial keeps them and leaves refused_resources empty. Only
+        # the decision and the top-level refusal distinguish success.
+        controller = self.build()
+        self.aws.instances_result = [
+            instance(instance_id="i-expired", operation="a", expires_at=self.clock.now - 5)
+        ]
+        self.aws.terminate_error = ProviderRefusal("AWS_REFUSED", "UnauthorizedOperation")
+        result = controller.reap(apply=True)
+        self.assertEqual(result["decision"], "cleanup_failed")
+        self.assertEqual(result["termination_requested"], ["i-expired"])
+        self.assertEqual(result["refused_resources"], [])
+        self.assertEqual(result["refusal"]["reason"], "AWS_REFUSED")
+
     def test_reap_apply_requests_termination_and_does_not_claim_confirmation(self):
         controller = self.build()
         self.aws.instances_result = [instance(instance_id="i-expired", operation="a", expires_at=self.clock.now - 5)]

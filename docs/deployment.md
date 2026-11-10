@@ -318,6 +318,34 @@ the decision is `wait` with reason `no_runnable_demand` and no price evidence â€
 that is a healthy installation, not a failed one. Push a job that asks for your
 label, or wait for one, to see the priced decision.
 
+### Prove the cleanup identity terminates something
+
+The controller terminates its own expired instance on the next `apply` tick, so
+a cleanup identity that is never observed terminating can still be correct â€” and
+a reap that reports nothing is indistinguishable from a reap that would be
+denied. To see it work, take the controller out of the picture:
+
+1. stop the admission schedule on the scaler
+   (`systemctl disable --now ci-burst-apply.timer`) so nothing else can terminate
+   the canary first;
+2. launch one instance carrying the ownership tags and an `ci-burst:expires-at`
+   in the past. The reaper reads tags, not the ledger, so a tagged canary is
+   exactly its production input. Put a no-op bootstrap in the launch so it
+   registers no runner and takes no job;
+3. run `reap --apply` on the cleanup host. The answer must name the instance in
+   `termination_requested` with an empty `refused_resources`. A
+   `reason: AWS_REFUSED` with `UnauthorizedOperation` means the policy's
+   `ec2:ResourceTag/ci-burst:deployment` condition does not match the canary's
+   tag, or the instance is not tagged `ci-burst:managed=true`;
+4. confirm the instance reaches `terminated` with `status` or
+   `describe-instances`: a termination request is not confirmed removal;
+5. re-enable the scaler timer.
+
+EC2 keeps listing a terminated instance for about an hour. While it is listed, an
+unrecorded owned instance is reported in `status` under
+`slot.ignored_discrepancies` and does not block admission; a **live** unrecorded
+instance still does, because it may be spending money nothing accounts for.
+
 ## 7. Qualify live support
 
 `apply` is refused until the queue contract is verified against the running

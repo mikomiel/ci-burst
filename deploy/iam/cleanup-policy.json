@@ -1,0 +1,20 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadTheQueueInventory",
+      "Effect": "Allow",
+      "Action": "ec2:DescribeInstances",
+      "Resource": "*"
+    },
+    {
+      "Sid": "TerminateOnlyOwnedInstances",
+      "Effect": "Allow",
+      "Action": "ec2:TerminateInstances",
+      "Resource": "arn:aws:ec2:eu-central-1:123456789012:instance/*",
+      "Condition": {
+        "StringEquals": { "ec2:ResourceTag/ci-burst:managed": "true" }
+      }
+    }
+  ]
+}

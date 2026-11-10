@@ -16,8 +16,6 @@ and the validation step that binds it to that tag.
 
 ## [0.1.0] - 2026-11-10
 
-<!-- release-pending: v0.1.0 -->
-
 ### Added
 
 - Add the bounded AWS Spot controller ([#4](https://github.com/mikomiel/ci-burst/pull/4)).

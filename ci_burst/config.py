@@ -25,8 +25,9 @@ SUPPORTED_CONTRACTS = {
     "forgejo-17.0.1-runners-jobs": (
         "GET /api/v1/repos/{owner}/{repo}/actions/runners/jobs returns a JSON "
         "array of ActionRunJob records; a record is eligible demand when its "
-        "status is waiting, needs is empty and its complete runs_on set is "
-        "supported by the configured worker labels."
+        "status is waiting and its complete runs_on set is supported by the "
+        "configured worker labels; status blocked is dependency-blocked work, "
+        "and needs is metadata that never decides eligibility."
     ),
 }
 

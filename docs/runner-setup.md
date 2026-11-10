@@ -23,6 +23,7 @@ Placeholders use `example` values. Replace every one with your own.
 | `eu-central-1` / `eu-central-1a` | your Region and availability zone |
 | `forgejo.example.com` | your Forgejo hostname |
 | `owner/repository` | the repository whose jobs the runner may take |
+| `cloud-ci` | the deployment-specific routing label in `RUNNER_LABELS` and `[worker].labels` |
 | `vpc-...`, `subnet-...`, `sg-...`, `ami-...` | your network and image ids |
 
 ## Threat model
@@ -139,9 +140,9 @@ runner before you rely on the rotation.
 If host-root visibility of the registration token is unacceptable, do not store
 a registration token on the worker at all. Pre-create ephemeral runner
 credentials (one per launch) and store each UUID and token in SSM as a
-SecureString JSON value. The bootstrap writes the runner configuration from
-that value and starts `one-job`; it never calls `register`. The trade-off is
-that the operator must replenish credentials for each launch.
+SecureString JSON value. A bootstrap for this alternative writes the runner
+configuration from that value and starts `one-job`; it never calls `register`.
+The trade-off is that the operator must replenish credentials for each launch.
 
 ## 3. Network placement
 
@@ -209,106 +210,21 @@ aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
 Without it, launches fail with
 `AuthFailure.ServiceLinkedRoleCreationNotPermitted`.
 
-User data (no secret in it). It runs as root, prepares the unprivileged runner
-account, registers, blocks the metadata service for the job account, runs one
-job and always terminates the instance:
+### Worker bootstrap
 
-```sh
-#!/bin/bash
-set -euo pipefail
-umask 077
-exec > >(tee -a /dev/ttyS0) 2>&1 || true
-export DEBIAN_FRONTEND=noninteractive
+User data (no secret in it). The bootstrap is the repository-owned file
+[`deploy/runner/bootstrap.sh`](../deploy/runner/bootstrap.sh). It runs as root,
+prepares the unprivileged runner account, registers an ephemeral runner, blocks
+the metadata service for the job account, runs one job and always terminates
+the instance.
 
-# A failed bootstrap must not leave a running instance. Every exit path,
-# successful or not, removes the token file and terminates the instance.
-TOKEN_FILE=""
-cleanup_token() {
-  if [ -n "$TOKEN_FILE" ] && [ -e "$TOKEN_FILE" ]; then
-    shred -u "$TOKEN_FILE" 2>/dev/null || rm -f "$TOKEN_FILE"
-  fi
-}
-on_exit() {
-  rc=$?
-  echo "bootstrap exiting rc=$rc"
-  cleanup_token
-  sync
-  shutdown -h now
-}
-trap on_exit EXIT
-# Independent watchdog for a hung step. Do not ignore a failure: without it a
-# hung apt or download would never reach the exit trap.
-systemd-run --on-active=3600 --unit=runner-lifetime /sbin/shutdown -h now
-
-apt-get update -y
-apt-get install -y --no-install-recommends curl ca-certificates awscli iptables
-
-# Pin the runner. Replace version and checksum with the combination you
-# verified from the release page.
-RUNNER_VERSION=13.2.1
-RUNNER_SHA=<sha256-for-your-architecture>
-ARCH=arm64
-# This pinned version still accepts `register`, and prints:
-#   `register` has been deprecated; declare connections in the runner configuration instead
-# A future major version may remove it, so the pin is part of the contract:
-# change the version only together with a bootstrap that declares the
-# connection in the runner configuration.
-curl -fsSL --max-time 60 -o /tmp/forgejo-runner \
-  "https://code.forgejo.org/forgejo/runner/releases/download/v${RUNNER_VERSION}/forgejo-runner-${RUNNER_VERSION}-linux-${ARCH}"
-echo "${RUNNER_SHA}  /tmp/forgejo-runner" | sha256sum -c -
-install -m 0755 /tmp/forgejo-runner /usr/local/bin/forgejo-runner
-rm -f /tmp/forgejo-runner
-
-# Dedicated unprivileged account: jobs run here, never as root.
-id runner >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin runner
-install -d -o runner -g runner -m 0700 /var/lib/forgejo-runner
-install -d -m 0755 /etc/forgejo-runner
-cat > /etc/forgejo-runner/config.yml <<'CFG'
-runner:
-  file: /var/lib/forgejo-runner/.runner
-  capacity: 1
-cache:
-  enabled: false
-CFG
-chown root:runner /etc/forgejo-runner/config.yml
-chmod 0640 /etc/forgejo-runner/config.yml
-
-# Pin Forgejo's name only if your DNS does not already resolve it.
-# echo '192.0.2.10 forgejo.example.com' >> /etc/hosts
-
-PARAM=/forgejo/runner/registration-token
-TOKEN_FILE=$(mktemp /run/runner-token.XXXXXX)
-chmod 600 "$TOKEN_FILE"
-
-aws ssm get-parameter --region eu-central-1 --name "$PARAM" \
-  --with-decryption --query Parameter.Value --output text > "$TOKEN_FILE"
-
-# The stock CLI accepts the registration token only as an argument, and only
-# non-interactive mode can set --ephemeral. This is the one place it is read.
-# The registration finishes before the runner starts, so no job code exists
-# during that window; host root and exec auditing can still observe it.
-/usr/local/bin/forgejo-runner register --no-interactive \
-  -c /etc/forgejo-runner/config.yml \
-  --instance https://forgejo.example.com \
-  --token "$(cat "$TOKEN_FILE")" \
-  --name "burst-$(hostname)" \
-  --labels burst:host \
-  --ephemeral
-cleanup_token
-
-# The runner account needs its own registration file, not the registration token.
-chown -R runner:runner /var/lib/forgejo-runner
-
-# Job code must not be able to use the instance profile to mint credentials.
-iptables -A OUTPUT -m owner --uid-owner runner -d 169.254.169.254 -j REJECT
-iptables -A OUTPUT -m owner --uid-owner runner -d 169.254.170.2 -j REJECT
-
-# One job, bound in time; shutdown happens in the EXIT trap.
-install -d -o runner -g runner -m 0700 /var/lib/forgejo-runner/work
-cd /var/lib/forgejo-runner
-timeout --signal=TERM --kill-after=60 3600 \
-  runuser -u runner -- /usr/local/bin/forgejo-runner one-job -c /etc/forgejo-runner/config.yml || true
-```
+Paste the file into the template's user data after replacing the placeholders
+its header documents. This guide deliberately does not carry a second copy: the
+advertised labels, the runner pin and the lifecycle live in that one file. The
+bootstrap is part of the template, so any change to it is a new launch-template
+version; an approved version is never edited in place
+([operations.md § Worker image and launch template](operations.md#worker-image-and-launch-template)
+owns that rule).
 
 `one-job` polls the queue once. When nothing is queued it exits with
 `Error: no task received`; that is the expected empty-queue result, not a broken
@@ -316,32 +232,63 @@ runner. `one-job -w` (`--wait`) blocks until Forgejo assigns a task. Trigger the
 worker only after you observe queue demand, or pass `--wait`; an idle launch
 otherwise pays for a boot that does no work.
 
-### Labels choose an executor
+### Runner pin and the deprecated `register` command
 
-Set the template's label to match your controller configuration
-(`[worker].labels`), for example `ci-burst:host`, or update that configuration
-to `burst:host`.
-
-A runner label may carry an executor suffix: the part after the colon names the
-executor, and a bare label silently means the default Docker executor.
-`--labels strong-ci` therefore registers a Docker-backed runner. On a host
-without a Docker socket, registration still succeeds and then every `one-job`
-dies immediately with:
+The bootstrap pins `forgejo-runner` **13.2.1** (`RUNNER_VERSION`) and checks the
+downloaded binary against `RUNNER_SHA`. The pin is deliberate; do not move it
+without the migration this section describes. In that version the `register`
+command is deprecated but still works, and prints:
 
 ```text
-Error: daemon Docker Engine socket not found and docker_host config was invalid
+`register` has been deprecated; declare connections in the runner configuration instead
 ```
 
-`--labels strong-ci:host` selects the host executor instead. The bootstrap above
-passes `burst:host` for that reason; when you rename the label, keep the `:host`
-suffix or provide a working Docker socket in the image.
+The deprecation applies to the 13.x runner line, including the pinned 13.2.1.
+The bootstrap depends on `register --no-interactive ... --ephemeral`: the
+non-interactive flag is what lets a fresh worker boot without a person, and
+`--ephemeral` is what makes Forgejo delete the runner after one job. A
+replacement must keep both properties. Declaring the connection in the runner
+configuration (`server.connections`) or passing the connection options to
+`one-job` removes `register`, but Forgejo must mint the runner UUID and token
+before the worker boots, so the reusable registration-token model in section 2
+changes with it. The upstream
+[registration guide](https://forgejo.org/docs/latest/admin/actions/registration/)
+owns the configuration shape and the ephemeral semantics.
 
-A worker may advertise more than one label; an image built for a specific
-architecture can also carry `linux-arm64:host` or `linux-x86_64:host`, for
-example. Every advertised label is a routing claim to qualify against the image,
-not a fact derived from the instance type: ci-burst routes on the labels you
-declare, so verify that the image and machine really match a label before jobs
-depend on it.
+The pin is correct while the pinned runner still provides non-interactive
+ephemeral registration. The version that would force the migration is the first
+release that no longer ships the `register` subcommand: no released version
+removes it as of 13.2.1, and removal would first be possible in a new major
+(14.0.0). A migration is a bootstrap change, so it also needs a new
+launch-template version and an end-to-end run that proves one job and a
+terminated instance before it replaces the pin.
+
+### Labels choose an executor
+
+The bootstrap is the single owner of the advertised label set. It advertises a
+deployment-specific routing label and the architecture label of the image, each
+in the runner's `name:executor` form:
+
+- the part before `:` is the label the controller matches;
+- the part after `:` names the executor. A bare label silently means the
+  default Docker executor, and on a host without a Docker socket every
+  `one-job` dies immediately with:
+
+  ```text
+  Error: daemon Docker Engine socket not found and docker_host config was invalid
+  ```
+
+  The bootstrap uses the `:host` executor for that reason; when you rename or
+  add a label, keep `:host` or provide a working Docker socket in the image.
+
+The controller routes on its own configuration, not on what a worker advertises,
+so `[worker].labels` must list the same set including the architecture label, or
+the burst is not eligible for jobs that require it.
+
+Every advertised label is a routing claim rather than evidence of capability,
+and it must be qualified against the actual image and machine before a job
+relies on it. [operations.md § Labels](operations.md#labels) owns that rule and
+the matching semantics; this guide does not repeat them.
 
 ## 5. Verify
 

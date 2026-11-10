@@ -119,9 +119,24 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(observation.status, "empty")
 
     def test_dependency_blocked_is_not_demand(self):
+        # Dependency-blocked work carries its own status. A `waiting` job is
+        # not blocked by a populated `needs`: the server fills that list from
+        # the workflow and does not clear it when the dependency finishes.
         observation, _ = self.observe(fixture("jobs_blocked.json"))
         self.assertEqual(observation.demand, 0)
         self.assertEqual(observation.blocked, 1)
+        self.assertEqual(observation.notes, ())
+
+    def test_waiting_job_with_static_needs_is_demand(self):
+        # Measured on forgejo 17.0.1+gitea-1.22.0: a job waiting for a runner
+        # still lists the dependency that already succeeded, so `needs` is
+        # metadata and never decides eligibility.
+        observation, _ = self.observe(fixture("jobs_waiting_with_needs.json"))
+        self.assertEqual(observation.demand, 1)
+        self.assertEqual(observation.blocked, 0)
+        attempt = observation.attempts[0]
+        self.assertEqual(attempt.handle, "h-3-1")
+        self.assertEqual(attempt.needs, ("classify",))
 
     def test_assigned_job_is_not_demand(self):
         observation, _ = self.observe(fixture("jobs_assigned.json"))
@@ -149,6 +164,30 @@ class ObserverTests(unittest.TestCase):
         observation, _ = self.observe(json.dumps([record]).encode())
         self.assertEqual(observation.demand, 0)
         self.assertEqual(observation.incompatible, 1)
+
+    def test_job_requiring_the_routing_and_architecture_labels_is_demand(self):
+        # The burst worker advertises the routing label and the image's
+        # architecture label; a job asking for both bare labels is eligible.
+        self.config = load(
+            write_config(
+                self.root,
+                config={"worker": {"labels": ["cloud-ci:host", "linux-arm64:host"]}},
+            )
+        )
+        record = {
+            "id": 8,
+            "run_id": 1,
+            "attempt": 1,
+            "handle": "h-8-1",
+            "status": "waiting",
+            "runs_on": ["cloud-ci", "linux-arm64"],
+            "needs": [],
+        }
+        observation, transport = self.observe(json.dumps([record]).encode())
+        self.assertEqual(observation.demand, 1)
+        self.assertEqual(observation.incompatible, 0)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(transport.calls[0][0]).query)
+        self.assertEqual(query, {"labels": ["cloud-ci,linux-arm64"]})
 
     def test_repeated_record_is_deduplicated(self):
         observation, _ = self.observe(fixture("jobs_duplicate.json"))

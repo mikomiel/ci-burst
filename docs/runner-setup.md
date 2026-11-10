@@ -248,6 +248,11 @@ apt-get install -y --no-install-recommends curl ca-certificates awscli iptables
 RUNNER_VERSION=13.2.1
 RUNNER_SHA=<sha256-for-your-architecture>
 ARCH=arm64
+# This pinned version still accepts `register`, and prints:
+#   `register` has been deprecated; declare connections in the runner configuration instead
+# A future major version may remove it, so the pin is part of the contract:
+# change the version only together with a bootstrap that declares the
+# connection in the runner configuration.
 curl -fsSL --max-time 60 -o /tmp/forgejo-runner \
   "https://code.forgejo.org/forgejo/runner/releases/download/v${RUNNER_VERSION}/forgejo-runner-${RUNNER_VERSION}-linux-${ARCH}"
 echo "${RUNNER_SHA}  /tmp/forgejo-runner" | sha256sum -c -
@@ -305,20 +310,63 @@ timeout --signal=TERM --kill-after=60 3600 \
   runuser -u runner -- /usr/local/bin/forgejo-runner one-job -c /etc/forgejo-runner/config.yml || true
 ```
 
+`one-job` polls the queue once. When nothing is queued it exits with
+`Error: no task received`; that is the expected empty-queue result, not a broken
+runner. `one-job -w` (`--wait`) blocks until Forgejo assigns a task. Trigger the
+worker only after you observe queue demand, or pass `--wait`; an idle launch
+otherwise pays for a boot that does no work.
+
+### Labels choose an executor
+
 Set the template's label to match your controller configuration
 (`[worker].labels`), for example `ci-burst:host`, or update that configuration
 to `burst:host`.
 
+A runner label may carry an executor suffix: the part after the colon names the
+executor, and a bare label silently means the default Docker executor.
+`--labels strong-ci` therefore registers a Docker-backed runner. On a host
+without a Docker socket, registration still succeeds and then every `one-job`
+dies immediately with:
+
+```text
+Error: daemon Docker Engine socket not found and docker_host config was invalid
+```
+
+`--labels strong-ci:host` selects the host executor instead. The bootstrap above
+passes `burst:host` for that reason; when you rename the label, keep the `:host`
+suffix or provide a working Docker socket in the image.
+
+A worker may advertise more than one label; an image built for a specific
+architecture can also carry `linux-arm64:host` or `linux-x86_64:host`, for
+example. Every advertised label is a routing claim to qualify against the image,
+not a fact derived from the instance type: ci-burst routes on the labels you
+declare, so verify that the image and machine really match a label before jobs
+depend on it.
+
 ## 5. Verify
 
-1. Launch one instance from the template version, with a distinct tag such as
-   `Name=runner-smoke-test`.
-2. Read the console output (the bootstrap tees to the serial console). Look for
-   the SSM read, `Runner registered successfully.`, and `one-job` waiting.
+1. Add a trivial workflow or job with a matching `runs-on` label, then launch
+   one instance from the template version with a distinct tag such as
+   `Name=runner-smoke-test`. Queue the job first: a plain `one-job` exits with
+   `Error: no task received` when the queue is empty (see section 4).
+2. Read the bootstrap output. It is still available after the instance is gone:
+
+   ```sh
+   aws ec2 get-console-output --region eu-central-1 \
+     --instance-id i-0123456789abcdef0 --latest --query Output --output text
+   ```
+
+   The record can lag several minutes after termination, and
+   `tee: /dev/ttyS0: Input/output error` lines are noise from the serial
+   console, not evidence that the record is missing. Look for the SSM read,
+   `Runner registered successfully.`, one job running, and the power-off.
+   A healthy reference run moves through boot, toolchain install (about 25 s),
+   registration, one job and power-off; use that order as a sanity check when a
+   run stops early.
 3. In Forgejo, the repository's Actions → Runners page shows the new runner in
-   `idle`, then `active` when a job starts.
-4. Add a trivial workflow or job with a matching `runs-on` label and confirm it
-   runs on the worker and the instance terminates afterwards.
+   `idle`, then `active` when the job starts.
+4. Confirm the job ran on the worker and that the instance terminated
+   afterwards.
 5. A manually launched instance is not owned by ci-burst. The controller's
    cleanup selects only instances carrying its own `ci-burst:managed` and
    deployment tags, so terminate a manual test yourself.

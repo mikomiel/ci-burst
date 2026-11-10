@@ -350,12 +350,11 @@ What a promotion does and does not do:
   tree, so an edited or untracked file in the clone can never enter the image
   under a clean commit's name. The clone is only a fetch cache and is never
   reset, cleaned or checked out;
-- the build runs with host networking (`podman build --network=host`). A
-  container bridge whose MTU is larger than the host's path MTU stalls large
-  transfers with no error, and the base image plus the package install are the
-  only transfers large enough to hit it. The smoke run uses the same
-  `ci-burst` network as the scheduled units, so the gate exercises exactly the
-  networking they use;
+- the build runs with host networking (`podman build --network=host`). The base
+  image and the package install are large transfers too, and a bridge whose MTU
+  is above the host's path MTU stalls them the same way it stalls the
+  controller's own responses. The smoke run uses the same `ci-burst` network as
+  the scheduled units, so the gate exercises exactly the networking they use;
 - a fetch, archive, build or smoke failure keeps the previous image in place and
   logs one line with a reason code (`fetch_failed`, `archive_failed`,
   `unpack_failed`, `build_failed`, `smoke_failed`, `tag_failed`,

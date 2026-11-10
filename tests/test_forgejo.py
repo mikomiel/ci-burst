@@ -119,9 +119,24 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(observation.status, "empty")
 
     def test_dependency_blocked_is_not_demand(self):
+        # Dependency-blocked work carries its own status. A `waiting` job is
+        # not blocked by a populated `needs`: the server fills that list from
+        # the workflow and does not clear it when the dependency finishes.
         observation, _ = self.observe(fixture("jobs_blocked.json"))
         self.assertEqual(observation.demand, 0)
         self.assertEqual(observation.blocked, 1)
+        self.assertEqual(observation.notes, ())
+
+    def test_waiting_job_with_static_needs_is_demand(self):
+        # Measured on forgejo 17.0.1+gitea-1.22.0: a job waiting for a runner
+        # still lists the dependency that already succeeded, so `needs` is
+        # metadata and never decides eligibility.
+        observation, _ = self.observe(fixture("jobs_waiting_with_needs.json"))
+        self.assertEqual(observation.demand, 1)
+        self.assertEqual(observation.blocked, 0)
+        attempt = observation.attempts[0]
+        self.assertEqual(attempt.handle, "h-3-1")
+        self.assertEqual(attempt.needs, ("classify",))
 
     def test_assigned_job_is_not_demand(self):
         observation, _ = self.observe(fixture("jobs_assigned.json"))

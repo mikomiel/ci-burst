@@ -84,6 +84,11 @@ name. The policies are deliberately small:
 - the reaper has no `RunInstances` at all, and the scaler cannot create users,
   read other parameters or change IAM.
 
+The deployment identifier is a placeholder in every policy as well: both
+termination grants require `ec2:ResourceTag/ci-burst:deployment` to equal the
+TOML's `deployment` value. Change them together — changing only the TOML keeps
+launch working but denies every later termination.
+
 Create one access key per user. The secret is shown once; write it straight
 into the credential file on the host that uses it (Step 4) and never into a
 repository, a terminal history, a chat or a ticket. Both keys are long-lived:
@@ -204,12 +209,12 @@ From the checkout, on the scaler:
 install -o root -g root -m 0644 deploy/ci-burst-apply.service /etc/systemd/system/
 install -o root -g root -m 0644 deploy/ci-burst-apply.timer   /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable ci-burst-apply.timer
 ```
 
-`enable` without `--now` only links the timer for the next boot: admission stays
-off until Step 8. Enabling and starting it here would begin launching as soon
-as Step 7 sets `live-verified`, before the supervised first burst.
+Install the apply unit and timer, but do not enable or start the timer yet. An
+enabled timer also starts at boot (`OnBootSec=30s`), so enabling it before the
+supervised burst would let a reboot begin unsupervised admission as soon as
+Step 7 sets `live-verified`. Step 8 enables it only after that burst.
 
 On the reaper host:
 
@@ -273,7 +278,7 @@ command as Step 6, replacing `plan` with `apply`. Watch three things:
 Only after that burst is understood, turn admission on:
 
 ```sh
-systemctl start ci-burst-apply.timer        # the timer is already enabled
+systemctl enable --now ci-burst-apply.timer
 journalctl -u ci-burst-apply.service -f     # one JSON line per run
 ```
 
@@ -290,8 +295,12 @@ remove its container too:
 systemctl disable --now ci-burst-apply.timer
 systemctl stop ci-burst-apply.service
 podman rm --force --ignore ci-burst-apply
-podman ps --all --filter name=ci-burst-apply   # must print no container
+podman rm --force --ignore ci-burst-manual
+podman ps --all --filter name=ci-burst          # must print no container
 ```
+
+The manual invocation from Step 8 runs under the fixed name `ci-burst-manual`
+and would otherwise keep running after the rollback.
 
 The unit's `ExecStopPost` removes the named container, and the second command
 is the verification, not a duplicate. A launch request already sent to AWS is

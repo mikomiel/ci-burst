@@ -62,8 +62,8 @@ All paths are fixed by the units. Create them before the first run.
 | --- | --- | --- |
 | `/etc/ci-burst/deployment.toml` | read-only file | deployment TOML |
 | `/var/lib/ci-burst` | writable directory | SQLite ledger, `.lock`, rollback journal |
-| `/etc/ci-burst/aws-scaling` | read-only directory | scaling identity credentials |
-| `/etc/ci-burst/aws-cleanup` | read-only directory | cleanup identity credentials |
+| `/etc/ci-burst/aws-scaling` | read-only directory | scaling credentials, launch-capable profile |
+| `/etc/ci-burst/aws-cleanup` | read-only directory | cleanup credentials, describe/terminate only |
 | `/etc/ci-burst/forgejo.env` | podman env-file, not mounted | Forgejo token |
 
 ```sh
@@ -73,16 +73,26 @@ install -o root -g root -m 0644 deployment.toml /etc/ci-burst/deployment.toml
 install -d -o 10001 -g 10001 -m 0700 /var/lib/ci-burst
 
 install -d -o root -g 10001 -m 0750 /etc/ci-burst/aws-scaling /etc/ci-burst/aws-cleanup
-install -o root -g 10001 -m 0640 credentials /etc/ci-burst/aws-scaling/credentials
-install -o root -g 10001 -m 0640 credentials /etc/ci-burst/aws-cleanup/credentials
+install -o root -g 10001 -m 0640 scaling-credentials /etc/ci-burst/aws-scaling/credentials
+install -o root -g 10001 -m 0640 cleanup-credentials /etc/ci-burst/aws-cleanup/credentials
 
 install -o root -g root -m 0600 forgejo.env /etc/ci-burst/forgejo.env
 ```
 
 The AWS SDK reads `/etc/ci-burst/aws/credentials` and, if present,
 `/etc/ci-burst/aws/config` inside the container. The mount target is
-`/etc/ci-burst/aws`; the two directories above are the scaling and cleanup
-sources, never both at once.
+`/etc/ci-burst/aws`; each unit mounts only its own source directory.
+
+The two `install` lines take different source files on purpose. Each destination
+is mounted into a different unit, so the scaling unit never sees the cleanup
+file and the cleanup unit never sees the scaling file. Both files must define
+the profile that `aws.profile` names, or `default` when that key is unset: the
+mount selects the file, not the profile, and the shared TOML names the same
+profile for both units. The scaling file holds the launch-capable scaling
+identity. The cleanup file holds the cleanup identity, which keeps
+`DescribeInstances` and `TerminateInstances` without launch permission. Never
+copy the scaling file into the cleanup directory: cleanup would inherit launch
+permission, and a broken scaling identity would take cleanup with it.
 
 Under rootless podman the mapping differs. Add
 `--userns=keep-id:uid=10001,gid=10001` to the run command so container UID/GID
@@ -161,8 +171,15 @@ Every run prints one JSON document with stable reason codes. There is no
 daemon to restart: each run reads the TOML, the credentials and the env-file
 fresh.
 
-On a host with SELinux enforcing, add `:Z` to the bind-mount options, for
-example `.../deployment.toml:ro,Z`, so podman relabels them.
+On a host with SELinux enforcing, add a relabel option to each bind mount. The
+deployment TOML is shared by both units and can be in use by two containers at
+the same time, so give it the shared label: `.../deployment.toml:ro,z`. Use the
+private label `:Z` only for a source one unit uses alone, such as
+`/var/lib/ci-burst:rw,Z` or `/etc/ci-burst/aws-scaling:ro,Z`. `:Z` relabels the
+source to one container's private category and breaks any other container using
+it at that moment, so do not mix `:z` and `:Z` on one source. Where relabeling
+is not permitted, apply a `container_file_t` label to the paths once with
+`chcon` instead.
 
 ## Scheduled operation with systemd
 
@@ -182,7 +199,9 @@ systemctl list-timers 'ci-burst-*'
 `ci-burst-apply.timer` starts one `apply` run 60 seconds after the previous run
 finished; the effective period is the run duration plus about 60 seconds. The
 timer never starts a second copy of the unit, and the ledger's writer lock would
-refuse one anyway.
+refuse one anyway. Disabling the timer does not stop a run that is already
+executing; the rollback procedure quiesces the service before state is
+inspected or moved.
 
 `ci-burst-reap.timer` runs `reap --apply` five minutes after the previous run
 finished, on its own unit.
@@ -232,8 +251,11 @@ deployment, one controller host and one ledger copy is the supported topology.
   reservation budget is local.
 - `reap` never needs this directory, which is why cleanup keeps working when
   the ledger is unavailable.
-- To migrate hosts, stop `ci-burst-apply.timer` first, move the whole directory
-  instead of copying it, and start admission only on the new host.
+- To migrate hosts, stop admission as in rollback step 1, including the
+  in-flight run, and confirm no container is still running before moving the
+  whole directory instead of copying it. A process that still holds the ledger
+  can keep writing to it while it is moved. Start admission only on the new
+  host.
 
 ## Rollback
 
@@ -241,21 +263,37 @@ The product rollback order is in
 [operations.md](operations.md#scheduler-cleanup-and-rollback). With the units
 installed it becomes:
 
-1. Stop admission immediately and leave cleanup alone:
+1. Stop admission completely, including the run already in progress.
+   Disabling the timer stops future triggers only; a run that is executing can
+   still reach the provider:
 
    ```sh
    systemctl disable --now ci-burst-apply.timer
-   systemctl list-timers ci-burst-reap.timer
+   systemctl stop ci-burst-apply.service
+   systemctl is-active ci-burst-apply.service              # never active/activating
+   podman ps --filter ancestor=localhost/ci-burst:latest   # must list no container
    ```
+
+   The service may report `inactive` or `failed`; both mean no invocation is
+   running. A run terminated while its provider request was in flight may
+   already have launched an instance, so do not treat the stop as proof that
+   nothing was created.
 
 2. Keep `ci-burst-reap.timer` enabled and running. Stopping cleanup is not
    part of rollback; expiry termination is the path that removes expired
    instances while admission is off.
-3. Inspect what remains with a manual `status` run, then the ledger if needed:
-   `state`, `slot` and `cloud` in the JSON.
-4. Terminate only resources the evidence proves are owned by this deployment,
-   and confirm the terminal state with `status` or another `reap` run. A
-   termination request is not confirmed removal.
+3. Inspect what remains with a manual `status` run using the apply mounts, then
+   the ledger if needed: `state`, `slot` and `cloud` in the JSON.
+4. Reconcile a launch request that may already have been sent. `apply` commits
+   its intent before the provider call, so a run stopped mid-request leaves an
+   unresolved operation, not a lost one. If `state.operations` shows an intent
+   or an `uncertain` operation, or `cloud.instances` lists an owned instance:
+   do not launch a replacement, do not delete the intent and do not start
+   `apply` again. `reap --apply` terminates the instance once its expiry tag
+   has passed, so keep cleanup running and confirm the terminal state with
+   `status`. Removing an owned instance before its expiry needs an operator
+   action with the cleanup identity; the product has no ad-hoc terminate
+   command. Terminate only resources the evidence proves are owned.
 5. Revert the source change through a reviewed pull request. Do not rewrite
    published history.
 

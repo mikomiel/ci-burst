@@ -87,7 +87,8 @@ launch_template_version = 4
 
 The order is the priority. Every candidate requires `zone` and `subnet_id`; an
 optional `launch_template_version` overrides the top-level version for that
-candidate. A candidate list that is empty, repeats a zone, lacks a valid
+candidate. A `subnet_id` is `subnet-` followed by exactly 8 or 17 hexadecimal
+characters. A candidate list that is empty, repeats a zone, lacks a valid
 subnet, carries an unknown key, uses a non-integer template version, names a
 zone outside the configured Region, or is supplied together with
 `availability_zone` is refused at load time with the stable code
@@ -259,17 +260,23 @@ candidate for insufficient capacity (`InsufficientInstanceCapacity`), that
 rejection proves no instance was created, so the same admission advances to the
 next eligible candidate in order — at most once per candidate — and a success
 ends the walk. Every attempt sends `MinCount = MaxCount = 1`, so no fallback can
-produce a second instance. The result reports the ordered `attempts` with each
-outcome (`capacity_rejected`, `accepted`, `rejected` or `uncertain`); `selected`
-remains the admission's first choice, so the accepted attempt is the placement
-that actually launched.
+produce a second instance. Before each advance the controller re-reads the clock:
+the candidate's Spot quote must still be within `price_max_age_seconds` and the
+admission lifetime must not have elapsed. A candidate whose evidence expired is
+recorded as `skipped` (`spot_price_stale`), not frozen or sent, and the next
+remaining candidate is considered. The result reports the ordered `attempts`
+with each outcome (`capacity_rejected`, `accepted`, `rejected`, `uncertain` or
+`skipped`); `selected` remains the admission's first choice, so the accepted
+attempt is the placement that actually launched.
 
 No other failure falls through: a non-capacity definite rejection keeps today's
 `launch_failed` behaviour, and an uncertain response keeps the operation
 outstanding. If every candidate is rejected for capacity the operation is
 `failed` — the slot is free — the queue stays unserved, and the result carries
-the stable `capacity_exhausted` reason plus the final provider refusal. Nothing
-is reported as launched.
+the stable `capacity_exhausted` reason plus the final provider refusal. If the
+remaining candidates' price evidence expires during the attempt, the operation
+is also `failed` with a free slot and the stable `spot_price_stale` reason, and
+no new admission or reservation is created. Nothing is reported as launched.
 
 ## Durable state and ownership
 

@@ -213,7 +213,10 @@ instance was created and suggests another configured placement may succeed, so
 it is the only trigger to advance within the same admission. The operation,
 reservation, expiry and single slot stay; only the frozen request, its hash and
 its own idempotency token move to the next candidate, once per candidate and in
-the configured order.
+the configured order. Freshness is re-checked before each advance: a quote that
+aged out while the previous attempt ran is not frozen or sent, and an admission
+whose remaining evidence all aged out ends failed with a free slot and no new
+reservation.
 
 Alternatives: retrying the same zone cannot help while capacity is absent;
 falling through on throttling or an unclassified error could create a second

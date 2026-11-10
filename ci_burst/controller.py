@@ -493,6 +493,19 @@ class Controller:
                     result["operation"] = operation.id
                     result["attempts"] = attempts
                     return
+                if now - plan.quote.timestamp > self.config.aws.price_max_age_seconds:
+                    # The quote that made this candidate eligible in _decide
+                    # has aged out while the previous attempt was running. It
+                    # must not be frozen or sent; a later candidate may still
+                    # carry fresh evidence.
+                    attempts.append(
+                        {
+                            "zone": plan.candidate.availability_zone,
+                            "outcome": "skipped",
+                            "reason": "spot_price_stale",
+                        }
+                    )
+                    continue
                 request = self._request(plan, decision["expires_at"], operation.id)
                 with self.ledger.transaction():
                     self.ledger.advance_operation(
@@ -527,6 +540,15 @@ class Controller:
                 result["attempts"] = attempts
                 result.setdefault("reasons", []).append("capacity_exhausted")
                 return
+        # Nothing was sent after the last definite rejection: every remaining
+        # candidate was skipped because its price evidence expired during the
+        # earlier attempt. Nothing was created, so release the slot instead of
+        # leaving an intent that can only be sent on stale evidence.
+        self.ledger.set_state(operation.id, "failed", detail="spot_price_stale")
+        result["decision"] = "refused"
+        result.setdefault("reasons", []).append("spot_price_stale")
+        result["operation"] = operation.id
+        result["attempts"] = attempts
 
     def _resume(self, slot, result):
         """Retry the one unresolved launch intent instead of replacing it."""

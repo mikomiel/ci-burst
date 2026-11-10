@@ -79,10 +79,10 @@ def _toml(value):
     return json.dumps(value)
 
 
-def zone_quote(zone, price_micros, clock):
+def zone_quote(zone, price_micros, clock, timestamp=None):
     return SpotQuote(
         price_micros=price_micros,
-        timestamp=clock.now,
+        timestamp=clock.now if timestamp is None else timestamp,
         price_display=f"{price_micros / 1_000_000:.6f}",
         instance_type="t4g.small",
         availability_zone=zone,
@@ -110,6 +110,8 @@ class MultiZoneAws(FakeAws):
 
     def run_spot(self, request):
         self.calls.append(("run_spot", json.loads(json.dumps(request))))
+        if self.on_run is not None:
+            self.on_run(request)
         error = self.run_errors.get(request["Placement"]["AvailabilityZone"])
         if isinstance(error, list):
             error = error.pop(0) if error else None
@@ -217,6 +219,35 @@ class PlanTests(MultiZoneCase):
         self.assertEqual(result["candidates"][0]["reason"], "spot_price_above_cap")
         self.assertEqual(result["selected"]["zone"], "eu-central-1b")
         self.assertEqual(result["price"]["availability_zone"], "eu-central-1b")
+
+    def test_plan_skips_stale_missing_and_wrong_scope_quotes(self):
+        config = self.config(
+            candidates=(
+                {"zone": "eu-central-1a", "subnet_id": "subnet-0123456789abcdef0"},
+                {"zone": "eu-central-1b", "subnet_id": "subnet-0123456789abcdef1"},
+                {"zone": "eu-central-1c", "subnet_id": "subnet-0123456789abcdef2"},
+                {"zone": "eu-central-1d", "subnet_id": "subnet-0123456789abcdef3"},
+            )
+        )
+        controller = self.build(
+            config=config,
+            quotes={
+                "eu-central-1a": zone_quote("eu-central-1a", 20_000, self.clock, timestamp=self.clock.now - 901),
+                "eu-central-1b": None,
+                "eu-central-1c": zone_quote("eu-central-1d", 20_000, self.clock),
+                "eu-central-1d": zone_quote("eu-central-1d", 30_000, self.clock),
+            },
+        )
+
+        result = controller.plan()
+
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(
+            [item.get("reason") for item in result["candidates"]],
+            ["spot_price_stale", "spot_price_unavailable", "spot_price_wrong_scope", None],
+        )
+        self.assertEqual(result["selected"]["zone"], "eu-central-1d")
+        self.assertEqual(result["price"]["availability_zone"], "eu-central-1d")
 
     def test_plan_uses_the_launch_template_version_pinned_by_a_candidate(self):
         config = self.config(
@@ -379,6 +410,74 @@ class LaunchFallbackTests(MultiZoneCase):
         self.assertEqual(second["operation"], first["operation"])
         self.assertEqual(len(self.reopened().operations()), 1)
 
+    def test_a_fallback_candidate_is_not_sent_on_stale_price_evidence(self):
+        config = self.config(
+            candidates=(
+                {"zone": "eu-central-1a", "subnet_id": "subnet-0123456789abcdef0"},
+                {"zone": "eu-central-1b", "subnet_id": "subnet-0123456789abcdef1"},
+            )
+        )
+        controller = self.build(
+            config=config,
+            quotes={
+                "eu-central-1a": zone_quote("eu-central-1a", 20_000, self.clock),
+                # 899 s old at admission: still eligible. Freshness is checked
+                # again before this candidate is frozen and sent.
+                "eu-central-1b": zone_quote(
+                    "eu-central-1b", 30_000, self.clock, timestamp=self.clock.now - 899
+                ),
+            },
+            run_errors={
+                "eu-central-1a": ProviderRefusal("AWS_REFUSED", "InsufficientInstanceCapacity"),
+            },
+        )
+        self.aws.on_run = lambda request: self.clock.advance(2)
+
+        result = controller.apply()
+
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("spot_price_stale", result["reasons"])
+        self.assertEqual(len(self.run_requests()), 1)
+        self.assertEqual(
+            [(item["zone"], item["outcome"]) for item in result["attempts"]],
+            [("eu-central-1a", "capacity_rejected"), ("eu-central-1b", "skipped")],
+        )
+        self.assertEqual(result["attempts"][1]["reason"], "spot_price_stale")
+        operations = self.reopened().operations()
+        # One admission only, and the slot is released rather than left with an
+        # intent that could only be sent on stale evidence.
+        self.assertEqual(len(operations), 1)
+        self.assertEqual(operations[0].state, "failed")
+        self.assertIsNone(operations[0].instance_id)
+        self.assertEqual(operations[0].request()["Placement"]["AvailabilityZone"], "eu-central-1a")
+
+    def test_an_uncertain_first_attempt_does_not_fall_through(self):
+        controller = self.build(
+            run_errors={
+                "eu-central-1a": ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True),
+            }
+        )
+
+        result = controller.apply()
+
+        self.assertEqual(result["decision"], "uncertain")
+        self.assertEqual(len(self.run_requests()), 1)
+        self.assertEqual(
+            result["attempts"],
+            [
+                {
+                    "zone": "eu-central-1a",
+                    "outcome": "uncertain",
+                    "reason": "AWS_UNCERTAIN",
+                    "detail": "ReadTimeout",
+                }
+            ],
+        )
+        self.assertNotIn("capacity_exhausted", result["reasons"])
+        operation = self.reopened().operations()[0]
+        self.assertEqual(operation.state, "uncertain")
+        self.assertIsNone(operation.instance_id)
+
     def test_a_non_capacity_rejection_does_not_fall_through(self):
         controller = self.build(
             run_errors={
@@ -473,6 +572,29 @@ class ConfigRefusalTests(MultiZoneCase):
             deployment_toml(candidates=({"zone": "eu-central-1a", "subnet_id": "subnet-xyz"},)),
             "subnet_id",
         )
+
+    def test_both_supported_subnet_identifier_lengths_load(self):
+        config = self.config(
+            candidates=(
+                {"zone": "eu-central-1a", "subnet_id": "subnet-0123456a"},
+                {"zone": "eu-central-1b", "subnet_id": "subnet-0123456789abcdeff"},
+            )
+        )
+
+        self.assertEqual(
+            [candidate.subnet_id for candidate in config.aws.zones],
+            ["subnet-0123456a", "subnet-0123456789abcdeff"],
+        )
+
+    def test_unsupported_subnet_identifier_lengths_are_refused(self):
+        for length in range(9, 17):
+            with self.subTest(length=length):
+                self.assert_refused(
+                    deployment_toml(
+                        candidates=({"zone": "eu-central-1a", "subnet_id": "subnet-" + "a" * length},)
+                    ),
+                    "8 or 17 hexadecimal characters",
+                )
 
     def test_unknown_candidate_key_is_refused(self):
         self.assert_refused(

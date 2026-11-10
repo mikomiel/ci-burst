@@ -59,6 +59,12 @@ Placement MUST be an ordered list of configured availability-zone candidates. Wh
 - **THEN** the operation is failed and the slot is free
 - **AND** the queue remains unserved with a stable reason code and no reported launch
 
+#### Scenario: Price evidence expires before the next candidate is sent
+- **WHEN** the next configured candidate's Spot quote becomes older than the freshness limit while the previous attempt runs
+- **THEN** that candidate is not frozen or sent
+- **AND** a later candidate with fresh evidence may still be attempted
+- **AND** if none remains, the operation is failed with a free slot and a stable stale-price reason, without a new admission or reservation
+
 ### Requirement: Durable idempotent launch intent
 Before requesting a launch, the controller MUST durably record operation identity, frozen launch parameters, an idempotency token, ownership, expiry and the required reservation. Retries MUST reuse the same token and parameters. A definite capacity rejection MAY advance to the next ordered candidate as specified for fallback, replacing the frozen request and token together. A failed durable write MUST prevent the cloud request.
 

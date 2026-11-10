@@ -38,7 +38,10 @@ _REGION = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d$")
 _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$")
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _TEMPLATE_NAME = re.compile(r"^[A-Za-z0-9()\\./_ -]{3,128}$")
-_SUBNET = re.compile(r"^subnet-[0-9a-f]{8,17}$")
+#: EC2 subnet identifiers are ``subnet-`` followed by exactly 8 or 17
+#: hexadecimal characters. Any other length would reach the provider as a
+#: malformed identifier instead of being refused here.
+_SUBNET = re.compile(r"^subnet-(?:[0-9a-f]{8}|[0-9a-f]{17})$")
 
 #: Keys accepted inside one ``[[aws.availability_zones]]`` table.
 _ZONE_CANDIDATE_KEYS = ("zone", "subnet_id", "launch_template_version")
@@ -244,7 +247,8 @@ def _zone_candidates(aws_table, region, default_version):
         subnet = entry.get("subnet_id")
         if not isinstance(subnet, str) or not _SUBNET.fullmatch(subnet):
             _zone_candidate_refusal(
-                f"{where}.subnet_id", 'must be a subnet id such as "subnet-0123456789abcdef0"'
+                f"{where}.subnet_id",
+                'must be a subnet id: "subnet-" followed by 8 or 17 hexadecimal characters',
             )
         version = entry.get("launch_template_version", default_version)
         if type(version) is not int or not 1 <= version <= 10_000:

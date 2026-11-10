@@ -6,7 +6,10 @@ name: review-gate
 
 on:
   workflow_run:
-    workflows: [CI]
+    # `review-signal` is the relay for review events: a review has no trusted trigger of its own, so a
+    # no-op workflow on the head's copy starts this one from the default branch instead. Without it a fresh
+    # approval is only noticed at the next schedule, which GitHub runs hours apart.
+    workflows: [CI, review-signal]
     types: [completed]
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, closed]

@@ -8,11 +8,8 @@
 # the tag the scheduled units resolve.
 #
 # The smoke run is a `plan` execution from the candidate against this host's own
-# configuration and scaling credentials. It must complete: exit 0 with a
-# decision document. A refusal (exit 2) is a failed smoke, because a candidate
-# that cannot read this host's configuration is exactly what the schedule would
-# hit on its next tick. `plan` writes nothing, allocates nothing and launches
-# nothing.
+# configuration and scaling credentials. It must complete with a decision, not
+# refuse: `plan` writes nothing, allocates nothing and launches nothing.
 #
 # Rollback handles are created before the serving tag moves, so a failure never
 # leaves the host with no working image and no way back:
@@ -87,15 +84,25 @@ if [ "$smoke_rc" -ne 0 ]; then
     log "smoke_failed: $want exit $smoke_rc"
     exit 2
 fi
+# The smoke gate accepts only a completed, non-refusal plan decision. A refusal
+# document (`decision: refused`, or `error`) means the candidate cannot read this
+# host's configuration, which is exactly what the next scheduled apply would hit.
+# The accepted decisions are the plan results that mean "observed, decided
+# nothing": `wait` and `would_launch`. A new plan decision needs this list
+# updated deliberately, in the same change that introduces it.
 if ! printf '%s' "$smoke" | python3 -c '
 import json
 import sys
 
 document = json.load(sys.stdin)
-if "error" in document or "decision" not in document:
+if not isinstance(document, dict):
+    raise SystemExit(1)
+if "error" in document:
+    raise SystemExit(1)
+if document.get("decision") not in ("wait", "would_launch"):
     raise SystemExit(1)
 ' 2>/dev/null; then
-    log "smoke_failed: $want did not print a plan decision"
+    log "smoke_failed: $want did not print a completed plan decision"
     exit 2
 fi
 
@@ -107,9 +114,27 @@ fi
 
 # The way back is captured before the serving tag moves, and captured from
 # `latest` rather than assumed: the first refresh after a manual install
-# replaces an image that has no sha tag of its own.
-current=$(podman image inspect --format '{{.Id}}' "$IMAGE:latest" 2>/dev/null || true)
-candidate=$(podman image inspect --format '{{.Id}}' "$IMAGE:candidate" 2>/dev/null || true)
+# replaces an image that has no sha tag of its own. An inspection failure is
+# not "no image": only a confirmed absent tag may skip the handle.
+candidate=$(podman image inspect --format '{{.Id}}' "$IMAGE:candidate") || {
+    log "inspect_failed: $IMAGE:candidate"
+    exit 2
+}
+if [ -z "$candidate" ]; then
+    log "inspect_failed: $IMAGE:candidate"
+    exit 2
+fi
+current=
+if podman image exists "$IMAGE:latest"; then
+    current=$(podman image inspect --format '{{.Id}}' "$IMAGE:latest") || {
+        log "inspect_failed: $IMAGE:latest"
+        exit 2
+    }
+    if [ -z "$current" ]; then
+        log "inspect_failed: $IMAGE:latest"
+        exit 2
+    fi
+fi
 if [ -n "$current" ] && [ "$current" != "$candidate" ]; then
     if ! podman tag "$current" "$IMAGE:previous"; then
         log "previous_tag_failed: $want"

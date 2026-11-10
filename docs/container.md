@@ -324,38 +324,41 @@ What a promotion does and does not do:
 - a fetch, archive, build or smoke failure keeps the previous image in place and
   logs one line with a reason code (`fetch_failed`, `archive_failed`,
   `unpack_failed`, `build_failed`, `smoke_failed`, `tag_failed`,
-  `previous_tag_failed`, `promote_failed`) in
+  `inspect_failed`, `previous_tag_failed`, `promote_failed`) in
   `journalctl -u ci-burst-refresh.service`;
 - the smoke run is a `plan` execution from the candidate against this host's own
   configuration and scaling credentials. It writes nothing and launches nothing.
-  It must **complete** — exit 0 with a decision document — because a refusal
-  means the candidate cannot read this host's configuration, which is exactly
-  what the next scheduled `apply` would hit. The document is validated with the
-  host's `python3`, which the lifecycle test below already requires.
+  It must **complete with a decision** — a `wait` or `would_launch` plan result —
+  because a refusal document means the candidate cannot read this host's
+  configuration, which is exactly what the next scheduled `apply` would hit. A
+  new plan decision is rejected until the script's accepted set is extended
+  deliberately. The document is validated with the host's `python3`, which the
+  lifecycle test below already requires.
 
-Rollback retags a previous image, and it must not race a refresh that is already
-running: the timer only schedules, so stopping the timer alone leaves an
-in-progress build free to move `latest` afterwards.
+Rollback retags a previous image, and it must not race a refresh: the timer only
+schedules, and a run that started before the operator acted would move `latest`
+again. Disable and stop the timer first, then the service, then retag under the
+script's own lock.
 
 ```sh
+systemctl disable --now ci-burst-refresh.timer   # no new runs, from here on
 systemctl stop ci-burst-refresh.service          # waits for a run in progress
-systemctl disable --now ci-burst-refresh.timer
-podman tag localhost/ci-burst:previous localhost/ci-burst:latest
-# or any promoted commit:
-podman tag localhost/ci-burst:sha-<12> localhost/ci-burst:latest
-```
-
-A run started by hand with `systemctl start ci-burst-refresh.service` takes the
-same lock as the timer, so hold it while retagging if one might be active:
-
-```sh
 flock /var/lib/ci-burst-image/refresh.lock \
   podman tag localhost/ci-burst:previous localhost/ci-burst:latest
 ```
 
+`previous` is whatever `latest` pointed at before the last promotion, including
+the hand-built image a fresh install starts with. Any promoted commit is also
+available as `localhost/ci-burst:sha-<12>`:
+
+```sh
+flock /var/lib/ci-burst-image/refresh.lock \
+  podman tag localhost/ci-burst:sha-<12> localhost/ci-burst:latest
+```
+
 `systemctl is-active ci-burst-refresh.service` reports the launcher, not a
-build: a promotion that already finished has moved `latest`, so roll back after
-it, not against it.
+build: a promotion that already finished has already moved `latest`, so roll
+back after it, not against it.
 
 The script is installed by hand from the checkout, so a change to the script
 needs that install step repeated; a change to the controller does not. The

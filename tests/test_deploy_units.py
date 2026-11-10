@@ -181,7 +181,7 @@ class RefreshTests(unittest.TestCase):
         # A completed decision is required, not "any document": a config refusal
         # is exit 2 and must fail the smoke.
         self.assertIn('if [ "$smoke_rc" -ne 0 ]', self.script)
-        self.assertIn('"decision" not in document', self.script)
+        self.assertIn('document.get("decision") not in ("wait", "would_launch")', self.script)
         self.assertIn("--name ci-burst-refresh-smoke", self.script)
 
     def test_promotes_latest_and_both_rollback_handles(self):
@@ -233,8 +233,16 @@ class RefreshBehaviourTests(unittest.TestCase):
             "podman",
             'case "$*" in\n'
             '  "run "*" plan --config "*) printf "%s" "$CI_BURST_TEST_SMOKE"; exit "$CI_BURST_TEST_SMOKE_RC" ;;\n'
-            '  "image inspect "*"latest"*) printf "%s\\n" sha256:old; exit 0 ;;\n'
+            '  "build "*) ctx= ; for a in "$@"; do ctx=$a; done\n'
+            '    { find "$ctx" -type f | sort; echo marker:; cat "$ctx/ci_burst/marker.py" 2>/dev/null; } '
+            '> "$CI_BURST_TEST_CONTEXT"; exit 0 ;;\n'
+            '  "image exists "*) exit "${CI_BURST_TEST_EXISTS_RC:-0}" ;;\n'
+            '  "image inspect "*"latest"*) [ "${CI_BURST_TEST_INSPECT_RC:-0}" = "0" ] '
+            '|| exit "${CI_BURST_TEST_INSPECT_RC}"\n'
+            '    printf "%s\\n" sha256:old; exit 0 ;;\n'
             '  "image inspect "*) printf "%s\\n" sha256:new; exit 0 ;;\n'
+            '  "tag "*) case "$*" in *"previous"*) exit "${CI_BURST_TEST_PREVIOUS_RC:-0}" ;; '
+            "*) exit 0 ;; esac ;;\n"
             "  *) exit 0 ;;\n"
             "esac",
         )
@@ -248,20 +256,23 @@ class RefreshBehaviourTests(unittest.TestCase):
         )
         path.chmod(0o755)
 
-    def run_script(self, smoke='{"decision": "wait"}', smoke_rc="0"):
+    def run_script(self, smoke='{"decision": "wait"}', smoke_rc="0", **extra):
+        environment = {
+            "PATH": f"{self.bin}:/usr/local/bin:/usr/bin:/bin",
+            "CI_BURST_SOURCE": str(self.root / "source"),
+            "CI_BURST_IMAGE_STATE": str(self.state),
+            "CI_BURST_CONFIG": str(self.root / "deployment.toml"),
+            "CI_BURST_AWS_DIR": str(self.root / "aws"),
+            "CI_BURST_TOKEN_ENV": str(self.root / "forgejo.env"),
+            "CI_BURST_TEST_WANT": self.want,
+            "CI_BURST_TEST_SMOKE": smoke,
+            "CI_BURST_TEST_SMOKE_RC": smoke_rc,
+            "CI_BURST_TEST_CONTEXT": str(self.root / "context.txt"),
+        }
+        environment.update({name: str(value) for name, value in extra.items()})
         return subprocess.run(
             ["sh", str(DEPLOY / "ci-burst-refresh.sh")],
-            env={
-                "PATH": f"{self.bin}:/usr/local/bin:/usr/bin:/bin",
-                "CI_BURST_SOURCE": str(self.root / "source"),
-                "CI_BURST_IMAGE_STATE": str(self.state),
-                "CI_BURST_CONFIG": str(self.root / "deployment.toml"),
-                "CI_BURST_AWS_DIR": str(self.root / "aws"),
-                "CI_BURST_TOKEN_ENV": str(self.root / "forgejo.env"),
-                "CI_BURST_TEST_WANT": self.want,
-                "CI_BURST_TEST_SMOKE": smoke,
-                "CI_BURST_TEST_SMOKE_RC": smoke_rc,
-            },
+            env=environment,
             capture_output=True,
             text=True,
         )
@@ -278,6 +289,78 @@ class RefreshBehaviourTests(unittest.TestCase):
         completed = self.run_script(smoke='{"other": true}')
         self.assertNotEqual(completed.returncode, 0, completed.stderr)
         self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_refusal_decision_at_zero_exit_never_promotes(self):
+        # The gate may not depend on the CLI's exit code alone: a future CLI
+        # regression could exit 0 with a refusal document.
+        completed = self.run_script(
+            smoke='{"decision": "refused", "rejection": {"reason": "CONFIG_INVALID"}}'
+        )
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("latest", self.calls.read_text(encoding="utf-8"))
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_non_object_document_never_promotes(self):
+        completed = self.run_script(smoke='["decision"]')
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_an_inspection_failure_never_moves_latest(self):
+        # "Cannot inspect the serving image" is not "no serving image": without a
+        # confirmed handle the promotion must not happen.
+        completed = self.run_script(CI_BURST_TEST_INSPECT_RC="1")
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn(
+            "tag localhost/ci-burst:candidate localhost/ci-burst:latest",
+            self.calls.read_text(encoding="utf-8"),
+        )
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_missing_previous_handle_never_moves_latest(self):
+        completed = self.run_script(CI_BURST_TEST_PREVIOUS_RC="1")
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertIn("tag sha256:old localhost/ci-burst:previous", calls)
+        self.assertNotIn("tag localhost/ci-burst:candidate localhost/ci-burst:latest", calls)
+
+    def test_builds_only_committed_files_at_the_fetched_commit(self):
+        # Real git, fake podman: the build context is the fetched commit's
+        # archive, so a dirty or untracked file in the clone cannot be deployed.
+        repository = self.root / "source"
+        (repository / "ci_burst").mkdir()
+        marker = repository / "ci_burst" / "marker.py"
+        marker.write_text("committed\n", encoding="utf-8")
+        self._git(repository, "init", "--quiet", "--initial-branch=main")
+        self._git(repository, "add", ".")
+        self._git(
+            repository,
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "seed",
+        )
+        self._git(repository, "remote", "add", "origin", str(repository))
+        marker.write_text("dirty\n", encoding="utf-8")
+        (repository / "ci_burst" / "untracked.py").write_text("untracked\n", encoding="utf-8")
+        (self.bin / "git").unlink()
+
+        completed = self.run_script()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        context = (self.root / "context.txt").read_text(encoding="utf-8")
+        self.assertIn("ci_burst/marker.py", context)
+        self.assertIn("committed", context)
+        self.assertNotIn("untracked.py", context)
+        self.assertNotIn("dirty", context)
+
+    @staticmethod
+    def _git(repository, *args):
+        subprocess.run(
+            ["git", *args], cwd=repository, check=True, capture_output=True, text=True
+        )
 
     def test_a_promotion_records_the_commit_and_both_rollback_handles(self):
         completed = self.run_script()

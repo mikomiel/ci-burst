@@ -11,25 +11,17 @@ regex = '''\b(?:10\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,
 [[rules]]
 id = "private-dns-name"
 description = "Do not publish internal deployment DNS names"
-# The optional leading `(?:\.)?` lets a dot-prefixed name (a filename such as
-# the dotenv file) be matched including its dot, so the allowlist below can
-# exempt exactly that filename without exempting the same word when it is used
-# as a real hostname (a HOST assignment, a URL, or bare).
-regex = '''(?i)(?:\.)?\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:internal|lan|local)\b'''
+# The match may begin with a backtick or a dot. That prefix is part of the
+# secret (secretGroup = 1), so an allowlist can exempt the quoted dotenv
+# filename without exempting the same word used as a hostname: a backticked
+# filename and a dot-prefixed filename are exempt, while HOST assignments, URLs,
+# bare prose and every other name under these TLDs are still flagged.
+regex = '''(?i)(`?(?:\.)?\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:internal|lan|local)\b)'''
+secretGroup = 1
   [[rules.allowlists]]
-  description = "The dotenv filename (dot-prefixed match) is not a private DNS name"
-  regexTarget = "match"
-  regexes = ['''^\.env\.local$''']
-  # Commit messages are scanned as anonymous text (`git log --format=%B |
-  # gitleaks stdin`), so a finding there carries no commit identity and the
-  # commit allowlist below cannot reach it. The prose that describes this false
-  # positive quotes the filename in backticks; a quoted filename is not a
-  # published hostname. The same word in a URL, a HOST assignment or bare text
-  # still matches the rule and is still flagged.
-  [[rules.allowlists]]
-  description = "Prose that quotes the dotenv filename in backticks is not a hostname"
-  regexTarget = "line"
-  regexes = ['''`env\.local`''']
+  description = "The dotenv filename, quoted or dot-prefixed, is not a private DNS name"
+  regexTarget = "secret"
+  regexes = ['''^\.env\.local$''', '''^`env\.local$''', '''^`\.env\.local$''']
   # The superseded first attempt of this same fix, still reachable from
   # feature branches that merged it before it was reworked; the literals it
   # flags are false positives of this rule in that commit's test comments.

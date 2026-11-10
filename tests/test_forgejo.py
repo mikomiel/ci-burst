@@ -133,6 +133,23 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(observation.demand, 0)
         self.assertEqual(observation.incompatible, 1)
 
+    def test_prefiltered_job_with_an_extra_label_is_incompatible(self):
+        # The server filter is a union over the job's labels, so a job selected
+        # by one shared label must still be rejected when its complete label set
+        # requires something the worker does not advertise.
+        record = {
+            "id": 7,
+            "run_id": 1,
+            "attempt": 1,
+            "handle": "h-7-1",
+            "status": "waiting",
+            "runs_on": ["homelab", "linux-arm64"],
+            "needs": [],
+        }
+        observation, _ = self.observe(json.dumps([record]).encode())
+        self.assertEqual(observation.demand, 0)
+        self.assertEqual(observation.incompatible, 1)
+
     def test_repeated_record_is_deduplicated(self):
         observation, _ = self.observe(fixture("jobs_duplicate.json"))
         self.assertEqual(observation.demand, 1)

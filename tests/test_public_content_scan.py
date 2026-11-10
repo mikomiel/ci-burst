@@ -2,16 +2,15 @@
 
 The CI `public-content` job runs pinned Gitleaks over the whole fetched history with
 `.gitleaks.toml`, so a false positive on any pushed branch fails every check. The standard
-dotenv filename trips the rule: its match is the dot-prefixed filename. The rule's
-allowlist exempts exactly that dot-prefixed match, while the same word used as a real
-hostname (in a URL, a HOST assignment, or bare) is still flagged. Commit messages are
-scanned as anonymous text, so a second allowlist exempts the prose line that quotes the
-filename in backticks.
+dotenv filename trips the rule. The match begins with the quote or dot that introduces the
+filename and that prefix is part of the reported secret, so the allowlist exempts exactly
+the two filename forms, while the same word used as a real hostname (in a URL, a HOST
+assignment, or bare) is still flagged.
 
-This test is structural and hermetic: it replays the rule's regex plus its allowlists over
+This test is structural and hermetic: it replays the rule's regex and allowlists over
 synthetic samples the way Gitleaks applies them -- allowlist regexes are searched against
-the configured target, not full-matched, `\\b` is ASCII as in Go's regexp, and commit
-allowlists are identity-based so they are not part of the text replay. Every sample is
+the configured target, not full-matched, and `\\b` is ASCII as in Go's regexp. Commit
+allowlists are identity-based and are not part of the text replay. Every sample is
 assembled at runtime from parts, so this fixture file contains no literal that the rule
 itself would flag.
 """
@@ -93,15 +92,20 @@ class PrivateDnsNameTests(unittest.TestCase):
             self.assertEqual(findings(sample, "private-dns-name"), [HOSTNAME],
                              f"{sample!r} must still be flagged")
 
-    def test_prose_line_quoting_the_filename_is_exempt(self):
-        # Commit messages are scanned as anonymous text; the prose that
-        # describes this false positive quotes the filename in backticks.
-        prose = f"the rule matches the bare word `{HOSTNAME}` inside the dotenv filename"
-        self.assertEqual(findings(prose, "private-dns-name"), [])
-        # The same word on a line without backticks is still hostname-shaped
-        # text and is still flagged.
-        self.assertEqual(findings(f"the rule matches {HOSTNAME} inside the line", "private-dns-name"),
-                         [HOSTNAME])
+    def test_quoted_or_dotted_filename_is_exempt(self):
+        # The two forms the filename takes: backticked in prose and dot-prefixed
+        # in a path tuple. Both are exempt; the quote or dot is part of the
+        # matched secret, which is what lets the allowlist tell them apart from
+        # the same word used as a hostname.
+        self.assertEqual(findings(f"`{HOSTNAME}`", "private-dns-name"), [])
+        self.assertEqual(findings(DOTENV, "private-dns-name"), [])
+
+    def test_quoted_finding_must_start_with_the_quote(self):
+        # A finding whose match does not begin with the quote or dot is a bare
+        # hostname and stays flagged, even on a line that also quotes the file.
+        self.assertEqual(findings(HOSTNAME, "private-dns-name"), [HOSTNAME])
+        combined = f"Rename `{HOSTNAME}`; HOST={dns('db', 'internal')}"
+        self.assertEqual(findings(combined, "private-dns-name"), [dns("db", "internal")])
 
     def test_ascii_word_boundary_matches_go(self):
         # Go's regexp uses ASCII word characters for `\b`, so a non-ASCII
@@ -116,22 +120,33 @@ class PrivateDnsNameTests(unittest.TestCase):
             f'"{dns("", "env", "lan")}"',
             dns("db", "local"),
             dns("", "db", "internal"),
+            f"`{dns('db', 'local')}`",
         )
         for sample in samples:
             self.assertTrue(findings(sample, "private-dns-name"),
                             f"{sample!r} must still be flagged")
 
-    def test_allowlist_is_anchored_to_the_exact_filename(self):
-        match_allowlists = [a for a in rule("private-dns-name").get("allowlists", [])
-                            if a.get("regexTarget") == "match"]
-        self.assertEqual(len(match_allowlists), 1)
-        regexes = match_allowlists[0]["regexes"]
+    def test_allowlists_exempt_only_the_filename_secrets(self):
+        secret_allowlists = [a for a in rule("private-dns-name").get("allowlists", [])
+                             if a.get("regexTarget") == "secret"]
+        self.assertEqual(len(secret_allowlists), 1)
+        regexes = secret_allowlists[0]["regexes"]
         for regex in regexes:
             self.assertTrue(regex.startswith("^") and regex.endswith("$"),
                             f"allowlist regex {regex!r} must be anchored so it cannot broaden")
-        # The anchored pattern exempts the dot-prefixed filename match and nothing else.
-        self.assertTrue(all(re.search(r, DOTENV) for r in regexes))
-        self.assertFalse(any(re.search(r, HOSTNAME) for r in regexes))
+        # Exactly the two filename secrets, and nothing else.
+        self.assertEqual(set(regexes),
+                         {r"^\.env\.local$", r"^`env\.local$", r"^`\.env\.local$"})
+        for regex in regexes:
+            self.assertFalse(re.search(regex, HOSTNAME))
+            self.assertFalse(re.search(regex, dns("db", "internal")))
+        # The rule reports the leading dot or quote as part of the secret.
+        entry = rule("private-dns-name")
+        self.assertEqual(entry.get("secretGroup"), 1)
+        pattern = re.compile(entry["regex"], re.ASCII)
+        for sample, expected in ((DOTENV, DOTENV), (f"`{HOSTNAME}`", "`" + HOSTNAME),
+                                 (f"`{DOTENV}`", "`" + DOTENV), (HOSTNAME, HOSTNAME)):
+            self.assertEqual(pattern.search(sample).group(1), expected)
 
     def test_superseded_fix_commit_allowlist_is_one_exact_sha(self):
         # The orphaned first attempt of this fix is exempted by commit SHA only,

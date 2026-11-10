@@ -241,10 +241,16 @@ podman run --rm --init --name ci-burst-manual --read-only \
   localhost/ci-burst:latest plan --config /etc/ci-burst/deployment.toml
 ```
 
-`plan` performs no cloud mutation and no durable write. It must print one JSON
-document with a decision, the template, the zone candidates and the price
-evidence. A refusal names its reason code; the troubleshooting table in Step 9
+`plan` performs no cloud mutation and no durable write. It prints one JSON
+document. A refusal names its reason code; the troubleshooting table in Step 9
 maps the common ones.
+
+The template, zone-candidate and price evidence appears only when there is
+eligible waiting demand and the slot is free: the command returns `wait` before
+reading a template or a price when there is nothing to launch. On an idle queue
+the decision is `wait` with reason `no_runnable_demand` and no price evidence —
+that is a healthy installation, not a failed one. Push a job that asks for your
+label, or wait for one, to see the priced decision.
 
 ## 7. Qualify live support
 

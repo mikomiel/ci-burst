@@ -328,6 +328,27 @@ increments, Spot price changes after launch, or resources left by failed
 cleanup. It is not a guaranteed cap on the AWS bill, and no status, lifetime or
 alert in this project should be described as one.
 
+### Sizing the window
+
+`allowance` bounds a rolling window, and sharing a pool label changes what the
+number means. A dispatch-only deployment spends one reservation per manual run; a
+deployment that also counts pool demand spends one per congested launch, which on
+a busy day can be a dozen. Size the figure from launches per day × reservation,
+not from how often someone dispatches, and keep the window guard as the hard
+stop rather than raising it to match an unexpected day.
+
+A failed attempt does not always spend the allowance: a definite provider
+rejection is released, while an uncertain outcome keeps its reservation until it
+is resolved. Only a window that contains uncertain or partially resolved attempts
+can be exhausted without an instance ever running.
+
+Worked example from the pilot: a `0.1200` maximum price with a one-hour lifetime
+and a `0.50` non-compute allowance reserves `0.62` per launch, so a `5.00` window
+admits eight. One evening of shared-pool launches plus five capacity rejections
+from before that release rule existed consumed `4.96`, and the next launch after
+that was refused with `budget_allowance_exhausted` until the window rolled.
+
+
 ## Launch decision and capacity fallback
 
 `plan` reports every configured candidate in order, each with the zone, subnet,

@@ -125,18 +125,35 @@ entry or a package build is not a release or a deployment, and none of them
 authorizes a tag, a package, an image, a deployment or a cloud change.
 
 Before 1.0, an observable behaviour change is a minor release and a fix is a
-patch; no other compatibility is promised. Tag names carry the `v` prefix and
-changelog headings carry the bare version. Create a tag only for a commit that
-already contains the matching released section; a released heading without a
-matching annotated tag is a defect that `tests/test_changelog.py` detects.
+patch; no other compatibility is promised.
+
+A release uses two changelog states:
+
+- **Preparation**, before the tag exists: move the Unreleased entries under
+  `## [X.Y.Z] - YYYY-MM-DD` and add `<!-- release-pending: vX.Y.Z -->` below
+  that heading. The marker is the explicit preparation state; `check:policy`
+  accepts the heading without its tag only while that marker is present. Merge
+  the preparation pull request.
+- **Published**, after the tag: create the annotated `vX.Y.Z` tag on the merge
+  commit and the GitHub Release from that section, then remove the marker in a
+  follow-up change. `python3 scripts/render_changelog.py --validate-release`
+  verifies that every released heading has its annotated `vX.Y.Z` tag and that
+  no marker remains.
+
+The tag must be `v`-prefixed and annotated; a lightweight or unprefixed tag is
+not a release and the checks reject it. A released heading without either the
+preparation marker or its tag is a defect.
 
 `CHANGELOG.md` records merged source history, never deployment or runtime
 evidence. Its Unreleased section is generated from merged `feat:`, `fix:`,
-`docs:` and `ci:` subjects; regenerate it rather than editing it by hand:
+`docs:` and `ci:` subjects after the latest release tag:
 
 ```sh
 python3 scripts/render_changelog.py --write
 ```
+
+`--write` refuses while a preparation marker is pending and its tag does not
+exist; do not regenerate between cutting the section and tagging it.
 
 ## Checks
 

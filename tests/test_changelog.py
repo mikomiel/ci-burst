@@ -1,12 +1,12 @@
-"""Changelog integrity and renderer contracts; no network.
+"""Changelog integrity, release states and renderer contracts; no network.
 
-The test reads the committed CHANGELOG.md and the local Git refs only. It
-does not prove a release, a deployment or runtime behavior.
+The test reads the committed CHANGELOG.md and local Git refs only. It does not
+prove a release, a deployment or runtime behavior.
 """
 
-import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,33 +15,22 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import render_changelog as changelog
 
 TEXT = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-RELEASED = re.compile(r"^## \[(?P<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\]", re.MULTILINE)
+
+PREPARED = (
+    "# Changelog\n\n## [Unreleased]\n\n"
+    "## [0.1.0] - 2026-11-09\n\n<!-- release-pending: v0.1.0 -->\n\n"
+    "### Added\n\n- Add the controller.\n"
+)
+PUBLISHED = PREPARED.replace("<!-- release-pending: v0.1.0 -->\n\n", "")
 
 
-def git(*arguments):
+def git(root, *arguments):
     return subprocess.run(
-        ("git", "-C", str(ROOT), *arguments),
+        ("git", "-C", str(root), *arguments),
         check=True,
         capture_output=True,
         text=True,
     ).stdout
-
-
-def tags():
-    """Tag name to object type; annotated tags report ``tag``."""
-    output = git("for-each-ref", "refs/tags", "--format=%(refname:short)%09%(objecttype)")
-    found = {}
-    for line in output.splitlines():
-        name, _, kind = line.partition("\t")
-        found[name] = kind
-    return found
-
-
-def shallow():
-    try:
-        return git("rev-parse", "--is-shallow-repository").strip() == "true"
-    except (subprocess.CalledProcessError, OSError):
-        return False
 
 
 class ChangelogFileTests(unittest.TestCase):
@@ -59,20 +48,111 @@ class ChangelogFileTests(unittest.TestCase):
         self.assertEqual(headings[0], changelog.UNRELEASED)
         self.assertEqual(changelog.unreleased_section(TEXT).count(changelog.UNRELEASED), 1)
 
-    def test_every_released_heading_has_a_matching_annotated_tag(self):
-        versions = RELEASED.findall(TEXT)
-        if not versions:
-            return  # No released section yet: nothing to bind to a tag.
-        found = tags()
-        if not found and shallow():
-            self.skipTest("shallow checkout has no tags; fetch tags to verify released headings")
-        for version in versions:
-            names = (version, f"v{version}")
-            annotated = [name for name in names if found.get(name) == "tag"]
-            self.assertTrue(
-                annotated,
-                f"released heading [{version}] needs an annotated tag, one of {names}",
-            )
+    def test_released_headings_are_prepared_or_tagged(self):
+        errors = changelog.binding_errors(TEXT, changelog.tag_types())
+        self.assertEqual(
+            errors,
+            [],
+            "invalid release state; in a shallow checkout run `git fetch --tags` first",
+        )
+
+
+class ReleaseStateTests(unittest.TestCase):
+    def test_preparation_state_passes_the_pre_merge_check_without_a_tag(self):
+        self.assertEqual(changelog.binding_errors(PREPARED, {}), [])
+
+    def test_unmarked_released_heading_without_a_tag_fails(self):
+        self.assertTrue(changelog.binding_errors(PUBLISHED, {}))
+
+    def test_published_heading_accepts_a_prefixed_annotated_tag(self):
+        self.assertEqual(changelog.binding_errors(PUBLISHED, {"v0.1.0": "tag"}), [])
+
+    def test_published_heading_rejects_lightweight_and_unprefixed_tags(self):
+        for tags in ({"v0.1.0": "commit"}, {"0.1.0": "tag"}, {}):
+            with self.subTest(tags=tags):
+                self.assertTrue(changelog.binding_errors(PUBLISHED, tags))
+
+    def test_preparation_marker_must_match_its_heading(self):
+        text = PREPARED.replace("release-pending: v0.1.0", "release-pending: v0.2.0")
+        self.assertTrue(changelog.binding_errors(text, {}))
+
+    def test_more_than_one_preparation_marker_fails(self):
+        text = PREPARED.replace(
+            "## [Unreleased]",
+            "## [Unreleased]\n\n## [0.2.0] - 2026-11-10\n\n<!-- release-pending: v0.2.0 -->",
+        )
+        errors = changelog.binding_errors(text, {})
+        self.assertTrue(any("more than one release" in error for error in errors))
+
+    def test_validation_rejects_a_remaining_preparation_marker(self):
+        self.assertTrue(changelog.release_validation_errors(PREPARED, {"v0.1.0": "tag"}))
+
+    def test_validation_accepts_a_published_bound_heading(self):
+        self.assertEqual(changelog.release_validation_errors(PUBLISHED, {"v0.1.0": "tag"}), [])
+
+    def test_write_is_blocked_while_the_preparation_tag_does_not_exist(self):
+        self.assertIsNotNone(changelog.write_blocked(PREPARED, None))
+        self.assertIsNone(changelog.write_blocked(PREPARED, "v0.1.0"))
+        self.assertIsNone(changelog.write_blocked("# Changelog\n\n## [Unreleased]\n", None))
+
+
+class ReleaseBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "changelog@example.com")
+        self.git("config", "user.name", "Changelog Test")
+
+    def git(self, *arguments):
+        return git(self.root, *arguments)
+
+    def commit(self, subject, filename="file.txt"):
+        (self.root / filename).write_text(subject + "\n", encoding="utf-8")
+        self.git("add", filename)
+        self.git("commit", "-q", "-m", subject)
+
+    def test_no_release_tag_means_no_boundary(self):
+        self.commit("feat: add the controller (#4)")
+        self.assertIsNone(changelog.release_tag(self.root))
+
+    def test_release_boundary_excludes_released_commits_from_unreleased(self):
+        self.commit("feat: add the controller (#4)")
+        released = (
+            "# Changelog\n\n## [Unreleased]\n\n"
+            "## [0.1.0] - 2026-11-09\n\n<!-- release-pending: v0.1.0 -->\n\n"
+            "### Added\n\n- Add the controller ([#4](https://github.com/mikomiel/ci-burst/pull/4)).\n"
+        )
+        (self.root / "CHANGELOG.md").write_text(released, encoding="utf-8")
+        self.git("add", "CHANGELOG.md")
+        self.git("commit", "-q", "-m", "docs: prepare the 0.1.0 release")
+        self.git("tag", "-a", "v0.1.0", "-m", "v0.1.0")
+        self.commit("fix: correct the quote timeout (#9)", "fix.txt")
+
+        boundary = changelog.release_tag(self.root)
+        self.assertEqual(boundary, "v0.1.0")
+        section = changelog.render_unreleased(changelog.merged_subjects(self.root, since=boundary))
+        self.assertIn("- Correct the quote timeout", section)
+        self.assertNotIn("controller", section)
+
+        updated = changelog.replace_unreleased(released, section)
+        self.assertIn("## [0.1.0] - 2026-11-09", updated)
+        self.assertIn("Add the controller", updated.split("## [0.1.0]")[1])
+        self.assertNotIn("Add the controller", changelog.unreleased_section(updated))
+        self.assertIn("- Correct the quote timeout", changelog.unreleased_section(updated))
+
+    def test_lightweight_release_tag_is_refused(self):
+        self.commit("feat: add the controller")
+        self.git("tag", "v0.1.0")
+        with self.assertRaises(ValueError):
+            changelog.release_tag(self.root)
+
+    def test_unprefixed_release_tag_is_refused(self):
+        self.commit("feat: add the controller")
+        self.git("tag", "-a", "0.1.0", "-m", "0.1.0")
+        with self.assertRaises(ValueError):
+            changelog.release_tag(self.root)
 
 
 class RenderTests(unittest.TestCase):

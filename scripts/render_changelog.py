@@ -5,10 +5,16 @@ fact. Only `feat`, `fix`, `docs` and `ci` subjects are listed; other types
 (such as `chore`) and merge commits are not. A pull request number at the end
 of a subject is rendered as a link.
 
+The section starts after the latest annotated release tag, so an entry that
+already has a released section is not rendered again. A release preparation
+marker defers that tag until the preparation commit is on `main`;
+`--validate-release` verifies the published state.
+
 Standard library only, no network:
 
-    python3 scripts/render_changelog.py           # print the section
-    python3 scripts/render_changelog.py --write   # replace it in CHANGELOG.md
+    python3 scripts/render_changelog.py                  # print the section
+    python3 scripts/render_changelog.py --write          # replace it
+    python3 scripts/render_changelog.py --validate-release
 """
 
 from __future__ import annotations
@@ -35,6 +41,9 @@ CATEGORY = {"feat": "Added", "fix": "Fixed", "docs": "Documentation", "ci": "CI"
 CATEGORY_ORDER = ("Added", "Changed", "Fixed", "Documentation", "CI")
 _SUBJECT = re.compile(r"^(feat|fix|docs|ci)(?:\([^)]*\))?!?:\s+(?P<text>\S.*)$")
 _PULL_REQUEST = re.compile(r"\s+\(#(?P<number>[0-9]+)\)$")
+_RELEASE_TAG = re.compile(r"^v(?P<version>[0-9]+\.[0-9]+\.[0-9]+)$")
+_RELEASED_HEADING = re.compile(r"^## \[(?P<version>[0-9]+\.[0-9]+\.[0-9]+)\]")
+_RELEASE_PENDING = re.compile(r"<!-- release-pending: v(?P<version>[0-9]+\.[0-9]+\.[0-9]+) -->")
 
 HEADER = f"""# Changelog
 
@@ -42,8 +51,9 @@ HEADER = f"""# Changelog
 
 The Unreleased section is generated from the Git history by
 [`scripts/render_changelog.py`](scripts/render_changelog.py); do not edit it by
-hand. A released section is added only for an annotated semantic version tag on
-`main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases) owns that boundary.
+hand. A released section is added for an annotated semantic version tag on
+`main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the preparation marker
+and the validation step that binds it to that tag.
 
 {GENERATED_MARKER}
 """
@@ -95,15 +105,131 @@ def render_unreleased(subjects, repository=REPOSITORY):
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def merged_subjects(root=ROOT):
-    """Subjects of non-merge commits, oldest first; no network."""
-    completed = subprocess.run(
-        ["git", "-C", str(root), "log", "--no-merges", "--reverse", "--format=%s"],
+def git(root, *arguments):
+    return subprocess.run(
+        ("git", "-C", str(root), *arguments),
         check=True,
         capture_output=True,
         text=True,
+    ).stdout
+
+
+def merged_subjects(root=ROOT, since=None):
+    """Subjects of non-merge commits after ``since``, oldest first; no network."""
+    revision = f"{since}..HEAD" if since else "HEAD"
+    output = git(root, "log", "--no-merges", "--reverse", "--format=%s", revision)
+    return [line for line in output.splitlines() if line.strip()]
+
+
+def tag_types(root=ROOT):
+    """Tag name to object type; an annotated tag reports ``tag``."""
+    output = git(root, "for-each-ref", "refs/tags", "--format=%(refname:short)%09%(objecttype)")
+    found = {}
+    for line in output.splitlines():
+        name, _, kind = line.partition("\t")
+        found[name] = kind
+    return found
+
+
+def release_tag(root=ROOT):
+    """Latest release tag reachable from HEAD, or None when no release exists.
+
+    The boundary must be an annotated ``vMAJOR.MINOR.PATCH`` tag. A lightweight
+    or unprefixed tag raises ValueError instead of being ignored, because
+    ignoring it would render already-released commits again.
+    """
+    try:
+        name = git(
+            root,
+            "describe",
+            "--tags",
+            "--abbrev=0",
+            "--match",
+            "v[0-9]*",
+            "--match",
+            "[0-9]*",
+        ).strip()
+    except subprocess.CalledProcessError:
+        return None
+    if _RELEASE_TAG.match(name) is None or git(root, "cat-file", "-t", name).strip() != "tag":
+        raise ValueError(f"release boundary {name!r} must be an annotated tag vMAJOR.MINOR.PATCH")
+    return name
+
+
+def released_sections(text):
+    """Return version to section text for released ``## [x.y.z]`` headings."""
+    sections = {}
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        match = _RELEASED_HEADING.match(lines[index])
+        index += 1
+        if match is None:
+            continue
+        start = index
+        while index < len(lines) and not lines[index].startswith("## "):
+            index += 1
+        sections[match.group("version")] = "\n".join(lines[start:index]).strip()
+    return sections
+
+
+def pending_versions(text):
+    """Release versions whose section carries a preparation marker."""
+    return [
+        version
+        for version, section in released_sections(text).items()
+        if _RELEASE_PENDING.search(section)
+    ]
+
+
+def binding_errors(text, tags):
+    """State errors for ``check:policy``: prepared or tag-bound, never neither."""
+    errors = []
+    pending = pending_versions(text)
+    if len(pending) > 1:
+        errors.append(
+            "more than one release is marked pending: "
+            + ", ".join(f"v{version}" for version in pending)
+        )
+    for version, section in released_sections(text).items():
+        marker = _RELEASE_PENDING.search(section)
+        if marker is not None:
+            if marker.group("version") != version:
+                errors.append(
+                    f"release-pending marker v{marker.group('version')} "
+                    f"does not match heading [{version}]"
+                )
+            continue
+        if tags.get(f"v{version}") != "tag":
+            errors.append(f"released heading [{version}] needs an annotated tag v{version}")
+    return errors
+
+
+def release_validation_errors(text, tags):
+    """Published-state errors: every released heading is tag-bound, nothing pending."""
+    errors = []
+    for version in pending_versions(text):
+        errors.append(
+            f"release-pending marker for v{version} remains; remove it after creating the tag"
+        )
+    for version in released_sections(text):
+        if tags.get(f"v{version}") != "tag":
+            errors.append(f"released heading [{version}] needs an annotated tag v{version}")
+    return errors
+
+
+def write_blocked(text, boundary):
+    """Reason why ``--write`` must not run, or None when the boundary is settled."""
+    pending = pending_versions(text)
+    if not pending:
+        return None
+    if len(pending) == 1 and boundary == f"v{pending[0]}":
+        return None
+    versions = ", ".join(f"v{version}" for version in pending)
+    return (
+        f"release preparation for {versions} is pending; "
+        "create the annotated tag and remove the marker before regenerating"
     )
-    return [line for line in completed.stdout.splitlines() if line.strip()]
 
 
 def _section_bounds(lines):
@@ -140,18 +266,43 @@ def replace_unreleased(text, section):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument(
         "--write",
         action="store_true",
         help="replace the Unreleased section in CHANGELOG.md instead of printing it",
     )
+    actions.add_argument(
+        "--validate-release",
+        action="store_true",
+        help="require every released heading to have an annotated tag and no preparation marker",
+    )
     args = parser.parse_args(argv)
 
-    section = render_unreleased(merged_subjects())
+    text = CHANGELOG.read_text(encoding="utf-8") if CHANGELOG.exists() else HEADER + "\n"
+
+    if args.validate_release:
+        errors = release_validation_errors(text, tag_types())
+        for error in errors:
+            print(f"error: {error}", file=sys.stderr)
+        if errors:
+            return 1
+        print("release state is consistent")
+        return 0
+
+    try:
+        boundary = release_tag()
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    section = render_unreleased(merged_subjects(since=boundary))
     if not args.write:
         sys.stdout.write(section)
         return 0
-    text = CHANGELOG.read_text(encoding="utf-8") if CHANGELOG.exists() else HEADER + "\n"
+    blocked = write_blocked(text, boundary)
+    if blocked is not None:
+        print(f"error: {blocked}", file=sys.stderr)
+        return 1
     CHANGELOG.write_text(replace_unreleased(text, section), encoding="utf-8")
     return 0
 

@@ -32,6 +32,39 @@ class RunnerBootstrapTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertRegex(label, r"^[a-z0-9][a-z0-9-]*:host$")
 
+    def test_the_configuration_example_lists_exactly_the_advertised_labels(self):
+        # A deployment whose [worker].labels omits an advertised label makes a
+        # job requiring that label ineligible; listing one the bootstrap does not
+        # advertise makes a job look routable that can never run. The walkthrough
+        # example and the bootstrap must agree.
+        advertised = re.search(
+            r'^RUNNER_LABELS="([^"]*)"$', self.script, re.MULTILINE
+        ).group(1).split(",")
+        walkthrough = (ROOT / "docs" / "deployment.md").read_text(encoding="utf-8").splitlines()
+        self.assertIn("[worker]", walkthrough, "the walkthrough must show the [worker] table")
+        start = walkthrough.index("[worker]")
+        documented = None
+        for line in walkthrough[start + 1 :]:
+            if line.startswith("["):
+                break
+            match = re.match(r"^labels = \[([^\]]*)\]$", line)
+            if match:
+                documented = [item.strip().strip('"') for item in match.group(1).split(",")]
+                break
+        self.assertIsNotNone(documented, "the [worker] table must set labels")
+        self.assertEqual(documented, advertised)
+
+    def test_operations_records_the_decision_and_its_matching_semantics(self):
+        operations = (ROOT / "docs" / "operations.md").read_text(encoding="utf-8")
+        self.assertIn("### The routing decision", operations)
+        # The record must name both lists that decide routing and the subset
+        # rule, because "exclusive" is a property of the label sets in use.
+        self.assertIn("`[worker].labels`", operations)
+        self.assertIn("subset", operations)
+        # And the accepted risk must be stated without claiming that a
+        # mis-routed job always fails loudly.
+        self.assertIn("may appear to succeed", operations)
+        self.assertIn("wrong artifact", operations)
     def test_passes_the_label_set_to_registration_unchanged(self):
         self.assertIn('--labels "${RUNNER_LABELS}"', self.script)
         flag_lines = re.findall(r"^\s*--labels\b.*$", self.script, re.MULTILINE)

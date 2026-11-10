@@ -23,7 +23,17 @@ CONTRACT = "forgejo-17.0.1-runners-jobs"
 #: Statuses the qualified contract understands. A record with any other value
 #: makes runnable semantics unproven for the whole observation, so demand is
 #: reported unavailable rather than guessed.
+#:
+#: ``waiting`` is the only runnable status, and it means "awaiting a runner":
+#: the server reports a job that way while its dependencies are already done.
+#: ``blocked`` is the server's dependency signal, so dependency-blocked work is
+#: counted and never launched. ``needs`` is static workflow metadata -- it stays
+#: populated after the dependency has succeeded -- so it never decides
+#: eligibility. Measured on ``forgejo 17.0.1+gitea-1.22.0``: a ``waiting`` job
+#: still lists the dependency that already succeeded, and a dependent job
+#: reports ``blocked`` until it does.
 RUNNABLE_STATUS = "waiting"
+BLOCKED_STATUS = "blocked"
 ASSIGNED_OR_TERMINAL_STATUSES = frozenset({"running", "success", "failure", "cancelled", "skipped"})
 
 
@@ -209,20 +219,27 @@ def _record(record, index):
     if "needs" not in record:
         raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", f"{where}.needs is absent")
     needs = record["needs"]
-    # A Go nil slice marshals as null and means "no dependencies". An absent
-    # key is different: dependency metadata is unknown, so demand is not
-    # established. Neither may be confused with an unread empty queue.
+    # Dependency metadata, carried but never used to decide eligibility: the
+    # server populates it from the workflow and does not clear it when the
+    # dependency finishes. A Go nil slice marshals as null and means "no
+    # `needs:` key". An absent key is still a shape error, so the record is
+    # refused rather than read as "no dependencies".
     if needs is not None and (
         not isinstance(needs, list) or any(not isinstance(need, str) for need in needs)
     ):
         raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", f"{where}.needs must be an array of strings")
-    if status != RUNNABLE_STATUS and status not in ASSIGNED_OR_TERMINAL_STATUSES:
+    if status not in (RUNNABLE_STATUS, BLOCKED_STATUS) and status not in ASSIGNED_OR_TERMINAL_STATUSES:
         raise ObservationRefusal("FORGEJO_UNKNOWN_STATUS", "unrecognized job status")
     return handle, job_id, attempt, status, tuple(runs_on), tuple(needs or ())
 
 
 def _reduce(records, worker_labels):
-    """Deduplicate attempts and keep only runnable, label-compatible demand."""
+    """Deduplicate attempts and keep only runnable, label-compatible demand.
+
+    A ``waiting`` record is demand whatever its ``needs`` says; a ``blocked``
+    record is dependency-blocked work and is counted, never launched; anything
+    already assigned or finished is counted as such.
+    """
     attempts = []
     seen = {}
     blocked = assigned = incompatible = duplicates = 0
@@ -236,11 +253,11 @@ def _reduce(records, worker_labels):
             duplicates += 1
             continue
         seen[handle] = signature
+        if status == BLOCKED_STATUS:
+            blocked += 1
+            continue
         if status != RUNNABLE_STATUS:
             assigned += 1
-            continue
-        if needs:
-            blocked += 1
             continue
         if not labels:
             incompatible += 1

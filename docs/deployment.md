@@ -201,6 +201,61 @@ same change: the policy — not the TOML — is what decides which placements ar
 allowed, so a candidate the policy omits is a denied launch rather than a
 fallback. A zone without a subnet cannot be used at all.
 
+## Verify the prerequisites
+
+The worker prerequisites in [runner-setup.md](runner-setup.md) stay
+**manual-only**: this repository has no infrastructure-as-code for the network,
+security groups, instance profile, registration parameter or launch template.
+The tutorial remains the build procedure, and a changed or missing resource is
+otherwise invisible until a launch fails.
+
+`scripts/check_prerequisites.py` is the runnable check. Run it from the
+checkout with the deployment TOML and a read-only operator identity that may
+describe the resources. (The scaling identity deliberately cannot describe
+subnets, route tables, security groups, SSM metadata or IAM.) It only reads:
+it never mutates a resource, and it never retrieves, decrypts or prints the
+registration parameter's value.
+
+```sh
+python3 scripts/check_prerequisites.py --config deployment.toml
+```
+
+`--config` defaults to `deployment.toml`, and `aws.profile` selects the
+credential route. The SSM parameter defaults to the tutorial's
+`/forgejo/runner/registration-token`; pass `--registration-parameter` if you
+used another name. The command needs Python 3.12 or newer and the runtime
+`boto3` dependency (`pip install -e .`).
+
+It checks, from read-only describe calls:
+
+- every configured template version exists and still satisfies the controller's
+  own template contract — a literal `ImageId`, an `InstanceType` and
+  `InstanceInitiatedShutdownBehavior = terminate` — and reports the image,
+  instance type, shutdown behaviour and bootstrap presence the controller will
+  launch;
+- every configured candidate's subnet exists in that zone and Region, and its
+  route table (or the VPC's main route table) has an active default route;
+- the template's security groups exist;
+- the template's instance profile and its role exist;
+- the registration parameter exists — metadata only.
+
+The output is one JSON document with stable reason codes. Exit `0` means every
+check passed, `2` means drift, and `3` means the check could not run
+completely. An incomplete check takes precedence over drift: if any check is
+unavailable the command exits `3`, while the drift reasons are still listed in
+`reasons`. A missing `ec2:DescribeSubnets`, `ssm:DescribeParameters` or
+`iam:GetInstanceProfile` permission, and an expected credential, session or
+session-configuration failure such as `ProfileNotFound` or `ConfigParseError`,
+are reported as `unavailable` and exit `3`; they are neither a pass nor drift.
+
+What it does not prove: nothing about a worker's runtime behaviour — boot,
+registration, job execution or termination; network reachability (security
+group rules, NACLs, DNS, NAT health or VPN/mesh routes); the bootstrap's content
+or the IAM policy's statements; and nothing about the control plane. A
+satisfied result is not a substitute for the recorded live evidence in
+[runner-setup.md](runner-setup.md) § 5 and
+[pilot-checklist.md](pilot-checklist.md).
+
 ## 6. Install the units
 
 From the checkout, on the scaler:

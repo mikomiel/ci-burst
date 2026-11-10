@@ -165,6 +165,30 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(observation.demand, 0)
         self.assertEqual(observation.incompatible, 1)
 
+    def test_job_requiring_the_routing_and_architecture_labels_is_demand(self):
+        # The burst worker advertises the routing label and the image's
+        # architecture label; a job asking for both bare labels is eligible.
+        self.config = load(
+            write_config(
+                self.root,
+                config={"worker": {"labels": ["cloud-ci:host", "linux-arm64:host"]}},
+            )
+        )
+        record = {
+            "id": 8,
+            "run_id": 1,
+            "attempt": 1,
+            "handle": "h-8-1",
+            "status": "waiting",
+            "runs_on": ["cloud-ci", "linux-arm64"],
+            "needs": [],
+        }
+        observation, transport = self.observe(json.dumps([record]).encode())
+        self.assertEqual(observation.demand, 1)
+        self.assertEqual(observation.incompatible, 0)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(transport.calls[0][0]).query)
+        self.assertEqual(query, {"labels": ["cloud-ci,linux-arm64"]})
+
     def test_repeated_record_is_deduplicated(self):
         observation, _ = self.observe(fixture("jobs_duplicate.json"))
         self.assertEqual(observation.demand, 1)

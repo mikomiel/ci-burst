@@ -280,6 +280,24 @@ class Ledger:
         values.append(operation_id)
         connection.execute("UPDATE operations SET %s WHERE id = ?" % ", ".join(assignments), values)
 
+    def fail_without_reservation(self, operation_id, *, detail, updated_at=None):
+        """Record a definite failure and release the allowance in one write.
+
+        Only a call site that proved nothing was created may use this: the
+        reservation is zeroed and the allowance is available again, while the
+        row keeps its state and its reason as the audit record of the attempt.
+        One statement, because a failure recorded without its release would
+        charge the window for an attempt that created nothing and nothing later
+        would complete it.
+        """
+        connection = self._require()
+        now = self._clock() if updated_at is None else updated_at
+        connection.execute(
+            "UPDATE operations SET state = 'failed', detail = ?, reservation_micros = 0,"
+            " updated_at = ? WHERE id = ?",
+            (detail, now, operation_id),
+        )
+
     def advance_operation(self, operation_id, *, request, request_sha256, client_token, detail=""):
         """Replace frozen launch parameters with the next ordered candidate.
 

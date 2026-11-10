@@ -105,10 +105,31 @@ class PlanTests(ControllerCase):
         self.assertIn("spot_price_above_cap", result["reasons"])
 
     def test_plan_refuses_stale_price(self):
-        aws = FakeAws(spot_quote=quote(price_micros=20_000, timestamp=self.clock.now - 4000))
+        # Staleness is the age of the observation, not of the provider's record.
+        aws = FakeAws(
+            spot_quote=quote(price_micros=20_000, observed_at=self.clock.now - 4000)
+        )
         result = self.build(observation=observation_demand(), aws=aws).plan()
         self.assertEqual(result["decision"], "refused")
         self.assertIn("spot_price_stale", result["reasons"])
+
+    def test_plan_accepts_a_stable_price_observed_now(self):
+        # A Spot price can be hours old and still current: the provider's
+        # timestamp is when the price last changed.
+        aws = FakeAws(
+            spot_quote=quote(
+                price_micros=20_000,
+                timestamp=self.clock.now - 12_793,
+                observed_at=self.clock.now,
+            )
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(result["decision"], "would_launch", result)
+        self.assertNotIn("spot_price_stale", result.get("reasons", []))
+        self.assertNotIn(
+            "spot_price_stale",
+            [candidate.get("reason") for candidate in result["candidates"]],
+        )
 
     def test_plan_refuses_missing_price(self):
         aws = FakeAws(spot_quote=None)
@@ -153,6 +174,7 @@ class PlanTests(ControllerCase):
             price_display="0.020000",
             instance_type="t4g.small",
             availability_zone="us-east-1a",
+            observed_at=self.clock.now,
         )
         result = self.build(observation=observation_demand(), aws=FakeAws(spot_quote=wrong)).plan()
         self.assertEqual(result["decision"], "refused")
@@ -241,7 +263,10 @@ class ApplyTests(ControllerCase):
         self.assertIn("slot_busy", result["reasons"])
         self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1)
 
-    def test_definite_launch_failure_frees_the_slot_but_keeps_the_reservation(self):
+    def test_definite_launch_failure_releases_the_slot_and_the_allowance(self):
+        # A definite rejection proves no instance was created, so the attempt
+        # must not consume the window: five capacity rejections used to exhaust
+        # a pilot's whole allowance without launching anything.
         controller = self.build(observation=observation_demand())
         self.aws.run_error = ProviderRefusal("AWS_REFUSED", "InsufficientInstanceCapacity")
         result = controller.apply()
@@ -249,8 +274,34 @@ class ApplyTests(ControllerCase):
         self.assertEqual(result["refusal"], {"reason": "AWS_REFUSED", "detail": "InsufficientInstanceCapacity"})
         operation = self.reopened().operation(result["operation"])
         self.assertEqual(operation.state, "failed")
+        # One write records the failure and the release together, so a restart
+        # between them cannot leave a failed operation still charging the window.
+        self.assertEqual(operation.reservation_micros, 0)
+        self.assertEqual(operation.detail, "AWS_REFUSED")
         window = current_window(self.clock.now, self.config.budget.window_seconds)
-        self.assertEqual(self.reopened().consumed_micros(window), operation.reservation_micros)
+        self.assertEqual(self.reopened().consumed_micros(window), 0)
+
+    def test_a_definite_non_capacity_refusal_releases_the_allowance(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_REFUSED", "UnauthorizedOperation")
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launch_failed")
+        window = current_window(self.clock.now, self.config.budget.window_seconds)
+        self.assertEqual(self.reopened().consumed_micros(window), 0)
+
+    def test_an_uncertain_launch_keeps_the_allowance(self):
+        # The provider may have created the instance: the reservation stays
+        # outstanding until the intent is resolved.
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "uncertain")
+        operation = self.reopened().operation(result["operation"])
+        self.assertGreater(operation.reservation_micros, 0)
+        window = current_window(self.clock.now, self.config.budget.window_seconds)
+        self.assertEqual(
+            self.reopened().consumed_micros(window), operation.reservation_micros
+        )
 
     def test_lost_response_is_uncertain_then_adopted_without_a_second_launch(self):
         controller = self.build(observation=observation_demand())

@@ -79,13 +79,15 @@ def _toml(value):
     return json.dumps(value)
 
 
-def zone_quote(zone, price_micros, clock, timestamp=None):
+def zone_quote(zone, price_micros, clock, timestamp=None, observed_at=None):
+    observed = clock.now if observed_at is None else observed_at
     return SpotQuote(
         price_micros=price_micros,
-        timestamp=clock.now if timestamp is None else timestamp,
+        timestamp=observed if timestamp is None else timestamp,
         price_display=f"{price_micros / 1_000_000:.6f}",
         instance_type="t4g.small",
         availability_zone=zone,
+        observed_at=observed,
     )
 
 
@@ -232,7 +234,7 @@ class PlanTests(MultiZoneCase):
         controller = self.build(
             config=config,
             quotes={
-                "eu-central-1a": zone_quote("eu-central-1a", 20_000, self.clock, timestamp=self.clock.now - 901),
+                "eu-central-1a": zone_quote("eu-central-1a", 20_000, self.clock, observed_at=self.clock.now - 901),
                 "eu-central-1b": None,
                 "eu-central-1c": zone_quote("eu-central-1d", 20_000, self.clock),
                 "eu-central-1d": zone_quote("eu-central-1d", 30_000, self.clock),
@@ -424,7 +426,7 @@ class LaunchFallbackTests(MultiZoneCase):
                 # 899 s old at admission: still eligible. Freshness is checked
                 # again before this candidate is frozen and sent.
                 "eu-central-1b": zone_quote(
-                    "eu-central-1b", 30_000, self.clock, timestamp=self.clock.now - 899
+                    "eu-central-1b", 30_000, self.clock, observed_at=self.clock.now - 899
                 ),
             },
             run_errors={
@@ -450,6 +452,10 @@ class LaunchFallbackTests(MultiZoneCase):
         self.assertEqual(operations[0].state, "failed")
         self.assertIsNone(operations[0].instance_id)
         self.assertEqual(operations[0].request()["Placement"]["AvailabilityZone"], "eu-central-1a")
+        # Nothing was created, so the admission releases its allowance instead
+        # of charging the window for an attempt that never reached the provider.
+        window = current_window(self.clock.now, controller.config.budget.window_seconds)
+        self.assertEqual(self.reopened().consumed_micros(window), 0)
 
     def test_an_uncertain_first_attempt_does_not_fall_through(self):
         controller = self.build(

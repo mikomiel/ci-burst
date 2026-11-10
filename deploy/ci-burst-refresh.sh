@@ -67,7 +67,12 @@ if ! tar -xf "$work/tree.tar" -C "$work/src"; then
     exit 2
 fi
 
-if ! podman build --quiet --tag "$IMAGE:candidate" "$work/src" >/dev/null; then
+# Host networking is for the build only: the base image and the package
+# install download far more than one segment, and a container bridge whose
+# MTU is larger than the host path MTU stalls those transfers with no error.
+# The smoke run below keeps the default network, so it exercises the same
+# networking the scheduled units use.
+if ! podman build --quiet --network=host --tag "$IMAGE:candidate" "$work/src" >/dev/null; then
     log "build_failed: $want"
     exit 2
 fi

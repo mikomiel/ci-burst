@@ -174,6 +174,14 @@ class RefreshTests(unittest.TestCase):
             with self.subTest(avoid=avoid):
                 self.assertNotIn(avoid, self.script)
 
+    def test_builds_with_host_networking_but_smokes_on_the_default_network(self):
+        # A container bridge MTU above the host path MTU stalls large downloads;
+        # the build needs the network, the smoke must mirror the scheduled units.
+        self.assertIn("podman build --quiet --network=host --tag", self.script)
+        smoke = self.script[self.script.index("podman run --rm") :]
+        smoke = smoke[: smoke.index("plan --config")]
+        self.assertNotIn("--network=host", smoke)
+
     def test_smoke_tests_the_candidate_before_promoting_it(self):
         smoke = self.script.index("plan --config")
         self.assertLess(self.script.index("podman build"), smoke)

@@ -38,12 +38,37 @@ ci-burst launches at most one Spot instance per deployment.
   `podman run --init`) and systemd on both the scaler host and the cleanup
   host. The commands and units assume the default podman user namespace:
   container UID/GID 10001 is host UID/GID 10001.
+- A named podman network, `ci-burst`, created with the MTU the host's path
+  supports (see below). The units and the refresh smoke run on it; the default
+  bridge is not used.
 - A deployment TOML prepared from [operations.md](operations.md), including
   the `forgejo.qualification` decision. `fixtures-only` still blocks `apply`.
 - A scaling identity and a separate cleanup identity, each provided as a
   read-only credentials directory. Never place credentials in the TOML.
 - Outbound network access to the Forgejo server and the AWS endpoints. The
   container publishes no port and needs no inbound access.
+
+### The container network
+
+Create the network once on every host that runs a unit:
+
+```sh
+podman network create --opt mtu=1300 ci-burst
+```
+
+The MTU is why this network exists. A container bridge defaults to 1500 bytes,
+and where the host's path cannot carry that, large TLS responses stall with no
+error: the connection hangs instead of failing, and only the requests with small
+responses come back. That asymmetry is the dangerous part — `plan` can look
+healthy while `apply` times out against the provider and the Forgejo API, which
+is what happened on the first live host before the network was named here.
+Nothing clamps MSS on such a path, so the container's own limit has to match it.
+`1300` is the value used in these examples; measure the path where it differs or
+where 1500 works, and create the network without `--opt mtu` in that case.
+
+Do not work around it with `--network=host`: the units keep their own network
+namespace so the loopback warning below stays true and the container cannot
+reach host-local services.
 
 ## Build the image
 
@@ -221,6 +246,7 @@ Install only the apply unit and timer on the scaler host:
 
 ```sh
 # scaler host
+podman network create --opt mtu=1300 ci-burst   # once, see "The container network"
 install -m 0644 \
   deploy/ci-burst-apply.service deploy/ci-burst-apply.timer \
   /etc/systemd/system/
@@ -233,6 +259,7 @@ Install only the reap unit and timer on the independent cleanup host:
 
 ```sh
 # independent cleanup host
+podman network create --opt mtu=1300 ci-burst   # once, see "The container network"
 install -m 0644 \
   deploy/ci-burst-reap.service deploy/ci-burst-reap.timer \
   /etc/systemd/system/
@@ -290,6 +317,7 @@ Install it beside the apply unit, from a clone of this repository:
 git clone https://github.com/mikomiel/ci-burst.git /opt/ci-burst-src
 install -d -m 0700 /var/lib/ci-burst-image
 install -m 0755 deploy/ci-burst-refresh.sh /usr/local/sbin/ci-burst-refresh
+podman network create --opt mtu=1300 ci-burst   # once, see "The container network"
 install -m 0644 \
   deploy/ci-burst-refresh.service deploy/ci-burst-refresh.timer \
   /etc/systemd/system/
@@ -324,8 +352,9 @@ What a promotion does and does not do:
 - the build runs with host networking (`podman build --network=host`). A
   container bridge whose MTU is larger than the host's path MTU stalls large
   transfers with no error, and the base image plus the package install are the
-  only transfers large enough to hit it. The smoke run keeps the default
-  network, so it exercises exactly the networking the scheduled units use;
+  only transfers large enough to hit it. The smoke run uses the same
+  `ci-burst` network as the scheduled units, so the gate exercises exactly the
+  networking they use;
 - a fetch, archive, build or smoke failure keeps the previous image in place and
   logs one line with a reason code (`fetch_failed`, `archive_failed`,
   `unpack_failed`, `build_failed`, `smoke_failed`, `tag_failed`,

@@ -81,7 +81,7 @@ fi
 attempt=1
 while :; do
     smoke_rc=0
-    smoke=$(podman run --rm --init --replace --name ci-burst-refresh-smoke \
+    smoke=$(podman run --rm --init --replace --network ci-burst --name ci-burst-refresh-smoke \
         --read-only \
         --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
         --volume "$CONFIG:/etc/ci-burst/deployment.toml:ro" \

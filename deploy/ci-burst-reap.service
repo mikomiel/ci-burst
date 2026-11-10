@@ -18,12 +18,18 @@ Documentation=https://github.com/mikomiel/ci-burst/blob/main/docs/container.md
 Wants=network-online.target
 After=network-online.target
 
+#
+# The unit names the `ci-burst` podman network instead of the default bridge.
+# The bridge MTU must not exceed the host's path MTU: a larger one makes large
+# TLS responses stall with no error, and the controller's provider and Forgejo
+# calls are exactly that traffic. Create the network with the host's path MTU
+# before enabling the unit; docs/container.md has the command and the reason.
 [Service]
 Type=oneshot
 TimeoutStartSec=300
 TimeoutStopSec=15
 KillMode=process
-ExecStart=/usr/bin/podman run --rm --replace --init --name ci-burst-reap \
+ExecStart=/usr/bin/podman run --rm --replace --init --network ci-burst --name ci-burst-reap \
     --read-only \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
     --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \

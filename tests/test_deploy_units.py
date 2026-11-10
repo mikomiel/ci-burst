@@ -81,6 +81,11 @@ class ApplyUnitTests(unittest.TestCase):
         self.assertIn("/etc/ci-burst/aws-scaling:/etc/ci-burst/aws:ro", self.exec_start)
         self.assertIn(f"{IMAGE} apply --config", self.exec_start)
 
+    def test_runs_on_the_named_network_with_the_host_path_mtu(self):
+        # The default bridge is 1500 and stalls large TLS responses where the
+        # path is smaller; the unit must name the measured network.
+        self.assertIn("--network ci-burst", self.exec_start)
+
     def test_publishes_no_port_and_has_no_daemon_flags(self):
         self.assertNotIn("--publish", self.exec_start)
         self.assertNotIn("--detach", self.exec_start)
@@ -109,6 +114,9 @@ class CleanupUnitTests(unittest.TestCase):
     def test_needs_no_forgejo_token_and_no_ledger(self):
         self.assertNotIn("--env-file", self.exec_start)
         self.assertNotIn("/var/lib/ci-burst", self.exec_start)
+
+    def test_runs_on_the_named_network_with_the_host_path_mtu(self):
+        self.assertIn("--network ci-burst", self.exec_start)
 
     def test_has_its_own_named_container_and_cleanup_command(self):
         self.assertIn("--name ci-burst-reap", self.exec_start)
@@ -174,13 +182,14 @@ class RefreshTests(unittest.TestCase):
             with self.subTest(avoid=avoid):
                 self.assertNotIn(avoid, self.script)
 
-    def test_builds_with_host_networking_but_smokes_on_the_default_network(self):
+    def test_builds_with_host_networking_but_smokes_on_the_unit_network(self):
         # A container bridge MTU above the host path MTU stalls large downloads;
         # the build needs the network, the smoke must mirror the scheduled units.
         self.assertIn("podman build --quiet --network=host --tag", self.script)
         smoke = self.script[self.script.index("podman run --rm") :]
         smoke = smoke[: smoke.index("plan --config")]
         self.assertNotIn("--network=host", smoke)
+        self.assertIn("--network ci-burst", smoke)
 
     def test_smoke_tests_the_candidate_before_promoting_it(self):
         smoke = self.script.index("plan --config")
@@ -453,6 +462,11 @@ class RefreshBehaviourTests(unittest.TestCase):
 class ImageTests(unittest.TestCase):
     def setUp(self):
         self.dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    def test_the_guide_creates_the_network_every_host_needs(self):
+        guide = (ROOT / "docs/container.md").read_text(encoding="utf-8")
+        self.assertIn("podman network create --opt mtu=1300 ci-burst", guide)
+        self.assertIn("### The container network", guide)
 
     def test_uses_the_python_slim_base_and_installs_the_package(self):
         self.assertIn("FROM python:3.12-slim", self.dockerfile)

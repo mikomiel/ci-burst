@@ -1,0 +1,14 @@
+# Expiry cleanup schedule: one reap --apply every five minutes, independent of
+# the apply timer. Expiry is an hourly boundary, so five minutes keeps cleanup
+# timely without making it a high-frequency job.
+[Unit]
+Description=Run ci-burst reap --apply every five minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=5min
+AccuracySec=15s
+Unit=ci-burst-reap.service
+
+[Install]
+WantedBy=timers.target

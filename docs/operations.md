@@ -55,10 +55,50 @@ database = "state.sqlite3"
 
 Optional keys: `forgejo.timeout_seconds` (10), `forgejo.max_response_bytes`
 (2,000,000), `aws.price_max_age_seconds` (900), `aws.profile`,
-`controller.max_instances` (only `1` is accepted).
+`aws.availability_zones`, `controller.max_instances` (only `1` is accepted).
 Relative state paths resolve against the configuration file directory. Unknown
-keys, floating-point money, a template-version alias, a non-`https` Forgejo URL
-and a second instance are refused.
+keys, floating-point money, a template-version alias, a non-`https` Forgejo URL,
+a second instance and a malformed zone-candidate list (`ZONE_CANDIDATES_INVALID`)
+are refused.
+
+### Availability-zone candidates
+
+`aws.availability_zone` above is the original one-candidate form: the launch
+template keeps the network choice. To let a capacity rejection in one zone fall
+through to another, replace it with an ordered array of tables:
+
+```toml
+[aws]
+region = "eu-central-1"
+launch_template_name = "example-ci-burst-runner"
+launch_template_version = 3
+max_spot_price = "0.0400"
+max_lifetime_seconds = 3600
+
+[[aws.availability_zones]]
+zone = "eu-central-1a"
+subnet_id = "subnet-0123456789abcdef0"
+
+[[aws.availability_zones]]
+zone = "eu-central-1b"
+subnet_id = "subnet-0123456789abcdef1"
+launch_template_version = 4
+```
+
+The order is the priority. Every candidate requires `zone` and `subnet_id`; an
+optional `launch_template_version` overrides the top-level version for that
+candidate. A `subnet_id` is `subnet-` followed by exactly 8 or 17 hexadecimal
+characters. A candidate list that is empty, repeats a zone, lacks a valid
+subnet, carries an unknown key, uses a non-integer template version, names a
+zone outside the configured Region, or is supplied together with
+`availability_zone` is refused at load time with the stable code
+`ZONE_CANDIDATES_INVALID`. Placement is static configuration: ci-burst never
+discovers zones and never substitutes a zone that is not configured.
+
+The candidate subnet is sent as the `RunInstances` request's `SubnetId`
+parameter, so a template used with a candidate list must not pin network
+interfaces or a subnet itself. The single-zone form sends no subnet override and
+keeps the network choice in the launch template.
 
 The source runs on Python 3.12 or newer and needs `boto3` at runtime. The
 standard-library tests run without the SDK, a token or a cloud account.
@@ -161,6 +201,10 @@ The worker contract the template must implement:
 - a maximum lifetime that covers image boot, a delayed job and a failed
   bootstrap. Ephemeral registration is not an expiry mechanism.
 
+A candidate may pin its own numeric template version. Every version a candidate
+names must satisfy this contract; a template whose `Placement` pins one zone
+makes the other candidates ineligible instead of overriding that pin.
+
 Changing the image or bootstrap means a new template version and a
 configuration change; an approved version is not edited in place.
 
@@ -184,16 +228,20 @@ reservation = ceil(max_spot_price * max_lifetime_seconds / 3600)
             + non_compute_allowance
 ```
 
-A launch is refused unless a fresh Spot quote exists for the configured
-instance type and availability zone, is not older than
-`price_max_age_seconds`, is not above `max_spot_price`, and the current window
-still has `allowance` left after the reservation. The quote response must
-identify its own availability zone, instance type and `Linux/UNIX` product;
-missing metadata is not replaced with the requested scope. The window is anchored at a
-multiple of `window_seconds`. Outstanding operations carry their reservation
-into later windows; a completed operation is charged to the window it started
-in. Requesting termination does not refund consumed allowance, and a restart
-does not reset it.
+A launch is refused unless the selected candidate has a fresh Spot quote for the
+configured instance type and its availability zone, is not older than
+`price_max_age_seconds`, and is not above `max_spot_price`. Every configured
+candidate is priced in order; one whose quote is missing, stale, out of scope or
+above the ceiling is skipped and the next candidate is considered, so one
+expensive zone does not refuse a launch another configured zone can serve. The
+quote response must identify its own availability zone, instance type and
+`Linux/UNIX` product; missing metadata is not replaced with the requested scope.
+The reservation is computed from `max_spot_price`, never from an observed quote,
+and the current window must still have `allowance` left after it. The window is
+anchored at a multiple of `window_seconds`. Outstanding operations carry their
+reservation into later windows; a completed operation is charged to the window
+it started in. Requesting termination does not refund consumed allowance, and a
+restart does not reset it.
 
 The reservation estimates compute at the configured maximum price for the
 configured lifetime, plus the configured non-compute allowance. It does not
@@ -201,6 +249,45 @@ bound EBS, data transfer, public addressing, log delivery, minimum billing
 increments, Spot price changes after launch, or resources left by failed
 cleanup. It is not a guaranteed cap on the AWS bill, and no status, lifetime or
 alert in this project should be described as one.
+
+## Launch decision and capacity fallback
+
+`plan` reports every configured candidate in order, each with the zone, subnet,
+template version, eligibility and the Spot quote used for it when one was read,
+plus the `selected` candidate. A candidate is `skipped` with a stable reason
+(`spot_price_unavailable`, `spot_price_stale`, `spot_price_wrong_scope`,
+`spot_price_above_cap`, `template_placement_mismatch` or
+`template_bootstrap_missing`); when none is eligible the decision is `refused`
+with those reasons and `no_eligible_candidate`. A provider error while reading a
+price refuses the whole plan (`spot_price_unavailable`) instead of silently
+dropping a configured candidate; only an answered quote that is absent from the
+requested scope marks that candidate skipped. A configured template version that
+cannot be read or is unusable refuses the plan with `template_unusable` and
+`template_error` rather than dropping that candidate.
+
+`apply` still launches at most one instance: one admission, one reservation, one
+ledger operation and one slot. If the provider definitely rejects the selected
+candidate for insufficient capacity (`InsufficientInstanceCapacity`), that
+rejection proves no instance was created, so the same admission advances to the
+next eligible candidate in order — at most once per candidate — and a success
+ends the walk. Every attempt sends `MinCount = MaxCount = 1`, so no fallback can
+produce a second instance. Before each advance the controller re-reads the clock:
+the candidate's Spot quote must still be within `price_max_age_seconds` and the
+admission lifetime must not have elapsed. A candidate whose evidence expired is
+recorded as `skipped` (`spot_price_stale`), not frozen or sent, and the next
+remaining candidate is considered. The result reports the ordered `attempts`
+with each outcome (`capacity_rejected`, `accepted`, `rejected`, `uncertain` or
+`skipped`); `selected` remains the admission's first choice, so the accepted
+attempt is the placement that actually launched.
+
+No other failure falls through: a non-capacity definite rejection keeps today's
+`launch_failed` behaviour, and an uncertain response keeps the operation
+outstanding. If every candidate is rejected for capacity the operation is
+`failed` — the slot is free — the queue stays unserved, and the result carries
+the stable `capacity_exhausted` reason plus the final provider refusal. If the
+remaining candidates' price evidence expires during the attempt, the operation
+is also `failed` with a free slot and the stable `spot_price_stale` reason, and
+no new admission or reservation is created. Nothing is reported as launched.
 
 ## Durable state and ownership
 
@@ -221,6 +308,15 @@ idempotency makes the retry safe. A rejected **retry** keeps the operation
 uncertain, because rejecting the retry does not prove the original request
 created nothing. Only a definite rejection of the first attempt may release the
 slot, and ambiguous provider errors stay uncertain.
+
+The frozen intent names the candidate currently being attempted. A definite
+capacity rejection is the one case that may replace it: the same operation
+advances to the next ordered candidate, replacing the frozen request, its hash
+and its own client token while keeping the operation id, admission window and
+reservation. A changed placement needs its own idempotency token because one
+token cannot describe two requests. A resumed intent is retried exactly as
+frozen and never falls through, because a rejected retry cannot prove the
+earlier request created nothing.
 
 Two bounds refuse rather than launch: an unresolved intent older than the
 24-hour client-token validity, and an intent whose configured lifetime has
@@ -318,7 +414,11 @@ zero residual cost.
 
 ## Supported limits
 
-One repository, one region, one availability zone, one owned instance, one
-writer, one ledger. Not supported: concurrent controllers, multiple ledgers,
-warm pools, On-Demand fallback, provider selection, job retries, workflow
-rewrites, image construction and secret distribution.
+One repository, one Region and one ordered list of availability-zone candidates
+(the single-zone key is the one-candidate form), one owned instance, one writer
+and one ledger. Ordered fallback is supported only for a definite insufficient
+capacity rejection, within one admission and at most once per configured
+candidate. Not supported: concurrent controllers, multiple ledgers, warm pools,
+On-Demand fallback, automatic zone or Region discovery and substitution,
+provider selection, job retries, workflow rewrites, image construction and
+secret distribution.

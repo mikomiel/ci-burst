@@ -8,31 +8,65 @@ resource identity, crash recovery and Forgejo's ownership of job results.
 ## ADDED Requirements
 
 ### Requirement: Explicitly pinned launch prerequisites
-Live provisioning MUST use an operator-prepared launch template with an explicit numeric version and literal immutable image ID. Region and deployment identity MUST be explicit. The controller MUST NOT create VPCs, subnets, security groups, IAM roles, images or bootstrap-secret infrastructure.
+Live provisioning MUST use an operator-prepared launch template with an explicit numeric version and literal immutable image ID. Region and deployment identity MUST be explicit. Placement MUST come only from the configured ordered availability-zone candidate list, and a candidate MAY pin its own numeric template version. The controller MUST NOT create VPCs, subnets, security groups, IAM roles, images or bootstrap-secret infrastructure.
 
 #### Scenario: Approved immutable template
 - **WHEN** the configured template version resolves to the approved image and worker contract
 - **THEN** that exact configuration is recorded in launch intent
-- **AND** the launch uses the configured Region without automatic substitution
+- **AND** the launch uses the configured Region and a configured candidate without automatic substitution
+
+#### Scenario: Candidate-specific template version
+- **WHEN** a placement candidate pins its own numeric template version
+- **THEN** the launch intent for that candidate records that exact version
+- **AND** every candidate version used still satisfies the worker template contract
 
 #### Scenario: Mutable or incomplete prerequisites
 - **WHEN** the template uses a moving version alias, a dynamically resolved image or missing required worker settings
 - **THEN** live provisioning is refused before a launch request
 
 ### Requirement: One owned instance in the initial version
-The initial version MUST permit at most one nonterminal owned instance or unresolved launch intent per deployment. Pending, starting, busy, terminating and uncertain resources MUST consume that capacity. Unsupported higher concurrency MUST be rejected rather than silently enabled.
+The initial version MUST permit at most one nonterminal owned instance or unresolved launch intent per deployment. Pending, starting, busy, terminating and uncertain resources MUST consume that capacity. Unsupported higher concurrency MUST be rejected rather than silently enabled. An ordered placement fallback MUST NOT admit a second instance, reservation or ledger operation.
 
 #### Scenario: Instance is starting or termination is incomplete
 - **WHEN** the deployment has a nonterminal instance or an unresolved launch
 - **THEN** further demand does not create another instance
+
+#### Scenario: Capacity rejection falls through to the next candidate
+- **WHEN** a definite capacity rejection advances the same admission to the next configured candidate
+- **THEN** no additional instance, reservation or ledger operation is created
+- **AND** the fallback uses `MinCount` and `MaxCount` of one
 
 #### Scenario: Unrecorded owned resource exists
 - **WHEN** remote discovery finds matching owned resources that cannot be reconciled with durable state
 - **THEN** new launches are blocked
 - **AND** the discrepancy is reported rather than treated as available capacity
 
+### Requirement: Ordered capacity fallback within one admission
+Placement MUST be an ordered list of configured availability-zone candidates. When the provider definitely rejects a launch for insufficient capacity, and only then, the controller MAY attempt the next configured candidate in order within the same admission. It MUST NOT retry a candidate, create a second instance, or fall through for any other failure. If every candidate is rejected the slot MUST stay free with a stable reason.
+
+#### Scenario: First candidate lacks capacity
+- **WHEN** the first selected candidate is definitely rejected for insufficient instance capacity
+- **THEN** the same admission attempts the next configured candidate once, in order
+- **AND** the operation, reservation and single slot are preserved
+
+#### Scenario: Non-capacity or uncertain provider failure
+- **WHEN** the launch fails for a reason other than insufficient capacity, or its outcome is uncertain
+- **THEN** the controller does not attempt another candidate
+- **AND** the operation follows the existing failed or uncertain path
+
+#### Scenario: Every candidate lacks capacity
+- **WHEN** every configured candidate is definitely rejected for insufficient capacity
+- **THEN** the operation is failed and the slot is free
+- **AND** the queue remains unserved with a stable reason code and no reported launch
+
+#### Scenario: Price evidence expires before the next candidate is sent
+- **WHEN** the next configured candidate's Spot quote becomes older than the freshness limit while the previous attempt runs
+- **THEN** that candidate is not frozen or sent
+- **AND** a later candidate with fresh evidence may still be attempted
+- **AND** if none remains, the operation is failed with a free slot and a stable stale-price reason, without a new admission or reservation
+
 ### Requirement: Durable idempotent launch intent
-Before requesting a launch, the controller MUST durably record operation identity, frozen launch parameters, an idempotency token, ownership, expiry and the required reservation. Retries MUST reuse the same token and parameters. A failed durable write MUST prevent the cloud request.
+Before requesting a launch, the controller MUST durably record operation identity, frozen launch parameters, an idempotency token, ownership, expiry and the required reservation. Retries MUST reuse the same token and parameters. A definite capacity rejection MAY advance to the next ordered candidate as specified for fallback, replacing the frozen request and token together. A failed durable write MUST prevent the cloud request.
 
 #### Scenario: Process stops before sending the request
 - **WHEN** launch intent committed but the process stopped before calling AWS
@@ -44,7 +78,7 @@ Before requesting a launch, the controller MUST durably record operation identit
 - **THEN** no launch request is sent
 
 ### Requirement: Uncertain creation remains owned
-A timeout or lost launch response MUST be treated as uncertain creation rather than proof that no instance exists. Recovery MUST discover by the operation's immutable identity and reconcile the result. Changing Region, placement, template or token to bypass uncertainty MUST be forbidden.
+A timeout or lost launch response MUST be treated as uncertain creation rather than proof that no instance exists. Recovery MUST discover by the operation's immutable identity and reconcile the result. Changing Region, placement, template or token to bypass uncertainty MUST be forbidden; the only permitted placement change is the configured ordered fallback after a definite capacity rejection, which keeps the same operation and reservation.
 
 #### Scenario: AWS created an instance but the response was lost
 - **WHEN** a retry follows an uncertain request
@@ -95,7 +129,7 @@ A successful termination request MUST NOT be treated as confirmed resource remov
 - **AND** it does not report that no charged resources remain
 
 ### Requirement: Interruption does not authorize fallback or job success
-The lifecycle MUST tolerate Spot loss without an interruption notice. It MUST NOT fall back to On-Demand, change the requested resource class or manufacture a CI result. A later launch MUST require fresh runnable demand and normal admission checks.
+The lifecycle MUST tolerate Spot loss without an interruption notice. It MUST NOT fall back to On-Demand, change the requested resource class or manufacture a CI result; the only permitted fallback is the configured ordered availability-zone list. A later launch MUST require fresh runnable demand and normal admission checks.
 
 #### Scenario: Abrupt Spot loss
 - **WHEN** an owned instance disappears while work was running and no notice was received
@@ -103,6 +137,7 @@ The lifecycle MUST tolerate Spot loss without an interruption notice. It MUST NO
 - **AND** Forgejo retains the job result and retry decision
 
 #### Scenario: Spot capacity is unavailable
-- **WHEN** the approved Spot request cannot obtain capacity
-- **THEN** the controller reports that failure
-- **AND** it does not launch an On-Demand or differently configured replacement
+- **WHEN** the approved Spot request cannot obtain capacity in the selected candidate
+- **THEN** the controller may try the next configured candidate within the same admission
+- **AND** it does not launch an On-Demand instance, an unconfigured placement or a second instance
+- **AND** if every candidate fails it reports the failure with a free slot rather than a success

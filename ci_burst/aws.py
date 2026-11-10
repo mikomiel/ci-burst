@@ -50,6 +50,23 @@ DEFINITE_LAUNCH_ERRORS = frozenset(
     }
 )
 
+#: Launch error codes that prove the provider rejected the request because the
+#: requested placement had no Spot capacity. Every code here is also a definite
+#: launch error, so the rejection proves that no instance was created and the
+#: same admission may advance to the next configured candidate. No other error
+#: is capacity-related: in particular a throttled or unclassified failure may
+#: have created an instance and must not be retried in another zone.
+CAPACITY_LAUNCH_ERRORS = frozenset({"InsufficientInstanceCapacity"})
+
+
+def is_capacity_failure(refusal):
+    """True only for a definite, capacity-related launch rejection."""
+    return (
+        not refusal.uncertain
+        and refusal.reason == "AWS_REFUSED"
+        and refusal.detail in CAPACITY_LAUNCH_ERRORS
+    )
+
 
 @dataclass(frozen=True)
 class Template:

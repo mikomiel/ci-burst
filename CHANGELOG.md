@@ -14,27 +14,44 @@ and the validation step that binds it to that tag.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-10
+
+<!-- release-pending: v0.1.0 -->
+
 ### Added
 
 - Add the bounded AWS Spot controller ([#4](https://github.com/mikomiel/ci-burst/pull/4)).
+- Add ordered availability-zone fallback to the Spot launch ([#25](https://github.com/mikomiel/ci-burst/pull/25)).
+- Add container image and independent apply/reap units ([#24](https://github.com/mikomiel/ci-burst/pull/24)).
+- Verify worker prerequisites against the deployment ([#37](https://github.com/mikomiel/ci-burst/pull/37)).
+- Advertise the runner architecture label ([#38](https://github.com/mikomiel/ci-burst/pull/38)).
+- Refresh the controller image from merged main ([#39](https://github.com/mikomiel/ci-burst/pull/39)).
+- Report unit drift without installing anything ([#49](https://github.com/mikomiel/ci-burst/pull/49)).
 
 ### Fixed
 
 - Read review status creators from the status list ([#3](https://github.com/mikomiel/ci-burst/pull/3)).
-- Bound the changelog at the release boundary.
-- Fail closed when release evidence is unavailable.
-- Tighten the changelog release checks.
-- Reconcile release tags and sections both ways.
-- Verify the release tag contains its changelog section.
+- Send the mandatory queue label filter and accept a null job list ([#28](https://github.com/mikomiel/ci-burst/pull/28)).
+- Keep the dotenv filename out of the private-dns-name scan rule ([#27](https://github.com/mikomiel/ci-burst/pull/27)).
+- Treat blocked status as the dependency signal ([#36](https://github.com/mikomiel/ci-burst/pull/36)).
+- Run the units and the smoke on the host's MTU network ([#41](https://github.com/mikomiel/ci-burst/pull/41)).
+- Measure quote freshness and release the allowance honestly ([#44](https://github.com/mikomiel/ci-burst/pull/44)).
 
 ### Documentation
 
 - Propose bounded AWS Spot queue burst ([#1](https://github.com/mikomiel/ci-burst/pull/1)).
 - Add a self-service AWS runner setup tutorial ([#5](https://github.com/mikomiel/ci-burst/pull/5)).
-- Add a changelog and the release boundary.
 - Add runner setup follow-ups from live testing ([#22](https://github.com/mikomiel/ci-burst/pull/22)).
+- Add the deployment walkthrough and control-plane policies ([#33](https://github.com/mikomiel/ci-burst/pull/33)).
+- Add a changelog and the release boundary ([#23](https://github.com/mikomiel/ci-burst/pull/23)).
+- Record the exclusive routing label and match the config example to it ([#46](https://github.com/mikomiel/ci-burst/pull/46)).
+- Dependency-blocked work is not listed by the endpoint ([#47](https://github.com/mikomiel/ci-burst/pull/47)).
+- Burst capacity joins the strong-ci pool ([#50](https://github.com/mikomiel/ci-burst/pull/50)).
+- Size the window for launches, not for dispatches ([#51](https://github.com/mikomiel/ci-burst/pull/51)).
 
 ### CI
 
 - Gate merges on exact-head Gandalf approval ([#2](https://github.com/mikomiel/ci-burst/pull/2)).
 - Add dependency automation and document the merge scope ([#8](https://github.com/mikomiel/ci-burst/pull/8)).
+- Relay review events to the review gate ([#26](https://github.com/mikomiel/ci-burst/pull/26)).
+- Build the container image without credentials ([#45](https://github.com/mikomiel/ci-burst/pull/45)).

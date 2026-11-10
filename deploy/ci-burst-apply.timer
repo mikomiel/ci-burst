@@ -1,0 +1,16 @@
+# Admission schedule: one apply about every 60 seconds.
+#
+# The next run is scheduled from when the previous one finished, so two apply
+# processes never overlap; the ledger's writer lock is the second line of
+# defence, not the scheduler.
+[Unit]
+Description=Run ci-burst apply about every 60 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=ci-burst-apply.service
+
+[Install]
+WantedBy=timers.target

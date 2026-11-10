@@ -112,6 +112,32 @@ python3 scripts/github_pr_automation.py merge
 context. Do not use it from an authoring session. No policy operation creates
 a release, deployment or cloud resource.
 
+## Releases
+
+A release exists only after both maintainer actions, in order:
+
+1. an annotated semantic version tag `vMAJOR.MINOR.PATCH` on `main`; and
+2. a GitHub Release for that tag whose notes are the matching `CHANGELOG.md`
+   section.
+
+Creating the tag is a maintainer decision. A merge, a green check, a changelog
+entry or a package build is not a release or a deployment, and none of them
+authorizes a tag, a package, an image, a deployment or a cloud change.
+
+Before 1.0, an observable behaviour change is a minor release and a fix is a
+patch; no other compatibility is promised. Tag names carry the `v` prefix and
+changelog headings carry the bare version. Create a tag only for a commit that
+already contains the matching released section; a released heading without a
+matching annotated tag is a defect that `tests/test_changelog.py` detects.
+
+`CHANGELOG.md` records merged source history, never deployment or runtime
+evidence. Its Unreleased section is generated from merged `feat:`, `fix:`,
+`docs:` and `ci:` subjects; regenerate it rather than editing it by hand:
+
+```sh
+python3 scripts/render_changelog.py --write
+```
+
 ## Checks
 
 Use Node.js 22.12+, Python 3.12+ and the committed planning lockfile:

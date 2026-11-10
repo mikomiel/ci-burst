@@ -134,11 +134,18 @@ A record is eligible demand only when:
 - its `handle` is present, and repeated records for that attempt agree.
 
 Records with `running`, `success`, `failure`, `cancelled` or `skipped` do not
-contribute. Any other status, a missing required field, a non-array payload,
-invalid JSON, a response above the size bound or an unreadable request makes
-demand unavailable rather than zero. The contract defines no pagination, so the
-single response is the complete queue for that repository; the adapter does not
-use the server-side label filter because its semantics are not qualified.
+contribute. Any other status, a missing required field, a non-array payload
+other than `null`, invalid JSON, a response above the size bound or an unreadable
+request makes demand unavailable rather than zero. The contract defines no
+pagination, so one response is the complete queue for that repository.
+
+The `labels` query is mandatory, not an optimisation: the server answers JSON
+`null` when it is absent. The adapter sends the worker's bare label names (the
+part before the executor suffix, so `strong-ci` for `strong-ci:host`) and reads
+`null` as an empty queue, because the server also answers `null` for a filter
+that matches nothing. The filter is a union prefilter, so a job selected by one
+shared label is still compared against its complete `runs_on` set above; it never
+substitutes for that comparison.
 
 Attempts are deduplicated by `handle`. A retry is a new handle and remains
 distinguishable. ci-burst never assigns, requeues or reserves a job, and it does
@@ -151,14 +158,18 @@ must match a bounded identifier shape or is reported as `<redacted>`.
 `qualification = "fixtures-only"` is the shipped default and blocks `apply`.
 To qualify a deployment, the operator must, with an owner-scoped read token:
 
-1. confirm the endpoint returns the array shape above for the repository;
+1. confirm the endpoint returns the shape above for the repository, including
+   the mandatory `labels` filter and `null` for no match;
 2. observe one known waiting job, one dependency-blocked job and one running
    job, and verify the demand classification;
 3. record the evidence with the deployment;
 4. only then set `qualification = "live-verified"`.
 
-A different Forgejo version or a changed response shape needs a new contract
-identifier, not a re-declaration.
+Observed on `forgejo 17.0.1+gitea-1.22.0`: `runs_on` holds bare label names
+(`strong-ci`, `homelab`), an absent `labels` parameter returns `null`, a
+non-matching filter also returns `null`, and the filter is a union over the job's
+labels. A changed response shape or a different Forgejo version needs a new
+contract identifier, not a re-declaration.
 
 ## Worker image and launch template
 

@@ -232,29 +232,52 @@ must qualify that label against the image and machine before relying on it.
 
 ### The routing decision
 
-The worker advertises a **burst-only** label, `cloud-ci`, and the persistent
-fleet does not. A job reaches cloud capacity only when it asks for that label
-by name, and in the pilot only one repository job does, only on an explicit
-`workflow_dispatch`. The alternative — reusing a label the permanent runners
-also advertise — was rejected because Forgejo hands a waiting job to whichever
-runner takes it first: a launch meant to add capacity could instead absorb work
-the warm pool would have finished sooner, and "how much work ran on cloud
-capacity" would stop being measurable.
+The worker advertises a burst-oriented label, `cloud-ci`, and the permanent
+fleet does not advertise it. The alternative — reusing a label the permanent
+runners also carry — was rejected because Forgejo hands a waiting job to
+whichever runner takes it first: a launch meant to add capacity could instead
+absorb work the warm pool would have finished sooner, and "how much work ran on
+cloud capacity" would stop being measurable.
 
-The worker advertises its architecture label as well (`linux-arm64` for the
-arm64 image), because a job may require a complete label set such as
-`[cloud-ci, linux-arm64]`. `[worker].labels` must list exactly what the
-bootstrap registers; the controller compares a job's whole `runs_on` set
-against it, so a missing entry makes such a job ineligible rather than
-mis-routed.
+Two different lists decide two different things, and they are configured to the
+same set:
 
-Accepted risk: a mis-routed job is a job that asks for `cloud-ci` and needs
-something the worker cannot provide — another architecture, or a toolchain the
-baked image lacks. It fails on the worker with the job's own error and Forgejo
-records that failure; it cannot drift onto a different machine class, because
-the label set is the whole match, and it cannot take fleet work, because the
-worker does not advertise a fleet label. The cost of the mistake is one failed
-run, not a wrong result.
+- `[worker].labels` in the deployment decides which waiting jobs the controller
+  counts as demand. A job is eligible only when its complete `runs_on` set is a
+  subset of this list.
+- the labels the bootstrap registers decide which jobs Forgejo may **assign**
+  to a launched worker. Once the instance exists, the controller does not
+  choose the job.
+
+Because the match is a subset check, exclusivity is a property of the label
+sets in use, not of the word "exclusive":
+
+- a job whose `runs_on` is exactly `[cloud-ci]` is eligible and assignable;
+- a job whose `runs_on` additionally requires something the worker advertises
+  (for example `[cloud-ci, linux-arm64]`) is also eligible, which is why the
+  worker advertises the image's architecture label at all;
+- a job whose `runs_on` is a subset of the worker's labels **without**
+  `cloud-ci` (for example `[linux-arm64]` alone) would be eligible too, and
+  Forgejo could assign it to the burst worker.
+
+So the routing rule is: every workflow that could run on this worker must name
+`cloud-ci`, and no workflow may request only the worker's other labels. Check
+that whenever a label is added to the worker or a workflow starts using one —
+the repository's own CI does, and its architecture jobs always pair the
+architecture with a fleet label.
+
+Accepted risk, stated without the comfort of "it just fails":
+
+- a job that names a label the worker does not advertise is not assigned to it,
+  and stays waiting for another runner;
+- a job that names only labels the worker advertises, and needs a capability
+  the image lacks, may fail at run time **or may appear to succeed while
+  producing the wrong artifact** — a host-architecture selection is the obvious
+  example, and labels cannot detect it. Qualification of the image for the job
+  class, and assertions inside the job, are the mitigations; neither the label
+  match nor the controller verifies what a job produces;
+- a workflow that asks for only the worker's non-routing labels can take cloud
+  capacity for fleet work, which is what the check above prevents.
 
 ## Budget and reservations
 

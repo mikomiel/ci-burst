@@ -40,19 +40,31 @@ class RunnerBootstrapTests(unittest.TestCase):
         advertised = re.search(
             r'^RUNNER_LABELS="([^"]*)"$', self.script, re.MULTILINE
         ).group(1).split(",")
-        walkthrough = (ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
-        match = re.search(r"^labels = \[([^\]]*)\]$", walkthrough, re.MULTILINE)
-        self.assertIsNotNone(match, "the walkthrough must show a [worker].labels example")
-        documented = [item.strip().strip('"') for item in match.group(1).split(",")]
+        walkthrough = (ROOT / "docs" / "deployment.md").read_text(encoding="utf-8").splitlines()
+        self.assertIn("[worker]", walkthrough, "the walkthrough must show the [worker] table")
+        start = walkthrough.index("[worker]")
+        documented = None
+        for line in walkthrough[start + 1 :]:
+            if line.startswith("["):
+                break
+            match = re.match(r"^labels = \[([^\]]*)\]$", line)
+            if match:
+                documented = [item.strip().strip('"') for item in match.group(1).split(",")]
+                break
+        self.assertIsNotNone(documented, "the [worker] table must set labels")
         self.assertEqual(documented, advertised)
 
-    def test_operations_records_the_exclusive_routing_decision(self):
+    def test_operations_records_the_decision_and_its_matching_semantics(self):
         operations = (ROOT / "docs" / "operations.md").read_text(encoding="utf-8")
         self.assertIn("### The routing decision", operations)
-        self.assertIn("burst-only", operations)
-        # The accepted risk must be named, not implied.
-        self.assertIn("Accepted risk", operations)
-
+        # The record must name both lists that decide routing and the subset
+        # rule, because "exclusive" is a property of the label sets in use.
+        self.assertIn("`[worker].labels`", operations)
+        self.assertIn("subset", operations)
+        # And the accepted risk must be stated without claiming that a
+        # mis-routed job always fails loudly.
+        self.assertIn("may appear to succeed", operations)
+        self.assertIn("wrong artifact", operations)
     def test_passes_the_label_set_to_registration_unchanged(self):
         self.assertIn('--labels "${RUNNER_LABELS}"', self.script)
         flag_lines = re.findall(r"^\s*--labels\b.*$", self.script, re.MULTILINE)

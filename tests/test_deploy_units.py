@@ -13,7 +13,8 @@ could silently remove:
 * the image has no daemon surface, uses file credentials only, and the build
   context admits only the declared build inputs;
 * credential-free CI builds the image from the repository root, keeps the
-  workflow's read-only token and publishes nothing.
+  workflow's read-only token and publishes nothing; the semantic workflow
+  checks live in ``tests/workflow-policy.test.mjs``.
 
 The live lifecycle itself, including stopping an active invocation and keeping
 cleanup running, is exercised by ``tests/test_container_lifecycle.py`` and the
@@ -506,214 +507,41 @@ class ImageTests(unittest.TestCase):
         self.assertIn("AWS_CONFIG_FILE=/etc/ci-burst/aws/config", self.dockerfile)
 
 
-CONTAINER_IMAGE_JOB = "container-image"
-CREDENTIAL_REFERENCE = re.compile(r"\bsecrets\s*\.|\bgithub\.token\b", re.IGNORECASE)
-
-
-def _child_lines(lines, header):
-    """Return the lines indented below ``lines[header]``."""
-    indent = len(lines[header]) - len(lines[header].lstrip())
-    block = []
-    for line in lines[header + 1 :]:
-        if line.strip() and len(line) - len(line.lstrip()) <= indent:
-            break
-        block.append(line)
-    return block
-
-
-def _top_level_entry(text, key):
-    """Return the header line and children of a top-level ``key:`` entry."""
-    lines = text.splitlines()
-    for index, line in enumerate(lines):
-        if not line.startswith(" ") and (
-            line.rstrip() == f"{key}:" or line.startswith(f"{key}: ")
-        ):
-            return [line, *_child_lines(lines, index)]
-    return []
-
-
-def _job_lines(text, job=CONTAINER_IMAGE_JOB):
-    """Return the lines of ``jobs.<job>``, including nested blocks, or None."""
-    lines = text.splitlines()
-    header = f"  {job}:"
-    if header not in lines:
-        return None
-    return _child_lines(lines, lines.index(header))
-
-
-def _steps(job_lines):
-    """Return the job's steps as text, with the list indentation removed."""
-    steps = []
-    for line in job_lines:
-        if line.startswith("      - "):
-            steps.append([line[8:]])
-        elif steps and line.startswith("        "):
-            steps[-1].append(line[8:])
-    return ["\n".join(step) for step in steps]
-
-
-def _configured(lines):
-    """Drop blank lines and comment-only lines; a comment is not configuration."""
-    return [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
-
-
-def credential_violations(text):
-    """Return every credential reference in the job's effective configuration.
-
-    A job-level or workflow-level ``env`` entry reaches the build even when no
-    step names it, so the scan covers both configurations instead of only the
-    step text.
-    """
-    job = _job_lines(text)
-    if job is None:
-        return [f"job {CONTAINER_IMAGE_JOB} is missing"]
-    effective = _configured(job) + _configured(_top_level_entry(text, "env"))
-    return [
-        f"credential reference: {line.strip()}"
-        for line in effective
-        if CREDENTIAL_REFERENCE.search(line)
-    ]
-
-
-def working_directory_violations(text):
-    """Return configuration that would move the build context off the root.
-
-    ``docker build .`` is the repository root only when no workflow or job
-    ``defaults.run.working-directory`` and no step-level ``working-directory``
-    moves it.
-    """
-    job = _job_lines(text)
-    if job is None:
-        return [f"job {CONTAINER_IMAGE_JOB} is missing"]
-    violations = []
-    for label, lines in (
-        ("workflow defaults", _top_level_entry(text, "defaults")),
-        ("job configuration", job),
-    ):
-        for line in _configured(lines):
-            if "working-directory:" in line:
-                violations.append(f"{label} sets a working directory: {line.strip()}")
-    return violations
-
-
 class ContainerImageCITests(unittest.TestCase):
-    """The committed workflow builds the image and publishes nothing.
+    """The committed job text: its own timeout and the exact build command.
 
-    The build proves the ``Dockerfile`` still builds; it is not a publication
-    path. These tests read the committed workflow, so they fail when the job is
-    removed, when a push, a login or a credential is added to it, when the
-    effective working directory moves, or when the workflow gains a write or
-    registry token. They do not run Docker or GitHub Actions.
+    Workflow semantics — credential references, permissions, registry use and
+    the effective working directory — are pinned in
+    ``tests/workflow-policy.test.mjs`` with the pinned ``yaml`` parser. This
+    test keeps only the narrow text shape the Python suite can state without a
+    second workflow reader.
     """
 
     TEXT = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 
-    def job_lines(self):
-        job = _job_lines(self.TEXT)
-        self.assertIsNotNone(job, f"{CONTAINER_IMAGE_JOB} must be a job in ci.yml")
-        return job
-
-    def steps(self):
-        return _steps(self.job_lines())
-
-    def grants(self):
-        lines = self.TEXT.splitlines()
-        self.assertIn("permissions:", lines)
-        block = {}
-        for line in lines[lines.index("permissions:") + 1 :]:
-            if line.strip() and not line.startswith("  "):
-                break
-            match = re.fullmatch(r"  ([a-z-]+): (\S+)", line)
-            if match:
-                block[match.group(1)] = match.group(2)
-        return block
+    def job_body(self):
+        match = re.search(r"(?ms)^  container-image:\n(.*?)(?=^  \S|\Z)", self.TEXT)
+        self.assertIsNotNone(match, "container-image must be a job in ci.yml")
+        return match.group(1)
 
     def test_the_job_exists_with_its_own_name_and_timeout(self):
-        block = "\n".join(self.job_lines())
-        # The name states the proof, so a reader sees this is not a publish job.
-        self.assertRegex(block, r"(?m)^    name: .*image.*build")
-        self.assertRegex(block, r"(?m)^    runs-on: ubuntu-24\.04$")
-        timeout = re.search(r"(?m)^    timeout-minutes: (\d+)$", block)
+        body = self.job_body()
+        self.assertRegex(body, r"(?m)^    name: .*image.*builds?$")
+        timeout = re.search(r"(?m)^    timeout-minutes: (\d+)$", body)
         self.assertIsNotNone(timeout, "the job needs its own timeout")
         self.assertLessEqual(int(timeout.group(1)), 10)
 
-    def test_it_runs_only_the_build_on_the_repository_root(self):
-        steps = self.steps()
-        self.assertEqual(len(steps), 2, "one checkout and one build, nothing else")
-        self.assertRegex(steps[0], r"(?m)^uses: actions/checkout@[0-9a-f]{40}(?:\s+#.*)?$")
-        self.assertIn("persist-credentials: false", steps[0])
-        commands = [
-            line for step in steps for line in step.splitlines() if line.startswith("run:")
-        ]
-        self.assertEqual(commands, ["run: docker build --tag ci-burst:ci ."])
-
-    def test_the_effective_configuration_carries_no_credential(self):
-        self.assertEqual(credential_violations(self.TEXT), [])
-
-    def test_the_effective_configuration_has_no_publish_or_login(self):
-        # Scan configuration, not the comment that names what it avoids.
-        configured = "\n".join(
-            _configured(self.job_lines()) + _configured(_top_level_entry(self.TEXT, "env"))
-        ).lower()
-        for forbidden in ("docker push", "docker login", "login-action", "registry"):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, configured)
-
-    def test_the_build_stays_at_the_repository_root(self):
-        self.assertEqual(working_directory_violations(self.TEXT), [])
+    def test_it_runs_the_exact_build_command(self):
+        commands = re.findall(r"(?m)^        run: (.+)$", self.job_body())
+        self.assertEqual(commands, ["docker build --tag ci-burst:ci ."])
 
     def test_the_workflow_grants_only_the_read_token(self):
-        self.assertEqual(self.grants(), {"contents": "read"})
+        grants = re.search(r"(?m)^permissions:\n((?:  [^\n]*\n)+)", self.TEXT)
+        self.assertIsNotNone(grants, "the workflow needs a top-level permissions block")
+        self.assertEqual(grants.group(1).strip(), "contents: read")
         for forbidden in ("packages:", "id-token:", "contents: write"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, self.TEXT)
-        # The job keeps the workflow-level token; no job-level override widens it.
-        self.assertNotRegex("\n".join(self.job_lines()), r"(?m)^    permissions:")
-
-    def test_a_mutated_secret_reference_is_rejected(self):
-        # The mutation proves the checker reads the effective configuration,
-        # including a job-level and a workflow-level env, not only the steps.
-        mutations = {
-            "job env": self.TEXT.replace(
-                "    name: container-image builds\n",
-                "    env:\n"
-                "      CI_TEST_TOKEN: ${{ secrets.CI_TEST_TOKEN }}\n"
-                "    name: container-image builds\n",
-            ),
-            "workflow env": self.TEXT.replace(
-                "permissions:\n",
-                "env:\n  CI_TEST_TOKEN: ${{ secrets.CI_TEST_TOKEN }}\npermissions:\n",
-            ),
-        }
-        for where, mutated in mutations.items():
-            with self.subTest(where=where):
-                self.assertNotEqual(mutated, self.TEXT, "the mutation must apply")
-                self.assertTrue(
-                    credential_violations(mutated),
-                    "a credential reference outside the steps must be rejected",
-                )
-
-    def test_a_mutated_working_directory_is_rejected(self):
-        mutations = {
-            "workflow defaults": self.TEXT.replace(
-                "jobs:\n",
-                "defaults:\n  run:\n    working-directory: elsewhere\njobs:\n",
-            ),
-            "job defaults": self.TEXT.replace(
-                "    timeout-minutes: 10\n",
-                "    timeout-minutes: 10\n"
-                "    defaults:\n"
-                "      run:\n"
-                "        working-directory: elsewhere\n",
-            ),
-        }
-        for where, mutated in mutations.items():
-            with self.subTest(where=where):
-                self.assertNotEqual(mutated, self.TEXT, "the mutation must apply")
-                self.assertTrue(
-                    working_directory_violations(mutated),
-                    "a working directory that moves the build must be rejected",
-                )
 
 
 def _dockerignore_rules():

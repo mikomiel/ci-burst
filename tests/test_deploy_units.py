@@ -317,7 +317,10 @@ class RefreshBehaviourTests(unittest.TestCase):
             smoke='{"decision": "refused", "rejection": {"reason": "CONFIG_INVALID"}}'
         )
         self.assertNotEqual(completed.returncode, 0, completed.stderr)
-        self.assertNotIn("latest", self.calls.read_text(encoding="utf-8"))
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertNotIn("latest", calls)
+        # Exit zero is not retried: the document itself is the evidence.
+        self.assertEqual(calls.count("plan --config"), 1)
         self.assertFalse((self.state / "deployed-sha").exists())
 
     def test_a_non_object_document_never_promotes(self):

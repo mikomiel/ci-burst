@@ -242,55 +242,53 @@ must qualify that label against the image and machine before relying on it.
 
 ### The routing decision
 
-The worker advertises a burst-oriented label, `cloud-ci`, and the permanent
-fleet does not advertise it. The alternative — reusing a label the permanent
-runners also carry — was rejected because Forgejo hands a waiting job to
-whichever runner takes it first: a launch meant to add capacity could instead
-absorb work the warm pool would have finished sooner, and "how much work ran on
-cloud capacity" would stop being measurable.
+The worker advertises the heavy pool's label as well as its own: `strong-ci` and
+`cloud-ci`, plus the image's architecture label (`linux-arm64`). Cloud capacity
+is therefore extra capacity for the pool that actually backs up, not a separate
+island — a `runs-on: strong-ci` job can be picked up by the burst worker, which
+is the point of bursting. `cloud-ci` remains the explicit route: a workflow that
+asks for it is asking for cloud capacity specifically, which is what a manual
+dispatch uses to qualify a deployment without disturbing the pool.
 
-Two different lists decide two different things, and they are configured to the
-same set:
+Both pools see `strong-ci` demand, and that is intended. It has consequences an
+operator must budget for:
 
-- `[worker].labels` in the deployment decides which waiting jobs the controller
-  counts as demand. A job is eligible only when its complete `runs_on` set is a
-  subset of this list.
-- the labels the bootstrap registers decide which jobs Forgejo may **assign**
-  to a launched worker. Once the instance exists, the controller does not
-  choose the job.
+- the controller counts `strong-ci` demand, so it launches when the pool is busy
+  rather than only when someone dispatches. Each launch reserves the configured
+  maximum price × lifetime against the window, so a busy day consumes the
+  allowance faster than a dispatch-only deployment would; the window guard is
+  what stops it, and it refuses rather than overspending;
+- a job the worker takes can fail if the worker or its network does. Forgejo
+  records that failure like any other and the job can be re-run; nothing about
+  the label makes the job less safe to run, because the worker runs the same
+  repository code as the pool;
+- the worker's own labels decide what Forgejo may **assign**, while
+  `[worker].labels` in the deployment decides what the controller **counts** as
+  demand. A supported deployment configures the same set; a mismatch either
+  launches for work the worker cannot take, or misses work it could.
 
-Because the match is a subset check, exclusivity is a property of the label
-sets in use, not of the word "exclusive":
+Complete-label-set matching is a subset check, so a job whose `runs_on` is a
+subset of the worker's labels is eligible — including a job that asks only
+`[strong-ci]` or only `[linux-arm64]`. That is consistent with sharing the pool
+label. It also means a workflow that asks for a label the worker does not
+advertise stays waiting for another runner, and no label match proves anything
+about capability.
 
-- a job whose `runs_on` is exactly `[cloud-ci]` is eligible and assignable;
-- a job whose `runs_on` additionally requires something the worker advertises
-  (for example `[cloud-ci, linux-arm64]`) is also eligible, which is why the
-  worker advertises the image's architecture label at all;
-- a job whose `runs_on` is a subset of the worker's labels **without**
-  `cloud-ci` (for example `[linux-arm64]` alone) would be eligible too, and
-  Forgejo could assign it to the burst worker.
+Accepted risk, stated plainly:
 
-So the routing rule is: every workflow that could run on this worker must name
-`cloud-ci`, and no workflow may request only the worker's other labels. Check
-that whenever a label is added to the worker or a workflow starts using one.
-The workflows that matter are the ones in the repository this deployment
-observes, not this repository's own CI: in the pilot that is one Forgejo
-repository whose architecture jobs pair the architecture label with a fleet
-label, which is why no job there can match this worker on the architecture
-label alone.
-
-Accepted risk, stated without the comfort of "it just fails":
-
-- a job that names a label the worker does not advertise is not assigned to it,
-  and stays waiting for another runner;
-- a job that names only labels the worker advertises, and needs a capability
-  the image lacks, may fail at run time **or may appear to succeed while
-  producing the wrong artifact** — a host-architecture selection is the obvious
-  example, and labels cannot detect it. Qualification of the image for the job
-  class, and assertions inside the job, are the mitigations; neither the label
-  match nor the controller verifies what a job produces;
-- a workflow that asks for only the worker's non-routing labels can take cloud
-  capacity for fleet work, which is what the check above prevents.
+- a job that names only labels the worker advertises, and needs a capability the
+  image lacks, may fail at run time **or may appear to succeed while producing
+  the wrong artifact** — a host-architecture selection is the obvious example,
+  and labels cannot detect it. Qualification of the image for the job class, and
+  assertions inside the job, are the mitigations; neither the label match nor the
+  controller verifies what a job produces;
+- a worker that dies mid-job takes that job down with it. That is a failed run,
+  not a wrong result, and it is why the burst label stays available for
+  workloads that should only ever run on cloud capacity;
+- if `cloud-ci` is ever removed from the worker or the deployment, the burst
+  stops being separately addressable and only pool congestion can trigger it.
+  That is a configuration change, not a silent one, because this section and the
+  deployment example are the owners of the label set.
 
 ## Budget and reservations
 

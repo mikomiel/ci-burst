@@ -96,16 +96,28 @@ class Template:
 
 @dataclass(frozen=True)
 class SpotQuote:
+    """One observed Spot price.
+
+    ``timestamp`` is the provider's own record time, which for a Spot price is
+    the moment the price last **changed**, not the moment it was read.
+    ``observed_at`` is when this controller read it, and it is the value a
+    freshness bound must use: a price that has been stable for hours is still a
+    current price. Both are kept so the evidence shows what the provider said
+    and when it was asked.
+    """
+
     price_micros: int
     timestamp: float
     price_display: str
     instance_type: str
     availability_zone: str
+    observed_at: float
 
     def as_dict(self):
         return {
             "price_display": self.price_display,
             "timestamp": self.timestamp,
+            "observed_at": self.observed_at,
             "instance_type": self.instance_type,
             "availability_zone": self.availability_zone,
         }
@@ -234,7 +246,12 @@ class Aws:
             ProductDescriptions=["Linux/UNIX"],
             StartTime=start,
         )
-        return _spot_quote(response.get("SpotPriceHistory") or [], instance_type, availability_zone)
+        return _spot_quote(
+            response.get("SpotPriceHistory") or [],
+            instance_type,
+            availability_zone,
+            self._clock(),
+        )
 
     def owned_instances(self, deployment):
         filters = [
@@ -326,7 +343,7 @@ def _timestamp(value):
     return None
 
 
-def _spot_quote(entries, instance_type, availability_zone):
+def _spot_quote(entries, instance_type, availability_zone, observed_at):
     """Pick the newest quote in the requested placement scope."""
     # The response must identify its own scope. A missing field is not
     # replaced with the value we asked for, because that would fabricate
@@ -355,6 +372,7 @@ def _spot_quote(entries, instance_type, availability_zone):
         price_display=price,
         instance_type=instance_type,
         availability_zone=availability_zone,
+        observed_at=observed_at,
     )
 
 

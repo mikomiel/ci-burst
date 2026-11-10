@@ -354,7 +354,7 @@ class Controller:
         for plan in plans:
             if plan.reason is not None:
                 judged.append(plan)
-            elif now - plan.quote.timestamp > self.config.aws.price_max_age_seconds:
+            elif now - plan.quote.observed_at > self.config.aws.price_max_age_seconds:
                 judged.append(replace(plan, reason="spot_price_stale"))
             elif (
                 plan.quote.availability_zone != plan.candidate.availability_zone
@@ -488,12 +488,13 @@ class Controller:
                     # expired before it boots. Nothing was created, so the slot
                     # is released.
                     self.ledger.set_state(operation.id, "failed", detail="admission_expired")
+                    self.ledger.release_reservation(operation.id)
                     result["decision"] = "refused"
                     result.setdefault("reasons", []).append("admission_expired")
                     result["operation"] = operation.id
                     result["attempts"] = attempts
                     return
-                if now - plan.quote.timestamp > self.config.aws.price_max_age_seconds:
+                if now - plan.quote.observed_at > self.config.aws.price_max_age_seconds:
                     # The quote that made this candidate eligible in _decide
                     # has aged out while the previous attempt was running. It
                     # must not be frozen or sent; a later candidate may still
@@ -534,6 +535,7 @@ class Controller:
                 return
             if index + 1 == len(plans):
                 self.ledger.set_state(operation.id, "failed", detail=refusal.reason)
+                self.ledger.release_reservation(operation.id)
                 result["decision"] = "launch_failed"
                 result["refusal"] = refusal.as_dict()
                 result["operation"] = operation.id
@@ -545,6 +547,7 @@ class Controller:
         # earlier attempt. Nothing was created, so release the slot instead of
         # leaving an intent that can only be sent on stale evidence.
         self.ledger.set_state(operation.id, "failed", detail="spot_price_stale")
+        self.ledger.release_reservation(operation.id)
         result["decision"] = "refused"
         result.setdefault("reasons", []).append("spot_price_stale")
         result["operation"] = operation.id
@@ -599,6 +602,7 @@ class Controller:
                 return "capacity", refusal
             else:
                 self.ledger.set_state(operation.id, "failed", detail=refusal.reason)
+                self.ledger.release_reservation(operation.id)
                 result["decision"] = "launch_failed"
                 outcome = "refused"
             result["refusal"] = refusal.as_dict()

@@ -280,6 +280,21 @@ class Ledger:
         values.append(operation_id)
         connection.execute("UPDATE operations SET %s WHERE id = ?" % ", ".join(assignments), values)
 
+    def release_reservation(self, operation_id, *, updated_at=None):
+        """Return an operation's window allowance when it created nothing.
+
+        Only a definite refusal may call this: the provider proved no instance
+        was created, so the reservation is zeroed and the allowance is available
+        again. The row, its state and its detail stay as the audit record of the
+        attempt, and ``consumed_micros`` stops counting it.
+        """
+        connection = self._require()
+        now = self._clock() if updated_at is None else updated_at
+        connection.execute(
+            "UPDATE operations SET reservation_micros = 0, updated_at = ? WHERE id = ?",
+            (now, operation_id),
+        )
+
     def advance_operation(self, operation_id, *, request, request_sha256, client_token, detail=""):
         """Replace frozen launch parameters with the next ordered candidate.
 

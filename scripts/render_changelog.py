@@ -243,43 +243,12 @@ def pending_versions(text):
     return _pending(released_sections(text))
 
 
-def boundary_problem(text, root=ROOT):
-    """Reason the Unreleased boundary cannot be trusted, or None.
-
-    A shallow checkout cannot render complete history, and a released section
-    whose annotated tag is unavailable or unreachable cannot establish where
-    Unreleased starts. An empty tag list is accepted only when the changelog
-    has no released section to reconcile.
-    """
-    if is_shallow(root):
-        return (
-            "shallow history cannot establish the release boundary; "
-            "run git fetch --unshallow"
-        )
-    try:
-        sections = released_sections(text)
-    except ValueError as error:
-        return str(error)
-    pending = _pending(sections)
-    tags = applicable_tags(root)
-    for version in sections:
-        if version in pending:
-            continue
-        if f"v{version}" not in tags:
-            return _tag_error(version)
-    for name in tags:
-        if name[1:] not in sections:
-            return (
-                f"annotated tag {name} has no released section; "
-                "released history is not reconciled"
-            )
-    return None
-
-
-def binding_errors(text, tags):
-    """State errors for ``check:policy``: prepared or tag-bound, never neither.
+def _reconcile(text, tags, allow_preparation):
+    """Reconcile released sections and applicable tags in both directions.
 
     ``tags`` is the set of applicable tag names from :func:`applicable_tags`.
+    A preparation-marked section may lack its tag only when the caller allows
+    preparation; every applicable tag still needs its section.
     """
     try:
         sections = released_sections(text)
@@ -292,6 +261,9 @@ def binding_errors(text, tags):
             "more than one release is marked pending: "
             + ", ".join(f"v{version}" for version in pending)
         )
+    inside = sum(len(_RELEASE_PENDING.findall(section)) for section in sections.values())
+    if len(_RELEASE_PENDING.findall(text)) > inside:
+        errors.append("release-pending marker outside a released section")
     for version, section in sections.items():
         marker = _RELEASE_PENDING.search(section)
         if marker is not None:
@@ -300,30 +272,47 @@ def binding_errors(text, tags):
                     f"release-pending marker v{marker.group('version')} "
                     f"does not match heading [{version}]"
                 )
+            if not allow_preparation:
+                errors.append(
+                    f"release-pending marker for v{version} remains; "
+                    "remove it after creating the tag"
+                )
             continue
         if f"v{version}" not in tags:
             errors.append(_tag_error(version))
+    for name in tags:
+        if name[1:] not in sections:
+            errors.append(
+                f"annotated tag {name} has no released section; "
+                "released history is not reconciled"
+            )
     return errors
+
+
+def binding_errors(text, tags):
+    """Pre-merge errors: sections and tags reconcile, preparation is explicit."""
+    return _reconcile(text, tags, allow_preparation=True)
 
 
 def release_validation_errors(text, tags):
-    """Published-state errors: every released heading is tag-bound, nothing pending.
+    """Published-state errors: no marker, and sections and tags reconcile."""
+    return _reconcile(text, tags, allow_preparation=False)
 
-    ``tags`` is the set of applicable tag names from :func:`applicable_tags`.
+
+def boundary_problem(text, root=ROOT):
+    """Reason the Unreleased boundary cannot be trusted, or None.
+
+    A shallow checkout cannot render complete history, and a section or tag
+    that fails bidirectional reconciliation cannot establish where Unreleased
+    starts.
     """
-    try:
-        sections = released_sections(text)
-    except ValueError as error:
-        return [str(error)]
-    errors = []
-    for version in _pending(sections):
-        errors.append(
-            f"release-pending marker for v{version} remains; remove it after creating the tag"
+    if is_shallow(root):
+        return (
+            "shallow history cannot establish the release boundary; "
+            "run git fetch --unshallow"
         )
-    for version in sections:
-        if f"v{version}" not in tags:
-            errors.append(_tag_error(version))
-    return errors
+    errors = _reconcile(text, applicable_tags(root), allow_preparation=True)
+    return errors[0] if errors else None
 
 
 def write_blocked(text, boundary):

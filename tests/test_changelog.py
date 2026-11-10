@@ -120,6 +120,16 @@ class ReleaseStateTests(unittest.TestCase):
                 )
 
 
+    def test_marker_outside_a_released_section_is_refused(self):
+        for text in (
+            "# Changelog\n\n## [Unreleased]\n\n<!-- release-pending: v0.1.0 -->\n\n- One.\n",
+            "# Changelog\n\n<!-- release-pending: v0.1.0 -->\n\n## [Unreleased]\n",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(changelog.binding_errors(text, set()))
+                self.assertTrue(changelog.release_validation_errors(text, set()))
+
+
 class ReleaseBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -323,6 +333,32 @@ class ReleaseBoundaryTests(unittest.TestCase):
                 )
                 self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
                 self.assertIn("noncanonical release heading", completed.stderr)
+        self.assertEqual((self.root / "CHANGELOG.md").read_text(encoding="utf-8"), text)
+
+    def test_release_checks_reject_a_reachable_tag_without_a_section(self):
+        self.commit("feat: add the controller")
+        self.git("tag", "-a", "v0.1.0", "-m", "v0.1.0")
+        text = "# Changelog\n\n## [Unreleased]\n"
+        (self.root / "CHANGELOG.md").write_text(text, encoding="utf-8")
+        self.add_renderer()
+
+        tags = changelog.applicable_tags(self.root)
+        self.assertEqual(tags, {"v0.1.0"})
+        self.assertTrue(changelog.binding_errors(text, tags))
+        self.assertTrue(changelog.release_validation_errors(text, tags))
+        self.assertIn("no released section", changelog.boundary_problem(text, self.root))
+
+        for arguments in (("--validate-release",), ("--write",)):
+            with self.subTest(arguments=arguments):
+                completed = subprocess.run(
+                    (sys.executable, "scripts/render_changelog.py", *arguments),
+                    cwd=self.root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+                self.assertIn("no released section", completed.stderr)
         self.assertEqual((self.root / "CHANGELOG.md").read_text(encoding="utf-8"), text)
 
 

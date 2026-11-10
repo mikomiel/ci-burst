@@ -142,7 +142,8 @@ A release uses two changelog states:
 
 The tag must be `v`-prefixed and annotated; a lightweight or unprefixed tag is
 not a release and the checks reject it. A released heading without either the
-preparation marker or its tag is a defect.
+preparation marker or its tag is a defect, and so is an annotated release tag
+without its released section.
 
 `CHANGELOG.md` records merged source history, never deployment or runtime
 evidence. Its Unreleased section is generated from merged `feat:`, `fix:`,

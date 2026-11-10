@@ -74,4 +74,6 @@ test('validation CI stays read-only and checks policy alongside OpenSpec', () =>
   assert.ok(commands.includes('npm run check:policy'));
   assert.ok(commands.includes('npm run check:spec'));
   assert.ok(commands.some((c) => c.startsWith('npm ci --ignore-scripts')));
+  const checkout = w.jobs.planning.steps.find((step) => step.uses?.startsWith('actions/checkout@'));
+  assert.equal(checkout.with['fetch-depth'], 0); // changelog release checks need tags
 });

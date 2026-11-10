@@ -280,6 +280,29 @@ class Ledger:
         values.append(operation_id)
         connection.execute("UPDATE operations SET %s WHERE id = ?" % ", ".join(assignments), values)
 
+    def advance_operation(self, operation_id, *, request, request_sha256, client_token, detail=""):
+        """Replace frozen launch parameters with the next ordered candidate.
+
+        The caller only uses this after a definite provider rejection proved
+        that the previous request created no instance. Operation identity,
+        reservation, admission window and creation time stay unchanged; the
+        request, its hash and its own idempotency token advance together, so a
+        later resume retries the candidate actually being attempted.
+        """
+        connection = self._require()
+        connection.execute(
+            "UPDATE operations SET request_json = ?, request_sha256 = ?, client_token = ?,"
+            " detail = ?, updated_at = ? WHERE id = ?",
+            (
+                json.dumps(request, sort_keys=True, separators=(",", ":")),
+                request_sha256,
+                client_token,
+                detail,
+                self._clock(),
+                operation_id,
+            ),
+        )
+
     def consumed_micros(self, window_start):
         """Allowance already committed: current-window spend plus carryover."""
         connection = self._require()

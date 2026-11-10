@@ -32,6 +32,27 @@ class RunnerBootstrapTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertRegex(label, r"^[a-z0-9][a-z0-9-]*:host$")
 
+    def test_the_configuration_example_lists_exactly_the_advertised_labels(self):
+        # A deployment whose [worker].labels omits an advertised label makes a
+        # job requiring that label ineligible; listing one the bootstrap does not
+        # advertise makes a job look routable that can never run. The walkthrough
+        # example and the bootstrap must agree.
+        advertised = re.search(
+            r'^RUNNER_LABELS="([^"]*)"$', self.script, re.MULTILINE
+        ).group(1).split(",")
+        walkthrough = (ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
+        match = re.search(r"^labels = \[([^\]]*)\]$", walkthrough, re.MULTILINE)
+        self.assertIsNotNone(match, "the walkthrough must show a [worker].labels example")
+        documented = [item.strip().strip('"') for item in match.group(1).split(",")]
+        self.assertEqual(documented, advertised)
+
+    def test_operations_records_the_exclusive_routing_decision(self):
+        operations = (ROOT / "docs" / "operations.md").read_text(encoding="utf-8")
+        self.assertIn("### The routing decision", operations)
+        self.assertIn("burst-only", operations)
+        # The accepted risk must be named, not implied.
+        self.assertIn("Accepted risk", operations)
+
     def test_passes_the_label_set_to_registration_unchanged(self):
         self.assertIn('--labels "${RUNNER_LABELS}"', self.script)
         flag_lines = re.findall(r"^\s*--labels\b.*$", self.script, re.MULTILINE)

@@ -230,6 +230,32 @@ A broad label can also accept jobs outside the intended class. Exclusive burst
 routing requires a label only the burst worker advertises, and the operator
 must qualify that label against the image and machine before relying on it.
 
+### The routing decision
+
+The worker advertises a **burst-only** label, `cloud-ci`, and the persistent
+fleet does not. A job reaches cloud capacity only when it asks for that label
+by name, and in the pilot only one repository job does, only on an explicit
+`workflow_dispatch`. The alternative — reusing a label the permanent runners
+also advertise — was rejected because Forgejo hands a waiting job to whichever
+runner takes it first: a launch meant to add capacity could instead absorb work
+the warm pool would have finished sooner, and "how much work ran on cloud
+capacity" would stop being measurable.
+
+The worker advertises its architecture label as well (`linux-arm64` for the
+arm64 image), because a job may require a complete label set such as
+`[cloud-ci, linux-arm64]`. `[worker].labels` must list exactly what the
+bootstrap registers; the controller compares a job's whole `runs_on` set
+against it, so a missing entry makes such a job ineligible rather than
+mis-routed.
+
+Accepted risk: a mis-routed job is a job that asks for `cloud-ci` and needs
+something the worker cannot provide — another architecture, or a toolchain the
+baked image lacks. It fails on the worker with the job's own error and Forgejo
+records that failure; it cannot drift onto a different machine class, because
+the label set is the whole match, and it cannot take fleet work, because the
+worker does not advertise a fleet label. The cost of the mistake is one failed
+run, not a wrong result.
+
 ## Budget and reservations
 
 Before a launch, ci-burst computes an exact reservation in micro-units:

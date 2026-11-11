@@ -15,10 +15,11 @@ MIT-licensed public project.
 - Defaults to observation; requires an explicit apply to launch, and offers an
   independent expiry-cleanup path that never launches.
 
-The product source is implemented and covered by standard-library tests. There
-is still **no release, published image, deployment or live-qualified Forgejo
-contract**:
-`qualification = "fixtures-only"` is the shipped default and blocks `apply`.
+The product source is implemented, covered by standard-library tests and
+released. A release is source history, not a deployment: this repository
+publishes no image, and the deployment procedure and the live Forgejo contract
+qualification are the operator's records. `qualification = "fixtures-only"` is
+the shipped default and blocks `apply` until an operator records that evidence.
 AWS resources, IAM, networking, registration credentials and the runner image
 remain operator-owned prerequisites. No cost-saving or absolute AWS-billing-cap
 claim has been established.
@@ -49,14 +50,19 @@ image is built locally and none is published.
 
 ## Project stage
 
-The product change is the [AWS Spot queue-burst proposal](openspec/changes/aws-spot-queue-burst/proposal.md),
-with its [design](openspec/changes/aws-spot-queue-burst/design.md),
-[acceptance specifications](openspec/changes/aws-spot-queue-burst/specs/) and
-[task record](openspec/changes/aws-spot-queue-burst/tasks.md).
+The delivered product change is archived as the [AWS Spot queue-burst
+change](openspec/changes/archive/2026-11-11-aws-spot-queue-burst/proposal.md),
+with its [design](openspec/changes/archive/2026-11-11-aws-spot-queue-burst/design.md),
+[acceptance specifications](openspec/changes/archive/2026-11-11-aws-spot-queue-burst/specs/)
+and [task record](openspec/changes/archive/2026-11-11-aws-spot-queue-burst/tasks.md).
+Its requirements are promoted to the [capability
+specifications](openspec/specs/), and the next behavioural change needs its own
+proposal.
 
-There is no release yet. [CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the
-boundary: an annotated semver tag on `main` plus a GitHub Release whose notes
-are that [CHANGELOG.md](CHANGELOG.md) section.
+A release exists. [CHANGELOG.md](CHANGELOG.md) records merged source history and
+[CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the release record and its
+boundary: an annotated semver tag on `main` plus a GitHub Release whose notes are
+that changelog section.
 
 ## Checks
 

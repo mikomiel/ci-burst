@@ -1,8 +1,9 @@
 # Contributing
 
-ci-burst is at the design stage. Discuss changes against the active OpenSpec
-proposal before implementing the controller. Keep changes small and testable
-without a private platform, cloud account or production credentials.
+ci-burst is implemented and released. The OpenSpec change that delivered it is
+archived, and the next behavioural change needs its own proposal before
+implementation. Keep changes small and testable without a private platform,
+cloud account or production credentials.
 
 ## Pull requests
 
@@ -52,13 +53,13 @@ to repeat a merge blindly.
 
 The ordinary-path allowlist in `scripts/pr_policy.py` is enforced, not
 advisory. Unknown paths need a human decision; they are not implicitly safe.
-This pre-implementation repository initially admits only root README/changelog
-and the named OpenSpec proposal, design, tasks, metadata and capability-spec
-files. Arbitrary Markdown is not implicitly ordinary: new documentation areas
-and agent-instruction variants still require a human. Workflows, scripts
-wherever introduced, tests and dependency/packaging definitions are not
-admitted. New ordinary areas require a reviewed policy change and tests. Both
-rename endpoints count; an incomplete file list cannot clear the guard.
+The allowlist admits only root README/changelog and the named OpenSpec proposal,
+design, tasks, metadata and capability-spec files. Arbitrary Markdown is not
+implicitly ordinary: new documentation areas and agent-instruction variants
+still require a human. Workflows, scripts wherever introduced, tests and
+dependency/packaging definitions are not admitted. New ordinary areas require a
+reviewed policy change and tests. Both rename endpoints count; an incomplete
+file list cannot clear the guard.
 
 ### Status freshness and failure behavior
 

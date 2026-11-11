@@ -966,6 +966,8 @@ class FleetTests(ControllerCase):
         self.assertEqual(result["operation"], "first")
         self.assertEqual(result["expires_at"], expiries["first"])
         self.assertEqual(result["reservation"], "0.440000")
+        self.assertIsNotNone(result["instance_id"])
+        self.assertEqual(result["instance_id"], resumes[-1]["instance_id"])
         self.assertNotIn("reasons", result)
         self.assertNotIn("refusal", result)
         self.assertNotIn("attempts", result)

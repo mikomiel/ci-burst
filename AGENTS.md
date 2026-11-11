@@ -5,9 +5,17 @@ authoritative source and PR surface for this repository.
 
 ## Current stage
 
-The repository is being bootstrapped with an OpenSpec change. No controller
-is implemented yet. Read `openspec/changes/aws-spot-queue-burst/` before
-implementation. Planning completion is not implementation or runtime evidence.
+The controller, the independent expiry-cleanup path, queue-label routing and
+the container image with its deploy units are implemented, covered by
+standard-library tests and released. This repository states the source, its
+tests and its release history, not a deployment's state: the deployment
+procedure and the live Forgejo contract qualification are the operator's
+records, outside this repository, and the shipped
+`qualification = "fixtures-only"` default blocks provisioning until an operator
+records that evidence. The archived `aws-spot-queue-burst` change
+under `openspec/changes/archive/` is the design and acceptance record, and
+`openspec/specs/` holds the merged capability requirements. Source completion
+is not deployment or runtime evidence.
 
 ## Working contract
 

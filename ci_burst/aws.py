@@ -1,10 +1,10 @@
 """Thin AWS adapter with a lazy SDK import.
 
 Only the calls the controller needs are wrapped: read an immutable launch
-template version, read a fresh Spot quote, launch one instance, discover owned
-instances and request termination. The adapter never logs request parameters,
-user data or credential material; a provider failure is reported as its error
-code only.
+template version, read a fresh Spot quote, launch one instance per admitted
+worker, discover owned instances and request termination. The adapter never logs
+request parameters, user data or credential material; a provider failure is
+reported as its error code only.
 
 ``boto3`` is imported on first use, so the tests run on a checkout with no cloud
 SDK installed. A caller may inject a client, which the adapter-boundary tests

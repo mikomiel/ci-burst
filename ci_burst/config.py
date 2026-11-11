@@ -65,6 +65,18 @@ class WorkerConfig:
 
 
 @dataclass(frozen=True)
+class ControllerConfig:
+    """How many owned workers one deployment may run at once.
+
+    The default of one preserves the original single-slot behaviour; the
+    supported range is small on purpose, because every slot is a separate
+    reservation against the same allowance.
+    """
+
+    max_instances: int
+
+
+@dataclass(frozen=True)
 class ZoneCandidate:
     """One entry in the ordered placement list.
 
@@ -109,6 +121,7 @@ class Config:
     path: Path
     forgejo: ForgejoConfig
     worker: WorkerConfig
+    controller: ControllerConfig
     aws: AwsConfig
     budget: BudgetConfig
     state: StateConfig
@@ -282,10 +295,11 @@ def load(path):
 
     deployment = _string(raw, "deployment", "config", pattern=_DEPLOYMENT, pattern_name="a tag-safe name")
 
-    controller = _table(raw.get("controller", {}), "controller", ("max_instances",))
-    max_instances = _integer(controller, "max_instances", "controller", minimum=1, maximum=1, required=False)
-    if max_instances not in (None, 1):
-        _fail("controller.max_instances", "only one owned instance is supported")
+    controller_table = _table(raw.get("controller", {}), "controller", ("max_instances",))
+    max_instances = _integer(
+        controller_table, "max_instances", "controller", minimum=1, maximum=4, required=False
+    )
+    controller = ControllerConfig(max_instances=1 if max_instances is None else max_instances)
 
     forgejo_table = _table(
         raw.get("forgejo", {}),
@@ -370,6 +384,7 @@ def load(path):
         path=config_path,
         forgejo=forgejo,
         worker=worker,
+        controller=controller,
         aws=aws,
         budget=budget,
         state=state,

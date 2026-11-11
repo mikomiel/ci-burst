@@ -690,6 +690,166 @@ class ApplyTests(ControllerCase):
         self.assertNotIn("Authorization", dumped)
 
 
+class FleetTests(ControllerCase):
+    def fleet_config(self, max_instances=4):
+        return load(write_config(self.root, config={"controller": {"max_instances": max_instances}}))
+
+    def test_plan_reports_the_batch_size_for_a_backlog(self):
+        controller = self.build(observation=observation_demand(5), config=self.fleet_config(3))
+        result = controller.plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(result["demand"], 5)
+        self.assertEqual(result["free_instances"], 3)
+        self.assertEqual(result["launch_count"], 3)
+        self.assertEqual(result["budget"]["launch_count"], 3)
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_demand_two_within_a_four_slot_fleet_launches_two(self):
+        controller = self.build(observation=observation_demand(2), config=self.fleet_config(4))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(result["launches"]), 2)
+        self.assertEqual(len(self.reopened().operations()), 2)
+
+    def test_a_backlog_beyond_the_limit_launches_the_limit(self):
+        controller = self.build(observation=observation_demand(6), config=self.fleet_config(4))
+        result = controller.apply()
+        self.assertEqual(len(result["launches"]), 4)
+        self.assertEqual(len(self.reopened().operations()), 4)
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 4)
+
+    def test_existing_workers_leave_only_the_free_slots(self):
+        self.seed(state="running", operation_id="busy-a", instance_id="i-busy-a")
+        self.seed(state="running", operation_id="busy-b", instance_id="i-busy-b")
+        controller = self.build(observation=observation_demand(4), config=self.fleet_config(4))
+        result = controller.apply()
+        self.assertEqual(result["launch_count"], 2)
+        self.assertEqual(len(result["launches"]), 2)
+        self.assertEqual(len(self.reopened().operations()), 4)
+
+    def test_a_three_zone_batch_rotates_through_the_candidate_order(self):
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 3},
+                    "aws": {
+                        "availability_zones": [
+                            {"zone": "eu-central-1a", "subnet_id": "subnet-0123456789abcdef0"},
+                            {"zone": "eu-central-1b", "subnet_id": "subnet-0123456789abcdef1"},
+                            {"zone": "eu-central-1c", "subnet_id": "subnet-0123456789abcdef2"},
+                        ]
+                    },
+                },
+            )
+        )
+        quotes = {
+            zone: quote(clock=self.clock, availability_zone=zone)
+            for zone in ("eu-central-1a", "eu-central-1b", "eu-central-1c")
+        }
+        controller = self.build(
+            observation=observation_demand(3),
+            aws=FakeAws(spot_quote=quotes),
+            config=config,
+        )
+        result = controller.apply()
+        runs = [call[1] for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(
+            [run["Placement"]["AvailabilityZone"] for run in runs],
+            ["eu-central-1a", "eu-central-1b", "eu-central-1c"],
+        )
+        self.assertEqual(
+            [run["SubnetId"] for run in runs],
+            ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1", "subnet-0123456789abcdef2"],
+        )
+        self.assertEqual(len({run["ClientToken"] for run in runs}), 3)
+        self.assertEqual(len(result["launches"]), 3)
+
+    def test_allowance_caps_a_batch_and_notes_the_cap(self):
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 4},
+                    "budget": {"allowance": "1.08"},
+                },
+            )
+        )
+        controller = self.build(observation=observation_demand(6), config=config)
+        result = controller.apply()
+        self.assertEqual(result["launch_count"], 2)
+        self.assertEqual(len(result["launches"]), 2)
+        self.assertIn("budget_capped_batch", result["notes"])
+        window = current_window(self.clock.now, config.budget.window_seconds)
+        self.assertEqual(self.reopened().consumed_micros(window), 1_080_000)
+        self.assertEqual(self.reopened().window_launches(window), 2)
+
+    def test_two_unresolved_intents_both_resume(self):
+        self.seed(state="intent", instance_id=None, operation_id="first")
+        self.seed(state="intent", instance_id=None, operation_id="second")
+        controller = self.build(observation=observation_demand())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "resumed")
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 2)
+        operations = self.reopened().operations()
+        self.assertEqual({operation.client_token for operation in operations}, {"ci-burst-first", "ci-burst-second"})
+        self.assertEqual({operation.state for operation in operations}, {"starting"})
+
+    def test_lowered_limit_waits_and_never_terminates(self):
+        self.seed(state="running", operation_id="busy-a", instance_id="i-busy-a")
+        self.seed(state="running", operation_id="busy-b", instance_id="i-busy-b")
+        controller = self.build(observation=observation_demand(4), config=self.fleet_config(1))
+        self.aws.instances_result = [
+            instance(instance_id="i-busy-a", operation="busy-a", expires_at=self.clock.now + 3000),
+            instance(instance_id="i-busy-b", operation="busy-b", expires_at=self.clock.now + 3000),
+        ]
+        result = controller.apply()
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("slot_busy", result["reasons"])
+        self.assertIn("above_configured_limit", result["notes"])
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(self.aws.terminated, [])
+
+    def test_a_failed_launch_stops_the_rest_of_the_batch(self):
+        controller = self.build(observation=observation_demand(3), config=self.fleet_config(3))
+        runs = []
+
+        def fail_second(request):
+            runs.append(request)
+            if len(runs) == 2:
+                self.aws.run_error = ProviderRefusal("AWS_REFUSED", "UnauthorizedOperation")
+
+        self.aws.on_run = fail_second
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launch_failed")
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 2)
+        self.assertEqual(
+            [entry["decision"] for entry in result["launches"]],
+            ["launched", "launch_failed"],
+        )
+        self.assertIsNone(result["launches"][1]["instance_id"])
+        operations = self.reopened().operations()
+        self.assertEqual(len(operations), 2)
+        self.assertEqual({operation.state for operation in operations}, {"starting", "failed"})
+
+    def test_status_reports_the_controller_limit_and_window_budget(self):
+        config = self.fleet_config(4)
+        controller = self.build(config=config)
+        self.seed(state="running", reservation=540_000)
+        result = controller.status()
+        self.assertEqual(result["controller"], {"max_instances": 4})
+        self.assertEqual(
+            result["budget"]["window_start"],
+            current_window(self.clock.now, config.budget.window_seconds),
+        )
+        self.assertEqual(result["budget"]["window_seconds"], 86400)
+        self.assertEqual(result["budget"]["allowance"], "10.000000")
+        self.assertEqual(result["budget"]["consumed"], "0.540000")
+        self.assertEqual(result["budget"]["launches"], 1)
+        self.assertEqual(result["budget"]["busy_instances"], 1)
+        self.assertEqual(result["budget"]["hourly_ceiling"], "0.160000")
+
+
 class ReapTests(ControllerCase):
     def test_reap_plans_only_expired_owned_instances(self):
         controller = self.build()

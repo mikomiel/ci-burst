@@ -59,10 +59,11 @@ log() { printf 'ci-burst-refresh: %s\n' "$*"; }
 
 # The accepted decision depends on the role's command: `plan` reports `wait` or
 # `would_launch` when it observed and decided to do nothing; `reap` without
-# `--apply` reports `planned` when it selected nothing to terminate. A refusal
-# document, an `error`, or any other decision fails the smoke. A command this
-# script does not know refuses before anything is built, rather than guessing an
-# accepted set for it.
+# `--apply` reports `planned` after selecting expired instances without
+# requesting their termination, so a nonempty `expired` list is still `planned`.
+# A refusal document, an `error`, or any other decision fails the smoke. A
+# command this script does not know refuses before anything is built, rather
+# than guessing an accepted set for it.
 case "$SMOKE_COMMAND" in
     plan) ACCEPTED_DECISIONS="wait would_launch" ;;
     reap) ACCEPTED_DECISIONS="planned" ;;

@@ -72,9 +72,12 @@ Nothing clamps MSS on such a path, so the container's own limit has to match it.
 the measured value when it is lower than 1500, and omit `--opt mtu` only when
 the path carries the default 1500.
 
-Do not work around it with `--network=host`: the units keep their own network
-namespace, so the loopback warning below stays true and a loopback address in
-the deployment TOML still names the container, not the Forgejo server.
+Do not work around it with `--network=host` for a controller unit: the units keep
+their own network namespace, so the loopback warning below stays true and a
+loopback address in the deployment TOML still names the container, not the
+Forgejo server. The one legitimate exception is the cleanup host, where `reap`
+talks only to AWS and the host's podman networking has no egress; that host
+installs `deploy/ci-burst-reap-host-network.conf` and nothing else changes.
 
 ## Build the image
 
@@ -418,8 +421,10 @@ What a promotion does and does not do:
 - the build runs with host networking (`podman build --network=host`). The base
   image and the package install are large transfers too, and a bridge whose MTU
   is above the host's path MTU stalls them the same way it stalls the
-  controller's own responses. The smoke run uses the same `ci-burst` network as
-  the scheduled units, so the gate exercises exactly the networking they use;
+  controller's own responses. The smoke run uses the same network as the
+  scheduled unit on that host — the named `ci-burst` network by default, or host
+  networking where the reap unit needs the versioned override — so the gate
+  exercises exactly the networking that unit uses;
 - a fetch, archive, build or smoke failure keeps the previous image in place and
   logs one line with a reason code (`fetch_failed`, `archive_failed`,
   `unpack_failed`, `build_failed`, `smoke_failed`, `tag_failed`,
@@ -428,13 +433,16 @@ What a promotion does and does not do:
   `units_current`) in `journalctl -u ci-burst-refresh.service`. Only a confirmed absent
   `localhost/ci-burst:latest` (podman's "absent" status) may skip the rollback
   handle; a failed inspection or a storage error fails the run instead;
-- the smoke run is a `plan` execution from the candidate against this host's own
-  configuration and scaling credentials. It writes nothing and launches nothing.
-  It must **complete with a decision** — a `wait` or `would_launch` plan result —
-  because a refusal document means the candidate cannot read this host's
-  configuration, which is exactly what the next scheduled `apply` would hit. A
-  new plan decision is rejected until the script's accepted set is extended
-  deliberately. The document is validated with the host's `python3`, which the
+- the smoke run is one execution of the command this host's scheduled unit runs,
+  from the candidate, against this host's own configuration and its own
+  credentials: `plan` on a controller host (it writes nothing and launches
+  nothing), `reap` without `--apply` on a cleanup-only host (it selects expired
+  instances but requests no termination). It must **complete with a decision from
+  the accepted set for that command** — `wait` or `would_launch` for `plan`,
+  `planned` for `reap` — because a refusal document means the candidate cannot
+  read this host's configuration, which is exactly what the next scheduled run
+  would hit. A new decision is rejected until the script's accepted set is
+  extended deliberately. The document is validated with the host's `python3`, which the
   lifecycle test below already requires. One transient failure retries the run
   once after 20 seconds (`CI_BURST_SMOKE_RETRY_SECONDS`), because an unreachable
   Forgejo or AWS is not evidence about the image; a second failure keeps the

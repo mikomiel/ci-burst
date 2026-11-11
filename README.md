@@ -14,6 +14,10 @@ public project licensed under GPL-3.0-only.
   before every cloud request.
 - Defaults to observation; requires an explicit apply to launch, and offers an
   independent expiry-cleanup path that never launches.
+- Turns the console of the workers it owns into deduplicated events and a
+  metrics textfile, so a launch that never registers is visible as an event
+  rather than as a queue that does not move. The reader is bounded, holds no
+  queue credential and copies no arbitrary console text.
 
 The product source is implemented, covered by standard-library tests and
 released. A release is source history, not a deployment: this repository
@@ -33,6 +37,7 @@ Requires Python 3.12 or newer. Live use needs the `boto3` runtime dependency
 python -m ci_burst plan   --config deployment.toml
 python -m ci_burst apply  --config deployment.toml
 python -m ci_burst status --config deployment.toml
+python -m ci_burst export --config deployment.toml --metrics-file ci-burst.prom
 python -m ci_burst reap   --config deployment.toml [--apply]
 ```
 

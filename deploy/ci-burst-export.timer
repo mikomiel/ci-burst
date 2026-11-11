@@ -1,0 +1,17 @@
+# Observation schedule: one export about every 60 seconds.
+#
+# The next run is scheduled from when the previous one finished, so two export
+# processes never overlap, matching the apply timer's shape. A run that outlives
+# its own interval delays the next one instead of queueing behind it; the
+# alert on `ci_burst_export_last_run_timestamp_seconds` sees the resulting gap.
+[Unit]
+Description=Run ci-burst export about every 60 seconds
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=ci-burst-export.service
+
+[Install]
+WantedBy=timers.target

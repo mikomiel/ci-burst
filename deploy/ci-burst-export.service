@@ -1,0 +1,36 @@
+# One bounded observation run per invocation. The command reads the console of
+# the instances this deployment owns and writes two files: an append-only event
+# stream and one Prometheus textfile. It mutates nothing and holds no queue
+# credential, so this unit installs no Forgejo token env-file.
+#
+# The image runs as uid 10001, and the textfile directory is root-owned because
+# the collector is not the only writer of that directory. The container
+# therefore writes the textfile into its own state directory, and ExecStartPost
+# publishes it into the collector's directory with a rename inside that
+# directory, which is atomic: a scrape either sees the previous sample set or
+# the new one, never a torn file.
+#
+# The state directory is the only writable host path. The ledger is opened
+# read-only and is never created, migrated or replaced by this command.
+[Unit]
+Description=ci-burst export (bounded worker console evidence and metrics)
+Documentation=https://github.com/mikomiel/ci-burst/blob/main/docs/container.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=180
+TimeoutStopSec=15
+KillMode=process
+ExecStart=/usr/bin/podman run --rm --replace --init --network ci-burst --name ci-burst-export \
+    --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,noexec,size=32m \
+    --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \
+    --volume /var/lib/ci-burst:/var/lib/ci-burst:rw \
+    --volume /etc/ci-burst/aws-scaling:/etc/ci-burst/aws:ro \
+    localhost/ci-burst:latest export --config /etc/ci-burst/deployment.toml \
+        --metrics-file /var/lib/ci-burst/export/ci-burst.prom
+ExecStartPost=/usr/bin/install -m 0644 /var/lib/ci-burst/export/ci-burst.prom /var/lib/prometheus/node-exporter/.ci-burst.prom.new
+ExecStartPost=/usr/bin/mv -f /var/lib/prometheus/node-exporter/.ci-burst.prom.new /var/lib/prometheus/node-exporter/ci-burst.prom
+ExecStopPost=-/usr/bin/podman rm --force --ignore --time 5 ci-burst-export

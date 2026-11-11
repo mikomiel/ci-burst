@@ -51,12 +51,12 @@ def quote(price_micros=20_000, timestamp=None, clock=None, observed_at=None, ava
     )
 
 
-def instance(instance_id="i-0123456789abcdef0", state="running", operation="op", expires_at=None, **tags):
+def instance(instance_id="i-0123456789abcdef0", state="running", operation="op", expires_at=None, zone=None, **tags):
     values = {"ci-burst:managed": "true", "ci-burst:deployment": "test-deployment", "ci-burst:operation": operation}
     if expires_at is not None:
         values["ci-burst:expires-at"] = str(int(expires_at))
     values.update(tags)
-    return Instance(instance_id=instance_id, state=state, tags=values, launch_time=0.0)
+    return Instance(instance_id=instance_id, state=state, tags=values, launch_time=0.0, availability_zone=zone)
 
 
 class FakeAws:
@@ -72,6 +72,7 @@ class FakeAws:
         self.terminate_error = None
         self.terminated = []
         self.instances_by_id = {}
+        self.consoles = {}
         self.account = "111122223333"
         self.on_run = None
         self.on_quote = None
@@ -108,6 +109,11 @@ class FakeAws:
         self.calls.append(("owned_instances", deployment))
         self._maybe_raise()
         return list(self.instances_result)
+
+    def console_output(self, instance_ids):
+        self.calls.append(("console_output", list(instance_ids)))
+        self._maybe_raise()
+        return {identifier: self.consoles.get(identifier, "") for identifier in instance_ids if identifier in self.consoles}
 
     def instances(self, instance_ids):
         self.calls.append(("instances", list(instance_ids)))

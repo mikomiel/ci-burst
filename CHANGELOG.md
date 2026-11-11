@@ -14,6 +14,21 @@ and the validation step that binds it to that tag.
 
 ## [Unreleased]
 
+### Added
+
+- Ship the optional in-VPC router as a deployment artefact ([#68](https://github.com/mikomiel/ci-burst/pull/68)).
+- Surface worker console evidence as events and metrics.
+
+### Fixed
+
+- Refresh the image on a cleanup-only host ([#64](https://github.com/mikomiel/ci-burst/pull/64)).
+- Run the job with the fleet's umask ([#65](https://github.com/mikomiel/ci-burst/pull/65)).
+- Make the repository bootstrap the deployed template user data ([#66](https://github.com/mikomiel/ci-burst/pull/66)).
+
+### Documentation
+
+- Relicense ci-burst under GPL-3.0-only ([#67](https://github.com/mikomiel/ci-burst/pull/67)).
+
 ## [0.2.0] - 2026-11-11
 
 ### Added

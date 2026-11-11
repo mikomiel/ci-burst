@@ -83,7 +83,7 @@ with programmatic access and no console access:
 
 | User | Policy | Purpose |
 | --- | --- | --- |
-| `ci-burst-scaler` | [deploy/iam/scaling-policy.json](../deploy/iam/scaling-policy.json) | reads the queue, launches the one template, terminates only owned instances |
+| `ci-burst-scaler` | [deploy/iam/scaling-policy.json](../deploy/iam/scaling-policy.json) | reads the queue, launches the one template, reads owned worker consoles, terminates only owned instances |
 | `ci-burst-reaper` | [deploy/iam/cleanup-policy.json](../deploy/iam/cleanup-policy.json) | describes and terminates only owned instances; no launch |
 
 Replace the placeholders in both files before attaching them: account id,
@@ -96,6 +96,11 @@ name. The policies are deliberately small:
   from the policy is a denied launch, not a fallback;
 - `TerminateInstances` carries an `ec2:ResourceTag/ci-burst:managed = true`
   condition, so an instance the controller did not tag cannot be terminated;
+- `ec2:GetConsoleOutput` is one read grant, on `instance/*`, for the `export`
+  command only. The shipped policy is not tag-scoped because the provider has no
+  per-tag condition for this read: the boundary is the identity that holds the
+  grant, so keep it on the scaler user and off every other identity. Skip the
+  grant if you do not install the export unit; nothing else reads a console;
 - the reaper has no `RunInstances` at all, and the scaler cannot create users,
   read other parameters or change IAM.
 
@@ -311,6 +316,26 @@ Install the apply unit and timer, but do not enable or start the timer yet. An
 enabled timer also starts at boot (`OnBootSec=30s`), so enabling it before the
 supervised burst would let a reboot begin unsupervised admission as soon as
 Step 7 sets `live-verified`. Step 8 enables it only after that burst.
+
+The observation unit is independent of admission and may be installed with it.
+It reads consoles and writes a textfile; it launches nothing, and its timer can
+be enabled immediately. Install it only if a collector reads the directory you
+pass to `ExecStartPost` — the unit stages the textfile beside the collector's
+file and renames it into place, because the container runs as an unprivileged
+user and the collector's directory is root-owned:
+
+```sh
+install -o root -g root -m 0644 deploy/ci-burst-export.service /etc/systemd/system/
+install -o root -g root -m 0644 deploy/ci-burst-export.timer   /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now ci-burst-export.timer
+```
+
+The default textfile directory in this repository's unit is
+`/var/lib/prometheus/node-exporter`, which is where a node-exporter or Alloy
+textfile collector normally reads. Change both `ExecStartPost` lines if your
+collector reads elsewhere. [operations.md](operations.md) § "Worker evidence"
+owns the event schema, the metric names and the bounds.
 
 On the reaper host, with the same network created first:
 

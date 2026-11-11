@@ -111,15 +111,103 @@ standard-library tests run without the SDK, a token or a cloud account.
 python -m ci_burst plan   --config deployment.toml   # observation only
 python -m ci_burst apply  --config deployment.toml   # may launch the configured fleet
 python -m ci_burst status --config deployment.toml   # evidence, no mutation
+python -m ci_burst export --config deployment.toml \
+                          --metrics-file /var/lib/prometheus/node-exporter/ci-burst.prom
 python -m ci_burst reap   --config deployment.toml   # expired resources, no launch
 python -m ci_burst reap   --config deployment.toml --apply
 ```
 
 Exit codes: `0` for a completed decision, `2` for a refusal (nothing was
 mutated), `1` for a provider or cleanup failure. Every command prints one JSON
-document with stable reason codes. `plan` performs no durable write and no
-cloud mutation; `apply` is the only launch path; `reap` never needs Forgejo or
-the scaling ledger.
+document with stable reason codes. `plan`, `status` and `export` perform no
+cloud mutation and no ledger write; `apply` is the only launch path; `reap`
+never needs Forgejo or the scaling ledger.
+
+## Worker evidence
+
+The queue cannot tell you about a worker that never arrived. `export` reads the
+console of the instances this deployment owns and turns the shipped first-boot
+markers into two artefacts:
+
+```sh
+python -m ci_burst export --config deployment.toml \
+  --metrics-file /var/lib/prometheus/node-exporter/ci-burst.prom \
+  [--events-file PATH] [--state-file PATH]
+```
+
+The two optional paths default to `<ledger directory>/export/`, as
+`worker-events.ndjson` and `observed.json`.
+
+### The event stream
+
+One JSON object per line:
+
+```json
+{"id":"i-0123456789abcdef0:step:register","ts":"2026-11-11T16:55:17Z","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"step","step":"register"}
+{"id":"i-0123456789abcdef0:exit:0","ts":"...","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"exit","rc":0}
+```
+
+`event` is `step` (a step name from the shipped script's fixed set), `exit`
+(`bootstrap exiting rc=N`) or `error`, where `kind` is one of `forgejo_ping`,
+`ssm_timeout`, `apt_failed`, `register_failed` or `runner_error`. No console
+text is published: a failure line contributes its kind only. The console is not
+a trusted channel, and truncation is not redaction — read the raw line with the
+provider CLI when you need it.
+
+The file is replaced atomically on each run rather than appended to in place, so
+a collector must open it by path and must not hold a descriptor across runs; that
+rewrite is also what makes rotation and the size bound possible.
+
+Delivery is at least once. `id` is derived from the instance and the marker, so
+a repeat after a crash between publishing an event and saving the dedupe record
+carries the same identity and a consumer can drop it. The dedupe record keeps
+what was already emitted and is pruned after seven days; deleting it loses the
+history and the cumulative counters, never a decision.
+
+### The metrics textfile
+
+Every series carries the deployment label. `ci_burst_worker_launches_total`,
+`ci_burst_worker_registered_total` and `ci_burst_worker_unregistered_total` are
+cumulative counters kept separately from the expiring per-instance records, so
+they do not fall when an instance ages out of the provider's record window or
+when a record is pruned. `ci_burst_worker_unregistered_total` counts workers
+that ended without ever showing the registration marker; evidence observed once
+is never un-learned by a later empty console. `ci_burst_ledger_*` series come
+from the read-only ledger and are omitted — with a `ledger_omitted` note in the
+JSON result — when it cannot be read.
+`ci_burst_export_last_run_timestamp_seconds` is what a consumer uses to detect a
+stopped exporter.
+
+### Bounds
+
+| Bound | Value |
+| --- | --- |
+| console reads per run | 16 (the fleet limit is four) |
+| bytes read per console | 64 KiB |
+| error kinds per instance | 3 |
+| published console text | none |
+| event file | rotated at 4 MiB |
+| dedupe record | pruned after 7 days |
+
+Exceeding the console-read cap is a refusal (`console_read_cap_exceeded`, exit
+2) and nothing is written: more owned instances than the cap means the
+ownership tags disagree with the deployment.
+
+An instance without the ownership tags — a hand-launched canary — is invisible
+here on purpose; read its console directly with the provider CLI instead.
+
+Every input is validated before it is republished, because the command rewrites
+files it also reads. An ownership tag that is not one this deployment generated
+is omitted; a record, an instance key or a historical event line that no longer matches the
+schema — or that belongs to another deployment — is dropped (`state_rebuilt` or
+`events_pruned` in the result); a record with no usable retention timestamp is
+dropped rather than kept forever;
+a ledger state outside the ledger's own vocabulary is counted as `invalid`
+(`ledger_state_unknown`). None of those is a failure: derived evidence that
+cannot be validated is discarded, not published. The
+command never calls Forgejo and never mutates a resource, so it keeps working
+when the queue or the admission path is the thing that is broken.
+
 
 ## Queue contract
 

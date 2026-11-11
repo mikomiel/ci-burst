@@ -130,10 +130,70 @@ class CleanupUnitTests(unittest.TestCase):
         self.assertIn("--ignore", cleanup)
 
 
+class ExportUnitTests(unittest.TestCase):
+    """The observation unit reads evidence; it must gain no queue credential."""
+
+    def setUp(self):
+        self.service = unit("ci-burst-export.service")
+        self.exec_start = self.service["Service"]["execstart"]
+        self.raw = (DEPLOY / "ci-burst-export.service").read_text(encoding="utf-8")
+
+    def test_is_one_shot_with_a_named_container(self):
+        self.assertEqual(self.service["Service"]["type"], "oneshot")
+        self.assertIn("--name ci-burst-export", self.exec_start)
+        self.assertIn("--replace", self.exec_start)
+        self.assertIn("--init", self.exec_start)
+
+    def test_runs_the_export_command_read_only(self):
+        self.assertIn("--read-only", self.exec_start)
+        self.assertIn("export --config /etc/ci-burst/deployment.toml", self.exec_start)
+        self.assertIn("--metrics-file /var/lib/ci-burst/export/ci-burst.prom", self.exec_start)
+
+    def test_mounts_config_and_credentials_read_only_state_writable(self):
+        self.assertIn("/etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro", self.exec_start)
+        self.assertIn("/etc/ci-burst/aws-scaling:/etc/ci-burst/aws:ro", self.exec_start)
+        self.assertIn("/var/lib/ci-burst:/var/lib/ci-burst:rw", self.exec_start)
+
+    def test_needs_no_forgejo_token(self):
+        self.assertNotIn("--env-file", self.exec_start)
+        self.assertNotIn("forgejo.env", self.exec_start)
+
+    def test_publishes_the_textfile_with_an_ordered_rename(self):
+        # Two steps: stage next to the collector, then rename inside its own
+        # directory, so a scrape never reads a partial file. The exact commands
+        # and paths are pinned: a loose substring check would accept a wrong
+        # destination.
+        self.assertEqual(
+            re.findall(r"^ExecStartPost=(.*)$", self.raw, re.M),
+            [
+                "/usr/bin/install -m 0644 /var/lib/ci-burst/export/ci-burst.prom"
+                " /var/lib/prometheus/node-exporter/.ci-burst.prom.new",
+                "/usr/bin/mv -f /var/lib/prometheus/node-exporter/.ci-burst.prom.new"
+                " /var/lib/prometheus/node-exporter/ci-burst.prom",
+            ],
+        )
+        # The container never mounts the collector directory: it runs as uid
+        # 10001 and the directory is root-owned.
+        self.assertNotIn("/var/lib/prometheus", self.exec_start)
+
+    def test_cleanup_force_removes_the_named_container(self):
+        cleanup = _cleanup_argv(self.service)
+        self.assertEqual(cleanup[0], "/usr/bin/podman")
+        self.assertIn("rm", cleanup)
+        self.assertIn("--force", cleanup)
+        self.assertIn("ci-burst-export", cleanup)
+
+    def test_publishes_no_port_and_has_no_daemon_flags(self):
+        self.assertNotIn("--publish", self.exec_start)
+        self.assertNotIn("--detach", self.exec_start)
+        self.assertNotIn("--restart", self.exec_start)
+
+
 class TimerTests(unittest.TestCase):
     def test_each_timer_drives_its_own_unit_at_the_documented_interval(self):
         for name, service, interval in (
             ("ci-burst-apply.timer", "ci-burst-apply.service", "60s"),
+            ("ci-burst-export.timer", "ci-burst-export.service", "60s"),
             ("ci-burst-reap.timer", "ci-burst-reap.service", "5min"),
         ):
             with self.subTest(timer=name):
@@ -142,8 +202,8 @@ class TimerTests(unittest.TestCase):
                 self.assertEqual(timer["Timer"]["onunitinactivesec"], interval)
                 self.assertEqual(timer["Install"]["wantedby"], "timers.target")
 
-    def test_both_units_have_a_timer(self):
-        for service in ("ci-burst-apply", "ci-burst-reap"):
+    def test_every_unit_has_a_timer(self):
+        for service in ("ci-burst-apply", "ci-burst-export", "ci-burst-reap"):
             with self.subTest(service=service):
                 self.assertTrue((DEPLOY / f"{service}.service").is_file())
                 self.assertTrue((DEPLOY / f"{service}.timer").is_file())

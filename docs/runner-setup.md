@@ -23,7 +23,7 @@ Placeholders use `example` values. Replace every one with your own.
 | `eu-central-1` / `eu-central-1a` | your Region and availability zone |
 | `forgejo.example.com` | your Forgejo hostname |
 | `owner/repository` | the repository whose jobs the runner may take |
-| `cloud-ci` | the deployment-specific routing label in `RUNNER_LABELS` and `[worker].labels` |
+| `cloud-ci` | the deployment-specific routing label in the bootstrap's `--labels` and `[worker].labels` |
 | `vpc-...`, `subnet-...`, `sg-...`, `ami-...` | your network and image ids |
 
 ## Threat model
@@ -62,7 +62,7 @@ Policy `forgejo-runner-read-token`:
       "Sid": "ReadOneRegistrationToken",
       "Effect": "Allow",
       "Action": "ssm:GetParameter",
-      "Resource": "arn:aws:ssm:eu-central-1:123456789012:parameter/forgejo/runner/registration-token"
+      "Resource": "arn:aws:ssm:eu-central-1:123456789012:parameter/ci-burst/runner/registration-token"
     }
   ]
 }
@@ -122,7 +122,7 @@ token_file=$(mktemp)
 printf '%s' "$REG_TOKEN" > "$token_file"
 unset REG_TOKEN
 aws ssm put-parameter --region eu-central-1 \
-  --name /forgejo/runner/registration-token \
+  --name /ci-burst/runner/registration-token \
   --type SecureString --value "file://$token_file"
 shred -u "$token_file"
 ```
@@ -186,7 +186,7 @@ Set these values:
 
 | Setting | Value |
 | --- | --- |
-| Image | an image matching the instance architecture, with cloud-init |
+| Image | an image matching the instance architecture, with cloud-init and the runner preinstalled (see [The worker image](#the-worker-image)) |
 | Instance type | sized like your existing runners; arm64 images need `t4g`/`c7g`/`m7g`/`r7g` |
 | IAM instance profile | `forgejo-runner` |
 | Metadata options | IMDSv2 required (`HttpTokens=required`), hop limit 1 |
@@ -210,19 +210,54 @@ aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
 Without it, launches fail with
 `AuthFailure.ServiceLinkedRoleCreationNotPermitted`.
 
+### The worker image
+
+The template boots a prebuilt image, not a stock distribution. The image is an
+operator-owned prerequisite and this repository does not build it; it must
+provide what the bootstrap below assumes:
+
+- `forgejo-runner` **13.2.1** at `/usr/local/bin/forgejo-runner` — the pin lives
+  in the image, not in a download;
+- `/etc/forgejo-runner/config.yml`, readable by `runner`, declaring the Forgejo
+  instance, `runner.file: /var/lib/forgejo-runner/.runner`, capacity 1 and the
+  cache directories;
+- the `aws` CLI, which the bootstrap uses to read the registration token, and
+  `iptables` for the metadata block;
+- systemd, an unprivileged `runner` account with home
+  `/var/lib/forgejo-runner`, and cloud-init running the user data as root;
+- `/var/lib/forgejo-runner/.runner` as the registration-file location, because
+  the bootstrap changes to that directory before starting `one-job`, which
+  resolves the file relative to its working directory.
+
+A deployment that starts from a stock image must put the install into the
+bootstrap it publishes. Either way the file here is the bytes actually
+published, so it cannot carry values an operator is expected to edit before
+use.
+
 ### Worker bootstrap
 
 User data (no secret in it). The bootstrap is the repository-owned file
-[`deploy/runner/bootstrap.sh`](../deploy/runner/bootstrap.sh). It runs as root,
-prepares the unprivileged runner account, registers an ephemeral runner, blocks
-the metadata service for the job account, runs one job and always terminates
-the instance.
+[`deploy/runner/bootstrap.sh`](../deploy/runner/bootstrap.sh), and it is the
+bytes published as the template version — not a template or an example. It runs
+as root, reads the registration token from the SSM SecureString parameter,
+registers one ephemeral runner named `burst-<hostname>`, blocks the metadata
+service for the job account, runs exactly one job and always terminates the
+instance.
 
-Paste the file into the template's user data after replacing the placeholders
-its header documents. This guide deliberately does not carry a second copy: the
-advertised labels, the runner pin and the lifecycle live in that one file. The
-bootstrap is part of the template, so any change to it is a new launch-template
-version; an approved version is never edited in place
+The labels, the Forgejo URL and the parameter name are literal in the file. That
+is deliberate: a deployment that needs different values edits the file, publishes
+a new template version and bumps `launch_template_version`. Publishing:
+
+```sh
+aws ec2 create-launch-template-version --launch-template-name <template> \
+  --source-version <current> \
+  --launch-template-data "{\"UserData\":\"$(base64 -w0 deploy/runner/bootstrap.sh)\"}"
+```
+
+Then set the new number in the deployment TOML. `check-prerequisites` compares
+the pinned version's user data with this file and reports drift when they
+differ, so a merged edit that was never published does not pass unnoticed. An
+approved version is never edited in place
 ([operations.md § Worker image and launch template](operations.md#worker-image-and-launch-template)
 owns that rule).
 
@@ -232,20 +267,19 @@ runner. `one-job -w` (`--wait`) blocks until Forgejo assigns a task. Trigger the
 worker only after you observe queue demand, or pass `--wait`; an idle launch
 otherwise pays for a boot that does no work.
 
-The job runs with `umask 0022`, because that is what the persistent fleet's
-runner produces under systemd's default `UMask=0022`. The bootstrap script itself
-runs with `umask 077` for the registration token, and a job started directly from
-it would inherit 077 and create `0600`/`0700` files where the fleet creates
+The bootstrap runs with `umask 077` while it handles the registration token, then
+lowers to `umask 0022` before starting the job, because that is what the
+persistent fleet's runner produces under systemd's default `UMask=0022`. Without
+the second umask the job would create `0600`/`0700` files where the fleet creates
 `0644`/`0755`. That difference is invisible until a job asserts a mode, and then
 it fails only on burst capacity — a false red that looks like a defect in the
 change under test.
 
 ### Runner pin and the deprecated `register` command
 
-The bootstrap pins `forgejo-runner` **13.2.1** (`RUNNER_VERSION`) and checks the
-downloaded binary against `RUNNER_SHA`. The pin is deliberate; do not move it
-without the migration this section describes. In that version the `register`
-command is deprecated but still works, and prints:
+The image pins `forgejo-runner` **13.2.1**; the bootstrap never downloads it. The
+pin is deliberate; do not move it without the migration this section describes.
+In that version the `register` command is deprecated but still works, and prints:
 
 ```text
 `register` has been deprecated; declare connections in the runner configuration instead
@@ -316,7 +350,7 @@ the matching semantics; this guide does not repeat them.
    `tee: /dev/ttyS0: Input/output error` lines are noise from the serial
    console, not evidence that the record is missing. Look for the SSM read,
    `Runner registered successfully.`, one job running, and the power-off.
-   A healthy reference run moves through boot, toolchain install (about 25 s),
+   A healthy reference run moves through boot, the SSM token read,
    registration, one job and power-off; use that order as a sanity check when a
    run stops early.
 3. In Forgejo, the repository's Actions → Runners page shows the new runner in

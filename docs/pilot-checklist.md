@@ -16,8 +16,10 @@ cleanup bounds.
       exits after it, and also exits on bootstrap failure and on no job.
 - [ ] Maximum lifetime covers boot, queue wait and a failed bootstrap.
 - [ ] The worker holds no controller, provisioning or AWS credential.
-- [ ] Registration credentials arrive through an operator-owned secure channel;
-      not user data, image layers, command arguments or logs.
+- [ ] Registration credentials arrive through an operator-owned secure channel —
+      not user data, image layers or logs. The pinned runner CLI accepts its
+      token only as an argument, so the bootstrap reads it from a `0600` file and
+      shreds that file before the job starts.
 
 ## 2. Labels
 

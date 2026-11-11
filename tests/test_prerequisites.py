@@ -5,6 +5,7 @@ network call or real resource is involved. The checks are configuration
 comparisons only; they do not prove a worker's runtime behaviour.
 """
 
+import base64
 import copy
 import io
 import json
@@ -25,6 +26,7 @@ from support import write_config  # noqa: E402
 from ci_burst.errors import ProviderRefusal  # noqa: E402
 
 PARAMETER = prerequisites.DEFAULT_REGISTRATION_PARAMETER
+BOOTSTRAP = ROOT / "deploy" / "runner" / "bootstrap.sh"
 PROFILE = "example-runner-profile"
 ROLE = "example-runner-role"
 PROFILE_ARN = "arn:aws:iam::000000000000:instance-profile/workers/example-runner"
@@ -47,7 +49,9 @@ def template_data(**overrides):
         "ImageId": "ami-0123456789abcdef0",
         "InstanceType": "t4g.small",
         "InstanceInitiatedShutdownBehavior": "terminate",
-        "UserData": "ExampleBootstrap",
+        # A template that carries the published bytes passes by default; the
+        # drift tests below replace this with something else.
+        "UserData": base64.b64encode(BOOTSTRAP.read_bytes()).decode("ascii"),
         "SecurityGroupIds": [SG_ID],
         "IamInstanceProfile": {"Name": PROFILE},
     }
@@ -440,6 +444,56 @@ class PrerequisiteTests(unittest.TestCase):
     def test_missing_bootstrap_is_drift(self):
         self.ec2.templates[3] = template_data(UserData=None)
         self.assert_drift(self.check(), "template_bootstrap_missing")
+
+    def test_user_data_matching_the_repository_bootstrap_passes(self):
+        result = self.check()
+        self.assertEqual(self.records(result, "template")[0]["status"], "pass")
+        self.assertNotIn("template_bootstrap_drift", result["reasons"])
+
+    def test_user_data_differing_from_the_repository_bootstrap_is_drift(self):
+        # The repository file is exactly what an operator publishes as a new
+        # version. A pinned version carrying other bytes means a merged change
+        # reached no worker, which is the HB-3194 defect.
+        stale = base64.b64encode(b"#!/bin/bash\n# another bootstrap\n").decode("ascii")
+        self.ec2.templates[3] = template_data(UserData=stale)
+        result = self.check()
+        self.assert_drift(result, "template_bootstrap_drift")
+        self.assertEqual(self.records(result, "template")[0]["status"], "drift")
+
+    def test_user_data_that_is_not_base64_is_drift(self):
+        self.ec2.templates[3] = template_data(UserData="not base64 at all")
+        self.assert_drift(self.check(), "template_bootstrap_drift")
+
+    def test_user_data_trailing_newlines_do_not_count_as_drift(self):
+        # A console paste can add a trailing newline; that is not a behavioural
+        # difference and must not fail the check.
+        pasted = base64.b64encode(BOOTSTRAP.read_bytes() + b"\n").decode("ascii")
+        self.ec2.templates[3] = template_data(UserData=pasted)
+        self.assertEqual(self.check()["decision"], "satisfied")
+
+    def test_user_data_without_a_final_newline_passes(self):
+        body = BOOTSTRAP.read_bytes().rstrip(b"\n")
+        self.ec2.templates[3] = template_data(UserData=base64.b64encode(body).decode("ascii"))
+        self.assertEqual(self.check()["decision"], "satisfied")
+
+    def test_user_data_with_extra_trailing_newlines_passes(self):
+        body = BOOTSTRAP.read_bytes() + b"\n\n"
+        self.ec2.templates[3] = template_data(UserData=base64.b64encode(body).decode("ascii"))
+        self.assertEqual(self.check()["decision"], "satisfied")
+
+    def test_user_data_with_a_changed_interior_byte_is_drift(self):
+        original = BOOTSTRAP.read_bytes()
+        body = original.replace(b"STEP register", b"STEP registeR", 1)
+        self.assertNotEqual(body, original, "the fixture byte must exist")
+        self.ec2.templates[3] = template_data(UserData=base64.b64encode(body).decode("ascii"))
+        self.assert_drift(self.check(), "template_bootstrap_drift")
+
+    def test_unreadable_user_data_source_is_unavailable_not_drift(self):
+        with mock.patch.object(prerequisites, "BOOTSTRAP", self.root / "missing-bootstrap.sh"):
+            result = self.check()
+        self.assert_unavailable(result, "template_bootstrap_source_unreadable")
+        record = self.records(result, "template_bootstrap")[0]
+        self.assertEqual(record["status"], "unavailable")
 
     def test_template_placement_mismatch_is_drift(self):
         self.ec2.templates[3] = template_data(Placement={"AvailabilityZone": "eu-central-1b"})

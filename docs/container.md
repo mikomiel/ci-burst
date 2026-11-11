@@ -35,7 +35,7 @@ needs a credential.
 
 The container is not a scheduler. Forgejo owns job assignment and results;
 ci-burst launches up to the configured `controller.max_instances` Spot instances
-per deployment (an integer in 1..4, default 1).
+per deployment (an integer in 1..12, default 1).
 
 ## Prerequisites
 

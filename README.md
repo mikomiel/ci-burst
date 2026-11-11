@@ -6,7 +6,7 @@ public project licensed under GPL-3.0-only.
 ## What it does
 
 - Observes runnable jobs for one Forgejo repository and explicit runner labels.
-- Adds up to a configured number of Spot instances (default one, maximum four)
+- Adds up to a configured number of Spot instances (default one, maximum twelve)
   from an operator-prepared, pinned launch template while the queue has work and
   the budget allows it.
 - Keeps Forgejo as the only scheduler and job-result authority.

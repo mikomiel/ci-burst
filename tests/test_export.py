@@ -111,11 +111,20 @@ class ExporterTests(unittest.TestCase):
         self.metrics = self.root / "textfile" / "ci-burst.prom"
         self.state_file = self.root / "state" / "export" / "observed.json"
 
-    def build(self, instances, consoles, ledger=None):
-        config = load(write_config(self.root, config={"state": {"database": str(self.root / "state" / "state.sqlite3")}}))
+    def build(self, instances, consoles, ledger=None, max_instances=None):
+        extra = {"controller": {"max_instances": max_instances}} if max_instances is not None else {}
+        config = load(
+            write_config(
+                self.root,
+                config={"state": {"database": str(self.root / "state" / "state.sqlite3")}} | extra,
+            )
+        )
         aws = FakeAws(instances=instances)
         aws.consoles = consoles
         return Exporter(config, aws=aws, ledger=ledger, clock=lambda: NOW)
+
+    def console_read_calls(self, exporter):
+        return [call[1] for call in exporter.aws.calls if call[0] == "console_output"]
 
     def run_export(self, exporter, now=NOW):
         return exporter.run(
@@ -208,14 +217,113 @@ class ExporterTests(unittest.TestCase):
         self.assertNotIn("ci_burst_ledger_consumed_micros", text)
         self.assertIn("ci_burst_worker_launches_total", text)
 
-    def test_console_cap_refuses_before_writing_anything(self):
-        owned = [instance(f"i-0123456789abcde{index:02x}") for index in range(MAX_CONSOLE_READS + 1)]
-        exporter = self.build(owned, {})
+    def test_console_cap_refuses_more_live_workers_than_the_configured_limit(self):
+        owned = [
+            instance("i-0123456789abcdef0"),
+            instance("i-0123456789abcdef1"),
+            instance("i-0123456789abcdef2"),
+        ]
+        exporter = self.build(owned, {}, max_instances=2)
         with self.assertRaises(ProviderRefusal) as raised:
             self.run_export(exporter)
         self.assertEqual(raised.exception.reason, "console_read_cap_exceeded")
         self.assertFalse(self.events.exists())
         self.assertFalse(self.metrics.exists())
+
+    def test_turnover_beyond_the_read_budget_is_deferred_not_refused(self):
+        owned = [
+            instance(f"i-0123456789abcde{index:02x}", state="terminated")
+            for index in range(MAX_CONSOLE_READS + 8)
+        ]
+        exporter = self.build(owned, {})
+        result = self.run_export(exporter)
+        self.assertEqual(result["decision"], "reported")
+        self.assertIn("console_read_deferred", result["notes"])
+        self.assertEqual(result["console_reads"], MAX_CONSOLE_READS)
+        self.assertTrue(self.metrics.exists())
+        self.assertEqual(len(self.console_read_calls(exporter)[0]), MAX_CONSOLE_READS)
+
+    def test_a_deferred_record_is_read_on_the_next_run(self):
+        owned = [
+            instance(f"i-0123456789abcde{index:02x}", state="terminated")
+            for index in range(MAX_CONSOLE_READS + 2)
+        ]
+        consoles = {item.instance_id: CLEAN_BOOT for item in owned}
+        exporter = self.build(owned, consoles)
+        self.assertEqual(self.run_export(exporter)["console_reads"], MAX_CONSOLE_READS)
+        second = self.run_export(exporter)
+        self.assertEqual(second["console_reads"], 2)
+        self.assertNotIn("console_read_deferred", second["notes"])
+        self.assertEqual(second["totals"]["launches"], MAX_CONSOLE_READS + 2)
+
+    def test_a_record_that_left_the_live_states_is_not_read_again(self):
+        exporter = self.build(
+            [instance("i-0123456789abcdef0", state="terminated")],
+            {"i-0123456789abcdef0": CLEAN_BOOT},
+        )
+        self.assertEqual(self.run_export(exporter)["console_reads"], 1)
+        again = self.build(
+            [instance("i-0123456789abcdef0", state="terminated")],
+            {"i-0123456789abcdef0": CLEAN_BOOT},
+        )
+        result = self.run_export(again)
+        self.assertEqual(result["console_reads"], 0)
+        self.assertEqual(self.console_read_calls(again), [])
+        self.assertEqual(result["events_emitted"], 0)
+
+    def test_a_terminating_worker_is_read_until_a_final_state_is_observed(self):
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": NOISE})
+        self.run_export(exporter)
+        # Terminating is not finished: the console and the lifecycle carry on.
+        for _ in range(2):
+            ending = self.build(
+                [instance("i-0123456789abcdef0", state="shutting-down")],
+                {"i-0123456789abcdef0": CLEAN_BOOT},
+            )
+            self.assertEqual(self.run_export(ending)["console_reads"], 1)
+        final = self.build(
+            [instance("i-0123456789abcdef0", state="terminated")],
+            {"i-0123456789abcdef0": CLEAN_BOOT},
+        )
+        result = self.run_export(final)
+        self.assertEqual(result["console_reads"], 1)
+        self.assertEqual(result["totals"]["registered"], 1)
+        settled = self.build(
+            [instance("i-0123456789abcdef0", state="terminated")],
+            {"i-0123456789abcdef0": CLEAN_BOOT},
+        )
+        self.assertEqual(self.run_export(settled)["console_reads"], 0)
+
+    def test_an_exit_marker_while_running_does_not_finish_the_record(self):
+        running = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": FAILED_PING})
+        self.assertEqual(self.run_export(running)["console_reads"], 1)
+        still_running = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": FAILED_PING})
+        self.assertEqual(self.run_export(still_running)["console_reads"], 1)
+        final = self.build(
+            [instance("i-0123456789abcdef0", state="terminated")],
+            {"i-0123456789abcdef0": FAILED_PING},
+        )
+        self.assertEqual(self.run_export(final)["console_reads"], 1)
+
+    def test_a_shutting_down_worker_counts_toward_the_configured_limit(self):
+        owned = [
+            instance("i-0123456789abcdef0"),
+            instance("i-0123456789abcdef1", state="shutting-down"),
+        ]
+        exporter = self.build(owned, {}, max_instances=1)
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.run_export(exporter)
+        self.assertEqual(raised.exception.reason, "console_read_cap_exceeded")
+
+    def test_a_mixed_inventory_reads_every_live_worker_before_history(self):
+        live = [instance(f"i-0123456789abc0{index:02x}") for index in range(12)]
+        history = [instance(f"i-0123456789abc1{index:02x}", state="terminated") for index in range(16)]
+        exporter = self.build(live + history, {}, max_instances=12)
+        result = self.run_export(exporter)
+        self.assertEqual(result["console_reads"], MAX_CONSOLE_READS)
+        read = set(self.console_read_calls(exporter)[0])
+        self.assertEqual(read & {item.instance_id for item in live}, {item.instance_id for item in live})
+        self.assertIn("console_read_deferred", result["notes"])
 
     def test_structurally_corrupt_records_are_rebuilt_and_reported(self):
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -451,7 +559,8 @@ class ExporterTests(unittest.TestCase):
                             "emitted": ["exit:\u00b2", "exit:9999", "exit:000", "exit:0"],
                             "steps": [],
                             "errors": [],
-                            "exit_code": 0,
+                            "state": "running",
+                            "exit_code": None,
                             "registered": False,
                         }
                     },

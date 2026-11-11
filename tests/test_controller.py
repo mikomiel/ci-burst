@@ -748,6 +748,19 @@ class FleetTests(ControllerCase):
         self.assertEqual(len(self.reopened().operations()), 4)
         self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 4)
 
+    def test_the_supported_ceiling_admits_twelve_distinct_workers(self):
+        controller = self.build(observation=observation_demand(20), config=self.fleet_config(12))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(result["launches"]), 12)
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 12)
+        operations = self.reopened().operations()
+        self.assertEqual(len(operations), 12)
+        self.assertEqual(len({operation.id for operation in operations}), 12)
+        self.assertEqual(len({operation.client_token for operation in operations}), 12)
+        self.assertEqual({operation.reservation_micros for operation in operations}, {result["reservation_micros"]})
+        self.assertEqual(controller.status()["budget"]["hourly_ceiling"], "0.480000")
+
     def test_existing_workers_leave_only_the_free_slots(self):
         self.seed(state="running", operation_id="busy-a", instance_id="i-busy-a")
         self.seed(state="running", operation_id="busy-b", instance_id="i-busy-b")

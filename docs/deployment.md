@@ -192,7 +192,7 @@ qualification = "fixtures-only"
 labels = ["cloud-ci:host", "strong-ci:host", "linux-arm64:host"]
 
 [controller]
-# Optional, integer 1..4, default 1. A worker launched for one job occupies one
+# Optional, integer 1..12, default 1. A worker launched for one job occupies one
 # slot until it terminates.
 max_instances = 4
 
@@ -221,7 +221,7 @@ database = "/var/lib/ci-burst/state.sqlite3"
 adapter sends the bare names (`cloud-ci`) as the queue filter. `[state]
 database` must be absolute and inside `/var/lib/ci-burst`. Keep
 `qualification = "fixtures-only"` until Step 7 is complete: it blocks `apply`.
-`controller.max_instances` is optional: it bounds the owned fleet to `1..4` and
+`controller.max_instances` is optional: it bounds the owned fleet to `1..12` and
 defaults to `1`, so a deployment that omits it keeps the original one-slot
 behaviour. Raise it only after one burst is understood; the allowance still caps
 every batch, and § Fleet size and fan-out in

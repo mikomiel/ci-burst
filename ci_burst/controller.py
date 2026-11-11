@@ -703,7 +703,15 @@ class Controller:
         result["resumes"] = resumes
         for entry in pending:
             operation = self.ledger.operation(entry["operation"])
-            attempt = {}
+            # Every outcome carries the durable operation's own expiry and
+            # reservation; only the instance identity depends on a confirmed
+            # send, and the candidate walk stays empty for a resume.
+            attempt = {
+                "operation": operation.id,
+                "expires_at": operation.expires_at,
+                "reservation": format_money(operation.reservation_micros),
+                "attempts": [],
+            }
             now = self.clock()
             if now - operation.created_at > CLIENT_TOKEN_MAX_AGE_SECONDS:
                 attempt["decision"] = "refused"
@@ -719,10 +727,11 @@ class Controller:
             record = {
                 "operation": operation.id,
                 "decision": attempt["decision"],
+                "reasons": attempt.get("reasons", []),
                 "instance_id": attempt.get("instance_id"),
-                "expires_at": attempt.get("expires_at"),
-                "reservation": attempt.get("reservation"),
-                "attempts": attempt.get("attempts", []),
+                "expires_at": attempt["expires_at"],
+                "reservation": attempt["reservation"],
+                "attempts": attempt["attempts"],
             }
             if "refusal" in attempt:
                 record["refusal"] = attempt["refusal"]
@@ -735,21 +744,20 @@ class Controller:
 
     def _report_resume(self, result, attempt, operation_id):
         """Report one resumed intent at the top level without stale fields."""
-        for key in ("operation", "instance_id", "expires_at", "reservation", "attempts"):
+        for key in ("operation", "instance_id", "expires_at", "reservation", "attempts", "refusal"):
             result.pop(key, None)
         result["operation"] = operation_id
         result["decision"] = attempt["decision"]
-        if "reasons" in attempt:
+        result["expires_at"] = attempt["expires_at"]
+        result["reservation"] = attempt["reservation"]
+        if attempt.get("instance_id") is not None:
+            result["instance_id"] = attempt["instance_id"]
+        if attempt.get("reasons"):
             result["reasons"] = attempt["reasons"]
         else:
             result.pop("reasons", None)
         if "refusal" in attempt:
             result["refusal"] = attempt["refusal"]
-        else:
-            result.pop("refusal", None)
-        for key in ("instance_id", "expires_at", "reservation", "attempts"):
-            if key in attempt:
-                result[key] = attempt[key]
 
     def _send(self, operation, request, result, success_decision, first_attempt=True, *, defer_capacity=False):
         """Send one frozen request and report what it proved.

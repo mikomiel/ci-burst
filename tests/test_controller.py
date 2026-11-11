@@ -713,6 +713,17 @@ class FleetTests(ControllerCase):
             )
         )
 
+    def seed_intent(self, operation_id, *, expires_at, reservation):
+        """Seed one unresolved intent, advancing the clock after each seed."""
+        self.seed(
+            state="intent",
+            instance_id=None,
+            operation_id=operation_id,
+            expires_at=expires_at,
+            reservation=reservation,
+        )
+        self.clock.advance(1)
+
     def test_plan_reports_the_batch_size_for_a_backlog(self):
         controller = self.build(observation=observation_demand(5), config=self.fleet_config(3))
         result = controller.plan()
@@ -910,31 +921,63 @@ class FleetTests(ControllerCase):
         self.assertEqual(self.reopened().consumed_micros(window), 1_080_000)
         self.assertEqual(self.reopened().window_launches(window), 2)
 
-    def test_two_unresolved_intents_both_resume(self):
-        self.seed(state="intent", instance_id=None, operation_id="first")
-        self.seed(state="intent", instance_id=None, operation_id="second")
+    def test_unresolved_intents_resume_in_creation_order(self):
+        expiries = {}
+        reservations = {"third": 640_000, "second": 540_000, "first": 440_000}
+        for operation_id in ("third", "second", "first"):
+            expiries[operation_id] = self.clock.now + 3600
+            self.seed_intent(
+                operation_id,
+                expires_at=expiries[operation_id],
+                reservation=reservations[operation_id],
+            )
         controller = self.build(observation=observation_demand())
         result = controller.apply()
         self.assertEqual(result["decision"], "resumed")
-        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 2)
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 3)
+        resumes = result["resumes"]
         self.assertEqual(
-            [entry["operation"] for entry in result["resumes"]], ["first", "second"]
+            [entry["operation"] for entry in resumes], ["third", "second", "first"]
         )
         self.assertEqual(
-            [entry["decision"] for entry in result["resumes"]], ["resumed", "resumed"]
+            [entry["expires_at"] for entry in resumes],
+            [expiries["third"], expiries["second"], expiries["first"]],
         )
-        self.assertNotEqual(
-            result["resumes"][0]["instance_id"], result["resumes"][1]["instance_id"]
+        self.assertEqual(
+            [entry["reservation"] for entry in resumes],
+            ["0.640000", "0.540000", "0.440000"],
         )
-        self.assertEqual(result["operation"], "second")
+        self.assertEqual([entry["reasons"] for entry in resumes], [[], [], []])
+        self.assertEqual([entry["attempts"] for entry in resumes], [[], [], []])
+        self.assertEqual(len({entry["instance_id"] for entry in resumes}), 3)
+        self.assertEqual(
+            set(resumes[0]),
+            {
+                "operation",
+                "decision",
+                "reasons",
+                "instance_id",
+                "expires_at",
+                "reservation",
+                "attempts",
+            },
+        )
+        # The top level names the last resumed intent with its own fields.
+        self.assertEqual(result["operation"], "first")
+        self.assertEqual(result["expires_at"], expiries["first"])
+        self.assertEqual(result["reservation"], "0.440000")
+        self.assertNotIn("reasons", result)
+        self.assertNotIn("refusal", result)
+        self.assertNotIn("attempts", result)
         operations = self.reopened().operations()
-        self.assertEqual({operation.client_token for operation in operations}, {"ci-burst-first", "ci-burst-second"})
         self.assertEqual({operation.state for operation in operations}, {"starting"})
 
-    def test_resume_uncertainty_does_not_reuse_an_earlier_instance(self):
-        self.seed(state="intent", instance_id=None, operation_id="first", reservation=540_000)
-        self.seed(state="intent", instance_id=None, operation_id="second")
-        self.seed(state="intent", instance_id=None, operation_id="third")
+    def test_resume_uncertainty_keeps_the_deciding_intents_own_expiry(self):
+        first_expiry = self.clock.now + 3600
+        self.seed_intent("third", expires_at=first_expiry, reservation=440_000)
+        second_expiry = self.clock.now + 7200
+        self.seed_intent("second", expires_at=second_expiry, reservation=540_000)
+        self.seed_intent("first", expires_at=self.clock.now + 10800, reservation=640_000)
         controller = self.build(observation=observation_demand())
         runs = []
 
@@ -947,52 +990,138 @@ class FleetTests(ControllerCase):
         result = controller.apply()
         self.assertEqual(result["decision"], "uncertain")
         self.assertEqual(result["operation"], "second")
+        self.assertEqual(result["expires_at"], second_expiry)
+        self.assertEqual(result["reservation"], "0.540000")
         self.assertNotIn("instance_id", result)
+        self.assertNotIn("reasons", result)
+        self.assertNotIn("attempts", result)
         self.assertEqual(result["refusal"]["reason"], "AWS_UNCERTAIN")
         # The third intent is not retried after the unsuccessful one.
         self.assertEqual(len(runs), 2)
-        first, second = result["resumes"]
-        self.assertEqual([first["operation"], second["operation"]], ["first", "second"])
-        self.assertEqual(first["decision"], "resumed")
-        self.assertIsNotNone(first["instance_id"])
-        self.assertEqual(first["reservation"], "0.540000")
-        self.assertIsNone(second["instance_id"])
-        self.assertEqual(second["decision"], "uncertain")
-        self.assertEqual(second["refusal"]["reason"], "AWS_UNCERTAIN")
+        resumed, uncertain = result["resumes"]
+        self.assertEqual([resumed["operation"], uncertain["operation"]], ["third", "second"])
+        self.assertEqual(resumed["decision"], "resumed")
+        self.assertEqual(resumed["expires_at"], first_expiry)
+        self.assertEqual(resumed["reservation"], "0.440000")
+        self.assertIsNotNone(resumed["instance_id"])
+        self.assertIsNone(uncertain["instance_id"])
+        self.assertEqual(uncertain["expires_at"], second_expiry)
+        self.assertEqual(uncertain["reservation"], "0.540000")
+        self.assertEqual(uncertain["reasons"], [])
+        self.assertEqual(uncertain["decision"], "uncertain")
+        self.assertEqual(uncertain["refusal"]["reason"], "AWS_UNCERTAIN")
+        self.assertEqual(
+            set(uncertain),
+            {
+                "operation",
+                "decision",
+                "reasons",
+                "instance_id",
+                "expires_at",
+                "reservation",
+                "attempts",
+                "refusal",
+            },
+        )
         ledger = self.reopened()
-        self.assertEqual(ledger.operation("first").state, "starting")
-        self.assertEqual(ledger.operation("first").instance_id, first["instance_id"])
+        self.assertEqual(ledger.operation("third").state, "starting")
+        self.assertEqual(ledger.operation("third").instance_id, resumed["instance_id"])
         self.assertEqual(ledger.operation("second").state, "uncertain")
-        self.assertEqual(ledger.operation("third").state, "intent")
+        self.assertEqual(ledger.operation("first").state, "intent")
 
     def test_resume_stops_at_an_intent_whose_lifetime_elapsed(self):
-        self.seed(state="intent", instance_id=None, operation_id="first", reservation=540_000)
-        self.seed(
-            state="intent",
-            instance_id=None,
-            operation_id="second",
-            expires_at=self.clock.now + 60,
-        )
-        self.seed(state="intent", instance_id=None, operation_id="third")
+        first_expiry = self.clock.now + 3600
+        self.seed_intent("third", expires_at=first_expiry, reservation=440_000)
+        second_expiry = self.clock.now + 30
+        self.seed_intent("second", expires_at=second_expiry, reservation=540_000)
+        self.seed_intent("first", expires_at=self.clock.now + 10800, reservation=640_000)
         controller = self.build(observation=observation_demand())
         self.aws.on_run = lambda request: self.clock.advance(120)
         result = controller.apply()
         self.assertEqual(result["decision"], "refused")
-        self.assertIn("unresolved_intent_lifetime_elapsed", result["reasons"])
+        self.assertEqual(result["reasons"], ["unresolved_intent_lifetime_elapsed"])
         self.assertEqual(result["operation"], "second")
+        self.assertEqual(result["expires_at"], second_expiry)
+        self.assertEqual(result["reservation"], "0.540000")
         self.assertNotIn("instance_id", result)
+        self.assertNotIn("refusal", result)
+        self.assertNotIn("attempts", result)
         runs = [call for call in self.aws.calls if call[0] == "run_spot"]
         self.assertEqual(len(runs), 1)
-        first, second = result["resumes"]
-        self.assertEqual([first["operation"], second["operation"]], ["first", "second"])
-        self.assertEqual(first["decision"], "resumed")
-        self.assertIsNotNone(first["instance_id"])
-        self.assertEqual(second["decision"], "refused")
-        self.assertIsNone(second["instance_id"])
+        resumed, elapsed = result["resumes"]
+        self.assertEqual([resumed["operation"], elapsed["operation"]], ["third", "second"])
+        self.assertEqual(resumed["expires_at"], first_expiry)
+        self.assertEqual(resumed["reservation"], "0.440000")
+        self.assertEqual(elapsed["expires_at"], second_expiry)
+        self.assertEqual(elapsed["reservation"], "0.540000")
+        self.assertEqual(elapsed["decision"], "refused")
+        self.assertEqual(elapsed["reasons"], ["unresolved_intent_lifetime_elapsed"])
+        self.assertIsNone(elapsed["instance_id"])
+        self.assertEqual(elapsed["attempts"], [])
+        self.assertEqual(
+            set(elapsed),
+            {
+                "operation",
+                "decision",
+                "reasons",
+                "instance_id",
+                "expires_at",
+                "reservation",
+                "attempts",
+            },
+        )
+        self.assertNotIn("attempts", result)
         ledger = self.reopened()
-        self.assertEqual(ledger.operation("first").state, "starting")
+        self.assertEqual(ledger.operation("third").state, "starting")
         self.assertEqual(ledger.operation("second").state, "intent")
-        self.assertEqual(ledger.operation("third").state, "intent")
+        self.assertEqual(ledger.operation("first").state, "intent")
+
+    def test_resume_stops_at_an_intent_whose_client_token_expired(self):
+        first_expiry = self.clock.now + 3600
+        self.seed_intent("third", expires_at=first_expiry, reservation=440_000)
+        second_expiry = self.clock.now + 100_000
+        self.seed_intent("second", expires_at=second_expiry, reservation=540_000)
+        self.seed_intent("first", expires_at=self.clock.now + 200_000, reservation=640_000)
+        controller = self.build(observation=observation_demand())
+        self.aws.on_run = lambda request: self.clock.advance(25 * 3600)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["unresolved_intent_expired"])
+        self.assertEqual(result["operation"], "second")
+        self.assertEqual(result["expires_at"], second_expiry)
+        self.assertEqual(result["reservation"], "0.540000")
+        self.assertNotIn("instance_id", result)
+        self.assertNotIn("refusal", result)
+        self.assertNotIn("attempts", result)
+        runs = [call for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(runs), 1)
+        resumed, expired = result["resumes"]
+        self.assertEqual([resumed["operation"], expired["operation"]], ["third", "second"])
+        self.assertEqual(resumed["expires_at"], first_expiry)
+        self.assertEqual(resumed["reservation"], "0.440000")
+        self.assertEqual(expired["expires_at"], second_expiry)
+        self.assertEqual(expired["reservation"], "0.540000")
+        self.assertEqual(expired["decision"], "refused")
+        self.assertEqual(expired["reasons"], ["unresolved_intent_expired"])
+        self.assertIsNone(expired["instance_id"])
+        self.assertEqual(expired["attempts"], [])
+        self.assertEqual(
+            set(expired),
+            {
+                "operation",
+                "decision",
+                "reasons",
+                "instance_id",
+                "expires_at",
+                "reservation",
+                "attempts",
+            },
+        )
+        self.assertNotIn("attempts", result)
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation("third").state, "starting")
+        self.assertEqual(ledger.operation("second").state, "intent")
+        self.assertEqual(ledger.operation("first").state, "intent")
 
     def test_lowered_limit_waits_and_never_terminates(self):
         self.seed(state="running", operation_id="busy-a", instance_id="i-busy-a")

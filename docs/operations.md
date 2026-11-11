@@ -530,14 +530,27 @@ already elapsed. Both keep the unresolved ownership and block admission until
 an operator resolves them. When more than one launch intent is unresolved,
 `apply` retries them in creation order and stops at the first intent whose age
 exceeds the client-token window, whose lifetime elapsed, or whose retry is not
-accepted; the intents it did not reach stay outstanding for the next apply. The
-result carries a `resumes` array with one entry per attempted intent
-(`operation`, `decision`, `instance_id`, `expires_at`, `reservation`,
-`attempts`, and `refusal` when present). Each entry describes only its own
-intent, and the top-level `operation`, `decision`, `refusal`, `instance_id`,
-`expires_at` and `reservation` describe the intent that decided the outcome —
-the failing one when a retry fails, so an earlier instance is never reported
-against it.
+accepted. Intents after the deciding one are not sent and stay `intent` in the
+ledger for the next apply.
+
+Every attempted intent produces one `resumes` record in creation order. A
+record's `expires_at` and `reservation` always come from the durable operation,
+whatever the outcome; `instance_id` is `null` until a launch is confirmed, and
+`refusal` appears only for an uncertain retry:
+
+| `decision` | `reasons` | `instance_id` | `refusal` | `expires_at` / `reservation` | `attempts` |
+| --- | --- | --- | --- | --- | --- |
+| `resumed` | `[]` | confirmed instance | absent | from the operation | `[]` |
+| `uncertain` | `[]` | `null` | provider refusal | from the operation | `[]` |
+| `refused` | `["unresolved_intent_expired"]` | `null` | absent | from the operation | `[]` |
+| `refused` | `["unresolved_intent_lifetime_elapsed"]` | `null` | absent | from the operation | `[]` |
+
+Every record also carries `operation`. The top level carries the deciding
+intent's `operation`, `decision`, `expires_at` and `reservation`; its
+`instance_id` appears only when that intent was confirmed, its `reasons` only for
+the two expiry refusals, and its `refusal` only for an uncertain retry. The top
+level carries no `attempts` field, and a resume sends one frozen request, so a
+record's `attempts` is always empty.
 
 The EC2 client is built without the SDK's transparent retries, so one recorded
 provider call is one HTTP attempt; the controller's own resume is the only

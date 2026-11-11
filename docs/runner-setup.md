@@ -232,6 +232,14 @@ runner. `one-job -w` (`--wait`) blocks until Forgejo assigns a task. Trigger the
 worker only after you observe queue demand, or pass `--wait`; an idle launch
 otherwise pays for a boot that does no work.
 
+The job runs with `umask 0022`, because that is what the persistent fleet's
+runner produces under systemd's default `UMask=0022`. The bootstrap script itself
+runs with `umask 077` for the registration token, and a job started directly from
+it would inherit 077 and create `0600`/`0700` files where the fleet creates
+`0644`/`0755`. That difference is invisible until a job asserts a mode, and then
+it fails only on burst capacity — a false red that looks like a defect in the
+change under test.
+
 ### Runner pin and the deprecated `register` command
 
 The bootstrap pins `forgejo-runner` **13.2.1** (`RUNNER_VERSION`) and checks the

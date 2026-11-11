@@ -76,12 +76,31 @@ class RunnerBootstrapTests(unittest.TestCase):
         self.assertEqual(len(ephemeral), 1, ephemeral)
 
     def test_runs_exactly_one_job_then_terminates(self):
-        command = "runuser -u runner -- /usr/local/bin/forgejo-runner one-job"
+        command = (
+            "runuser -u runner -- sh -c 'umask 0022; exec "
+            "/usr/local/bin/forgejo-runner one-job"
+        )
         self.assertEqual(self.script.count(command), 1)
         self.assertNotIn("forgejo-runner daemon", self.script)
         self.assertIn("timeout --signal=TERM --kill-after=60 3600", self.script)
         self.assertIn("trap on_exit EXIT", self.script)
         self.assertIn("shutdown -h now", self.script)
+
+    def test_runs_the_job_with_the_fleets_umask(self):
+        # The script needs 077 for the registration token, but the job must see
+        # the modes the persistent fleet produces (systemd UMask=0022). Without
+        # this, a mode-sensitive test passes on the fleet and fails on cloud
+        # capacity, and the failure looks like a diff defect.
+        self.assertIn("umask 077", self.script)
+        self.assertIn("umask 0022; exec /usr/local/bin/forgejo-runner one-job", self.script)
+        # Exactly one place lowers the umask, and it is the job invocation: the
+        # credential section above must keep 077.
+        occurrences = [
+            line for line in self.script.splitlines() if "umask 0022" in line
+        ]
+        self.assertEqual(len(occurrences), 1, occurrences)
+        self.assertIn("runuser -u runner -- sh -c 'umask 0022", occurrences[0])
+        self.assertIn("one-job -c /etc/forgejo-runner/config.yml", occurrences[0])
 
     def test_setup_guide_references_the_bootstrap_instead_of_copying_it(self):
         guide = SETUP_GUIDE.read_text(encoding="utf-8")

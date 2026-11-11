@@ -131,5 +131,11 @@ iptables -A OUTPUT -m owner --uid-owner runner -d 169.254.170.2 -j REJECT
 # One job, bound in time; shutdown happens in the EXIT trap.
 install -d -o runner -g runner -m 0700 /var/lib/forgejo-runner/work
 cd /var/lib/forgejo-runner
+# The job must see the file modes the persistent fleet produces. This script
+# raised its own umask to 077 for the credential files above and never restored
+# it, so a runner started from here would create 0600/0700 where the fleet's
+# systemd unit (UMask=0022) creates 0644/0755, and a mode-sensitive job would
+# fail only on cloud capacity. Restore 0022 for the job itself and keep 077 for
+# everything that touches the registration token.
 timeout --signal=TERM --kill-after=60 3600 \
-  runuser -u runner -- /usr/local/bin/forgejo-runner one-job -c /etc/forgejo-runner/config.yml || true
+  runuser -u runner -- sh -c 'umask 0022; exec /usr/local/bin/forgejo-runner one-job -c /etc/forgejo-runner/config.yml' || true

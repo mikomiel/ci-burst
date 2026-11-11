@@ -229,6 +229,12 @@ provide what the bootstrap below assumes:
   cache directories;
 - the `aws` CLI, which the bootstrap uses to read the registration token, and
   `iptables` for the metadata block;
+- the job toolchain the queue needs, not only the runner binary. Runner classes
+  differ by architecture, never by installed packages, so a job may be batched
+  onto any runner of its architecture. Without one of those tools the job fails
+  closed and looks like a defect in the change under test.
+  [operations.md § Worker image and launch template](operations.md#worker-image-and-launch-template)
+  owns the rule; the deployment records the set it qualifies;
 - systemd, an unprivileged `runner` account with home
   `/var/lib/forgejo-runner`, and cloud-init running the user data as root;
 - `/var/lib/forgejo-runner/.runner` as the registration-file location, because

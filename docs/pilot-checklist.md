@@ -8,6 +8,9 @@ cleanup bounds.
 ## 1. Image and template
 
 - [ ] Image builds the pinned runner and the job toolchain the queue needs.
+- [ ] On a launched worker, every tool of that recorded set resolves
+      (`command -v jq promtool uv node ruff psql …`). A missing tool is an image
+      defect to fix in the image, never a reason to route the job elsewhere.
 - [ ] Template version is numeric and points at a literal, immutable image id.
 - [ ] `InstanceType`, architecture and memory suit the intended job class.
 - [ ] `InstanceInitiatedShutdownBehavior = terminate`; disposable volumes

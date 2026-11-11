@@ -17,12 +17,12 @@ MIT-licensed public project.
 
 The product source is implemented, covered by standard-library tests and
 released. A release is source history, not a deployment: this repository
-publishes no image, and deployment plus the live Forgejo contract qualification
-are the operator's. `qualification = "fixtures-only"` is the shipped default and
-blocks `apply` until an operator qualifies a deployment. AWS resources, IAM,
-networking, registration credentials and the runner image remain
-operator-owned prerequisites. No cost-saving or absolute AWS-billing-cap claim
-has been established.
+publishes no image, and the deployment procedure and the live Forgejo contract
+qualification are the operator's records. `qualification = "fixtures-only"` is
+the shipped default and blocks `apply` until an operator records that evidence.
+AWS resources, IAM, networking, registration credentials and the runner image
+remain operator-owned prerequisites. No cost-saving or absolute AWS-billing-cap
+claim has been established.
 
 ## Try it
 

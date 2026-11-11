@@ -16,8 +16,6 @@ and the validation step that binds it to that tag.
 
 ## [0.2.0] - 2026-11-11
 
-<!-- release-pending: v0.2.0 -->
-
 ### Added
 
 - Run a bounded fleet of up to four workers ([#59](https://github.com/mikomiel/ci-burst/pull/59)).

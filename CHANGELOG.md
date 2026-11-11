@@ -17,6 +17,7 @@ and the validation step that binds it to that tag.
 ### Fixed
 
 - A terminated unrecorded instance stops blocking admission ([#54](https://github.com/mikomiel/ci-burst/pull/54)).
+- Compare the committed Unreleased region exactly.
 
 ### Documentation
 

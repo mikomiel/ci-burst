@@ -106,6 +106,7 @@ class RouterForwardingTests(unittest.TestCase):
             "ip",
             'case "$*" in\n'
             '  "route show default") echo "default via 192.0.2.1 dev eth0" ;;\n'
+            '  "link show wg0") [ -n "${WG_PRESENT:-}" ] && exit 0; exit 1 ;;\n'
             "esac\n"
             "exit 0\n",
         )
@@ -120,8 +121,9 @@ class RouterForwardingTests(unittest.TestCase):
             "exit 0\n",
         )
 
-    def run_forward(self, check_exit="1"):
+    def run_forward(self, check_exit="1", wireguard=True):
         environment = dict(os.environ)
+        environment.pop("WG_PRESENT", None)
         environment.update(
             {
                 "PATH": f"{self.bin}:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -130,6 +132,8 @@ class RouterForwardingTests(unittest.TestCase):
                 "CI_BURST_ROUTER_CIDR_FILE": str(self.cidrs),
             }
         )
+        if wireguard:
+            environment["WG_PRESENT"] = "1"
         return subprocess.run(
             ["bash", str(self.script)], env=environment, capture_output=True, text=True, check=False
         )
@@ -146,6 +150,14 @@ class RouterForwardingTests(unittest.TestCase):
             self.assertIn(f"-t nat -A POSTROUTING -s {cidr} -o wg0 -j MASQUERADE", appended)
             self.assertIn(f"-t filter -A FORWARD -s {cidr} -o eth0 -j ACCEPT", appended)
             self.assertIn(f"-t filter -A FORWARD -s {cidr} -o wg0 -j ACCEPT", appended)
+
+    def test_without_wireguard_only_the_default_interface_is_configured(self):
+        completed = self.run_forward(wireguard=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        appended = self.appended()
+        for cidr in ("192.0.2.0/24", "198.51.100.0/24"):
+            self.assertIn(f"-t nat -A POSTROUTING -s {cidr} -o eth0 -j MASQUERADE", appended)
+            self.assertFalse([line for line in appended if "-o wg0" in line])
 
     def test_existing_rules_are_not_appended_again(self):
         completed = self.run_forward(check_exit="0")

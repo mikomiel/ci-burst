@@ -8,8 +8,8 @@ of a subject is rendered as a link.
 The section starts after the latest annotated release tag, so an entry that
 already has a released section is not rendered again. A release preparation
 marker defers that tag until the preparation commit is on `main`;
-`--validate-release` verifies the published state, and `--check` reports drift
-between the committed section and that rendering.
+`--validate-release` verifies the published state, and `--check` reports a
+committed file that differs from what `--write` would produce.
 
 Rendering fails closed when the history is shallow, when a released heading
 cannot be reconciled with a local reachable annotated tag (for example in a
@@ -417,34 +417,21 @@ def replace_unreleased(text, section):
     return "\n".join(updated).rstrip("\n") + "\n"
 
 
-def unreleased_is_current(text, section):
-    """True when the committed Unreleased region already equals ``section``.
+def changelog_is_current(text, section):
+    """True when ``--write`` would leave CHANGELOG.md byte-identical.
 
-    The region is compared exactly, not through :func:`unreleased_section`,
-    which trims blank lines before the next heading and repairs a missing final
-    newline. It runs from the ``## [Unreleased]`` heading to the next level-two
-    heading, or to the end of the file, and :func:`replace_unreleased` always
-    separates it from that heading with exactly one blank line. A surplus blank
-    line or a missing final newline is therefore drift, not formatting that can
-    be normalised away.
+    ``--write`` renders from the universal-newline-translated read and writes
+    UTF-8 without translation, so the committed bytes are compared with exactly
+    the bytes it would write. Reading the section back instead would hide a
+    CRLF section, CRLF elsewhere in the file, a surplus blank line before the
+    next heading and a missing final newline: all of them are drift that
+    ``--write`` would rewrite.
     """
-    lines = text.splitlines(keepends=True)
-    offsets = [0]
-    for line in lines:
-        offsets.append(offsets[-1] + len(line))
-    start = next(
-        (index for index, line in enumerate(lines) if line.rstrip("\r\n") == UNRELEASED),
-        None,
-    )
-    if start is None:
+    try:
+        committed = CHANGELOG.read_bytes()
+    except FileNotFoundError:
         return False
-    end = next(
-        (index for index in range(start + 1, len(lines)) if _H2.match(lines[index])),
-        None,
-    )
-    if end is None:
-        return text[offsets[start]:] == section
-    return text[offsets[start]:offsets[end]] == section + "\n"
+    return committed == replace_unreleased(text, section).encode("utf-8")
 
 
 def main(argv=None):
@@ -463,7 +450,7 @@ def main(argv=None):
     actions.add_argument(
         "--check",
         action="store_true",
-        help="report a committed Unreleased section that differs from the rendering and exit 1",
+        help="report a committed changelog that differs from what --write would produce and exit 1",
     )
     args = parser.parse_args(argv)
 
@@ -495,13 +482,13 @@ def main(argv=None):
         return 1
     section = render_unreleased(merged_subjects(since=boundary))
     if args.check:
-        if unreleased_is_current(text, section):
+        if changelog_is_current(text, section):
             print("changelog is up to date")
             return 0
         sys.stdout.write(section)
         print(
-            "error: the committed Unreleased section is stale; regenerate it "
-            "with python3 scripts/render_changelog.py --write",
+            "error: CHANGELOG.md differs from what --write would produce; "
+            "regenerate it with python3 scripts/render_changelog.py --write",
             file=sys.stderr,
         )
         return 1

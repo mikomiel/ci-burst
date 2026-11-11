@@ -1,5 +1,5 @@
 #!/bin/sh
-# Deploy the current ci-burst main to this host as the controller image.
+# Deploy the current ci-burst main to this host as the ci-burst image.
 #
 # One run compares the deployed commit with origin/main and does nothing when
 # they match. Otherwise it builds the image from a tar archive of exactly that
@@ -7,9 +7,17 @@
 # under a clean commit's name), smoke-tests the candidate, and only then moves
 # the tag the scheduled units resolve.
 #
-# The smoke run is a `plan` execution from the candidate against this host's own
-# configuration and scaling credentials. It must complete with a decision, not
-# refuse: `plan` writes nothing, allocates nothing and launches nothing.
+# The smoke run is one execution from the candidate against this host's own
+# configuration and its own credentials, and it must complete with a decision
+# rather than refuse. Which command it runs depends on the host's role:
+#   * a controller host runs `plan` (observation only: writes nothing, allocates
+#     nothing, launches nothing) with the scaling credentials;
+#   * a cleanup-only host runs `reap` without `--apply` (inventory and expiry
+#     selection, never a termination) with the cleanup credentials and no
+#     Forgejo token.
+# The distinction matters because a reaper whose image cannot read this host's
+# configuration keeps a green timer while expiry cleanup has stopped, which is
+# precisely the failure this smoke exists to catch.
 #
 # Rollback handles are created before the serving tag moves, so a failure never
 # leaves the host with no working image and no way back:
@@ -33,14 +41,31 @@ AWS_CREDENTIALS=${CI_BURST_AWS_DIR:-/etc/ci-burst/aws-scaling}
 TOKEN_ENV=${CI_BURST_TOKEN_ENV:-/etc/ci-burst/forgejo.env}
 IMAGE=localhost/ci-burst
 SMOKE_RETRY_SECONDS=${CI_BURST_SMOKE_RETRY_SECONDS:-20}
+SMOKE_COMMAND=${CI_BURST_SMOKE_COMMAND:-plan}
+SMOKE_NETWORK=${CI_BURST_SMOKE_NETWORK:-ci-burst}
 UNIT_DIR=${CI_BURST_UNIT_DIR:-/etc/systemd/system}
 
 # The units this deployment installs by hand. They are compared, never written:
 # installing scheduler units unattended needs atomic generations and admission
-# control that are disproportionate to how rarely a unit changes.
-UNITS="ci-burst-apply.service ci-burst-apply.timer ci-burst-refresh.service ci-burst-refresh.timer"
+# control that are disproportionate to how rarely a unit changes. A host with a
+# different role overrides the list, so its drift report describes that host
+# instead of reporting the other role's units as missing.
+UNITS=${CI_BURST_UNITS:-"ci-burst-apply.service ci-burst-apply.timer ci-burst-refresh.service ci-burst-refresh.timer"}
 
 log() { printf 'ci-burst-refresh: %s\n' "$*"; }
+
+# The accepted decision depends on the role's command: `plan` reports `wait` or
+# `would_launch` when it observed and decided to do nothing; `reap` without
+# `--apply` reports `planned` when it selected nothing to terminate. A refusal
+# document, an `error`, or any other decision fails the smoke. A command this
+# script does not know refuses before anything is built, rather than guessing an
+# accepted set for it.
+case "$SMOKE_COMMAND" in
+    plan) ACCEPTED_DECISIONS="wait would_launch" ;;
+    reap) ACCEPTED_DECISIONS="planned" ;;
+    *) log "smoke_command_invalid: $SMOKE_COMMAND"; exit 2 ;;
+esac
+
 
 install -d -m 0700 "$STATE"
 exec 9>"$STATE/refresh.lock"
@@ -87,13 +112,19 @@ fi
 attempt=1
 while :; do
     smoke_rc=0
-    smoke=$(podman run --rm --init --replace --network ci-burst --name ci-burst-refresh-smoke \
+    set -- run --rm --init --replace --network "$SMOKE_NETWORK" --name ci-burst-refresh-smoke \
         --read-only \
         --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
         --volume "$CONFIG:/etc/ci-burst/deployment.toml:ro" \
-        --volume "$AWS_CREDENTIALS:/etc/ci-burst/aws:ro" \
-        --env-file "$TOKEN_ENV" \
-        "$IMAGE:candidate" plan --config /etc/ci-burst/deployment.toml 2>/dev/null) || smoke_rc=$?
+        --volume "$AWS_CREDENTIALS:/etc/ci-burst/aws:ro"
+    # A cleanup-only host has no Forgejo token, and its reaper must not need one:
+    # the reaper is deliberately independent of Forgejo. An empty or absent token
+    # path drops the flag instead of failing the run.
+    if [ -n "$TOKEN_ENV" ] && [ -f "$TOKEN_ENV" ]; then
+        set -- "$@" --env-file "$TOKEN_ENV"
+    fi
+    set -- "$@" "$IMAGE:candidate" "$SMOKE_COMMAND" --config /etc/ci-burst/deployment.toml
+    smoke=$(podman "$@" 2>/dev/null) || smoke_rc=$?
     if [ "$smoke_rc" -eq 0 ]; then
         break
     fi
@@ -108,14 +139,14 @@ while :; do
     attempt=$((attempt + 1))
     sleep "$SMOKE_RETRY_SECONDS"
 done
-# The smoke gate accepts only a completed, non-refusal plan decision. A refusal
-# document (`decision: refused`, or `error`) means the candidate cannot read this
-# host's configuration, which is exactly what the next scheduled apply would hit.
-# The accepted decisions are the plan results that mean "observed, decided
-# nothing": `wait` and `would_launch`. A new plan decision needs this list
-# updated deliberately, in the same change that introduces it.
-if ! printf '%s' "$smoke" | python3 -c '
+# The smoke gate accepts only a completed, non-refusal decision for this host's
+# role. A refusal document (`decision: refused`, or `error`) means the candidate
+# cannot read this host's configuration, which is exactly what the next scheduled
+# run would hit. A new decision needs this list updated deliberately, in the same
+# change that introduces it.
+if ! printf '%s' "$smoke" | ACCEPTED_DECISIONS="$ACCEPTED_DECISIONS" python3 -c '
 import json
+import os
 import sys
 
 document = json.load(sys.stdin)
@@ -123,10 +154,11 @@ if not isinstance(document, dict):
     raise SystemExit(1)
 if "error" in document:
     raise SystemExit(1)
-if document.get("decision") not in ("wait", "would_launch"):
+accepted = set(os.environ.get("ACCEPTED_DECISIONS", "").split())
+if document.get("decision") not in accepted:
     raise SystemExit(1)
 ' 2>/dev/null; then
-    log "smoke_failed: $want did not print a completed plan decision"
+    log "smoke_failed: $want did not print an accepted $SMOKE_COMMAND decision"
     exit 2
 fi
 

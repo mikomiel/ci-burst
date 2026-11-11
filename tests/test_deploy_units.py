@@ -189,19 +189,20 @@ class RefreshTests(unittest.TestCase):
         # A container bridge MTU above the host path MTU stalls large downloads;
         # the build needs the network, the smoke must mirror the scheduled units.
         self.assertIn("podman build --quiet --network=host --tag", self.script)
-        smoke = self.script[self.script.index("podman run --rm") :]
-        smoke = smoke[: smoke.index("plan --config")]
+        self.assertIn("SMOKE_NETWORK=${CI_BURST_SMOKE_NETWORK:-ci-burst}", self.script)
+        smoke = self.script[self.script.index("set -- run --rm") :]
+        smoke = smoke[: smoke.index("done\n")]
         self.assertNotIn("--network=host", smoke)
-        self.assertIn("--network ci-burst", smoke)
+        self.assertIn('--network "$SMOKE_NETWORK"', smoke)
 
     def test_smoke_tests_the_candidate_before_promoting_it(self):
-        smoke = self.script.index("plan --config")
+        smoke = self.script.index('"$SMOKE_COMMAND" --config')
         self.assertLess(self.script.index("podman build"), smoke)
         self.assertLess(smoke, self.script.index('"$IMAGE:latest"'))
         # A completed decision is required, not "any document": a config refusal
         # is exit 2 and must fail the smoke.
         self.assertIn('if [ "$attempt" -ge 2 ]', self.script)
-        self.assertIn('document.get("decision") not in ("wait", "would_launch")', self.script)
+        self.assertIn('document.get("decision") not in accepted', self.script)
         self.assertIn("--name ci-burst-refresh-smoke", self.script)
 
     def test_retries_the_smoke_once_and_only_once(self):
@@ -214,11 +215,45 @@ class RefreshTests(unittest.TestCase):
         self.assertIn('"$IMAGE:previous"', self.script)
         self.assertIn("deployed-sha", self.script)
 
+    def test_the_smoke_command_is_the_hosts_role_and_never_guessed(self):
+        self.assertIn("SMOKE_COMMAND=${CI_BURST_SMOKE_COMMAND:-plan}", self.script)
+        self.assertIn('plan) ACCEPTED_DECISIONS="wait would_launch"', self.script)
+        self.assertIn('reap) ACCEPTED_DECISIONS="planned"', self.script)
+        # An unknown command must refuse: guessing an accepted set for it is how
+        # a role mismatch would promote an image that cannot do its job.
+        self.assertIn("smoke_command_invalid", self.script)
+        self.assertIn("did not print an accepted $SMOKE_COMMAND decision", self.script)
+
+    def test_a_cleanup_host_needs_no_forgejo_token(self):
+        # The reaper is deliberately outside the Forgejo credential boundary, so
+        # the smoke must drop --env-file rather than require a file that host must
+        # not have.
+        self.assertIn('[ -n "$TOKEN_ENV" ] && [ -f "$TOKEN_ENV" ]', self.script)
+        self.assertIn('--env-file "$TOKEN_ENV"', self.script)
+
+    def test_a_cleanup_only_host_has_a_versioned_drop_in(self):
+        # A systemd drop-in may repeat Environment=, so the text is read as-is;
+        # an INI parser would keep only the last one.
+        drop_in = (DEPLOY / "ci-burst-refresh-cleanup.conf").read_text(encoding="utf-8")
+        for assignment in (
+            "Environment=CI_BURST_SMOKE_COMMAND=reap",
+            "Environment=CI_BURST_AWS_DIR=/etc/ci-burst/aws-cleanup",
+            "Environment=CI_BURST_SMOKE_NETWORK=host",
+            "Environment=CI_BURST_TOKEN_ENV=",
+            "Environment=CI_BURST_UNITS=ci-burst-reap.service ci-burst-reap.timer",
+        ):
+            with self.subTest(assignment=assignment):
+                self.assertIn(assignment, drop_in)
+        container = (ROOT / "docs" / "container.md").read_text(encoding="utf-8")
+        self.assertIn("ci-burst-refresh-cleanup.conf", container)
+        self.assertIn("CI_BURST_UNITS", container)
+
     def test_compares_the_scaler_units_and_schedules_nothing(self):
         units_line = next(
             line for line in self.script.splitlines() if line.startswith("UNITS=")
         )
         self.assertNotIn("reap", units_line)
+        self.assertIn("CI_BURST_UNITS", units_line)
         self.assertIn("cmp -s", self.script)
         self.assertIn("units_drift", self.script)
         # The refresh loop reports drift; it never installs, reloads or restarts.
@@ -270,7 +305,7 @@ class RefreshBehaviourTests(unittest.TestCase):
         self._fake(
             "podman",
             'case "$*" in\n'
-            '  "run "*" plan --config "*) printf "%s" "$CI_BURST_TEST_SMOKE"\n'
+            '  "run "*" --config "*) printf "%s" "$CI_BURST_TEST_SMOKE"\n'
             '    if [ -n "${CI_BURST_TEST_SMOKE_SEQUENCE:-}" ]; then\n'
             '      n=$(( $(cat "$CI_BURST_TEST_SMOKE_SEQUENCE.count" 2>/dev/null || echo 0) + 1 ))\n'
             '      printf "%s" "$n" > "$CI_BURST_TEST_SMOKE_SEQUENCE.count"\n'
@@ -353,6 +388,38 @@ class RefreshBehaviourTests(unittest.TestCase):
     def test_a_non_object_document_never_promotes(self):
         completed = self.run_script(smoke='["decision"]')
         self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_a_cleanup_host_smoke_runs_reap_without_apply_and_promotes(self):
+        completed = self.run_script(
+            smoke='{"decision": "planned"}',
+            CI_BURST_SMOKE_COMMAND="reap",
+            CI_BURST_TOKEN_ENV="",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertIn("reap --config", calls)
+        self.assertNotIn("plan --config", calls)
+        self.assertNotIn("--apply", calls)
+        # The reaper host must not need a Forgejo token file.
+        self.assertNotIn("--env-file", calls)
+        self.assertTrue((self.state / "deployed-sha").exists())
+
+    def test_a_cleanup_host_refuses_a_plan_decision(self):
+        # The per-role accepted set is what stops a wrong-command smoke from
+        # promoting: `wait` is a plan decision and cannot prove a reaper image.
+        completed = self.run_script(
+            smoke='{"decision": "wait"}',
+            CI_BURST_SMOKE_COMMAND="reap",
+            CI_BURST_TOKEN_ENV="",
+        )
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_an_unknown_smoke_command_refuses_before_building(self):
+        completed = self.run_script(CI_BURST_SMOKE_COMMAND="status")
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("build", self.calls.read_text(encoding="utf-8"))
         self.assertFalse((self.state / "deployed-sha").exists())
 
     def test_an_inspection_failure_never_moves_latest(self):

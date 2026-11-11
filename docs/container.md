@@ -336,6 +336,37 @@ The script defaults to `/opt/ci-burst-src`, `/var/lib/ci-burst-image`,
 `/etc/ci-burst/deployment.toml`, `/etc/ci-burst/aws-scaling` and
 `/etc/ci-burst/forgejo.env`; `CI_BURST_SOURCE`, `CI_BURST_IMAGE_STATE`,
 `CI_BURST_CONFIG`, `CI_BURST_AWS_DIR` and `CI_BURST_TOKEN_ENV` override them.
+`CI_BURST_SMOKE_COMMAND` (default `plan`), `CI_BURST_SMOKE_NETWORK` (default
+`ci-burst`) and `CI_BURST_UNITS` adapt the smoke and the drift list to a host
+whose role is cleanup-only.
+
+A cleanup-only host runs the same unit and script with a drop-in, because its
+scheduled operation is `reap` rather than `apply`:
+
+```sh
+# cleanup host
+git clone https://github.com/mikomiel/ci-burst.git /opt/ci-burst-src
+install -d -m 0700 /var/lib/ci-burst-image
+install -m 0755 deploy/ci-burst-refresh.sh /usr/local/sbin/ci-burst-refresh
+install -m 0644 \
+  deploy/ci-burst-refresh.service deploy/ci-burst-refresh.timer \
+  /etc/systemd/system/
+install -d -m 0755 /etc/systemd/system/ci-burst-refresh.service.d
+install -m 0644 deploy/ci-burst-refresh-cleanup.conf \
+  /etc/systemd/system/ci-burst-refresh.service.d/cleanup.conf
+systemctl daemon-reload
+systemctl enable --now ci-burst-refresh.timer
+systemctl list-timers 'ci-burst-*'
+```
+
+The drop-in is what makes the same unit safe on both hosts: the smoke runs
+`reap` without `--apply` (it reads this host's configuration, reaches the cleanup
+identity and selects nothing to terminate), the cleanup credentials mount where
+the scaling credentials mount on the controller host, the Forgejo token path is
+emptied so no `--env-file` is passed, host networking matches the reap unit, and
+the drift report compares that host's own units. The accepted decision there is
+`planned`; `wait` or `would_launch` would mean the smoke ran the wrong command
+and is refused.
 
 What a promotion does and does not do:
 
@@ -354,7 +385,14 @@ What a promotion does and does not do:
   installing scheduler units unattended needs atomic generations, rollback
   pairing and admission control — a transaction whose failure modes cost more
   than the rare manual step it would remove. The report exists so the
-  difference never grows silently;
+  difference never grows silently. `CI_BURST_UNITS` narrows the comparison to the
+  units a host actually runs, so a cleanup-only host does not report the
+  controller's units as missing on every run;
+- the smoke proves the role the host actually runs: `plan` on a controller host,
+  `reap` without `--apply` on a cleanup-only host. A candidate that cannot read
+  this host's configuration or reach this host's own identity never becomes
+  `latest`, which is what stops a stale image from silently disabling expiry
+  cleanup after a configuration change;
 - it publishes nothing: no registry, no git tag, no release, no announcement. A
   merge deploys the controller; [CONTRIBUTING.md](../CONTRIBUTING.md) § Releases
   owns the release boundary, and a merge is still neither a release nor a

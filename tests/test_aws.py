@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ci_burst.aws import Aws, _definite_launch_error, _instances, _spot_quote
+from ci_burst.aws import Aws, _definite_launch_error, _instances, _spot_quote, is_capacity_failure
 from ci_burst.config import load
 from ci_burst.errors import ProviderRefusal
 
@@ -90,6 +90,16 @@ class ErrorClassificationTests(unittest.TestCase):
             self.assertTrue(_definite_launch_error(code), code)
         for code in ("InternalError", "Throttling", "RequestLimitExceeded", "ServiceUnavailable", "Unknown"):
             self.assertFalse(_definite_launch_error(code), code)
+
+    def test_an_account_spot_limit_is_definite_but_not_placement_capacity(self):
+        # An exhausted account-wide Spot limit is a pre-flight refusal: nothing
+        # was created, so the admission may decide again on the next run. It is
+        # not proof that this candidate's zone had no capacity, so it must not
+        # advance to another candidate.
+        code = "MaxSpotInstanceCountExceeded"
+        self.assertTrue(_definite_launch_error(code))
+        self.assertFalse(is_capacity_failure(ProviderRefusal("AWS_REFUSED", code)))
+        self.assertTrue(is_capacity_failure(ProviderRefusal("AWS_REFUSED", "InsufficientInstanceCapacity")))
 
 
 class InstanceParsingTests(unittest.TestCase):

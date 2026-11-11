@@ -72,9 +72,12 @@ Nothing clamps MSS on such a path, so the container's own limit has to match it.
 the measured value when it is lower than 1500, and omit `--opt mtu` only when
 the path carries the default 1500.
 
-Do not work around it with `--network=host`: the units keep their own network
-namespace, so the loopback warning below stays true and a loopback address in
-the deployment TOML still names the container, not the Forgejo server.
+Do not work around it with `--network=host` for a controller unit: the units keep
+their own network namespace, so the loopback warning below stays true and a
+loopback address in the deployment TOML still names the container, not the
+Forgejo server. The one legitimate exception is the cleanup host, where `reap`
+talks only to AWS and the host's podman networking has no egress; that host
+installs `deploy/ci-burst-reap-host-network.conf` and nothing else changes.
 
 ## Build the image
 
@@ -336,6 +339,51 @@ The script defaults to `/opt/ci-burst-src`, `/var/lib/ci-burst-image`,
 `/etc/ci-burst/deployment.toml`, `/etc/ci-burst/aws-scaling` and
 `/etc/ci-burst/forgejo.env`; `CI_BURST_SOURCE`, `CI_BURST_IMAGE_STATE`,
 `CI_BURST_CONFIG`, `CI_BURST_AWS_DIR` and `CI_BURST_TOKEN_ENV` override them.
+`CI_BURST_SMOKE_COMMAND` (default `plan`), `CI_BURST_SMOKE_NETWORK` (default
+`ci-burst`) and `CI_BURST_UNITS` adapt the smoke and the drift list to a host
+whose role is cleanup-only.
+
+A cleanup-only host runs the same unit and script with a drop-in, because its
+scheduled operation is `reap` rather than `apply`:
+
+```sh
+# cleanup host
+git clone https://github.com/mikomiel/ci-burst.git /opt/ci-burst-src
+install -d -m 0700 /var/lib/ci-burst-image
+install -m 0755 deploy/ci-burst-refresh.sh /usr/local/sbin/ci-burst-refresh
+install -m 0644 \
+  deploy/ci-burst-refresh.service deploy/ci-burst-refresh.timer \
+  /etc/systemd/system/
+install -d -m 0755 /etc/systemd/system/ci-burst-refresh.service.d
+install -m 0644 deploy/ci-burst-refresh-cleanup.conf \
+  /etc/systemd/system/ci-burst-refresh.service.d/cleanup.conf
+systemctl daemon-reload
+systemctl enable --now ci-burst-refresh.timer
+systemctl list-timers 'ci-burst-*'
+```
+
+If the host cannot use podman's named network, install
+`deploy/ci-burst-reap-host-network.conf` beside the reap unit at the same time and
+keep `CI_BURST_SMOKE_NETWORK=host` in the refresh drop-in; see the networking
+paragraph below. Without that drop-in, remove the line so the smoke uses the
+shipped unit's network.
+
+The drop-in is what makes the same unit safe on both hosts: the smoke runs
+`reap` without `--apply` (it reads this host's configuration, reaches the cleanup
+identity and selects expired instances without requesting their termination — a
+dry run may list them), the cleanup credentials mount where the scaling
+credentials mount on the controller host, the Forgejo token path is emptied so no
+`--env-file` is passed, and the drift report compares that host's own units. The
+accepted decision there is `planned`; `wait` or `would_launch` would mean the
+smoke ran the wrong command and is refused.
+
+**The smoke network must match the installed reap unit.** A host that keeps the
+shipped `ci-burst-reap.service` keeps the script's default (`ci-burst`) and must
+not carry the `CI_BURST_SMOKE_NETWORK=host` line. A host whose podman networking
+has no egress installs `deploy/ci-burst-reap-host-network.conf`, which moves the
+scheduled unit to host networking; the same host sets `host` for the smoke. A
+mismatch promotes an image the scheduled unit cannot run, which is the failure
+this gate exists to catch.
 
 What a promotion does and does not do:
 
@@ -354,7 +402,14 @@ What a promotion does and does not do:
   installing scheduler units unattended needs atomic generations, rollback
   pairing and admission control — a transaction whose failure modes cost more
   than the rare manual step it would remove. The report exists so the
-  difference never grows silently;
+  difference never grows silently. `CI_BURST_UNITS` narrows the comparison to the
+  units a host actually runs, so a cleanup-only host does not report the
+  controller's units as missing on every run;
+- the smoke proves the role the host actually runs: `plan` on a controller host,
+  `reap` without `--apply` on a cleanup-only host. A candidate that cannot read
+  this host's configuration or reach this host's own identity never becomes
+  `latest`, which is what stops a stale image from silently disabling expiry
+  cleanup after a configuration change;
 - it publishes nothing: no registry, no git tag, no release, no announcement. A
   merge deploys the controller; [CONTRIBUTING.md](../CONTRIBUTING.md) § Releases
   owns the release boundary, and a merge is still neither a release nor a
@@ -366,8 +421,10 @@ What a promotion does and does not do:
 - the build runs with host networking (`podman build --network=host`). The base
   image and the package install are large transfers too, and a bridge whose MTU
   is above the host's path MTU stalls them the same way it stalls the
-  controller's own responses. The smoke run uses the same `ci-burst` network as
-  the scheduled units, so the gate exercises exactly the networking they use;
+  controller's own responses. The smoke run uses the same network as the
+  scheduled unit on that host — the named `ci-burst` network by default, or host
+  networking where the reap unit needs the versioned override — so the gate
+  exercises exactly the networking that unit uses;
 - a fetch, archive, build or smoke failure keeps the previous image in place and
   logs one line with a reason code (`fetch_failed`, `archive_failed`,
   `unpack_failed`, `build_failed`, `smoke_failed`, `tag_failed`,
@@ -376,13 +433,16 @@ What a promotion does and does not do:
   `units_current`) in `journalctl -u ci-burst-refresh.service`. Only a confirmed absent
   `localhost/ci-burst:latest` (podman's "absent" status) may skip the rollback
   handle; a failed inspection or a storage error fails the run instead;
-- the smoke run is a `plan` execution from the candidate against this host's own
-  configuration and scaling credentials. It writes nothing and launches nothing.
-  It must **complete with a decision** — a `wait` or `would_launch` plan result —
-  because a refusal document means the candidate cannot read this host's
-  configuration, which is exactly what the next scheduled `apply` would hit. A
-  new plan decision is rejected until the script's accepted set is extended
-  deliberately. The document is validated with the host's `python3`, which the
+- the smoke run is one execution of the command this host's scheduled unit runs,
+  from the candidate, against this host's own configuration and its own
+  credentials: `plan` on a controller host (it writes nothing and launches
+  nothing), `reap` without `--apply` on a cleanup-only host (it selects expired
+  instances but requests no termination). It must **complete with a decision from
+  the accepted set for that command** — `wait` or `would_launch` for `plan`,
+  `planned` for `reap` — because a refusal document means the candidate cannot
+  read this host's configuration, which is exactly what the next scheduled run
+  would hit. A new decision is rejected until the script's accepted set is
+  extended deliberately. The document is validated with the host's `python3`, which the
   lifecycle test below already requires. One transient failure retries the run
   once after 20 seconds (`CI_BURST_SMOKE_RETRY_SECONDS`), because an unreachable
   Forgejo or AWS is not evidence about the image; a second failure keeps the
@@ -415,8 +475,10 @@ back after it, not against it.
 
 The script is installed by hand from the checkout, so a change to the script
 needs that install step repeated; a change to the controller does not. The
-cleanup host runs no refresh timer: it needs the same image, and it is the
-scaler's job to prove a candidate starts before another host is pointed at it.
+cleanup host runs the same unit with the drop-in above, so it keeps the image
+current without a human copying one across. Its smoke is its own: a candidate
+that cannot read that host's configuration or reach the cleanup identity is never
+promoted there, even when the controller host promoted it.
 
 ### Verify the container cleanup
 

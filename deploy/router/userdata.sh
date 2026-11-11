@@ -95,19 +95,24 @@ cat > "${FORWARD}" <<'FORWARD'
 # Re-apply the ci-burst router rules for every configured worker CIDR.
 # Idempotent: an existing rule is detected with -C before -A.
 set -euo pipefail
-CIDR_FILE=/etc/ci-burst-router/worker-cidrs
+CIDR_FILE="${CI_BURST_ROUTER_CIDR_FILE:-/etc/ci-burst-router/worker-cidrs}"
 IFACE=$(ip route show default | awk '{print $5; exit}')
 [ -n "${IFACE}" ] || { echo "no default interface" >&2; exit 1; }
 sysctl -q -w net.ipv4.ip_forward=1
-ensure() { iptables -C "$@" 2>/dev/null || iptables -A "$@"; }
-ensure FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# -C and -A take the chain immediately, so the table selector comes first.
+ensure_rule() {
+  local table="$1"
+  shift
+  iptables -t "${table}" -C "$@" 2>/dev/null || iptables -t "${table}" -A "$@"
+}
+ensure_rule filter FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 while read -r cidr; do
   [ -n "${cidr}" ] || continue
-  ensure -t nat POSTROUTING -s "${cidr}" -o "${IFACE}" -j MASQUERADE
-  ensure FORWARD -s "${cidr}" -o "${IFACE}" -j ACCEPT
+  ensure_rule nat POSTROUTING -s "${cidr}" -o "${IFACE}" -j MASQUERADE
+  ensure_rule filter FORWARD -s "${cidr}" -o "${IFACE}" -j ACCEPT
   if ip link show wg0 >/dev/null 2>&1; then
-    ensure -t nat POSTROUTING -s "${cidr}" -o wg0 -j MASQUERADE
-    ensure FORWARD -s "${cidr}" -o wg0 -j ACCEPT
+    ensure_rule nat POSTROUTING -s "${cidr}" -o wg0 -j MASQUERADE
+    ensure_rule filter FORWARD -s "${cidr}" -o wg0 -j ACCEPT
   fi
 done < "${CIDR_FILE}"
 iptables -t nat -S POSTROUTING

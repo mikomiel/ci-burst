@@ -417,6 +417,36 @@ def replace_unreleased(text, section):
     return "\n".join(updated).rstrip("\n") + "\n"
 
 
+def unreleased_is_current(text, section):
+    """True when the committed Unreleased region already equals ``section``.
+
+    The region is compared exactly, not through :func:`unreleased_section`,
+    which trims blank lines before the next heading and repairs a missing final
+    newline. It runs from the ``## [Unreleased]`` heading to the next level-two
+    heading, or to the end of the file, and :func:`replace_unreleased` always
+    separates it from that heading with exactly one blank line. A surplus blank
+    line or a missing final newline is therefore drift, not formatting that can
+    be normalised away.
+    """
+    lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    start = next(
+        (index for index, line in enumerate(lines) if line.rstrip("\r\n") == UNRELEASED),
+        None,
+    )
+    if start is None:
+        return False
+    end = next(
+        (index for index in range(start + 1, len(lines)) if _H2.match(lines[index])),
+        None,
+    )
+    if end is None:
+        return text[offsets[start]:] == section
+    return text[offsets[start]:offsets[end]] == section + "\n"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     actions = parser.add_mutually_exclusive_group()
@@ -465,7 +495,7 @@ def main(argv=None):
         return 1
     section = render_unreleased(merged_subjects(since=boundary))
     if args.check:
-        if unreleased_section(text) == section:
+        if unreleased_is_current(text, section):
             print("changelog is up to date")
             return 0
         sys.stdout.write(section)

@@ -295,6 +295,10 @@ class ReleaseBoundaryTests(unittest.TestCase):
             "# Changelog\n\n## [Unreleased]\n\n"
             "## [0.1.0] - 2026-11-09\n\n### Added\n\n- Add the controller.\n"
         )
+        expected = (
+            "## [Unreleased]\n\n### Fixed\n\n"
+            "- Correct the quote timeout ([#9](https://github.com/mikomiel/ci-burst/pull/9)).\n"
+        )
         self.commit("feat: add the controller (#4)")
         (self.root / "CHANGELOG.md").write_text(released, encoding="utf-8")
         self.add_renderer()
@@ -305,13 +309,70 @@ class ReleaseBoundaryTests(unittest.TestCase):
 
         completed = self.run_check(self.root)
         self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
-        self.assertIn("- Correct the quote timeout", completed.stdout)
-        self.assertNotIn("controller", completed.stdout)
+        self.assertEqual(completed.stdout, expected)
         self.assertIn("stale", completed.stderr)
         self.assertIn("python3 scripts/render_changelog.py --write", completed.stderr)
         self.assertEqual(
             (self.root / "CHANGELOG.md").read_text(encoding="utf-8"), released
         )
+
+    def test_check_reports_surplus_blank_lines_before_the_next_heading(self):
+        released = (
+            "# Changelog\n\n## [Unreleased]\n\n"
+            "## [0.1.0] - 2026-11-09\n\n### Added\n\n- Add the controller.\n"
+        )
+        section = (
+            "## [Unreleased]\n\n### Fixed\n\n"
+            "- Correct the quote timeout ([#9](https://github.com/mikomiel/ci-burst/pull/9)).\n"
+        )
+        # One blank line is the canonical separator; a second one is drift that
+        # `unreleased_section` would trim, so the comparison must see it.
+        drifted = (
+            "# Changelog\n\n"
+            + section
+            + "\n\n## [0.1.0] - 2026-11-09\n\n### Added\n\n- Add the controller.\n"
+        )
+        self.commit("feat: add the controller (#4)")
+        (self.root / "CHANGELOG.md").write_text(released, encoding="utf-8")
+        self.add_renderer()
+        self.git("add", "CHANGELOG.md", "scripts/render_changelog.py")
+        self.git("commit", "-q", "-m", "chore(release): prepare the 0.1.0 section")
+        self.git("tag", "-a", "v0.1.0", "-m", "v0.1.0")
+        self.commit("fix: correct the quote timeout (#9)", "fix.txt")
+        (self.root / "CHANGELOG.md").write_text(drifted, encoding="utf-8")
+
+        completed = self.run_check(self.root)
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertEqual(completed.stdout, section)
+        self.assertNotIn("up to date", completed.stdout)
+        self.assertIn("python3 scripts/render_changelog.py --write", completed.stderr)
+        self.assertEqual(
+            (self.root / "CHANGELOG.md").read_text(encoding="utf-8"), drifted
+        )
+
+    def test_check_reports_a_missing_final_newline(self):
+        section = "## [Unreleased]\n\n### Added\n\n- Add the controller.\n"
+        text = "# Changelog\n\n" + section.rstrip("\n")
+        self.commit("feat: add the controller")
+        (self.root / "CHANGELOG.md").write_text(text, encoding="utf-8")
+        self.add_renderer()
+
+        completed = self.run_check(self.root)
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertEqual(completed.stdout, section)
+        self.assertNotIn("up to date", completed.stdout)
+        self.assertIn("python3 scripts/render_changelog.py --write", completed.stderr)
+        self.assertEqual(
+            (self.root / "CHANGELOG.md").read_text(encoding="utf-8"), text
+        )
+
+        # `--write` repairs solely the final newline, and the check agrees again.
+        self.assertEqual(self.run_write(self.root).returncode, 0)
+        self.assertTrue(
+            (self.root / "CHANGELOG.md").read_text(encoding="utf-8").endswith("\n")
+        )
+        self.assertEqual(self.run_check(self.root).returncode, 0)
+
 
     def test_check_accepts_an_up_to_date_section(self):
         section = (

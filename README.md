@@ -46,7 +46,8 @@ identities, hosts, configuration, scheduling and live qualification. The
 [pilot checklist](docs/pilot-checklist.md) is a preparation record, not
 authorization. Running the controller from a container beside Forgejo, driven
 by systemd timers, is described in [docs/container.md](docs/container.md); the
-image is built locally and none is published.
+image is built locally and none is published. A worker subnet with no internet
+path of its own needs the optional in-VPC router in [docs/router.md](docs/router.md).
 
 ## Project stage
 

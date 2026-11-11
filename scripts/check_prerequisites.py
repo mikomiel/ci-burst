@@ -9,6 +9,12 @@ launch fails. It also compares the pinned template version's user data with
 version, so a repository edit that was never published is drift rather than a
 silent no-op.
 
+When a candidate's default route targets a network interface, that router is
+part of the deployment too: the command checks that it is running and that its
+boot configuration forwards the candidate's CIDR. It cannot prove reachability
+— a real registration does that — and an unreadable router configuration is
+reported as unavailable rather than as a pass.
+
 The command only reads: it never mutates a resource, never reads a parameter
 value (not even a ciphertext), and never stores one. The template is read
 through the controller's own adapter, so its refusals and the reported image,
@@ -24,7 +30,9 @@ reported as ``unavailable``; it is not drift and not a pass.
 import argparse
 import base64
 import binascii
+import ipaddress
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -275,6 +283,29 @@ def _route_target(route):
     return None
 
 
+def _route_target_kind(route):
+    """Return the route target's field name, so a caller can tell an ENI from a gateway."""
+    for key in _ROUTE_TARGETS:
+        value = route.get(key)
+        if isinstance(value, str) and value:
+            return key
+    return None
+
+
+_CIDR = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}\b")
+
+
+def _cidrs(value):
+    """Return every valid IPv4 network literal in ``value``, normalised."""
+    networks = set()
+    for match in _CIDR.findall(value):
+        try:
+            networks.add(str(ipaddress.ip_network(match, strict=False)))
+        except ValueError:
+            continue
+    return networks
+
+
 def _default_routes(route_tables):
     """Return every default route, marking a blackholed destination."""
     routes = []
@@ -289,6 +320,7 @@ def _default_routes(route_tables):
                 {
                     "destination": destination,
                     "target": _route_target(route),
+                    "target_kind": _route_target_kind(route),
                     "active": route.get("State", "active") != "blackhole",
                 }
             )
@@ -530,7 +562,10 @@ class Prerequisites:
             if subnet_check is not None:
                 checks.append(subnet_check)
                 continue
-            checks.append(self._route_tables(candidate, placement_facts))
+            route_check, egress = self._route_tables(candidate, placement_facts)
+            checks.append(route_check)
+            if egress is not None:
+                checks.append(self._router(candidate, placement_facts, egress))
 
     def _subnet(self, candidate):
         """Return ``(record, None)`` on failure or ``(None, facts)`` on success."""
@@ -560,6 +595,8 @@ class Prerequisites:
             "vpc_id": subnet.get("VpcId"),
             "subnet_zone": subnet.get("AvailabilityZone"),
             "subnet_state": subnet.get("State"),
+            "subnet_cidr": subnet.get("CidrBlock"),
+            "map_public_ip_on_launch": subnet.get("MapPublicIpOnLaunch"),
         }
         reasons = []
         if subnet.get("AvailabilityZone") != candidate.availability_zone:
@@ -594,25 +631,147 @@ class Prerequisites:
                 )
                 tables = response.get("RouteTables") or []
         except ProviderCallError as error:
-            return _record(
-                "placement",
-                target,
-                status="unavailable",
-                facts=facts,
-                reasons=["route_table_read_unavailable"],
-                detail=error.code,
+            return (
+                _record(
+                    "placement",
+                    target,
+                    status="unavailable",
+                    facts=facts,
+                    reasons=["route_table_read_unavailable"],
+                    detail=error.code,
+                ),
+                None,
             )
         if not tables:
-            return _record("placement", target, status="drift", facts=facts, reasons=["route_table_missing"])
+            return _record("placement", target, status="drift", facts=facts, reasons=["route_table_missing"]), None
         facts["route_table_ids"] = [table.get("RouteTableId") for table in tables if table.get("RouteTableId")]
         routes = _default_routes(tables)
         active = [route for route in routes if route["active"] and route["target"]]
         if active:
-            facts["egress_route"] = {"destination": active[0]["destination"], "target": active[0]["target"]}
-            return _record("placement", target, facts=facts)
+            facts["egress_route"] = {
+                "destination": active[0]["destination"],
+                "target": active[0]["target"],
+                "target_kind": active[0]["target_kind"],
+            }
+            return _record("placement", target, facts=facts), active[0]
         if routes:
-            return _record("placement", target, status="drift", facts=facts, reasons=["egress_route_blackhole"])
-        return _record("placement", target, status="drift", facts=facts, reasons=["egress_route_missing"])
+            return (
+                _record("placement", target, status="drift", facts=facts, reasons=["egress_route_blackhole"]),
+                None,
+            )
+        return _record("placement", target, status="drift", facts=facts, reasons=["egress_route_missing"]), None
+
+    def _router(self, candidate, facts, egress):
+        """Check the instance that carries the candidate's egress.
+
+        A managed gateway is outside this contract and is reported as a fact. A
+        network-interface or instance target is resolved to its instance: the
+        instance must be running, and its boot configuration must mention the
+        candidate's subnet CIDR. That is the only pre-launch evidence available
+        for a hand-built router; the canary in docs/router.md is the real proof.
+        """
+        target = egress["target"]
+        kind = egress.get("target_kind")
+        subnet_cidr = facts.get("subnet_cidr")
+        if kind not in ("NetworkInterfaceId", "InstanceId"):
+            return _record(
+                "router",
+                target,
+                facts={"target_kind": kind, "subnet_cidr": subnet_cidr},
+            )
+        instance_id = target if kind == "InstanceId" else None
+        source_dest_check = None
+        try:
+            if instance_id is None:
+                response = _call(
+                    self._clients.ec2, "describe_network_interfaces", NetworkInterfaceIds=[target]
+                )
+                interfaces = response.get("NetworkInterfaces") or []
+                if not interfaces:
+                    return _record(
+                        "router", target, status="unavailable", reasons=["router_target_unresolved"]
+                    )
+                interface = interfaces[0]
+                source_dest_check = interface.get("SourceDestCheck")
+                instance_id = (interface.get("Attachment") or {}).get("InstanceId")
+                if not instance_id:
+                    return _record(
+                        "router",
+                        target,
+                        status="unavailable",
+                        facts={"source_dest_check": source_dest_check, "subnet_cidr": subnet_cidr},
+                        reasons=["router_target_unresolved"],
+                    )
+            instance_response = _call(self._clients.ec2, "describe_instances", InstanceIds=[instance_id])
+        except ProviderCallError as error:
+            return _record(
+                "router", target, status="unavailable", reasons=["router_read_unavailable"], detail=error.code
+            )
+        instance = next(
+            (
+                entry
+                for reservation in instance_response.get("Reservations") or []
+                for entry in reservation.get("Instances") or []
+                if entry.get("InstanceId") == instance_id
+            ),
+            None,
+        )
+        state = ((instance or {}).get("State") or {}).get("Name")
+        record_facts = {
+            "instance_id": instance_id,
+            "instance_state": state,
+            "source_dest_check": source_dest_check,
+            "subnet_cidr": subnet_cidr,
+        }
+        if state != "running":
+            return _record(
+                "router", target, status="drift", facts=record_facts, reasons=["router_target_not_running"]
+            )
+        try:
+            attribute = _call(
+                self._clients.ec2,
+                "describe_instance_attribute",
+                InstanceId=instance_id,
+                Attribute="userData",
+            )
+        except ProviderCallError as error:
+            return _record(
+                "router",
+                target,
+                status="unavailable",
+                facts=record_facts,
+                reasons=["router_user_data_unavailable"],
+                detail=error.code,
+            )
+        encoded = ((attribute.get("UserData") or {}).get("Value") or "").strip()
+        if not encoded:
+            return _record(
+                "router",
+                target,
+                status="unavailable",
+                facts=record_facts,
+                reasons=["router_user_data_unavailable"],
+                detail="no user data",
+            )
+        try:
+            decoded = base64.b64decode(encoded, validate=True).decode("utf-8", "replace")
+        except (binascii.Error, ValueError):
+            return _record(
+                "router",
+                target,
+                status="unavailable",
+                facts=record_facts,
+                reasons=["router_user_data_unavailable"],
+                detail="invalid base64",
+            )
+        forwarded = _cidrs(decoded)
+        record_facts["forwarded_cidrs"] = sorted(forwarded)
+        reasons = []
+        if subnet_cidr and subnet_cidr not in forwarded:
+            reasons.append("router_forwarding_missing_cidr")
+        return _record(
+            "router", target, status="drift" if reasons else "pass", facts=record_facts, reasons=reasons
+        )
 
     @staticmethod
     def _candidate_target(candidate):

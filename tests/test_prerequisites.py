@@ -31,6 +31,9 @@ PROFILE = "example-runner-profile"
 ROLE = "example-runner-role"
 PROFILE_ARN = "arn:aws:iam::000000000000:instance-profile/workers/example-runner"
 SUBNET_ID = "subnet-0123456789abcdef0"
+SUBNET_CIDR = "192.0.2.0/24"
+ROUTER_ENI_ID = "eni-0123456789abcdef0"
+ROUTER_INSTANCE_ID = "i-0123456789abcdef0"
 SG_ID = "sg-0123456789abcdef0"
 VPC_ID = "vpc-0123456789abcdef0"
 ROUTE_TABLE_ID = "rtb-0123456789abcdef0"
@@ -65,6 +68,8 @@ def subnet_data(**overrides):
         "AvailabilityZone": "eu-central-1a",
         "VpcId": VPC_ID,
         "State": "available",
+        "CidrBlock": SUBNET_CIDR,
+        "MapPublicIpOnLaunch": False,
     }
     values.update(overrides)
     return values
@@ -83,10 +88,39 @@ def route_table_data(**overrides):
     return values
 
 
+def router_user_data(cidrs=(SUBNET_CIDR,), extra=""):
+    """Base64 user data shaped like deploy/router/userdata.sh applies its rules."""
+    lines = ["#!/bin/bash", "set -euo pipefail"]
+    for cidr in cidrs:
+        lines.append(f"iptables -t nat -A POSTROUTING -s {cidr} -o eth0 -j MASQUERADE")
+        lines.append(f"iptables -A FORWARD -s {cidr} -o eth0 -j ACCEPT")
+    lines.append(extra)
+    return base64.b64encode(("\n".join(lines) + "\n").encode()).decode("ascii")
+
+
+def interface_data(**overrides):
+    values = {
+        "NetworkInterfaceId": ROUTER_ENI_ID,
+        "Attachment": {"InstanceId": ROUTER_INSTANCE_ID},
+        "SourceDestCheck": False,
+    }
+    values.update(overrides)
+    return values
+
+
+def instance_data(**overrides):
+    values = {"InstanceId": ROUTER_INSTANCE_ID, "State": {"Name": "running"}}
+    values.update(overrides)
+    return values
+
+
 class FakeEc2:
     def __init__(self):
         self.templates = {}
         self.subnets = {}
+        self.interfaces = {}
+        self.instances = {}
+        self.user_data = {}
         self.route_tables = []
         self.security_groups = {}
         self.security_group_names = {}
@@ -152,6 +186,35 @@ class FakeEc2:
                 and any(association.get("Main") for association in table.get("Associations") or [])
             ]
         }
+
+    def describe_network_interfaces(self, **kwargs):
+        self.calls.append(("describe_network_interfaces", kwargs))
+        self._maybe_raise("describe_network_interfaces")
+        interfaces = []
+        for interface_id in kwargs["NetworkInterfaceIds"]:
+            if interface_id not in self.interfaces:
+                raise ClientError("InvalidNetworkInterfaceID.NotFound")
+            interfaces.append(copy.deepcopy(self.interfaces[interface_id]))
+        return {"NetworkInterfaces": interfaces}
+
+    def describe_instances(self, **kwargs):
+        self.calls.append(("describe_instances", kwargs))
+        self._maybe_raise("describe_instances")
+        instances = []
+        for instance_id in kwargs["InstanceIds"]:
+            if instance_id not in self.instances:
+                raise ClientError("InvalidInstanceID.NotFound")
+            instances.append(copy.deepcopy(self.instances[instance_id]))
+        return {"Reservations": [{"Instances": instances}]}
+
+    def describe_instance_attribute(self, **kwargs):
+        self.calls.append(("describe_instance_attribute", kwargs))
+        self._maybe_raise("describe_instance_attribute")
+        instance_id = kwargs["InstanceId"]
+        if instance_id not in self.instances:
+            raise ClientError("InvalidInstanceID.NotFound")
+        value = self.user_data.get(instance_id)
+        return {"UserData": {"Value": value}} if value else {"UserData": {}}
 
     def describe_security_groups(self, **kwargs):
         self.calls.append(("describe_security_groups", kwargs))
@@ -314,6 +377,25 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertIn(reason, result["unavailable"])
         self.assertNotIn(reason, result["reasons"])
         self.assertEqual(prerequisites._exit_code(result["decision"]), 3)
+
+    def use_router(self, *, cidrs=(SUBNET_CIDR,), state="running", user_data=None):
+        """Point the candidate's default route at a router instance."""
+        self.ec2.route_tables = [
+            route_table_data(
+                Routes=[
+                    {
+                        "DestinationCidrBlock": "0.0.0.0/0",
+                        "NetworkInterfaceId": ROUTER_ENI_ID,
+                        "State": "active",
+                    }
+                ]
+            )
+        ]
+        self.ec2.interfaces[ROUTER_ENI_ID] = interface_data()
+        self.ec2.instances[ROUTER_INSTANCE_ID] = instance_data(State={"Name": state})
+        self.ec2.user_data[ROUTER_INSTANCE_ID] = (
+            router_user_data(cidrs) if user_data is None else user_data
+        )
 
     # -- satisfied -------------------------------------------------------
     def test_satisfied_prerequisites_are_reported(self):
@@ -604,6 +686,42 @@ class PrerequisiteTests(unittest.TestCase):
             )
         ]
         self.assert_drift(self.check(), "egress_route_blackhole")
+
+    # -- the optional router ---------------------------------------------
+    def test_router_forwarding_the_candidate_cidr_passes(self):
+        self.use_router()
+        result = self.check()
+        self.assertEqual(result["decision"], "satisfied")
+        router = self.records(result, "router")[0]
+        self.assertEqual(router["status"], "pass")
+        self.assertEqual(router["facts"]["instance_id"], ROUTER_INSTANCE_ID)
+        self.assertEqual(router["facts"]["instance_state"], "running")
+        self.assertIn(SUBNET_CIDR, router["facts"]["forwarded_cidrs"])
+
+    def test_router_missing_the_candidate_cidr_is_drift(self):
+        self.use_router(cidrs=("198.51.100.0/24",))
+        result = self.check()
+        self.assert_drift(result, "router_forwarding_missing_cidr")
+        self.assertEqual(self.records(result, "router")[0]["status"], "drift")
+
+    def test_stopped_router_is_drift(self):
+        self.use_router(state="stopped")
+        self.assert_drift(self.check(), "router_target_not_running")
+
+    def test_router_without_user_data_is_unavailable_not_a_pass(self):
+        self.use_router(user_data="")
+        self.assert_unavailable(self.check(), "router_user_data_unavailable")
+
+    def test_router_user_data_that_is_not_base64_is_unavailable_not_a_pass(self):
+        self.use_router(user_data="not base64!!")
+        self.assert_unavailable(self.check(), "router_user_data_unavailable")
+
+    def test_managed_gateway_target_skips_the_router_contract(self):
+        result = self.check()
+        router = self.records(result, "router")[0]
+        self.assertEqual(router["status"], "pass")
+        self.assertEqual(router["facts"]["target_kind"], "GatewayId")
+        self.assertNotIn("describe_instance_attribute", [name for name, _ in self.ec2.calls])
 
     # -- unavailable permissions -----------------------------------------
     def test_missing_iam_permission_is_unavailable_not_a_pass(self):

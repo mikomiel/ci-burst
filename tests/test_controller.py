@@ -690,6 +690,494 @@ class ApplyTests(ControllerCase):
         self.assertNotIn("Authorization", dumped)
 
 
+class FleetTests(ControllerCase):
+    def fleet_config(self, max_instances=4):
+        return load(write_config(self.root, config={"controller": {"max_instances": max_instances}}))
+
+    def zone_config(self, *, max_instances=2, zones=("eu-central-1a", "eu-central-1b")):
+        return load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": max_instances},
+                    "aws": {
+                        "availability_zones": [
+                            {
+                                "zone": zone,
+                                "subnet_id": f"subnet-0123456789abcdef{index:x}",
+                            }
+                            for index, zone in enumerate(zones)
+                        ]
+                    },
+                },
+            )
+        )
+
+    def seed_intent(self, operation_id, *, expires_at, reservation):
+        """Seed one unresolved intent, advancing the clock after each seed."""
+        self.seed(
+            state="intent",
+            instance_id=None,
+            operation_id=operation_id,
+            expires_at=expires_at,
+            reservation=reservation,
+        )
+        self.clock.advance(1)
+
+    def test_plan_reports_the_batch_size_for_a_backlog(self):
+        controller = self.build(observation=observation_demand(5), config=self.fleet_config(3))
+        result = controller.plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(result["demand"], 5)
+        self.assertEqual(result["free_instances"], 3)
+        self.assertEqual(result["launch_count"], 3)
+        self.assertEqual(result["budget"]["launch_count"], 3)
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_demand_two_within_a_four_slot_fleet_launches_two(self):
+        controller = self.build(observation=observation_demand(2), config=self.fleet_config(4))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(result["launches"]), 2)
+        self.assertEqual(len(self.reopened().operations()), 2)
+
+    def test_a_backlog_beyond_the_limit_launches_the_limit(self):
+        controller = self.build(observation=observation_demand(6), config=self.fleet_config(4))
+        result = controller.apply()
+        self.assertEqual(len(result["launches"]), 4)
+        self.assertEqual(len(self.reopened().operations()), 4)
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 4)
+
+    def test_existing_workers_leave_only_the_free_slots(self):
+        self.seed(state="running", operation_id="busy-a", instance_id="i-busy-a")
+        self.seed(state="running", operation_id="busy-b", instance_id="i-busy-b")
+        controller = self.build(observation=observation_demand(4), config=self.fleet_config(4))
+        result = controller.apply()
+        self.assertEqual(result["launch_count"], 2)
+        self.assertEqual(len(result["launches"]), 2)
+        self.assertEqual(len(self.reopened().operations()), 4)
+
+    def test_a_three_zone_batch_rotates_through_the_candidate_order(self):
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 3},
+                    "aws": {
+                        "availability_zones": [
+                            {"zone": "eu-central-1a", "subnet_id": "subnet-0123456789abcdef0"},
+                            {"zone": "eu-central-1b", "subnet_id": "subnet-0123456789abcdef1"},
+                            {"zone": "eu-central-1c", "subnet_id": "subnet-0123456789abcdef2"},
+                        ]
+                    },
+                },
+            )
+        )
+        quotes = {
+            zone: quote(clock=self.clock, availability_zone=zone)
+            for zone in ("eu-central-1a", "eu-central-1b", "eu-central-1c")
+        }
+        controller = self.build(
+            observation=observation_demand(3),
+            aws=FakeAws(spot_quote=quotes),
+            config=config,
+        )
+        result = controller.apply()
+        runs = [call[1] for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(
+            [run["Placement"]["AvailabilityZone"] for run in runs],
+            ["eu-central-1a", "eu-central-1b", "eu-central-1c"],
+        )
+        self.assertEqual(
+            [run["SubnetId"] for run in runs],
+            ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1", "subnet-0123456789abcdef2"],
+        )
+        self.assertEqual(len({run["ClientToken"] for run in runs}), 3)
+        self.assertEqual(len(result["launches"]), 3)
+        self.assertEqual(
+            [[attempt["zone"] for attempt in entry["attempts"]] for entry in result["launches"]],
+            [["eu-central-1a"], ["eu-central-1b"], ["eu-central-1c"]],
+        )
+
+    def test_a_later_worker_is_not_committed_after_the_shared_expiry_elapses(self):
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 2},
+                    "aws": {"max_lifetime_seconds": 60},
+                },
+            )
+        )
+        controller = self.build(observation=observation_demand(2), config=config)
+        self.aws.on_run = lambda request: self.clock.advance(70)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertIn("admission_expired", result["reasons"])
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1)
+        self.assertEqual(len(self.reopened().operations()), 1)
+
+    def test_a_stale_first_choice_skips_to_the_next_fresh_candidate(self):
+        config = self.zone_config(max_instances=2)
+        quotes = {
+            "eu-central-1a": quote(clock=self.clock, availability_zone="eu-central-1a"),
+            "eu-central-1b": quote(
+                clock=self.clock,
+                availability_zone="eu-central-1b",
+                observed_at=self.clock.now - 100,
+            ),
+        }
+        controller = self.build(
+            observation=observation_demand(2),
+            aws=FakeAws(spot_quote=quotes),
+            config=config,
+        )
+        self.aws.on_run = lambda request: self.clock.advance(850)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(result["launches"]), 2)
+        second = result["launches"][1]
+        self.assertEqual(second["zone"], "eu-central-1a")
+        self.assertEqual(
+            second["attempts"],
+            [
+                {"zone": "eu-central-1b", "outcome": "skipped", "reason": "spot_price_stale"},
+                {"zone": "eu-central-1a", "outcome": "accepted"},
+            ],
+        )
+
+    def test_a_capacity_fallback_reports_the_accepted_zone(self):
+        config = self.zone_config(max_instances=1)
+        quotes = {
+            zone: quote(clock=self.clock, availability_zone=zone)
+            for zone in ("eu-central-1a", "eu-central-1b")
+        }
+        aws = FakeAws(spot_quote=quotes)
+
+        def reject_first(request):
+            if request["Placement"]["AvailabilityZone"] == "eu-central-1a":
+                raise ProviderRefusal("AWS_REFUSED", "InsufficientInstanceCapacity")
+
+        aws.on_run = reject_first
+        controller = self.build(observation=observation_demand(1), aws=aws, config=config)
+        result = controller.apply()
+        launch = result["launches"][0]
+        self.assertEqual(launch["zone"], "eu-central-1b")
+        self.assertEqual(
+            launch["attempts"],
+            [
+                {
+                    "zone": "eu-central-1a",
+                    "outcome": "capacity_rejected",
+                    "reason": "AWS_REFUSED",
+                    "detail": "InsufficientInstanceCapacity",
+                },
+                {"zone": "eu-central-1b", "outcome": "accepted"},
+            ],
+        )
+        operation = self.reopened().operation(result["operation"])
+        self.assertEqual(operation.request()["Placement"]["AvailabilityZone"], "eu-central-1b")
+
+    def test_four_workers_over_two_zones_start_alternately(self):
+        config = self.zone_config(max_instances=4)
+        quotes = {
+            zone: quote(clock=self.clock, availability_zone=zone)
+            for zone in ("eu-central-1a", "eu-central-1b")
+        }
+        controller = self.build(
+            observation=observation_demand(4),
+            aws=FakeAws(spot_quote=quotes),
+            config=config,
+        )
+        result = controller.apply()
+        runs = [call[1] for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(
+            [run["Placement"]["AvailabilityZone"] for run in runs],
+            ["eu-central-1a", "eu-central-1b", "eu-central-1a", "eu-central-1b"],
+        )
+        self.assertEqual(
+            [entry["zone"] for entry in result["launches"]],
+            ["eu-central-1a", "eu-central-1b", "eu-central-1a", "eu-central-1b"],
+        )
+        self.assertEqual(len({entry["instance_id"] for entry in result["launches"]}), 4)
+
+    def test_allowance_caps_a_batch_and_notes_the_cap(self):
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 4},
+                    "budget": {"allowance": "1.08"},
+                },
+            )
+        )
+        controller = self.build(observation=observation_demand(6), config=config)
+        result = controller.apply()
+        self.assertEqual(result["launch_count"], 2)
+        self.assertEqual(len(result["launches"]), 2)
+        self.assertIn("budget_capped_batch", result["notes"])
+        window = current_window(self.clock.now, config.budget.window_seconds)
+        self.assertEqual(self.reopened().consumed_micros(window), 1_080_000)
+        self.assertEqual(self.reopened().window_launches(window), 2)
+
+    def test_unresolved_intents_resume_in_creation_order(self):
+        expiries = {}
+        reservations = {"third": 640_000, "second": 540_000, "first": 440_000}
+        for operation_id in ("third", "second", "first"):
+            expiries[operation_id] = self.clock.now + 3600
+            self.seed_intent(
+                operation_id,
+                expires_at=expiries[operation_id],
+                reservation=reservations[operation_id],
+            )
+        controller = self.build(observation=observation_demand())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "resumed")
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 3)
+        resumes = result["resumes"]
+        self.assertEqual(
+            [entry["operation"] for entry in resumes], ["third", "second", "first"]
+        )
+        self.assertEqual(
+            [entry["expires_at"] for entry in resumes],
+            [expiries["third"], expiries["second"], expiries["first"]],
+        )
+        self.assertEqual(
+            [entry["reservation"] for entry in resumes],
+            ["0.640000", "0.540000", "0.440000"],
+        )
+        self.assertEqual([entry["reasons"] for entry in resumes], [[], [], []])
+        self.assertEqual([entry["attempts"] for entry in resumes], [[], [], []])
+        self.assertEqual(len({entry["instance_id"] for entry in resumes}), 3)
+        self.assertEqual(
+            set(resumes[0]),
+            {
+                "operation",
+                "decision",
+                "reasons",
+                "instance_id",
+                "expires_at",
+                "reservation",
+                "attempts",
+            },
+        )
+        # The top level names the last resumed intent with its own fields.
+        self.assertEqual(result["operation"], "first")
+        self.assertEqual(result["expires_at"], expiries["first"])
+        self.assertEqual(result["reservation"], "0.440000")
+        self.assertNotIn("reasons", result)
+        self.assertNotIn("refusal", result)
+        self.assertNotIn("attempts", result)
+        operations = self.reopened().operations()
+        self.assertEqual({operation.state for operation in operations}, {"starting"})
+
+    def test_resume_uncertainty_keeps_the_deciding_intents_own_expiry(self):
+        first_expiry = self.clock.now + 3600
+        self.seed_intent("third", expires_at=first_expiry, reservation=440_000)
+        second_expiry = self.clock.now + 7200
+        self.seed_intent("second", expires_at=second_expiry, reservation=540_000)
+        self.seed_intent("first", expires_at=self.clock.now + 10800, reservation=640_000)
+        controller = self.build(observation=observation_demand())
+        runs = []
+
+        def second_is_uncertain(request):
+            runs.append(request)
+            if len(runs) == 2:
+                self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+
+        self.aws.on_run = second_is_uncertain
+        result = controller.apply()
+        self.assertEqual(result["decision"], "uncertain")
+        self.assertEqual(result["operation"], "second")
+        self.assertEqual(result["expires_at"], second_expiry)
+        self.assertEqual(result["reservation"], "0.540000")
+        self.assertNotIn("instance_id", result)
+        self.assertNotIn("reasons", result)
+        self.assertNotIn("attempts", result)
+        self.assertEqual(result["refusal"]["reason"], "AWS_UNCERTAIN")
+        # The third intent is not retried after the unsuccessful one.
+        self.assertEqual(len(runs), 2)
+        resumed, uncertain = result["resumes"]
+        self.assertEqual([resumed["operation"], uncertain["operation"]], ["third", "second"])
+        self.assertEqual(resumed["decision"], "resumed")
+        self.assertEqual(resumed["expires_at"], first_expiry)
+        self.assertEqual(resumed["reservation"], "0.440000")
+        self.assertIsNotNone(resumed["instance_id"])
+        self.assertIsNone(uncertain["instance_id"])
+        self.assertEqual(uncertain["expires_at"], second_expiry)
+        self.assertEqual(uncertain["reservation"], "0.540000")
+        self.assertEqual(uncertain["reasons"], [])
+        self.assertEqual(uncertain["decision"], "uncertain")
+        self.assertEqual(uncertain["refusal"]["reason"], "AWS_UNCERTAIN")
+        self.assertEqual(
+            set(uncertain),
+            {
+                "operation",
+                "decision",
+                "reasons",
+                "instance_id",
+                "expires_at",
+                "reservation",
+                "attempts",
+                "refusal",
+            },
+        )
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation("third").state, "starting")
+        self.assertEqual(ledger.operation("third").instance_id, resumed["instance_id"])
+        self.assertEqual(ledger.operation("second").state, "uncertain")
+        self.assertEqual(ledger.operation("first").state, "intent")
+
+    def test_resume_stops_at_an_intent_whose_lifetime_elapsed(self):
+        first_expiry = self.clock.now + 3600
+        self.seed_intent("third", expires_at=first_expiry, reservation=440_000)
+        second_expiry = self.clock.now + 30
+        self.seed_intent("second", expires_at=second_expiry, reservation=540_000)
+        self.seed_intent("first", expires_at=self.clock.now + 10800, reservation=640_000)
+        controller = self.build(observation=observation_demand())
+        self.aws.on_run = lambda request: self.clock.advance(120)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["unresolved_intent_lifetime_elapsed"])
+        self.assertEqual(result["operation"], "second")
+        self.assertEqual(result["expires_at"], second_expiry)
+        self.assertEqual(result["reservation"], "0.540000")
+        self.assertNotIn("instance_id", result)
+        self.assertNotIn("refusal", result)
+        self.assertNotIn("attempts", result)
+        runs = [call for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(runs), 1)
+        resumed, elapsed = result["resumes"]
+        self.assertEqual([resumed["operation"], elapsed["operation"]], ["third", "second"])
+        self.assertEqual(resumed["expires_at"], first_expiry)
+        self.assertEqual(resumed["reservation"], "0.440000")
+        self.assertEqual(elapsed["expires_at"], second_expiry)
+        self.assertEqual(elapsed["reservation"], "0.540000")
+        self.assertEqual(elapsed["decision"], "refused")
+        self.assertEqual(elapsed["reasons"], ["unresolved_intent_lifetime_elapsed"])
+        self.assertIsNone(elapsed["instance_id"])
+        self.assertEqual(elapsed["attempts"], [])
+        self.assertEqual(
+            set(elapsed),
+            {
+                "operation",
+                "decision",
+                "reasons",
+                "instance_id",
+                "expires_at",
+                "reservation",
+                "attempts",
+            },
+        )
+        self.assertNotIn("attempts", result)
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation("third").state, "starting")
+        self.assertEqual(ledger.operation("second").state, "intent")
+        self.assertEqual(ledger.operation("first").state, "intent")
+
+    def test_resume_stops_at_an_intent_whose_client_token_expired(self):
+        first_expiry = self.clock.now + 3600
+        self.seed_intent("third", expires_at=first_expiry, reservation=440_000)
+        second_expiry = self.clock.now + 100_000
+        self.seed_intent("second", expires_at=second_expiry, reservation=540_000)
+        self.seed_intent("first", expires_at=self.clock.now + 200_000, reservation=640_000)
+        controller = self.build(observation=observation_demand())
+        self.aws.on_run = lambda request: self.clock.advance(25 * 3600)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["unresolved_intent_expired"])
+        self.assertEqual(result["operation"], "second")
+        self.assertEqual(result["expires_at"], second_expiry)
+        self.assertEqual(result["reservation"], "0.540000")
+        self.assertNotIn("instance_id", result)
+        self.assertNotIn("refusal", result)
+        self.assertNotIn("attempts", result)
+        runs = [call for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(runs), 1)
+        resumed, expired = result["resumes"]
+        self.assertEqual([resumed["operation"], expired["operation"]], ["third", "second"])
+        self.assertEqual(resumed["expires_at"], first_expiry)
+        self.assertEqual(resumed["reservation"], "0.440000")
+        self.assertEqual(expired["expires_at"], second_expiry)
+        self.assertEqual(expired["reservation"], "0.540000")
+        self.assertEqual(expired["decision"], "refused")
+        self.assertEqual(expired["reasons"], ["unresolved_intent_expired"])
+        self.assertIsNone(expired["instance_id"])
+        self.assertEqual(expired["attempts"], [])
+        self.assertEqual(
+            set(expired),
+            {
+                "operation",
+                "decision",
+                "reasons",
+                "instance_id",
+                "expires_at",
+                "reservation",
+                "attempts",
+            },
+        )
+        self.assertNotIn("attempts", result)
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation("third").state, "starting")
+        self.assertEqual(ledger.operation("second").state, "intent")
+        self.assertEqual(ledger.operation("first").state, "intent")
+
+    def test_lowered_limit_waits_and_never_terminates(self):
+        self.seed(state="running", operation_id="busy-a", instance_id="i-busy-a")
+        self.seed(state="running", operation_id="busy-b", instance_id="i-busy-b")
+        controller = self.build(observation=observation_demand(4), config=self.fleet_config(1))
+        self.aws.instances_result = [
+            instance(instance_id="i-busy-a", operation="busy-a", expires_at=self.clock.now + 3000),
+            instance(instance_id="i-busy-b", operation="busy-b", expires_at=self.clock.now + 3000),
+        ]
+        result = controller.apply()
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("slot_busy", result["reasons"])
+        self.assertIn("above_configured_limit", result["notes"])
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(self.aws.terminated, [])
+
+    def test_a_failed_launch_stops_the_rest_of_the_batch(self):
+        controller = self.build(observation=observation_demand(3), config=self.fleet_config(3))
+        runs = []
+
+        def fail_second(request):
+            runs.append(request)
+            if len(runs) == 2:
+                self.aws.run_error = ProviderRefusal("AWS_REFUSED", "UnauthorizedOperation")
+
+        self.aws.on_run = fail_second
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launch_failed")
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 2)
+        self.assertEqual(
+            [entry["decision"] for entry in result["launches"]],
+            ["launched", "launch_failed"],
+        )
+        self.assertIsNone(result["launches"][1]["instance_id"])
+        operations = self.reopened().operations()
+        self.assertEqual(len(operations), 2)
+        self.assertEqual({operation.state for operation in operations}, {"starting", "failed"})
+
+    def test_status_reports_the_controller_limit_and_window_budget(self):
+        config = self.fleet_config(4)
+        controller = self.build(config=config)
+        self.seed(state="running", reservation=540_000)
+        result = controller.status()
+        self.assertEqual(result["controller"], {"max_instances": 4})
+        self.assertEqual(
+            result["budget"]["window_start"],
+            current_window(self.clock.now, config.budget.window_seconds),
+        )
+        self.assertEqual(result["budget"]["window_seconds"], 86400)
+        self.assertEqual(result["budget"]["allowance"], "10.000000")
+        self.assertEqual(result["budget"]["consumed"], "0.540000")
+        self.assertEqual(result["budget"]["launches"], 1)
+        self.assertEqual(result["budget"]["busy_instances"], 1)
+        self.assertEqual(result["budget"]["hourly_ceiling"], "0.160000")
+
+
 class ReapTests(ControllerCase):
     def test_reap_plans_only_expired_owned_instances(self):
         controller = self.build()

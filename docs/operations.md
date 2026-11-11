@@ -6,16 +6,18 @@ pilot. Read [SECURITY.md](../SECURITY.md) first.
 
 ## Scope and authority
 
-ci-burst observes one Forgejo repository queue and decides whether one more
-AWS Spot worker should exist. It is a capacity decision, not a scheduler:
+ci-burst observes one Forgejo repository queue and decides how many AWS Spot
+workers should exist, up to a configured bound. It is a capacity decision, not a
+scheduler:
 
 - Forgejo owns job assignment, dependencies, retries and CI results.
 - AWS owns instance lifecycle and billing.
 - ci-burst owns launch intent, ownership metadata and a conservative local
   reservation.
 
-The source ships no release, image, tag, deployment or live-qualified Forgejo
-contract. A green validation run proves source behavior only.
+The source ships an annotated release tag (`v0.1.0`) but no published image,
+deployment or live-qualified Forgejo contract. A green validation run proves
+source behavior only.
 
 ## Configuration
 
@@ -55,11 +57,11 @@ database = "state.sqlite3"
 
 Optional keys: `forgejo.timeout_seconds` (10), `forgejo.max_response_bytes`
 (2,000,000), `aws.price_max_age_seconds` (900), `aws.profile`,
-`aws.availability_zones`, `controller.max_instances` (only `1` is accepted).
-Relative state paths resolve against the configuration file directory. Unknown
-keys, floating-point money, a template-version alias, a non-`https` Forgejo URL,
-a second instance and a malformed zone-candidate list (`ZONE_CANDIDATES_INVALID`)
-are refused.
+`aws.availability_zones`, `controller.max_instances` (an integer in `1..4`,
+default `1`). Relative state paths resolve against the configuration file
+directory. Unknown keys, floating-point money, a template-version alias, a
+non-`https` Forgejo URL, a `controller.max_instances` outside `1..4` and a
+malformed zone-candidate list (`ZONE_CANDIDATES_INVALID`) are refused.
 
 ### Availability-zone candidates
 
@@ -107,7 +109,7 @@ standard-library tests run without the SDK, a token or a cloud account.
 
 ```sh
 python -m ci_burst plan   --config deployment.toml   # observation only
-python -m ci_burst apply  --config deployment.toml   # may launch one instance
+python -m ci_burst apply  --config deployment.toml   # may launch the configured fleet
 python -m ci_burst status --config deployment.toml   # evidence, no mutation
 python -m ci_burst reap   --config deployment.toml   # expired resources, no launch
 python -m ci_burst reap   --config deployment.toml --apply
@@ -305,6 +307,14 @@ reservation = ceil(max_spot_price * max_lifetime_seconds / 3600)
             + non_compute_allowance
 ```
 
+Every worker in a batch reserves this same `per_launch` amount, so a batch of N
+launches needs `N × per_launch` of the current window's remaining allowance. The
+configured limit caps the batch; the allowance can cap it first.
+
+`budget.remaining_after` in a decision still subtracts one worker's reservation,
+kept for compatibility with consumers that predate the fleet. The batch headroom
+is `per_launch_reservation × launch_count`, not `remaining_after`.
+
 A launch is refused unless the selected candidate has a fresh Spot quote for the
 configured instance type and its availability zone, was observed no longer ago
 than `price_max_age_seconds`, and is not above `max_spot_price`. Freshness is the
@@ -339,12 +349,19 @@ lifetime plus the non-compute allowance, and that reservation is charged to an
 **anchored** window: boundaries are floored from the epoch at a multiple of
 `window_seconds`, and outstanding operations carry into later windows. It is not
 a trailing period, so the end of one window and the start of the next are two
-budgets that can be spent back to back around the boundary. Size the allowance
-from launches per configured window; "per day" is the same statement only when
+budgets that can be spent back to back around the boundary.
+
+A batch of N workers reserves N times the per-launch amount in one tick. The
+same allowance therefore admits `allowance // per_launch` launches per anchored
+window, whether they are admitted one tick at a time or several per tick up to
+`controller.max_instances`. That is a bound per window, not per rolling hour or
+per day: a full batch just before a boundary and another just after can reserve
+up to twice the allowance across the pair of windows. Size the allowance from
+launches per configured window; "per day" is the same statement only when
 `window_seconds` is 86400.
 
 "Per dispatch" is not a safe unit either. The controller admits a launch whenever
-eligible demand remains and the slot is free, so one dispatched workflow with
+eligible demand remains and a slot is free, so one dispatched workflow with
 several eligible jobs can spend several reservations as its one-job workers
 finish. Only a workload with an established one-launch-per-dispatch shape can be
 sized by dispatches; every other deployment is sized by admitted launches.
@@ -368,6 +385,65 @@ shared-pool launches plus five capacity rejections from before the release rule
 consumed exactly that, and every cycle then refused with
 `budget_allowance_exhausted` until the window rolled.
 
+## Fleet size and fan-out
+
+Admission is demand-driven. One tick computes a batch size from three bounds:
+
+```
+launches = min(waiting jobs, free slots, affordable reservations)
+```
+
+- **Waiting jobs** is the eligible demand in the qualified queue observation.
+- **Free slots** is `controller.max_instances` minus the non-terminal owned
+  operations in the ledger. An intent, starting, running, terminating or
+  uncertain worker occupies a slot; a terminal or failed one does not.
+- **Affordable reservations** is `(allowance - consumed) // per_launch` for the
+  current anchored window, with `per_launch` as defined in § Budget and
+  reservations.
+
+A zero bound is not an error. No free slot waits with `slot_busy`, no demand waits
+with `no_runnable_demand`, and no affordable reservation refuses with
+`budget_allowance_exhausted`. When the allowance allows fewer launches than both
+demand and free slots, the batch is capped and the decision carries the
+`budget_capped_batch` note. `plan` reports the same `demand`, `free_instances`
+and `launch_count` that an `apply` would use.
+
+Each worker in a batch has its own launch intent, ledger operation, frozen
+request, client token and reservation. A batch is not one admission with several
+instances: every worker can be resumed, reconciled, expired and charged on its
+own. Every request still sends `MinCount = MaxCount = 1`.
+
+The launch order rotates the eligible candidate list cyclically by the worker
+index (`start = index % len(eligible)`, then
+`eligible[start:] + eligible[:start]`), so a batch starts at successive candidates
+and wraps: four workers over two zones start A, B, A, B. Rotation spreads workers
+across the ordered zones; it is not a capacity guarantee. Each worker starts at
+the first candidate in its rotation whose quote is still fresh, records the
+earlier candidates as `skipped` (`spot_price_stale`), and walks its own candidate
+order only on a definite capacity rejection.
+
+The worker contract stays one job per worker. An idle worker waits for one job
+until its own maximum lifetime, then shuts down and terminates; the reservation
+was charged when it launched and that termination does not refund it. Fan-out
+therefore trades reserved allowance for readiness: N workers can take N jobs at
+once, and a worker that never gets a job still costs up to its configured
+lifetime.
+
+If any worker in the batch ends in anything other than an accepted launch, the
+controller stops the batch and leaves the workers already launched in place. It
+does not terminate them to make the batch uniform.
+
+The shared admission lifetime is re-read before each worker is committed. If it
+elapsed while an earlier request was in flight, the batch stops with
+`admission_expired` and no further operation is created: the decision is
+`launched` when a worker already launched, otherwise `refused`. A later worker
+with no fresh candidate stops the same way with `spot_price_stale`.
+
+Lowering `controller.max_instances` below the number of live owned workers never
+terminates anything. New admission waits with `slot_busy` and the decision
+carries the note `above_configured_limit` until enough workers finish on their own
+lifetime; expiry cleanup remains the only owner of termination.
+
 ## Launch decision and capacity fallback
 
 `plan` reports every configured candidate in order, each with the zone, subnet,
@@ -383,29 +459,41 @@ requested scope marks that candidate skipped. A configured template version that
 cannot be read or is unusable refuses the plan with `template_unusable` and
 `template_error` rather than dropping that candidate.
 
-`apply` still launches at most one instance: one admission, one reservation, one
-ledger operation and one slot. If the provider definitely rejects the selected
-candidate for insufficient capacity (`InsufficientInstanceCapacity`), that
-rejection proves no instance was created, so the same admission advances to the
-next eligible candidate in order — at most once per candidate — and a success
-ends the walk. Every attempt sends `MinCount = MaxCount = 1`, so no fallback can
-produce a second instance. Before each advance the controller re-reads the clock:
+`apply` admits a batch of at most `controller.max_instances` workers, sized by
+waiting demand, free slots and affordable reservations (§ Fleet size and
+fan-out). Each worker in the batch is its own admission, with its own frozen
+request, ledger operation, client token and reservation; the batch stops as soon
+as one worker is not accepted. Within one worker, if the provider definitely
+rejects the selected candidate for insufficient capacity
+(`InsufficientInstanceCapacity`), that rejection proves no instance was created,
+so that admission advances to the next eligible candidate in order — at most once
+per candidate — and a success ends the walk. Every attempt sends `MinCount =
+MaxCount = 1`, so no fallback and no batch can produce a second instance for one
+worker. Before each worker and each advance the controller re-reads the clock:
 the candidate's Spot quote must still be within `price_max_age_seconds` and the
 admission lifetime must not have elapsed. A candidate whose evidence expired is
 recorded as `skipped` (`spot_price_stale`), not frozen or sent, and the next
-remaining candidate is considered. The result reports the ordered `attempts`
-with each outcome (`capacity_rejected`, `accepted`, `rejected`, `uncertain` or
-`skipped`); `selected` remains the admission's first choice, so the accepted
-attempt is the placement that actually launched.
+remaining candidate is considered. The result reports a `launches` array with one
+entry per admitted worker (`operation`, `instance_id`, `zone`, `reservation`,
+`decision`, `attempts`). Each entry's `zone` is the placement that actually
+accepted that worker, so a capacity fallback is not reported under the original
+choice, and its `attempts` carries that worker's own ordered outcomes
+(`capacity_rejected`, `accepted`, `rejected`, `uncertain` or `skipped`). The
+top-level `operation`, `instance_id`, `expires_at` and `reservation` are the
+first launch's values, so a one-worker deployment reads the shape it did before;
+the top-level `attempts` is the ordered outcome list of the first launch, or of
+the step that stopped the batch. `selected` remains the batch's first choice, so
+the accepted attempt is the placement that actually launched.
 
 No other failure falls through: a non-capacity definite rejection keeps today's
 `launch_failed` behaviour, and an uncertain response keeps the operation
 outstanding. If every candidate is rejected for capacity the operation is
-`failed` — the slot is free — the queue stays unserved, and the result carries
-the stable `capacity_exhausted` reason plus the final provider refusal. If the
-remaining candidates' price evidence expires during the attempt, the operation
-is also `failed` with a free slot and the stable `spot_price_stale` reason, and
-no new admission or reservation is created. Nothing is reported as launched.
+`failed` — its slot is free again — the queue stays unserved, and the result
+carries the stable `capacity_exhausted` reason plus the final provider refusal.
+If the remaining candidates' price evidence expires during the attempt, the
+operation is also `failed` with its slot free and the stable `spot_price_stale`
+reason, and no new admission or reservation is created. Nothing is reported as
+launched.
 
 ## Durable state and ownership
 
@@ -424,8 +512,8 @@ allocating a replacement operation. While an intent has no confirmed instance,
 the next apply resumes that **same** frozen request and client token; EC2
 idempotency makes the retry safe. A rejected **retry** keeps the operation
 uncertain, because rejecting the retry does not prove the original request
-created nothing. Only a definite rejection of the first attempt may release the
-slot, and ambiguous provider errors stay uncertain.
+created nothing. Only a definite rejection of the first attempt may release that
+worker's slot, and ambiguous provider errors stay uncertain.
 
 The frozen intent names the candidate currently being attempted. A definite
 capacity rejection is the one case that may replace it: the same operation
@@ -439,7 +527,30 @@ earlier request created nothing.
 Two bounds refuse rather than launch: an unresolved intent older than the
 24-hour client-token validity, and an intent whose configured lifetime has
 already elapsed. Both keep the unresolved ownership and block admission until
-an operator resolves them.
+an operator resolves them. When more than one launch intent is unresolved,
+`apply` retries them in creation order and stops at the first intent whose age
+exceeds the client-token window, whose lifetime elapsed, or whose retry is not
+accepted. Intents after the deciding one are not sent and stay `intent` in the
+ledger for the next apply.
+
+Every attempted intent produces one `resumes` record in creation order. A
+record's `expires_at` and `reservation` always come from the durable operation,
+whatever the outcome; `instance_id` is `null` until a launch is confirmed, and
+`refusal` appears only for an uncertain retry:
+
+| `decision` | `reasons` | `instance_id` | `refusal` | `expires_at` / `reservation` | `attempts` |
+| --- | --- | --- | --- | --- | --- |
+| `resumed` | `[]` | confirmed instance | absent | from the operation | `[]` |
+| `uncertain` | `[]` | `null` | provider refusal | from the operation | `[]` |
+| `refused` | `["unresolved_intent_expired"]` | `null` | absent | from the operation | `[]` |
+| `refused` | `["unresolved_intent_lifetime_elapsed"]` | `null` | absent | from the operation | `[]` |
+
+Every record also carries `operation`. The top level carries the deciding
+intent's `operation`, `decision`, `expires_at` and `reservation`; its
+`instance_id` appears only when that intent was confirmed, its `reasons` only for
+the two expiry refusals, and its `refusal` only for an uncertain retry. The top
+level carries no `attempts` field, and a resume sends one frozen request, so a
+record's `attempts` is always empty.
 
 The EC2 client is built without the SDK's transparent retries, so one recorded
 provider call is one HTTP attempt; the controller's own resume is the only
@@ -449,8 +560,8 @@ call cannot commit an already-expired intent or extend stale price evidence.
 
 Termination is confirmed only by the provider reporting `terminated` (or by the
 instance record disappearing after the provider's visibility window).
-`shutting-down`, `stopping` and `stopped` keep the operation outstanding and the
-single slot occupied. Expiry cleanup terminates only an instance that is both
+`shutting-down`, `stopping` and `stopped` keep the operation outstanding and its
+slot occupied. Expiry cleanup terminates only an instance that is both
 present in the current owned inventory and carries a valid, expired expiry tag;
 a ledger id alone is not permission to terminate.
 
@@ -477,7 +588,7 @@ ownership claims and do not block.
 
 Observation opens the ledger read-only. It never creates, initializes or
 migrates the file; an existing but uninitialized, unsupported or corrupt ledger
-makes `plan` refuse instead of computing a free slot from zero consumption. The
+makes `plan` refuse instead of computing free slots from zero consumption. The
 ledger uses a rollback journal so a read-only observation creates no
 `-wal`/`-shm` side files. The state path is converted to an escaped file URI
 before it is opened read-only, so a filename containing URI metacharacters
@@ -502,9 +613,10 @@ because nothing says which operation owned it.
 Use two routes, both machine identities; never copy a human login cache and
 never place credentials on a worker.
 
-- **Scaling identity**: read instance, template and Spot-price data; launch
-  one instance; create the ownership tags; request termination. It needs no
-  IAM administration, image creation, VPC construction or secret access.
+- **Scaling identity**: read instance, template and Spot-price data; launch up
+  to the configured fleet size; create the ownership tags; request termination.
+  It needs no IAM administration, image creation, VPC construction or secret
+  access.
 - **Cleanup identity**: describe and terminate owned instances only. It must
   work without Forgejo, without the scaling database and without launch
   permission.
@@ -536,15 +648,19 @@ Stopping cleanup is not part of rollback.
 a registered runner, a ready runner or a successful job. When the provider is
 unavailable or cleanup cannot be confirmed, status reports the unresolved
 operation and failure; it never reports clean completion, a successful job or
-zero residual cost.
+zero residual cost. It also reports the configured `controller.max_instances`,
+the anchored window's `allowance`, `consumed` and `launches`, the number of
+`busy_instances`, and the `hourly_ceiling` at that limit
+(`max_spot_price × max_instances`).
 
 ## Supported limits
 
 One repository, one Region and one ordered list of availability-zone candidates
-(the single-zone key is the one-candidate form), one owned instance, one writer
-and one ledger. Ordered fallback is supported only for a definite insufficient
-capacity rejection, within one admission and at most once per configured
-candidate. Not supported: concurrent controllers, multiple ledgers, warm pools,
-On-Demand fallback, automatic zone or Region discovery and substitution,
-provider selection, job retries, workflow rewrites, image construction and
-secret distribution.
+(the single-zone key is the one-candidate form), up to
+`controller.max_instances` (1..4) owned instances, one writer and one ledger.
+Ordered fallback is supported only for a definite insufficient capacity
+rejection, within one admission and at most once per configured candidate. Not
+supported: concurrent controllers, multiple ledgers, warm pools, On-Demand
+fallback, automatic zone or Region discovery and substitution, provider
+selection, job retries, workflow rewrites, image construction and secret
+distribution.

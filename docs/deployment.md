@@ -12,13 +12,15 @@ the order in which everything is installed. The details stay with their owners:
 | [pilot-checklist.md](pilot-checklist.md) | the preparation record you fill in, which is not authorization |
 | [../SECURITY.md](../SECURITY.md) | the threat model and what ci-burst deliberately does not do |
 
-You are building one control plane and one worker:
+You are building one control plane and a bounded fleet of workers:
 
 ```text
 Forgejo queue  ──read──▶  scaler host (apply timer)  ──launch──▶  AWS Spot worker ──register──▶ Forgejo
      ▲                                                   │
      └──────────────── one independent host (reap timer) ┘   expiry cleanup, no launch permission
 ```
+
+The scaler launches up to `controller.max_instances` workers, each for one job.
 
 Read the whole page before starting. Every step is reversible except the AWS
 identities' access keys, which you can deactivate at any time.
@@ -178,6 +180,11 @@ qualification = "fixtures-only"
 # set against this list, so a `strong-ci` job is demand here too.
 labels = ["cloud-ci:host", "strong-ci:host", "linux-arm64:host"]
 
+[controller]
+# Optional, integer 1..4, default 1. A worker launched for one job occupies one
+# slot until it terminates.
+max_instances = 4
+
 [aws]
 region = "eu-central-1"
 launch_template_name = "example-ci-burst-runner"
@@ -203,6 +210,11 @@ database = "/var/lib/ci-burst/state.sqlite3"
 adapter sends the bare names (`cloud-ci`) as the queue filter. `[state]
 database` must be absolute and inside `/var/lib/ci-burst`. Keep
 `qualification = "fixtures-only"` until Step 7 is complete: it blocks `apply`.
+`controller.max_instances` is optional: it bounds the owned fleet to `1..4` and
+defaults to `1`, so a deployment that omits it keeps the original one-slot
+behaviour. Raise it only after one burst is understood; the allowance still caps
+every batch, and § Fleet size and fan-out in
+[operations.md](operations.md#fleet-size-and-fan-out) owns the admission rule.
 
 Start with the one candidate the scaling policy authorizes. Add a
 `[[aws.availability_zones]]` table per further candidate, in priority order,
@@ -315,7 +327,7 @@ document. A refusal names its reason code; the troubleshooting table in Step 9
 maps the common ones.
 
 The template, zone-candidate and price evidence appears only when there is
-eligible waiting demand and the slot is free: the command returns `wait` before
+eligible waiting demand and a slot is free: the command returns `wait` before
 reading a template or a price when there is nothing to launch. On an idle queue
 the decision is `wait` with reason `no_runnable_demand` and no price evidence —
 that is a healthy installation, not a failed one. Push a job that asks for your
@@ -333,7 +345,7 @@ To see it work, arrange for the reaper to be the only actor that may act:
    qualification can launch capacity. On an existing installation follow the
    admission-stop procedure in Step 9 rather than disabling the timer alone,
    which does not stop an active service or a surviving manual container;
-2. launch one instance carrying **all** the ownership tags: `ci-burst:managed=true`,
+2. launch one canary instance carrying **all** the ownership tags: `ci-burst:managed=true`,
    `ci-burst:deployment` equal to the TOML's value, a `ci-burst:operation` value
    that is non-empty and not `pending`, and a positive Unix-epoch
    `ci-burst:expires-at` in the past. Discovery selects on the managed and
@@ -404,7 +416,8 @@ identifier, not a re-declaration.
 Keep the `apply` timer stopped and run one decision by hand with the same
 command as Step 6, replacing `plan` with `apply`. Watch three things:
 
-- the JSON decision reports `launched` and one operation;
+- the JSON decision reports `launched`, with one `launches` entry per admitted
+  worker and the top-level `operation` repeated from the first of them;
 - the instance appears with all four ownership tags
   (`ci-burst:managed`, `ci-burst:deployment`, `ci-burst:operation`,
   `ci-burst:expires-at`) and terminates after its one job;
@@ -466,5 +479,5 @@ conditions). Reverting the source is a reviewed change, not a history rewrite.
 | `spot_price_above_cap`, `spot_price_stale` | the price evidence is above `max_spot_price` or older than `price_max_age_seconds` |
 
 `status` prints the last decision and the operation's state without mutating
-anything. A refused cleanup stays visible and does not free the slot; a
+anything. A refused cleanup stays visible and does not free its slot; a
 termination request is not evidence that the instance is gone.

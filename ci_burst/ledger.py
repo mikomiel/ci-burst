@@ -331,6 +331,15 @@ class Ledger:
         ).fetchone()
         return int(row[0])
 
+    def window_launches(self, window_start):
+        """Count the operations admitted in one anchored window."""
+        connection = self._require()
+        row = connection.execute(
+            "SELECT COUNT(*) FROM operations WHERE reservation_window = ?",
+            (window_start,),
+        ).fetchone()
+        return int(row[0])
+
     def _require(self):
         if self._connection is None:
             raise StateRefusal("STATE_UNAVAILABLE")

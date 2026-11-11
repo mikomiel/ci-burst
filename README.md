@@ -6,8 +6,9 @@ MIT-licensed public project.
 ## What it does
 
 - Observes runnable jobs for one Forgejo repository and explicit runner labels.
-- Adds at most one Spot instance from an operator-prepared, pinned launch
-  template while the queue has work and the budget allows it.
+- Adds up to a configured number of Spot instances (default one, maximum four)
+  from an operator-prepared, pinned launch template while the queue has work and
+  the budget allows it.
 - Keeps Forgejo as the only scheduler and job-result authority.
 - Persists launch intent, ownership and a conservative local reservation
   before every cloud request.

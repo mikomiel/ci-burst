@@ -39,14 +39,14 @@ def template(**overrides):
     return Template(**values)
 
 
-def quote(price_micros=20_000, timestamp=None, clock=None, observed_at=None):
+def quote(price_micros=20_000, timestamp=None, clock=None, observed_at=None, availability_zone="eu-central-1a"):
     observed = observed_at if observed_at is not None else (clock.now if clock else 1_800_000_000.0)
     return SpotQuote(
         price_micros=price_micros,
         timestamp=timestamp if timestamp is not None else observed,
         price_display=f"{price_micros / 1_000_000:.6f}",
         instance_type="t4g.small",
-        availability_zone="eu-central-1a",
+        availability_zone=availability_zone,
         observed_at=observed,
     )
 
@@ -67,7 +67,8 @@ class FakeAws:
         self.error = error
         self.calls = []
         self.run_error = None
-        self.run_result = ["i-0123456789abcdef0"]
+        self.run_result = None
+        self.run_count = 0
         self.terminate_error = None
         self.terminated = []
         self.instances_by_id = {}
@@ -96,9 +97,12 @@ class FakeAws:
         if self.on_quote is not None:
             self.on_quote()
         self._maybe_raise()
-        if isinstance(self.spot_quote_value, Exception):
-            raise self.spot_quote_value
-        return self.spot_quote_value
+        value = self.spot_quote_value
+        if isinstance(value, dict):
+            value = value.get(availability_zone)
+        if isinstance(value, Exception):
+            raise value
+        return value
 
     def owned_instances(self, deployment):
         self.calls.append(("owned_instances", deployment))
@@ -115,7 +119,15 @@ class FakeAws:
             self.on_run(request)
         if self.run_error is not None:
             raise self.run_error
-        return list(self.run_result)
+        return self.next_instance()
+
+    def next_instance(self):
+        """Return one accepted instance; distinct per worker unless pinned."""
+        if self.run_result is not None:
+            return list(self.run_result)
+        instance_id = f"i-0123456789abcdef{self.run_count:x}"
+        self.run_count += 1
+        return [instance_id]
 
     def terminate(self, instance_ids):
         self.calls.append(("terminate", list(instance_ids)))
@@ -188,6 +200,9 @@ def write_config(tmp_path, *, config=None):
         for section, overrides in config.items():
             if isinstance(overrides, dict):
                 values.setdefault(section, {}).update(overrides)
+                if section == "aws" and "availability_zones" in overrides:
+                    # The two placement forms are mutually exclusive.
+                    values["aws"].pop("availability_zone", None)
             else:
                 values[section] = overrides
     path = Path(tmp_path) / "deployment.toml"
@@ -200,12 +215,26 @@ def _render(values):
     for key, value in values.items():
         if isinstance(value, dict):
             lines.append(f"[{key}]")
+            tables = []
             for inner, inner_value in value.items():
-                lines.append(f"{inner} = {_toml(inner_value)}")
+                if _table_array(inner_value):
+                    tables.append((inner, inner_value))
+                else:
+                    lines.append(f"{inner} = {_toml(inner_value)}")
             lines.append("")
+            for inner, inner_value in tables:
+                for entry in inner_value:
+                    lines.append(f"[[{key}.{inner}]]")
+                    for entry_key, entry_value in entry.items():
+                        lines.append(f"{entry_key} = {_toml(entry_value)}")
+                    lines.append("")
         else:
             lines.append(f"{key} = {_toml(value)}")
     return "\n".join(lines)
+
+
+def _table_array(value):
+    return isinstance(value, list) and bool(value) and all(isinstance(item, dict) for item in value)
 
 
 def _toml(value):

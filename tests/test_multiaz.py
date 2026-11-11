@@ -119,7 +119,7 @@ class MultiZoneAws(FakeAws):
             error = error.pop(0) if error else None
         if error is not None:
             raise error
-        return list(self.run_result)
+        return self.next_instance()
 
 
 class MultiZoneCase(unittest.TestCase):
@@ -537,7 +537,7 @@ class LaunchFallbackTests(MultiZoneCase):
         operation = self.reopened().operations()[0]
         self.assertEqual(operation.state, "failed")
         self.assertIsNone(operation.instance_id)
-        # The definite rejections created nothing, so the single slot is free.
+        # The definite rejections created nothing, so the slot is free.
         self.assertFalse(controller.status()["slot"]["busy"])
 
 

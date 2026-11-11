@@ -13,10 +13,10 @@ The source change defines three behavior contracts:
 
 ## Goals / Non-Goals
 
-**Goals:** one repository queue, one extra Spot instance, explicit application,
-durable recovery, conservative cost admission and cleanup outside the scaler's
-failure boundary. A contributor can test the product without a cloud account
-or a private platform.
+**Goals:** one repository queue, a bounded fleet of at most four extra Spot
+instances, explicit application, durable recovery, conservative cost admission
+and cleanup outside the scaler's failure boundary. A contributor can test the
+product without a cloud account or a private platform.
 
 **Non-goals:** distributed controllers, direct job assignment, managed runner
 images, a secret-distribution service, new IAM/network infrastructure or a
@@ -39,7 +39,7 @@ listener, dashboard, plugin system or second queue.
 
 Alternatives: Go is viable but is not needed for this low-throughput control
 loop. A daemon, web service and distributed datastore add deployment and
-recovery state without serving the one-instance requirement.
+recovery state without serving the bounded-fleet requirement.
 
 ### 2. Qualify a narrow Forgejo interface instead of guessing readiness
 
@@ -111,7 +111,11 @@ Use EC2 `RunInstances` with one-time Spot market options, `MinCount=MaxCount=1`,
 a template version fixed per candidate, fixed placement inputs and a stable
 `ClientToken`.
 Placement is the first eligible entry of the operator's ordered
-availability-zone candidate list. There is no On-Demand fallback and no
+availability-zone candidate list. Within a fleet batch each worker starts at the
+next eligible candidate and wraps through the eligible order, so workers spread
+across the zones that survived admission; candidates rejected during admission
+are not part of the rotation. Each worker still starts at the first candidate in
+its rotation whose quote is still fresh. There is no On-Demand fallback and no
 automatic Region or AZ substitution: the only permitted placement change is the
 configured order, followed after a proved capacity rejection.
 
@@ -120,10 +124,12 @@ identities. It records the frozen request parameters, their hash and the stable
 launch-request identifier. It also records creation and expiry times with the
 cost reservation. Required ownership and expiry tags are part of the launch
 request, not a later best-effort tag step. The frozen request names the candidate
-being attempted. The candidate subnet is a top-level `RunInstances` parameter,
-so a template used with a candidate list must leave network interfaces to the
-request; the single-zone form sends no subnet override and keeps the template's
-network choice.
+being attempted. A worker is committed only while the shared admission lifetime
+remains; the expiry is re-read before each worker, so a slow earlier request
+cannot create an already-expired intent. The candidate subnet is a top-level
+`RunInstances` parameter, so a template used with a candidate list must leave
+network interfaces to the request; the single-zone form sends no subnet override
+and keeps the template's network choice.
 
 The durable lifecycle is conceptually `intent -> starting -> running ->
 terminating -> terminal`; uncertain creation/cleanup remains outstanding.
@@ -184,8 +190,9 @@ bound; billing alerts do not provide that guarantee.
 
 At each applied reconciliation, read cloud state before admitting a new launch.
 Count every nonterminal owned instance and uncertain operation against the
-one-instance limit. A corrupt/lost ledger, untracked matching resource or
-unavailable provider blocks new launches; it does not initialize free capacity.
+configured `controller.max_instances` limit. A corrupt/lost ledger, untracked
+matching resource or unavailable provider blocks new launches; it does not
+initialize free capacity.
 
 `reap` uses exact deployment/operation ownership and validated expiry tags.
 It has its own explicit apply switch, does not need Forgejo, and can run with
@@ -221,10 +228,10 @@ explicit candidate list, launch in the first eligible candidate, and treat an
 `InsufficientInstanceCapacity` rejection as evidence that this placement cannot
 serve the request. That error is the only observed failure that both proves no
 instance was created and suggests another configured placement may succeed, so
-it is the only trigger to advance within the same admission. The operation,
-reservation, expiry and single slot stay; only the frozen request, its hash and
-its own idempotency token move to the next candidate, once per candidate and in
-the configured order. Freshness is re-checked before each advance: a quote that
+it is the only trigger to advance within the same admission. The worker's
+operation, reservation, expiry and slot stay; only the frozen request, its hash
+and its own idempotency token move to the next candidate, once per candidate and
+in the configured order. Freshness is re-checked before each advance: a quote that
 aged out while the previous attempt ran is not frozen or sent, and an admission
 whose remaining evidence all aged out ends failed with a free slot and no new
 reservation.

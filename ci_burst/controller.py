@@ -7,10 +7,12 @@ an explicit apply call and a writable ledger.
 
 Placement is an ordered list of availability-zone candidates. Admission prices
 every candidate and selects the first eligible one; a candidate above the price
-ceiling is skipped rather than fatal. The launch still admits at most one
-instance: one operation, one reservation and one slot. Only a definite,
-capacity-related provider rejection may advance the same operation to the next
-candidate, in order, because that rejection proves no instance was created.
+ceiling is skipped rather than fatal. Demand drives a bounded fleet: each
+admitted worker gets its own operation, reservation and client token, and the
+batch is capped by the configured limit and the remaining allowance. Only a
+definite, capacity-related provider rejection may advance the same operation to
+the next candidate, in order, because that rejection proves no instance was
+created.
 
 A launch intent is durable before the cloud request. While an intent has no
 confirmed instance, apply resumes that same frozen request and client token
@@ -181,6 +183,21 @@ class Controller:
         state = self._read_state(required=False)
         result["state"] = state
         result["slot"] = self._slot_from_state(state)
+        window_start = current_window(self.clock(), self.config.budget.window_seconds)
+        consumed = self.ledger.consumed_micros(window_start) if self.ledger.available else 0
+        launches = self.ledger.window_launches(window_start) if self.ledger.available else 0
+        result["controller"] = {"max_instances": self.config.controller.max_instances}
+        result["budget"] = {
+            "window_start": window_start,
+            "window_seconds": self.config.budget.window_seconds,
+            "allowance": format_money(self.config.budget.allowance),
+            "consumed": format_money(consumed),
+            "launches": launches,
+            "busy_instances": result["slot"]["instances"],
+            "hourly_ceiling": format_money(
+                self.config.aws.max_spot_price * self.config.controller.max_instances
+            ),
+        }
         try:
             instances = self.aws.owned_instances(self.config.deployment)
         except Refusal as refusal:
@@ -275,7 +292,13 @@ class Controller:
     def _slot_from_state(self, state):
         operations = state.get("operations", [])
         busy = [operation for operation in operations if operation["state"] not in ("terminal", "failed")]
-        return {"busy": bool(busy), "operations": busy, "discrepancies": []}
+        return {
+            "busy": bool(busy),
+            "instances": len(busy),
+            "limit": self.config.controller.max_instances,
+            "operations": busy,
+            "discrepancies": [],
+        }
 
     def _observe_or_refuse(self, result):
         try:
@@ -323,12 +346,25 @@ class Controller:
     def _decide(self, observation, slot):
         """Return the decision block and the ordered candidate plans behind it."""
         reasons, notes = [], []
-        decision = {"reasons": reasons, "notes": notes}
+        limit = slot["limit"]
+        instances = slot["instances"]
+        free = limit - instances
+        decision = {
+            "reasons": reasons,
+            "notes": notes,
+            "demand": observation.demand,
+            "free_instances": free,
+            "launch_count": 0,
+        }
+        if instances > limit:
+            # Lowering the limit never evicts a worker. It only stops admission
+            # until enough workers terminate on their own lifetime.
+            notes.append("above_configured_limit")
         if slot.get("discrepancies"):
             decision["decision"] = "refused"
             reasons.append("owned_state_discrepancy")
             return decision, ()
-        if slot["busy"]:
+        if free <= 0:
             decision["decision"] = "wait"
             reasons.append("slot_busy")
             return decision, ()
@@ -336,6 +372,7 @@ class Controller:
             decision["decision"] = "wait"
             reasons.append("no_runnable_demand")
             return decision, ()
+        requested = min(observation.demand, free)
         templates = self._templates(decision)
         if templates is None:
             decision["decision"] = "refused"
@@ -379,19 +416,30 @@ class Controller:
             reasons.append("no_eligible_candidate")
             return decision, plans
         window_start = current_window(now, self.config.budget.window_seconds)
-        reservation = hourly_cost_micros(
+        per_launch = hourly_cost_micros(
             self.config.aws.max_spot_price, self.config.aws.max_lifetime_seconds
         ) + self.config.budget.non_compute_allowance
         consumed = self.ledger.consumed_micros(window_start) if self.ledger.available else 0
+        # A consumed amount above the allowance permits no launch; the count of
+        # affordable reservations is never negative.
+        affordable = max(0, (self.config.budget.allowance - consumed) // per_launch)
+        launch_count = min(requested, min(affordable, free))
+        decision["launch_count"] = launch_count
         decision["budget"] = {
             "window_start": window_start,
             "window_seconds": self.config.budget.window_seconds,
             "allowance": format_money(self.config.budget.allowance),
             "consumed": format_money(consumed),
-            "required_reservation": format_money(reservation),
-            "remaining_after": format_money(self.config.budget.allowance - consumed - reservation),
+            # Kept for consumers that predate the fleet: the reservation one
+            # worker costs. ``per_launch_reservation`` is the clearer name.
+            "required_reservation": format_money(per_launch),
+            "per_launch_reservation": format_money(per_launch),
+            "launch_count": launch_count,
+            "remaining_after": format_money(self.config.budget.allowance - consumed - per_launch),
         }
-        if consumed + reservation > self.config.budget.allowance:
+        if affordable < requested:
+            notes.append("budget_capped_batch")
+        if launch_count == 0:
             decision["decision"] = "refused"
             reasons.append("budget_allowance_exhausted")
             return decision, plans
@@ -400,7 +448,7 @@ class Controller:
         decision["selected"] = selected.as_dict()
         decision["template"] = selected.template.as_dict()
         decision["decision"] = "launch_ready"
-        decision["reservation_micros"] = reservation
+        decision["reservation_micros"] = per_launch
         decision["window_start"] = window_start
         decision["expires_at"] = now + self.config.aws.max_lifetime_seconds
         return decision, plans
@@ -446,32 +494,119 @@ class Controller:
         return request
 
     def _launch(self, result, decision, plans, account):
-        now = self.clock()
-        if decision["expires_at"] <= now:
-            result["decision"] = "refused"
-            result.setdefault("reasons", []).append("admission_expired")
-            return result
+        """Launch the admitted workers, one operation and token per worker.
+
+        The candidate order is rotated cyclically by the worker index, and each
+        worker starts at the first candidate whose quote is still fresh; earlier
+        candidates in that rotation are recorded as skipped. A worker is
+        committed only while the shared admission lifetime remains, so a slow
+        earlier request cannot create an intent that is already expired. A
+        launch that does not end accepted stops the rest of the batch; the
+        workers already launched stay in place.
+        """
         eligible = [plan for plan in plans if plan.eligible]
-        operation_id = uuid.uuid4().hex
-        request = self._request(eligible[0], decision["expires_at"], operation_id)
-        request_sha256 = _sha256(request)
-        with self.ledger.transaction():
-            operation = self.ledger.new_operation(
-                operation_id=operation_id,
-                client_token=request["ClientToken"],
-                request=request,
-                request_sha256=request_sha256,
-                expires_at=decision["expires_at"],
-                reservation_micros=decision["reservation_micros"],
-                window_start=decision["window_start"],
-                region=self.config.aws.region,
-                account=account,
-                detail=request_sha256,
+        launches = []
+        result["launches"] = launches
+        for index in range(decision["launch_count"]):
+            if decision["expires_at"] <= self.clock():
+                # The shared lifetime can elapse while an earlier worker's
+                # request is in flight; committing another intent now would
+                # create an instance that is expired on arrival.
+                result["decision"] = "launched" if launches else "refused"
+                result.setdefault("reasons", []).append("admission_expired")
+                return result
+            start = index % len(eligible)
+            rotated = eligible[start:] + eligible[:start]
+            position, skipped = self._first_fresh(rotated)
+            if position is None:
+                # No remaining worker can start on fresh evidence, and nothing
+                # was committed for this one.
+                result["decision"] = "launched" if launches else "refused"
+                result.setdefault("reasons", []).append("spot_price_stale")
+                result["attempts"] = skipped
+                return result
+            order = rotated[position:]
+            selected = order[0]
+            operation_id = uuid.uuid4().hex
+            request = self._request(selected, decision["expires_at"], operation_id)
+            request_sha256 = _sha256(request)
+            with self.ledger.transaction():
+                operation = self.ledger.new_operation(
+                    operation_id=operation_id,
+                    client_token=request["ClientToken"],
+                    request=request,
+                    request_sha256=request_sha256,
+                    expires_at=decision["expires_at"],
+                    reservation_micros=decision["reservation_micros"],
+                    window_start=decision["window_start"],
+                    region=self.config.aws.region,
+                    account=account,
+                    detail=request_sha256,
+                )
+            # Intent is committed before the request, so a lost response is
+            # recoverable and never a reason to allocate a second operation for
+            # the same worker slot.
+            attempt = {}
+            self._send_candidates(operation, order, attempt, decision)
+            attempts = skipped + attempt.get("attempts", [])
+            launches.append(
+                {
+                    "operation": operation.id,
+                    "instance_id": attempt.get("instance_id"),
+                    "zone": self._accepted_zone(attempts, operation),
+                    "reservation": attempt.get(
+                        "reservation", format_money(operation.reservation_micros)
+                    ),
+                    "decision": attempt.get("decision"),
+                    "attempts": attempts,
+                }
             )
-        # Intent is committed, so a lost response is recoverable and never a
-        # reason to allocate a second operation for the same demand.
-        self._send_candidates(operation, eligible, result, decision)
+            if index == 0:
+                # Existing consumers read the first launch at the top level.
+                for key in ("operation", "instance_id", "expires_at", "reservation"):
+                    if key in attempt:
+                        result[key] = attempt[key]
+                result["attempts"] = attempts
+            if attempt.get("decision") != "launched":
+                decision = attempt.get("decision", "launch_failed")
+                if decision == "refused" and len(launches) > 1:
+                    # A refusal means nothing was mutated. This batch already
+                    # launched at least one worker, so report the stop as a
+                    # launch failure instead.
+                    decision = "launch_failed"
+                result["decision"] = decision
+                for key in ("reasons", "refusal"):
+                    if key in attempt:
+                        result[key] = attempt[key]
+                result["attempts"] = attempts
+                return result
+        result["decision"] = "launched"
         return result
+
+    def _first_fresh(self, plans):
+        """Return the first fresh candidate's position and the skipped ones."""
+        now = self.clock()
+        skipped = []
+        for position, plan in enumerate(plans):
+            if now - plan.quote.observed_at > self.config.aws.price_max_age_seconds:
+                skipped.append(
+                    {
+                        "zone": plan.candidate.availability_zone,
+                        "outcome": "skipped",
+                        "reason": "spot_price_stale",
+                    }
+                )
+                continue
+            return position, skipped
+        return None, skipped
+
+    def _accepted_zone(self, attempts, operation):
+        """The placement that accepted this worker, else its final frozen request."""
+        for attempt in attempts:
+            if attempt.get("outcome") == "accepted":
+                return attempt["zone"]
+        final = self.ledger.operation(operation.id) or operation
+        return final.request()["Placement"]["AvailabilityZone"]
 
     def _send_candidates(self, operation, plans, result, decision):
         """Attempt the ordered candidates within one admission.
@@ -554,32 +689,75 @@ class Controller:
         result["attempts"] = attempts
 
     def _resume(self, slot, result):
-        """Retry the one unresolved launch intent instead of replacing it."""
+        """Retry every unresolved launch intent instead of replacing it.
+
+        Each intent is sent into its own mapping so a later failure can never
+        inherit an earlier success's instance identity. The top-level result
+        describes the intent that decided the outcome; ``resumes`` keeps one
+        entry per attempted intent in creation order.
+        """
         pending = [operation for operation in slot["operations"] if not operation.get("instance_id")]
         if not pending:
             return False
-        if len(pending) > 1:
-            result["decision"] = "refused"
-            result.setdefault("reasons", []).append("unresolved_intent_conflict")
-            return True
-        operation_id = pending[0]["operation"]
-        operation = self.ledger.operation(operation_id)
-        now = self.clock()
-        if now - operation.created_at > CLIENT_TOKEN_MAX_AGE_SECONDS:
-            result["decision"] = "refused"
-            result.setdefault("reasons", []).append("unresolved_intent_expired")
-            result["operation"] = operation.id
-            return True
-        if operation.expires_at <= now:
-            # Sending an intent whose lifetime already elapsed would create an
-            # instance that is expired before it boots. Keep the unresolved
-            # ownership and block admission instead.
-            result["decision"] = "refused"
-            result.setdefault("reasons", []).append("unresolved_intent_lifetime_elapsed")
-            result["operation"] = operation.id
-            return True
-        self._send(operation, operation.request(), result, "resumed", first_attempt=False)
+        resumes = []
+        result["resumes"] = resumes
+        for entry in pending:
+            operation = self.ledger.operation(entry["operation"])
+            # Every outcome carries the durable operation's own expiry and
+            # reservation; only the instance identity depends on a confirmed
+            # send, and the candidate walk stays empty for a resume.
+            attempt = {
+                "operation": operation.id,
+                "expires_at": operation.expires_at,
+                "reservation": format_money(operation.reservation_micros),
+                "attempts": [],
+            }
+            now = self.clock()
+            if now - operation.created_at > CLIENT_TOKEN_MAX_AGE_SECONDS:
+                attempt["decision"] = "refused"
+                attempt["reasons"] = ["unresolved_intent_expired"]
+            elif operation.expires_at <= now:
+                # Sending an intent whose lifetime already elapsed would create
+                # an instance that is expired before it boots. Keep the
+                # unresolved ownership and block admission instead.
+                attempt["decision"] = "refused"
+                attempt["reasons"] = ["unresolved_intent_lifetime_elapsed"]
+            else:
+                self._send(operation, operation.request(), attempt, "resumed", first_attempt=False)
+            record = {
+                "operation": operation.id,
+                "decision": attempt["decision"],
+                "reasons": attempt.get("reasons", []),
+                "instance_id": attempt.get("instance_id"),
+                "expires_at": attempt["expires_at"],
+                "reservation": attempt["reservation"],
+                "attempts": attempt["attempts"],
+            }
+            if "refusal" in attempt:
+                record["refusal"] = attempt["refusal"]
+            resumes.append(record)
+            if record["decision"] != "resumed":
+                self._report_resume(result, attempt, operation.id)
+                return True
+        self._report_resume(result, attempt, operation.id)
         return True
+
+    def _report_resume(self, result, attempt, operation_id):
+        """Report one resumed intent at the top level without stale fields."""
+        for key in ("operation", "instance_id", "expires_at", "reservation", "attempts", "refusal"):
+            result.pop(key, None)
+        result["operation"] = operation_id
+        result["decision"] = attempt["decision"]
+        result["expires_at"] = attempt["expires_at"]
+        result["reservation"] = attempt["reservation"]
+        if attempt.get("instance_id") is not None:
+            result["instance_id"] = attempt["instance_id"]
+        if attempt.get("reasons"):
+            result["reasons"] = attempt["reasons"]
+        else:
+            result.pop("reasons", None)
+        if "refusal" in attempt:
+            result["refusal"] = attempt["refusal"]
 
     def _send(self, operation, request, result, success_decision, first_attempt=True, *, defer_capacity=False):
         """Send one frozen request and report what it proved.

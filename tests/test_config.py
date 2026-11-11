@@ -18,8 +18,27 @@ class ConfigTests(unittest.TestCase):
         config = load(write_config(self.root))
         self.assertEqual(config.deployment, "test-deployment")
         self.assertEqual(config.worker.labels, ("ci-burst:host", "homelab:host"))
+        self.assertEqual(config.controller.max_instances, 1)
         self.assertEqual(config.aws.max_spot_price, 40_000)
         self.assertEqual(config.state.database, self.root / "state.sqlite3")
+
+    def test_accepts_a_fleet_of_four(self):
+        config = load(write_config(self.root, config={"controller": {"max_instances": 4}}))
+        self.assertEqual(config.controller.max_instances, 4)
+
+    def test_refuses_zero_instances(self):
+        path = write_config(self.root, config={"controller": {"max_instances": 0}})
+        with self.assertRaises(ConfigRefusal) as raised:
+            load(path)
+        self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
+        self.assertEqual(raised.exception.detail, "controller.max_instances: must be between 1 and 4")
+
+    def test_refuses_a_fleet_above_four(self):
+        path = write_config(self.root, config={"controller": {"max_instances": 5}})
+        with self.assertRaises(ConfigRefusal) as raised:
+            load(path)
+        self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
+        self.assertEqual(raised.exception.detail, "controller.max_instances: must be between 1 and 4")
 
     def test_relative_state_path_resolves_against_config(self):
         config = load(write_config(self.root, config={"state": {"database": "var/state.sqlite3"}}))
@@ -41,11 +60,6 @@ class ConfigTests(unittest.TestCase):
 
     def test_refuses_mutable_template_version(self):
         path = write_config(self.root, config={"aws": {"launch_template_version": "$Latest"}})
-        with self.assertRaises(ConfigRefusal):
-            load(path)
-
-    def test_refuses_higher_concurrency(self):
-        path = write_config(self.root, config={"controller": {"max_instances": 2}})
         with self.assertRaises(ConfigRefusal):
             load(path)
 

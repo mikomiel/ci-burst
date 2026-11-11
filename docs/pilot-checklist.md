@@ -41,8 +41,8 @@ cleanup bounds.
 ## 4. Capacity, quota and network
 
 - [ ] The Region and every configured availability-zone candidate have the
-      chosen instance type and Spot capacity; the account's Spot quota covers
-      one instance.
+      chosen instance type and Spot capacity; the account's Spot quota covers the
+      configured `controller.max_instances` workers.
 - [ ] The worker reaches the Forgejo endpoint over the approved path; TLS
       verification is on and no redirect is followed.
 - [ ] Egress from the worker is limited to what the queue needs; the worker
@@ -52,8 +52,9 @@ cleanup bounds.
 
 - [ ] Scaling and cleanup use separate machine identities with the reviewed
       scopes; neither is a copied human login cache.
-- [ ] `max_spot_price`, `max_lifetime_seconds`, `window_seconds`, `allowance`
-      and `non_compute_allowance` are reviewed for the pilot.
+- [ ] `max_spot_price`, `max_lifetime_seconds`, `controller.max_instances`,
+      `window_seconds`, `allowance` and `non_compute_allowance` are reviewed for
+      the pilot, and the allowance covers the admitted batch size.
 - [ ] The ledger path is on durable local storage with the writer lock proven.
 - [ ] The scheduler runs `apply`; a separate scheduler runs `reap --apply`
       outside the scaler's failure boundary, and that path was tested while the
@@ -63,8 +64,8 @@ cleanup bounds.
 
 - [ ] A plan reports the exact template, Region, ordered candidates, selected
       zone and reservation.
-- [ ] One owned instance readback shows all four ownership tags and the expiry.
-- [ ] A refused or denied cleanup stays visible and does not free the slot.
+- [ ] A launched worker's readback shows all four ownership tags and the expiry.
+- [ ] A refused or denied cleanup stays visible and does not free its slot.
 - [ ] The operator knows that an accepted termination request is not confirmed
       removal and that residual charges may remain.
 

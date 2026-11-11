@@ -2,7 +2,8 @@
 
 The package is deliberately small: one repository scope, one Spot backend and
 one local SQLite ledger. Forgejo owns job scheduling and results; AWS owns
-instances. This controller only decides whether one more worker should exist.
+instances. This controller only decides how many workers, up to the configured
+limit, should exist.
 """
 
 __version__ = "0.1.0"

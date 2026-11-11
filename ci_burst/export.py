@@ -421,23 +421,42 @@ class Exporter:
         instances = [item for item in instances if _match(INSTANCE_PATTERN, item.instance_id) is not None]
         if not instances:
             summary.notes.append("no_owned_instances")
-        if len(instances) > MAX_CONSOLE_READS:
+        # The console-read bound is a bound per run, not a bound on what the
+        # provider still remembers: a terminating worker keeps its tags for about
+        # an hour, so a busy fleet legitimately shows many terminal records. Only
+        # a deployment running more non-terminal workers than its own configured
+        # limit is a disagreement worth refusing.
+        limit = self.config.controller.max_instances
+        live = [item for item in instances if _normalize_state(item.state) not in TERMINAL_STATES]
+        if len(live) > limit:
             raise ProviderRefusal(
                 "console_read_cap_exceeded",
-                f"{len(instances)} owned instances exceeds the cap of {MAX_CONSOLE_READS}",
+                f"{len(live)} non-terminal owned instances exceeds the configured limit of {limit}",
             )
-        consoles = self.aws.console_output([instance.instance_id for instance in instances])
 
         state, note = load_state(state_file)
         if note is not None:
             summary.notes.append(note)
         prune_state(state, current)
 
+        # A console carries evidence only while it can still change: a live
+        # worker's buffer grows, and a terminal one is finished after the first
+        # read that shows it left the live states. Finished records are never
+        # read again, so normal turnover cannot spend the per-run budget.
+        candidates = [item for item in instances if not _read_finished(state, item)]
+        reading = candidates[:MAX_CONSOLE_READS]
+        if len(candidates) > len(reading):
+            summary.notes.append("console_read_deferred")
+        read_ids = {item.instance_id for item in reading}
+        consoles = self.aws.console_output([item.instance_id for item in reading]) if reading else {}
+
         events = []
+        summary.observed = len(instances)
         for instance in instances:
-            summary.observed += 1
             provider_state = _normalize_state(instance.state)
             summary.states[provider_state] = summary.states.get(provider_state, 0) + 1
+            if instance.instance_id not in read_ids:
+                continue
             facts = parse_console(consoles.get(instance.instance_id, ""))
             record, created = _record_for(state, instance.instance_id, current)
             if created:
@@ -547,6 +566,17 @@ def _merge_record(record, instance, facts, now, provider_state):
 
 def _ended(record):
     return record.get("state") in TERMINAL_STATES or record.get("exit_code") is not None
+
+
+def _read_finished(state, instance):
+    """True when this instance's console can no longer carry new evidence.
+
+    A live worker is read again on every run because its buffer grows; a worker
+    that has been observed in a terminal state is finished after that read. A
+    record the run has never seen is unfinished by definition.
+    """
+    record = state["instances"].get(instance.instance_id)
+    return record is not None and _ended(record)
 
 
 def _events_for(instance, record, now, deployment):

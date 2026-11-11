@@ -182,16 +182,24 @@ stopped exporter.
 
 | Bound | Value |
 | --- | --- |
-| console reads per run | 16 (the fleet limit is four) |
+| console reads per run | 16, over the records that can still carry new evidence |
+| non-terminal owned instances | refused above `controller.max_instances` |
 | bytes read per console | 64 KiB |
 | error kinds per instance | 3 |
 | published console text | none |
 | event file | rotated at 4 MiB |
 | dedupe record | pruned after 7 days |
 
-Exceeding the console-read cap is a refusal (`console_read_cap_exceeded`, exit
-2) and nothing is written: more owned instances than the cap means the
-ownership tags disagree with the deployment.
+A terminal worker keeps its ownership tags for about an hour after termination,
+so a busy fleet legitimately shows many terminal records at once. A record is
+read again only while it can change: a live worker every run, a terminating one
+until a read shows it left the live states. A run that finds more candidates
+than the budget defers the rest with the note `console_read_deferred`, and the
+next run picks them up while they are still visible.
+
+Only a deployment running more non-terminal workers than its own configured
+limit is refused (`console_read_cap_exceeded`, exit 2, nothing written): that is
+the ownership tags disagreeing with the deployment, not turnover.
 
 An instance without the ownership tags — a hand-launched canary — is invisible
 here on purpose; read its console directly with the provider CLI instead.

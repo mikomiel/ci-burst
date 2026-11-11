@@ -18,9 +18,16 @@ that needs more concurrent workers has no supported configuration.
   configuration validation, the two acceptance specs that restate it, and the
   operator documentation that names it.
 - Add acceptance coverage for the new ceiling and for a value above it.
-- Nothing else changes: admission stays `min(eligible demand, free slots,
-  affordable reservations)`, and the reservation, ledger, placement, expiry and
-  cleanup paths do not read the bound beyond the free-slot count.
+- Make the worker-console reader's bound follow the ceiling. Its per-run cap was
+  sized for a four-worker fleet and counted records the provider still lists,
+  including terminated workers that keep their tags for about an hour. At a
+  higher ceiling that normal turnover would trip the cap and disable the
+  evidence stream, so a finished record is no longer re-read and an over-budget
+  run defers instead of refusing. Only a deployment running more non-terminal
+  workers than its own ceiling is still refused.
+- Admission is unchanged: `min(eligible demand, free slots, affordable
+  reservations)`. The reservation, ledger, placement, expiry and cleanup paths
+  do not read the bound beyond the free-slot count.
 
 ## Impact
 

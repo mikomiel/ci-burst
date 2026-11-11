@@ -17,8 +17,8 @@ change moves that one number and keeps the other two owners untouched.
 ## Goals / Non-Goals
 
 **Goals:** a deployment can raise peak concurrency to a still-bounded number
-without patching the product; the refusal above the new ceiling is explicit; the
-default and every existing behaviour are unchanged.
+without patching the product; every consumer of the bound keeps working at the new
+ceiling; the refusal above it is explicit; the default is unchanged.
 
 **Non-Goals:** dynamic or queue-driven ceilings, multiple concurrent controllers,
 warm pools, On-Demand capacity, per-worker capacity greater than one job, or any
@@ -30,9 +30,12 @@ change to reservations, placement, expiry and cleanup.
 
 A ceiling that a controller raised and lowered itself would be a second owner of
 capacity policy: the launch count is already demand-driven, so an adaptive
-ceiling adds no launches that demand would not have produced, and it would need a
-config-writing path or a new durable policy input. Admission stays single-owned
-and observable, and an operator who wants a different peak edits one integer.
+ceiling adds no launches that demand would not have produced. It would not have
+to write configuration — a governor could hold its state in the durable ledger
+instead — but it would still be a policy owner that answers a question admission
+already answers, and one that an operator cannot predict from the configuration.
+Admission stays single-owned and observable, and an operator who wants a
+different peak edits one integer.
 
 ### Twelve, not unlimited
 
@@ -46,13 +49,40 @@ and low enough that the per-tick work and the unallocated spend remain small.
 Larger fleets stay outside the product's single-controller scope
 (`docs/operations.md` §Supported limits).
 
+### The console reader's bound follows the ceiling
+
+The worker-console reader bounds one run at a small number of console reads. That
+bound was sized for a four-worker fleet and counted *records the provider still
+lists*, which includes terminated workers: a terminated instance keeps its
+ownership tags for about an hour. Turnover therefore looks like an oversized
+inventory — twelve slots replacing workers every few minutes exceed the per-run
+cap within the hour — and the reader refused (`console_read_cap_exceeded`),
+writing no event and no metrics file, exactly while the larger fleet most needed
+to be observable.
+
+Two changes keep the bound meaningful without weakening it:
+
+- a record is read only while it can carry new evidence: a live worker on every
+  run, and a terminating worker until the read that shows it terminal. A
+  finished record is never read again, so turnover costs nothing;
+- candidates beyond the per-run budget are deferred with a note, not refused. A
+  deferred record is a candidate on the next run while the provider still knows
+  it, so no evidence is lost and the provider work per run stays fixed.
+
+The refusal remains, re-pointed at the drift it was meant to catch: more
+non-terminal owned instances than the configured `controller.max_instances`
+means the ownership tags disagree with the deployment.
+
 ### Rejected: several deployments as one fleet
 
 Splitting the same queue across two deployments would double the bound without
-touching it, but each deployment would observe the same waiting jobs and race to
-expire its own intent, so the same job could be provisioned twice. The supported
-topology is one deployment, one controller host, one ledger and one writer, and
-this change does not weaken it.
+touching it, but each deployment would observe the same waiting jobs and admit a
+worker for them, so the same demand would reserve two instances; the deployments
+would also keep independent allowances with no shared exclusion. Forgejo still
+assigns each job once, so this is duplicated provisioning rather than duplicated
+work, and it defeats the reservation accounting. The supported topology is one
+deployment, one controller host, one ledger and one writer, and this change does
+not weaken it.
 
 ### Rejected: more jobs per worker
 
@@ -64,9 +94,12 @@ measurement of job interference.
 
 ## Risks
 
-- A deployment that raises the bound and leaves its allowance unchanged sees no
-  extra launches: the allowance caps the batch first. That is the intended
-  interaction, and `docs/operations.md` §Sizing the window owns the arithmetic.
+- A deployment that raises the bound and leaves its allowance unchanged gains
+  launches only up to what the allowance can afford: `min(demand, free slots,
+  affordable)` takes the smallest term, so an allowance that was the binding
+  constraint stays the ceiling on throughput. An allowance that already afforded
+  the old peak now affords the new one. `docs/operations.md` §Sizing the window
+  owns the arithmetic.
 - A higher ceiling multiplies `hourly_ceiling`. The value is reported, not
   enforced; the window allowance remains the spend guard.
 

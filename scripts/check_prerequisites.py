@@ -12,8 +12,9 @@ silent no-op.
 When a candidate's default route targets a network interface, that router is
 part of the deployment too: the command checks that it is running and that its
 boot configuration forwards the candidate's CIDR. It cannot prove reachability
-— a real registration does that — and an unreadable router configuration is
-reported as unavailable rather than as a pass.
+— a real registration does that. An unreadable router configuration, and a
+router that reads its CIDRs from SSM at boot, are reported as unavailable
+rather than as a pass.
 
 The command only reads: it never mutates a resource, never reads a parameter
 value (not even a ciphertext), and never stores one. The template is read
@@ -293,6 +294,11 @@ def _route_target_kind(route):
 
 
 _CIDR = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}\b")
+_COMMENT = re.compile(r"#.*$", re.MULTILINE)
+#: A router that reads its CIDRs from SSM at boot declares nothing this
+#: read-only command can see, so its forwarding is unverified rather than
+#: assumed either way.
+_SSM_CONFIGURED = re.compile(r"\baws\s+ssm\s+get-parameter\b")
 
 
 def _cidrs(value):
@@ -764,7 +770,17 @@ class Prerequisites:
                 reasons=["router_user_data_unavailable"],
                 detail="invalid base64",
             )
-        forwarded = _cidrs(decoded)
+        declared = _COMMENT.sub("", decoded)
+        if _SSM_CONFIGURED.search(declared):
+            return _record(
+                "router",
+                target,
+                status="unavailable",
+                facts=record_facts,
+                reasons=["router_forwarding_unverified"],
+                detail="forwarding is read from SSM at boot",
+            )
+        forwarded = _cidrs(declared)
         record_facts["forwarded_cidrs"] = sorted(forwarded)
         reasons = []
         if subnet_cidr and subnet_cidr not in forwarded:

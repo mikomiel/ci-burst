@@ -38,14 +38,22 @@ UNIT=/etc/systemd/system/ci-burst-router-forward.service
 echo "STEP packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y --no-install-recommends awscli wireguard-tools iptables python3
+apt-get install -y --no-install-recommends awscli curl wireguard-tools iptables python3
 
 echo "STEP config"
 install -d -m 0755 "${CONFIG_DIR}" /etc/wireguard /usr/local/sbin
+# The instance profile supplies credentials, not a Region. Resolve it from
+# IMDSv2 so the first boot works on an image with no AWS configuration.
+TOKEN=$(curl -sS --max-time 5 -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300") || TOKEN=""
+REGION=$(curl -sS --max-time 5 -H "X-aws-ec2-metadata-token: ${TOKEN}" \
+  "http://169.254.169.254/latest/meta-data/placement/region") || REGION=""
+[ -n "${REGION}" ] || { echo "cannot resolve the instance region from IMDS" >&2; exit 1; }
+echo "region ${REGION}"
 CONFIG_JSON=$(mktemp /run/ci-burst-router-config.XXXXXX)
 chmod 600 "${CONFIG_JSON}"
 trap 'shred -u "${CONFIG_JSON}" 2>/dev/null || rm -f "${CONFIG_JSON}"' EXIT
-aws ssm get-parameter --name "${CONFIG_PARAMETER}" --with-decryption \
+aws ssm get-parameter --region "${REGION}" --name "${CONFIG_PARAMETER}" --with-decryption \
   --query Parameter.Value --output text > "${CONFIG_JSON}"
 
 python3 - "${CONFIG_JSON}" "${CIDR_FILE}" "${WG_FILE}" <<'PY'

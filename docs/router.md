@@ -94,8 +94,12 @@ else — no launch, no tag, no terminate.
 
 The instance needs:
 
-- a subnet that can reach the internet gateway directly (a public subnet, or an
-  Elastic IP), so the router itself can reach SSM to read its configuration;
+- **a public IPv4 address on the instance**, so the router itself can reach the
+  package mirrors and SSM. A default route to an internet gateway is not enough:
+  without an associated public address the gateway drops the router's own
+  traffic. A subnet that auto-assigns public addresses,
+  `--associate-public-ip-address`, or an Elastic IP all satisfy this, and the
+  launch below asks for the address explicitly;
 - a security group that allows **all** inbound from every worker CIDR and all
   outbound — the same shape as the NAT-instance security group in the AWS
   documentation;
@@ -107,6 +111,7 @@ The instance needs:
 aws ec2 run-instances --region <region> \
   --image-id <debian-image> --instance-type t4g.nano \
   --subnet-id <router-subnet> --security-group-ids <router-sg> \
+  --associate-public-ip-address \
   --iam-instance-profile Name=<router-profile> \
   --user-data file://deploy/router/userdata.sh \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ci-burst-router}]'
@@ -146,8 +151,12 @@ aws ec2 run-instances --region <region> \
 
 Within about 40 seconds the worker must appear in the repository's runner list
 as `burst-ip-<private-ip-dashed>`. Its console output is the diagnostic when it
-does not: `STEP mount-options` followed by `STEP register` is a working path;
-`Connect timeout on endpoint URL` is a missing forwarding rule for that CIDR.
+does not: `STEP mount-options` followed by `STEP register` is a working path.
+`Connect timeout on endpoint URL` is a symptom of an unreachable path, not
+proof of one cause — a missing forwarding rule for that CIDR, source/destination
+checking still enabled, a security group or network ACL that does not admit the
+subnet, or a router with no internet path of its own all look the same from the
+worker.
 
 Terminate the canary when the test is done. It self-terminates after its
 lifetime, and the reaper does not manage it because it carries no
@@ -162,8 +171,12 @@ and confirm the tunnel and the rules return without logging in:
 aws ec2 reboot-instances --region <region> --instance-ids <instance-id>
 ```
 
-Then repeat one canary. A router that cannot come back after a reboot is a fleet
-that loses egress at the next host maintenance.
+A reboot request is acknowledged, not completed, so wait for it to finish and
+for the instance's status checks to pass again, then confirm from the console
+output that the log begins at a new boot — if it still shows the previous boot,
+the reboot has not happened and neither has the test. Then repeat the canary for
+**every** configured candidate, not one: a router that cannot come back after a
+reboot is a fleet that loses egress at the next host maintenance.
 
 ## 8. Replacing or removing the router
 

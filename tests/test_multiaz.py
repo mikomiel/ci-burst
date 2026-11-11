@@ -119,7 +119,7 @@ class MultiZoneAws(FakeAws):
             error = error.pop(0) if error else None
         if error is not None:
             raise error
-        return list(self.run_result)
+        return self.next_instance()
 
 
 class MultiZoneCase(unittest.TestCase):

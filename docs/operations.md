@@ -311,6 +311,10 @@ Every worker in a batch reserves this same `per_launch` amount, so a batch of N
 launches needs `N × per_launch` of the current window's remaining allowance. The
 configured limit caps the batch; the allowance can cap it first.
 
+`budget.remaining_after` in a decision still subtracts one worker's reservation,
+kept for compatibility with consumers that predate the fleet. The batch headroom
+is `per_launch_reservation × launch_count`, not `remaining_after`.
+
 A launch is refused unless the selected candidate has a fresh Spot quote for the
 configured instance type and its availability zone, was observed no longer ago
 than `price_max_age_seconds`, and is not above `max_spot_price`. Freshness is the
@@ -409,11 +413,14 @@ request, client token and reservation. A batch is not one admission with several
 instances: every worker can be resumed, reconciled, expired and charged on its
 own. Every request still sends `MinCount = MaxCount = 1`.
 
-The launch order rotates the eligible candidate list by the worker index
-(`eligible[i:] + eligible[:i]`), so three workers over three zones select the
-configured order, then the next zone, and so on. Rotation spreads workers across
-the ordered zones; it is not a capacity guarantee, and each worker still walks
-its own candidate order only on a definite capacity rejection.
+The launch order rotates the eligible candidate list cyclically by the worker
+index (`start = index % len(eligible)`, then
+`eligible[start:] + eligible[:start]`), so a batch starts at successive candidates
+and wraps: four workers over two zones start A, B, A, B. Rotation spreads workers
+across the ordered zones; it is not a capacity guarantee. Each worker starts at
+the first candidate in its rotation whose quote is still fresh, records the
+earlier candidates as `skipped` (`spot_price_stale`), and walks its own candidate
+order only on a definite capacity rejection.
 
 The worker contract stays one job per worker. An idle worker waits for one job
 until its own maximum lifetime, then shuts down and terminates; the reservation
@@ -425,6 +432,12 @@ lifetime.
 If any worker in the batch ends in anything other than an accepted launch, the
 controller stops the batch and leaves the workers already launched in place. It
 does not terminate them to make the batch uniform.
+
+The shared admission lifetime is re-read before each worker is committed. If it
+elapsed while an earlier request was in flight, the batch stops with
+`admission_expired` and no further operation is created: the decision is
+`launched` when a worker already launched, otherwise `refused`. A later worker
+with no fresh candidate stops the same way with `spot_price_stale`.
 
 Lowering `controller.max_instances` below the number of live owned workers never
 terminates anything. New admission waits with `slot_busy` and the decision
@@ -462,12 +475,15 @@ admission lifetime must not have elapsed. A candidate whose evidence expired is
 recorded as `skipped` (`spot_price_stale`), not frozen or sent, and the next
 remaining candidate is considered. The result reports a `launches` array with one
 entry per admitted worker (`operation`, `instance_id`, `zone`, `reservation`,
-`decision`) and the ordered `attempts` of the first launch, or of the launch
-that stopped the batch, with each outcome (`capacity_rejected`, `accepted`,
-`rejected`, `uncertain` or `skipped`); the top-level `operation`, `instance_id`,
-`expires_at` and `reservation` are the first launch's values, so a one-worker
-deployment reads the shape it did before. `selected` remains the batch's first
-choice, so the accepted attempt is the placement that actually launched.
+`decision`, `attempts`). Each entry's `zone` is the placement that actually
+accepted that worker, so a capacity fallback is not reported under the original
+choice, and its `attempts` carries that worker's own ordered outcomes
+(`capacity_rejected`, `accepted`, `rejected`, `uncertain` or `skipped`). The
+top-level `operation`, `instance_id`, `expires_at` and `reservation` are the
+first launch's values, so a one-worker deployment reads the shape it did before;
+the top-level `attempts` is the ordered outcome list of the first launch, or of
+the step that stopped the batch. `selected` remains the batch's first choice, so
+the accepted attempt is the placement that actually launched.
 
 No other failure falls through: a non-capacity definite rejection keeps today's
 `launch_failed` behaviour, and an uncertain response keeps the operation
@@ -511,7 +527,10 @@ earlier request created nothing.
 Two bounds refuse rather than launch: an unresolved intent older than the
 24-hour client-token validity, and an intent whose configured lifetime has
 already elapsed. Both keep the unresolved ownership and block admission until
-an operator resolves them.
+an operator resolves them. When more than one launch intent is unresolved,
+`apply` retries them in creation order and stops at the first intent whose age
+exceeds the client-token window, whose lifetime elapsed, or whose retry is not
+accepted; the intents it did not reach stay outstanding for the next apply.
 
 The EC2 client is built without the SDK's transparent retries, so one recorded
 provider call is one HTTP attempt; the controller's own resume is the only

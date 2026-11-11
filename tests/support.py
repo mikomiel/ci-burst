@@ -67,7 +67,8 @@ class FakeAws:
         self.error = error
         self.calls = []
         self.run_error = None
-        self.run_result = ["i-0123456789abcdef0"]
+        self.run_result = None
+        self.run_count = 0
         self.terminate_error = None
         self.terminated = []
         self.instances_by_id = {}
@@ -118,7 +119,15 @@ class FakeAws:
             self.on_run(request)
         if self.run_error is not None:
             raise self.run_error
-        return list(self.run_result)
+        return self.next_instance()
+
+    def next_instance(self):
+        """Return one accepted instance; distinct per worker unless pinned."""
+        if self.run_result is not None:
+            return list(self.run_result)
+        instance_id = f"i-0123456789abcdef{self.run_count:x}"
+        self.run_count += 1
+        return [instance_id]
 
     def terminate(self, instance_ids):
         self.calls.append(("terminate", list(instance_ids)))

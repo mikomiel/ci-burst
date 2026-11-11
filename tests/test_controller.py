@@ -694,6 +694,25 @@ class FleetTests(ControllerCase):
     def fleet_config(self, max_instances=4):
         return load(write_config(self.root, config={"controller": {"max_instances": max_instances}}))
 
+    def zone_config(self, *, max_instances=2, zones=("eu-central-1a", "eu-central-1b")):
+        return load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": max_instances},
+                    "aws": {
+                        "availability_zones": [
+                            {
+                                "zone": zone,
+                                "subnet_id": f"subnet-0123456789abcdef{index:x}",
+                            }
+                            for index, zone in enumerate(zones)
+                        ]
+                    },
+                },
+            )
+        )
+
     def test_plan_reports_the_batch_size_for_a_backlog(self):
         controller = self.build(observation=observation_demand(5), config=self.fleet_config(3))
         result = controller.plan()
@@ -764,6 +783,113 @@ class FleetTests(ControllerCase):
         )
         self.assertEqual(len({run["ClientToken"] for run in runs}), 3)
         self.assertEqual(len(result["launches"]), 3)
+        self.assertEqual(
+            [[attempt["zone"] for attempt in entry["attempts"]] for entry in result["launches"]],
+            [["eu-central-1a"], ["eu-central-1b"], ["eu-central-1c"]],
+        )
+
+    def test_a_later_worker_is_not_committed_after_the_shared_expiry_elapses(self):
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 2},
+                    "aws": {"max_lifetime_seconds": 60},
+                },
+            )
+        )
+        controller = self.build(observation=observation_demand(2), config=config)
+        self.aws.on_run = lambda request: self.clock.advance(70)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertIn("admission_expired", result["reasons"])
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1)
+        self.assertEqual(len(self.reopened().operations()), 1)
+
+    def test_a_stale_first_choice_skips_to_the_next_fresh_candidate(self):
+        config = self.zone_config(max_instances=2)
+        quotes = {
+            "eu-central-1a": quote(clock=self.clock, availability_zone="eu-central-1a"),
+            "eu-central-1b": quote(
+                clock=self.clock,
+                availability_zone="eu-central-1b",
+                observed_at=self.clock.now - 100,
+            ),
+        }
+        controller = self.build(
+            observation=observation_demand(2),
+            aws=FakeAws(spot_quote=quotes),
+            config=config,
+        )
+        self.aws.on_run = lambda request: self.clock.advance(850)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(result["launches"]), 2)
+        second = result["launches"][1]
+        self.assertEqual(second["zone"], "eu-central-1a")
+        self.assertEqual(
+            second["attempts"],
+            [
+                {"zone": "eu-central-1b", "outcome": "skipped", "reason": "spot_price_stale"},
+                {"zone": "eu-central-1a", "outcome": "accepted"},
+            ],
+        )
+
+    def test_a_capacity_fallback_reports_the_accepted_zone(self):
+        config = self.zone_config(max_instances=1)
+        quotes = {
+            zone: quote(clock=self.clock, availability_zone=zone)
+            for zone in ("eu-central-1a", "eu-central-1b")
+        }
+        aws = FakeAws(spot_quote=quotes)
+
+        def reject_first(request):
+            if request["Placement"]["AvailabilityZone"] == "eu-central-1a":
+                raise ProviderRefusal("AWS_REFUSED", "InsufficientInstanceCapacity")
+
+        aws.on_run = reject_first
+        controller = self.build(observation=observation_demand(1), aws=aws, config=config)
+        result = controller.apply()
+        launch = result["launches"][0]
+        self.assertEqual(launch["zone"], "eu-central-1b")
+        self.assertEqual(
+            launch["attempts"],
+            [
+                {
+                    "zone": "eu-central-1a",
+                    "outcome": "capacity_rejected",
+                    "reason": "AWS_REFUSED",
+                    "detail": "InsufficientInstanceCapacity",
+                },
+                {"zone": "eu-central-1b", "outcome": "accepted"},
+            ],
+        )
+        operation = self.reopened().operation(result["operation"])
+        self.assertEqual(operation.request()["Placement"]["AvailabilityZone"], "eu-central-1b")
+
+    def test_four_workers_over_two_zones_start_alternately(self):
+        config = self.zone_config(max_instances=4)
+        quotes = {
+            zone: quote(clock=self.clock, availability_zone=zone)
+            for zone in ("eu-central-1a", "eu-central-1b")
+        }
+        controller = self.build(
+            observation=observation_demand(4),
+            aws=FakeAws(spot_quote=quotes),
+            config=config,
+        )
+        result = controller.apply()
+        runs = [call[1] for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(
+            [run["Placement"]["AvailabilityZone"] for run in runs],
+            ["eu-central-1a", "eu-central-1b", "eu-central-1a", "eu-central-1b"],
+        )
+        self.assertEqual(
+            [entry["zone"] for entry in result["launches"]],
+            ["eu-central-1a", "eu-central-1b", "eu-central-1a", "eu-central-1b"],
+        )
+        self.assertEqual(len({entry["instance_id"] for entry in result["launches"]}), 4)
 
     def test_allowance_caps_a_batch_and_notes_the_cap(self):
         config = load(

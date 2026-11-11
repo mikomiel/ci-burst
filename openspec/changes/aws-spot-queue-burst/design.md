@@ -111,19 +111,24 @@ Use EC2 `RunInstances` with one-time Spot market options, `MinCount=MaxCount=1`,
 a template version fixed per candidate, fixed placement inputs and a stable
 `ClientToken`.
 Placement is the first eligible entry of the operator's ordered
-availability-zone candidate list. There is no On-Demand fallback and no
-automatic Region or AZ substitution: the only permitted placement change is the
-configured order, followed after a proved capacity rejection.
+availability-zone candidate list. Within a fleet batch each worker starts at the
+next candidate (`index % len(candidates)`) and wraps through the order, so
+workers spread across the configured zones; each worker still starts at the first
+candidate in its rotation whose quote is still fresh. There is no On-Demand
+fallback and no automatic Region or AZ substitution: the only permitted placement
+change is the configured order, followed after a proved capacity rejection.
 
 Before the request, one SQLite transaction stores the deployment and operation
 identities. It records the frozen request parameters, their hash and the stable
 launch-request identifier. It also records creation and expiry times with the
 cost reservation. Required ownership and expiry tags are part of the launch
 request, not a later best-effort tag step. The frozen request names the candidate
-being attempted. The candidate subnet is a top-level `RunInstances` parameter,
-so a template used with a candidate list must leave network interfaces to the
-request; the single-zone form sends no subnet override and keeps the template's
-network choice.
+being attempted. A worker is committed only while the shared admission lifetime
+remains; the expiry is re-read before each worker, so a slow earlier request
+cannot create an already-expired intent. The candidate subnet is a top-level
+`RunInstances` parameter, so a template used with a candidate list must leave
+network interfaces to the request; the single-zone form sends no subnet override
+and keeps the template's network choice.
 
 The durable lifecycle is conceptually `intent -> starting -> running ->
 terminating -> terminal`; uncertain creation/cleanup remains outstanding.

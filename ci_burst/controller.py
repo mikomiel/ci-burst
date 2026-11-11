@@ -496,30 +496,37 @@ class Controller:
     def _launch(self, result, decision, plans, account):
         """Launch the admitted workers, one operation and token per worker.
 
-        The eligible candidates are rotated by the launch index so successive
-        workers in one batch spread across the configured zones. Each launch
-        freezes its own request before the cloud call. A launch that does not
-        end accepted stops the rest of the batch; the workers already launched
-        stay in place.
+        The candidate order is rotated cyclically by the worker index, and each
+        worker starts at the first candidate whose quote is still fresh; earlier
+        candidates in that rotation are recorded as skipped. A worker is
+        committed only while the shared admission lifetime remains, so a slow
+        earlier request cannot create an intent that is already expired. A
+        launch that does not end accepted stops the rest of the batch; the
+        workers already launched stay in place.
         """
-        now = self.clock()
-        if decision["expires_at"] <= now:
-            result["decision"] = "refused"
-            result.setdefault("reasons", []).append("admission_expired")
-            return result
         eligible = [plan for plan in plans if plan.eligible]
         launches = []
         result["launches"] = launches
         for index in range(decision["launch_count"]):
-            rotated = eligible[index:] + eligible[:index]
-            selected = rotated[0]
-            if self.clock() - selected.quote.observed_at > self.config.aws.price_max_age_seconds:
-                # The quote that made this candidate eligible has aged out while
-                # earlier workers in the batch were launched. It must not be
-                # frozen or sent.
+            if decision["expires_at"] <= self.clock():
+                # The shared lifetime can elapse while an earlier worker's
+                # request is in flight; committing another intent now would
+                # create an instance that is expired on arrival.
+                result["decision"] = "launched" if launches else "refused"
+                result.setdefault("reasons", []).append("admission_expired")
+                return result
+            start = index % len(eligible)
+            rotated = eligible[start:] + eligible[:start]
+            position, skipped = self._first_fresh(rotated)
+            if position is None:
+                # No remaining worker can start on fresh evidence, and nothing
+                # was committed for this one.
                 result["decision"] = "launched" if launches else "refused"
                 result.setdefault("reasons", []).append("spot_price_stale")
+                result["attempts"] = skipped
                 return result
+            order = rotated[position:]
+            selected = order[0]
             operation_id = uuid.uuid4().hex
             request = self._request(selected, decision["expires_at"], operation_id)
             request_sha256 = _sha256(request)
@@ -540,16 +547,18 @@ class Controller:
             # recoverable and never a reason to allocate a second operation for
             # the same worker slot.
             attempt = {}
-            self._send_candidates(operation, rotated, attempt, decision)
+            self._send_candidates(operation, order, attempt, decision)
+            attempts = skipped + attempt.get("attempts", [])
             launches.append(
                 {
                     "operation": operation.id,
                     "instance_id": attempt.get("instance_id"),
-                    "zone": selected.candidate.availability_zone,
+                    "zone": self._accepted_zone(attempts, operation),
                     "reservation": attempt.get(
                         "reservation", format_money(operation.reservation_micros)
                     ),
                     "decision": attempt.get("decision"),
+                    "attempts": attempts,
                 }
             )
             if index == 0:
@@ -557,7 +566,7 @@ class Controller:
                 for key in ("operation", "instance_id", "expires_at", "reservation"):
                     if key in attempt:
                         result[key] = attempt[key]
-                result["attempts"] = attempt.get("attempts", [])
+                result["attempts"] = attempts
             if attempt.get("decision") != "launched":
                 decision = attempt.get("decision", "launch_failed")
                 if decision == "refused" and len(launches) > 1:
@@ -566,12 +575,38 @@ class Controller:
                     # launch failure instead.
                     decision = "launch_failed"
                 result["decision"] = decision
-                for key in ("reasons", "refusal", "attempts"):
+                for key in ("reasons", "refusal"):
                     if key in attempt:
                         result[key] = attempt[key]
+                result["attempts"] = attempts
                 return result
         result["decision"] = "launched"
         return result
+
+    def _first_fresh(self, plans):
+        """Return the first fresh candidate's position and the skipped ones."""
+        now = self.clock()
+        skipped = []
+        for position, plan in enumerate(plans):
+            if now - plan.quote.observed_at > self.config.aws.price_max_age_seconds:
+                skipped.append(
+                    {
+                        "zone": plan.candidate.availability_zone,
+                        "outcome": "skipped",
+                        "reason": "spot_price_stale",
+                    }
+                )
+                continue
+            return position, skipped
+        return None, skipped
+
+    def _accepted_zone(self, attempts, operation):
+        """The placement that accepted this worker, else its final frozen request."""
+        for attempt in attempts:
+            if attempt.get("outcome") == "accepted":
+                return attempt["zone"]
+        final = self.ledger.operation(operation.id) or operation
+        return final.request()["Placement"]["AvailabilityZone"]
 
     def _send_candidates(self, operation, plans, result, decision):
         """Attempt the ordered candidates within one admission.

@@ -9,7 +9,9 @@ The section starts after the latest annotated release tag, so an entry that
 already has a released section is not rendered again. A release preparation
 marker defers that tag until the preparation commit is on `main`;
 `--validate-release` verifies the published state, and `--check` reports a
-committed file that differs from what `--write` would produce.
+committed file that differs from what `--write` would produce. `--write` emits
+UTF-8 bytes with LF, so `--check`'s byte equality is platform-independent by
+construction.
 
 Rendering fails closed when the history is shallow, when a released heading
 cannot be reconciled with a local reachable annotated tag (for example in a
@@ -417,21 +419,31 @@ def replace_unreleased(text, section):
     return "\n".join(updated).rstrip("\n") + "\n"
 
 
+def changelog_bytes(text, section):
+    """The exact bytes ``--write`` emits: the rewrite encoded as UTF-8 with LF.
+
+    Writing and checking share this one definition, so neither can drift from
+    the other. ``--write`` writes these bytes rather than text, so no
+    text-mode newline translation can apply and the comparison holds on every
+    platform.
+    """
+    return replace_unreleased(text, section).encode("utf-8")
+
+
 def changelog_is_current(text, section):
     """True when ``--write`` would leave CHANGELOG.md byte-identical.
 
-    ``--write`` renders from the universal-newline-translated read and writes
-    UTF-8 without translation, so the committed bytes are compared with exactly
-    the bytes it would write. Reading the section back instead would hide a
-    CRLF section, CRLF elsewhere in the file, a surplus blank line before the
-    next heading and a missing final newline: all of them are drift that
-    ``--write`` would rewrite.
+    The committed bytes are compared with :func:`changelog_bytes`, the one
+    definition of what ``--write`` emits. Reading the section back as text
+    instead would hide a CRLF section, CRLF elsewhere in the file, a surplus
+    blank line before the next heading and a missing final newline: all of them
+    are drift that ``--write`` would rewrite.
     """
     try:
         committed = CHANGELOG.read_bytes()
     except FileNotFoundError:
         return False
-    return committed == replace_unreleased(text, section).encode("utf-8")
+    return committed == changelog_bytes(text, section)
 
 
 def main(argv=None):
@@ -495,7 +507,7 @@ def main(argv=None):
     if not args.write:
         sys.stdout.write(section)
         return 0
-    CHANGELOG.write_text(replace_unreleased(text, section), encoding="utf-8")
+    CHANGELOG.write_bytes(changelog_bytes(text, section))
     return 0
 
 

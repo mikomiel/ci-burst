@@ -435,7 +435,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
         section = "## [Unreleased]\n\n### Added\n\n- Add the controller.\n"
         text = "# Changelog\n"
         self.commit("feat: add the controller")
-        (self.root / "CHANGELOG.md").write_text(text, encoding="utf-8")
+        (self.root / "CHANGELOG.md").write_bytes(text.encode("utf-8"))
         self.add_renderer()
 
         completed = self.run_check(self.root)
@@ -443,14 +443,49 @@ class ReleaseBoundaryTests(unittest.TestCase):
         self.assertEqual(completed.stdout, section)
         self.assertNotIn("up to date", completed.stdout)
         self.assertIn("python3 scripts/render_changelog.py --write", completed.stderr)
-        self.assertEqual((self.root / "CHANGELOG.md").read_text(encoding="utf-8"), text)
+        self.assertEqual((self.root / "CHANGELOG.md").read_bytes(), text.encode("utf-8"))
 
         # `--write` appends the section rather than refusing; the check reports it.
         self.assertEqual(self.run_write(self.root).returncode, 0)
         self.assertEqual(
-            (self.root / "CHANGELOG.md").read_text(encoding="utf-8"),
-            text + "\n" + section,
+            (self.root / "CHANGELOG.md").read_bytes(),
+            (text + "\n" + section).encode("utf-8"),
         )
+        self.assertEqual(self.run_check(self.root).returncode, 0)
+
+    def test_write_emits_lf_bytes_when_os_linesep_is_not_lf(self):
+        section = "## [Unreleased]\n\n### Added\n\n- Add the controller.\n"
+        expected = ("# Changelog\n\n" + section).encode("utf-8")
+        self.commit("feat: add the controller")
+        (self.root / "CHANGELOG.md").write_bytes(b"# Changelog\n")
+        self.add_renderer()
+
+        # Simulate a platform whose default newline is CRLF and forbid text-mode
+        # writes, so a writer that could translate newlines fails loudly. The
+        # writer is byte-based, so the output is LF on every platform.
+        script = (
+            "import os\n"
+            "os.linesep = '\\r\\n'\n"
+            "import pathlib\n"
+            "def forbidden(*args, **kwargs):\n"
+            "    raise AssertionError('CHANGELOG.md must be written as bytes')\n"
+            "pathlib.Path.write_text = forbidden\n"
+            "import sys\n"
+            "sys.path.insert(0, 'scripts')\n"
+            "import render_changelog\n"
+            "raise SystemExit(render_changelog.main(['--write']))\n"
+        )
+        completed = subprocess.run(
+            (sys.executable, "-c", script),
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        written = (self.root / "CHANGELOG.md").read_bytes()
+        self.assertEqual(written, expected)
+        self.assertNotIn(b"\r", written)
         self.assertEqual(self.run_check(self.root).returncode, 0)
 
     def test_check_accepts_an_up_to_date_section(self):

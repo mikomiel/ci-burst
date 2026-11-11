@@ -334,7 +334,19 @@ The worker contract the template must implement:
   this leaves to host root and exec auditing, and its bounds, are in
   [runner-setup.md § Threat model](runner-setup.md#threat-model);
 - a maximum lifetime that covers image boot, a delayed job and a failed
-  bootstrap. Ephemeral registration is not an expiry mechanism.
+  bootstrap. Ephemeral registration is not an expiry mechanism;
+- the job toolchain the deployment's queue needs, not only the runner binary.
+  Runner classes differ by architecture and by cost tier, never by which
+  packages are installed: a job may be batched onto any runner of its
+  architecture, so every image carries the same set the persistent fleet
+  provides. `jq`, `promtool`, the pinned node/uv/ruff toolchain, the PostgreSQL
+  server binaries and whatever parsers a job invokes are the usual members.
+
+  A missing tool does not reliably fail the job. Depending on the workflow it
+  either fails, or skips the checks that needed it and exits green — a green
+  result that validated less than it claims. So the requirement lives here
+  rather than in a label, and a job keeps its own assertions about what it
+  needs; the image is verified rather than assumed.
 
 A candidate may pin its own numeric template version. Every version a candidate
 names must satisfy this contract; a template whose `Placement` pins one zone
@@ -389,6 +401,13 @@ subset of the worker's labels is eligible — including a job that asks only
 label. It also means a workflow that asks for a label the worker does not
 advertise stays waiting for another runner, and no label match proves anything
 about capability.
+
+Because the toolchain is part of every image, the labels a job names are
+expected to say *where* it runs, not *what is installed*: a pool or arch label
+must never be the mechanism that keeps a job away from a runner whose image is
+missing a package. An image that lacks part of the queue's toolchain is a
+runner-baseline defect, fixed by changing the image, and routing around it hides
+the defect for as long as the label holds.
 
 Accepted risk, stated plainly:
 

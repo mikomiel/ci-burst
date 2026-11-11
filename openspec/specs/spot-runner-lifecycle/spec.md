@@ -26,7 +26,7 @@ Live provisioning MUST use an operator-prepared launch template with an explicit
 
 ### Requirement: Bounded owned-instance fleet
 The deployment MUST permit at most the configured `controller.max_instances`
-(1..4, default 1) nonterminal owned instances or unresolved launch intents.
+(1..12, default 1) nonterminal owned instances or unresolved launch intents.
 Pending, starting, running, terminating and uncertain workers MUST each consume
 one slot, and a value outside the range MUST be rejected. Each worker MUST have
 its own admission, reservation and ledger operation, and the controller MUST NOT

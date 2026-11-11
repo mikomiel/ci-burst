@@ -57,10 +57,10 @@ database = "state.sqlite3"
 
 Optional keys: `forgejo.timeout_seconds` (10), `forgejo.max_response_bytes`
 (2,000,000), `aws.price_max_age_seconds` (900), `aws.profile`,
-`aws.availability_zones`, `controller.max_instances` (an integer in `1..4`,
+`aws.availability_zones`, `controller.max_instances` (an integer in `1..12`,
 default `1`). Relative state paths resolve against the configuration file
 directory. Unknown keys, floating-point money, a template-version alias, a
-non-`https` Forgejo URL, a `controller.max_instances` outside `1..4` and a
+non-`https` Forgejo URL, a `controller.max_instances` outside `1..12` and a
 malformed zone-candidate list (`ZONE_CANDIDATES_INVALID`) are refused.
 
 ### Availability-zone candidates
@@ -756,7 +756,7 @@ the anchored window's `allowance`, `consumed` and `launches`, the number of
 
 One repository, one Region and one ordered list of availability-zone candidates
 (the single-zone key is the one-candidate form), up to
-`controller.max_instances` (1..4) owned instances, one writer and one ledger.
+`controller.max_instances` (1..12) owned instances, one writer and one ledger.
 Ordered fallback is supported only for a definite insufficient capacity
 rejection, within one admission and at most once per configured candidate. Not
 supported: concurrent controllers, multiple ledgers, warm pools, On-Demand

@@ -297,7 +297,7 @@ def load(path):
 
     controller_table = _table(raw.get("controller", {}), "controller", ("max_instances",))
     max_instances = _integer(
-        controller_table, "max_instances", "controller", minimum=1, maximum=4, required=False
+        controller_table, "max_instances", "controller", minimum=1, maximum=12, required=False
     )
     controller = ControllerConfig(max_instances=1 if max_instances is None else max_instances)
 

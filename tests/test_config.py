@@ -26,19 +26,23 @@ class ConfigTests(unittest.TestCase):
         config = load(write_config(self.root, config={"controller": {"max_instances": 4}}))
         self.assertEqual(config.controller.max_instances, 4)
 
+    def test_accepts_the_ceiling(self):
+        config = load(write_config(self.root, config={"controller": {"max_instances": 12}}))
+        self.assertEqual(config.controller.max_instances, 12)
+
     def test_refuses_zero_instances(self):
         path = write_config(self.root, config={"controller": {"max_instances": 0}})
         with self.assertRaises(ConfigRefusal) as raised:
             load(path)
         self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
-        self.assertEqual(raised.exception.detail, "controller.max_instances: must be between 1 and 4")
+        self.assertEqual(raised.exception.detail, "controller.max_instances: must be between 1 and 12")
 
-    def test_refuses_a_fleet_above_four(self):
-        path = write_config(self.root, config={"controller": {"max_instances": 5}})
+    def test_refuses_a_fleet_above_the_ceiling(self):
+        path = write_config(self.root, config={"controller": {"max_instances": 13}})
         with self.assertRaises(ConfigRefusal) as raised:
             load(path)
         self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
-        self.assertEqual(raised.exception.detail, "controller.max_instances: must be between 1 and 4")
+        self.assertEqual(raised.exception.detail, "controller.max_instances: must be between 1 and 12")
 
     def test_relative_state_path_resolves_against_config(self):
         config = load(write_config(self.root, config={"state": {"database": "var/state.sqlite3"}}))

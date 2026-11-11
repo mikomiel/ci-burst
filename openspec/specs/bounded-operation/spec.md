@@ -8,7 +8,7 @@ admission, independent expiry cleanup and no implicit permission to spend.
 
 ### Requirement: Bounded fleet admission
 The controller MUST admit at most the configured `controller.max_instances`
-(1..4, default 1) concurrent owned workers. Each worker MUST have its own launch
+(1..12, default 1) concurrent owned workers. Each worker MUST have its own launch
 intent, reservation, ledger operation and idempotency token, and one request MUST
 create exactly one instance. A batch MUST NOT exceed the configured limit or the
 remaining allowance.

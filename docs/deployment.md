@@ -243,9 +243,9 @@ python3 scripts/check_prerequisites.py --config deployment.toml
 ```
 
 `--config` defaults to `deployment.toml`, and `aws.profile` selects the
-credential route. The SSM parameter defaults to the tutorial's
-`/forgejo/runner/registration-token`; pass `--registration-parameter` if you
-used another name. The command needs Python 3.12 or newer and the runtime
+credential route. The SSM parameter defaults to the name the published bootstrap
+reads, `/ci-burst/runner/registration-token`; pass `--registration-parameter` if
+you used another name. The command needs Python 3.12 or newer and the runtime
 `boto3` dependency (`pip install -e .`).
 
 It checks, from read-only describe calls:
@@ -255,6 +255,8 @@ It checks, from read-only describe calls:
   `InstanceInitiatedShutdownBehavior = terminate` — and reports the image,
   instance type, shutdown behaviour and bootstrap presence the controller will
   launch;
+- the pinned version's user data still matches
+  `deploy/runner/bootstrap.sh` byte for byte, trailing newlines aside;
 - every configured candidate's subnet exists in that zone and Region, and its
   route table (or the VPC's main route table) has an active default route;
 - the template's security groups exist;
@@ -272,8 +274,9 @@ are reported as `unavailable` and exit `3`; they are neither a pass nor drift.
 
 What it does not prove: nothing about a worker's runtime behaviour — boot,
 registration, job execution or termination; network reachability (security
-group rules, NACLs, DNS, NAT health or VPN/mesh routes); the bootstrap's content
-or the IAM policy's statements; and nothing about the control plane. A
+group rules, NACLs, DNS, NAT health or VPN/mesh routes); the semantic
+correctness of the compared bootstrap — that those bytes register and run on
+boot — or the IAM policy's statements; and nothing about the control plane. A
 satisfied result is not a substitute for the recorded live evidence in
 [runner-setup.md](runner-setup.md) § 5 and
 [pilot-checklist.md](pilot-checklist.md).

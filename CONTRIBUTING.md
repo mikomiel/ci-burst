@@ -203,6 +203,12 @@ Tests and examples must use synthetic data and reserved example domains.
 Do not publish real private deployment names, addresses, URLs or credentials.
 An ignore file is not a secret scanner.
 
+`deploy/runner/bootstrap.sh` is the one deliberate exception: it is the exact
+user data published to this deployment's launch template, so its Forgejo URL,
+SSM parameter name and label set are literals rather than example values. It
+carries no credential, no private address and no account id; every other file
+keeps the reserved example domains.
+
 ## Evidence and live tests
 
 Distinguish planned behavior, source present, reviewed, merged, deployed and

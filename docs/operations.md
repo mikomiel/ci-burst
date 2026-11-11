@@ -210,6 +210,13 @@ usable:
 - bootstrap `UserData` present (the controller checks presence only and never
   reads, stores or reports its contents).
 
+The repository's [`deploy/runner/bootstrap.sh`](../deploy/runner/bootstrap.sh) is
+the user data of the version a candidate pins: edit it, publish a new template
+version and bump the pin together. `scripts/check_prerequisites.py` compares the
+pinned version's user data with that file and reports drift, so an edit that was
+merged but never published does not pass unnoticed; the controller itself still
+checks presence only.
+
 The worker contract the template must implement:
 
 - a repository-scoped ephemeral runner that executes at most one job
@@ -219,8 +226,12 @@ The worker contract the template must implement:
 - disposable volumes with delete-on-termination;
 - no controller, provisioning or AWS credential on the worker;
 - registration credentials acquired through an operator-owned secure channel.
-  Inline user data, image layers, command arguments and logs are not accepted
-  channels, and ci-burst never generates or forwards that secret;
+  Inline user data, image layers and logs are not accepted channels, and
+  ci-burst never generates or forwards that secret. The pinned runner CLI
+  accepts its token only as an argument, so the published bootstrap reads it
+  from a `0600` file and shreds that file before the job starts; the exposure
+  this leaves to host root and exec auditing, and its bounds, are in
+  [runner-setup.md § Threat model](runner-setup.md#threat-model);
 - a maximum lifetime that covers image boot, a delayed job and a failed
   bootstrap. Ephemeral registration is not an expiry mechanism.
 

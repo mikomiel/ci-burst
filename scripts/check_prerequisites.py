@@ -4,7 +4,10 @@ The worker network, security groups, instance profile, registration parameter
 and launch template are operator-owned and remain a manual tutorial. This
 command compares the deployed facts with the deployment TOML and the template
 contract the controller already enforces, so a silent drift is visible before a
-launch fails.
+launch fails. It also compares the pinned template version's user data with
+``deploy/runner/bootstrap.sh``, the file an operator publishes as the next
+version, so a repository edit that was never published is drift rather than a
+silent no-op.
 
 The command only reads: it never mutates a resource, never reads a parameter
 value (not even a ciphertext), and never stores one. The template is read
@@ -19,6 +22,8 @@ reported as ``unavailable``; it is not drift and not a pass.
 """
 
 import argparse
+import base64
+import binascii
 import json
 import sys
 from dataclasses import dataclass
@@ -33,9 +38,15 @@ from ci_burst.config import load  # noqa: E402
 from ci_burst.errors import ConfigRefusal, ProviderRefusal, Refusal  # noqa: E402
 
 DEFAULT_CONFIG = "deployment.toml"
-#: The tutorial's literal parameter name. An operator who chose another name
-#: passes ``--registration-parameter``; the value is never read either way.
-DEFAULT_REGISTRATION_PARAMETER = "/forgejo/runner/registration-token"
+#: The parameter name the published bootstrap reads. An operator who chose
+#: another name passes ``--registration-parameter``; the value is never read
+#: either way.
+DEFAULT_REGISTRATION_PARAMETER = "/ci-burst/runner/registration-token"
+
+#: The repository's copy of the launch template's user data. The pinned version
+#: must carry exactly these bytes: an operator who edits this file publishes a
+#: new template version and bumps ``launch_template_version`` to it.
+BOOTSTRAP = ROOT / "deploy" / "runner" / "bootstrap.sh"
 
 EXIT_SATISFIED = 0
 EXIT_UNEXPECTED = 1
@@ -154,6 +165,30 @@ def _launch_template_data(response):
         return None
     data = entries[0].get("LaunchTemplateData")
     return data if isinstance(data, dict) else {}
+
+
+def _without_trailing_newlines(value):
+    # A console paste can add or drop trailing newlines. That is not a
+    # behavioural difference; every other byte is compared exactly.
+    return value.rstrip(b"\n")
+
+
+def _template_user_data(data):
+    """Return the template's decoded user data, or ``None`` when absent/invalid."""
+    encoded = data.get("UserData")
+    if not isinstance(encoded, str) or not encoded.strip():
+        return None
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _repository_bootstrap():
+    try:
+        return BOOTSTRAP.read_bytes()
+    except OSError:
+        return None
 
 
 def _security_group_ids(data):
@@ -303,6 +338,17 @@ class Prerequisites:
     def _templates(self, checks):
         """Read each distinct configured version once, through the adapter."""
         templates = {}
+        expected = _repository_bootstrap()
+        if expected is None:
+            checks.append(
+                _record(
+                    "template_bootstrap",
+                    "repository",
+                    status="unavailable",
+                    reasons=["template_bootstrap_source_unreadable"],
+                    detail="deploy/runner/bootstrap.sh",
+                )
+            )
         name = self._config.aws.launch_template_name
         for version in sorted({candidate.launch_template_version for candidate in self._config.aws.zones}):
             target = f"{name}@{version}"
@@ -364,6 +410,13 @@ class Prerequisites:
                 reasons.append("template_security_group_not_pinned")
             if not facts["instance_profile"]:
                 reasons.append("template_instance_profile_not_pinned")
+            # A template without user data is reported by the per-candidate
+            # check as `template_bootstrap_missing`; only a present-but-different
+            # body is drift against the repository file.
+            if expected is not None and facts["bootstrap_present"]:
+                actual = _template_user_data(data)
+                if actual is None or _without_trailing_newlines(actual) != _without_trailing_newlines(expected):
+                    reasons.append("template_bootstrap_drift")
             checks.append(
                 _record("template", target, status="drift" if reasons else "pass", facts=facts, reasons=reasons)
             )

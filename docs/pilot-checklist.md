@@ -8,9 +8,14 @@ cleanup bounds.
 ## 1. Image and template
 
 - [ ] Image builds the pinned runner and the job toolchain the queue needs.
-- [ ] On a launched worker, every tool of that recorded set resolves
-      (`command -v jq promtool uv node ruff psql …`). A missing tool is an image
-      defect to fix in the image, never a reason to route the job elsewhere.
+- [ ] On a launched worker, the recorded toolchain check passes as the job user
+      and fails on any missing command — a loop, not a multi-argument
+      `command -v`, which can succeed when only one name resolves:
+      `for t in jq promtool uv ruff node /usr/lib/postgresql/*/bin/postgres /usr/lib/postgresql/*/bin/initdb; do command -v "$t" >/dev/null || { echo "MISSING $t"; missing=1; }; done; test -z "${missing:-}"`.
+      Include the PostgreSQL **server** executables rather than `psql` alone,
+      and check the pinned versions the persistent fleet declares. A missing
+      tool is an image defect to fix in the image, never a reason to route the
+      job elsewhere.
 - [ ] Template version is numeric and points at a literal, immutable image id.
 - [ ] `InstanceType`, architecture and memory suit the intended job class.
 - [ ] `InstanceInitiatedShutdownBehavior = terminate`; disposable volumes

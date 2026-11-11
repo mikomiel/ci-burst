@@ -340,10 +340,13 @@ The worker contract the template must implement:
   packages are installed: a job may be batched onto any runner of its
   architecture, so every image carries the same set the persistent fleet
   provides. `jq`, `promtool`, the pinned node/uv/ruff toolchain, the PostgreSQL
-  server binaries and whatever parsers a job invokes are the usual members. A
-  missing tool fails the job closed, and that failure reads as a defect in the
-  change under test rather than as a runner gap, which is why the requirement
-  lives here and not in a label.
+  server binaries and whatever parsers a job invokes are the usual members.
+
+  A missing tool does not reliably fail the job. Depending on the workflow it
+  either fails, or skips the checks that needed it and exits green — a green
+  result that validated less than it claims. So the requirement lives here
+  rather than in a label, and a job keeps its own assertions about what it
+  needs; the image is verified rather than assumed.
 
 A candidate may pin its own numeric template version. Every version a candidate
 names must satisfy this contract; a template whose `Placement` pins one zone

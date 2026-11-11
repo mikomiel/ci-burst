@@ -231,8 +231,9 @@ provide what the bootstrap below assumes:
   `iptables` for the metadata block;
 - the job toolchain the queue needs, not only the runner binary. Runner classes
   differ by architecture, never by installed packages, so a job may be batched
-  onto any runner of its architecture. Without one of those tools the job fails
-  closed and looks like a defect in the change under test.
+  onto any runner of its architecture. Without one of those tools a job either
+  fails or silently skips the checks that needed it, so the image is verified
+  with the pilot checklist rather than assumed.
   [operations.md § Worker image and launch template](operations.md#worker-image-and-launch-template)
   owns the rule; the deployment records the set it qualifies;
 - systemd, an unprivileged `runner` account with home

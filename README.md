@@ -1,7 +1,7 @@
 # ci-burst
 
 A small Forgejo queue-driven AWS Spot runner controller. This is an original
-MIT-licensed public project.
+public project licensed under GPL-3.0-only.
 
 ## What it does
 
@@ -89,5 +89,5 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) and
 protected-main pull requests; controlled automated merging is not active merely
 because this policy exists.
 
-License: [MIT](LICENSE). No affiliation with Forgejo or Amazon Web Services
-is implied.
+License: [GPL-3.0-only](LICENSE). Copyright (C) 2026 ci-burst contributors.
+No affiliation with Forgejo or Amazon Web Services is implied.

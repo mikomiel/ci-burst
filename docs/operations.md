@@ -530,8 +530,8 @@ already elapsed. Both keep the unresolved ownership and block admission until
 an operator resolves them. When more than one launch intent is unresolved,
 `apply` retries them in creation order and stops at the first intent whose age
 exceeds the client-token window, whose lifetime elapsed, or whose retry is not
-accepted. Intents after the deciding one are not sent and stay `intent` in the
-ledger for the next apply.
+accepted. Intents after the deciding one are not sent and retain their existing
+ledger state for the next apply.
 
 Every attempted intent produces one `resumes` record in creation order. A
 record's `expires_at` and `reservation` always come from the durable operation,

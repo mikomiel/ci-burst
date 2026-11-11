@@ -8,7 +8,8 @@ of a subject is rendered as a link.
 The section starts after the latest annotated release tag, so an entry that
 already has a released section is not rendered again. A release preparation
 marker defers that tag until the preparation commit is on `main`;
-`--validate-release` verifies the published state.
+`--validate-release` verifies the published state, and `--check` reports drift
+between the committed section and that rendering.
 
 Rendering fails closed when the history is shallow, when a released heading
 cannot be reconciled with a local reachable annotated tag (for example in a
@@ -18,6 +19,7 @@ Standard library only, no network:
 
     python3 scripts/render_changelog.py                  # print the section
     python3 scripts/render_changelog.py --write          # replace it
+    python3 scripts/render_changelog.py --check          # report drift
     python3 scripts/render_changelog.py --validate-release
 """
 
@@ -428,6 +430,11 @@ def main(argv=None):
         action="store_true",
         help="require every released heading to have an annotated tag and no preparation marker",
     )
+    actions.add_argument(
+        "--check",
+        action="store_true",
+        help="report a committed Unreleased section that differs from the rendering and exit 1",
+    )
     args = parser.parse_args(argv)
 
     text = CHANGELOG.read_text(encoding="utf-8") if CHANGELOG.exists() else HEADER + "\n"
@@ -457,6 +464,17 @@ def main(argv=None):
         print(f"error: {blocked}", file=sys.stderr)
         return 1
     section = render_unreleased(merged_subjects(since=boundary))
+    if args.check:
+        if unreleased_section(text) == section:
+            print("changelog is up to date")
+            return 0
+        sys.stdout.write(section)
+        print(
+            "error: the committed Unreleased section is stale; regenerate it "
+            "with python3 scripts/render_changelog.py --write",
+            file=sys.stderr,
+        )
+        return 1
     if not args.write:
         sys.stdout.write(section)
         return 0

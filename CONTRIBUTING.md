@@ -159,6 +159,13 @@ python3 scripts/render_changelog.py --write
 `--write` refuses while a preparation marker is pending and its tag does not
 exist; do not regenerate between cutting the section and tagging it.
 
+`Unreleased` is a snapshot regenerated at release preparation, not a
+continuously updated index. `python3 scripts/render_changelog.py --check`
+reports its drift on demand: it prints the rendering that `--write` would
+produce and exits non-zero. It is deliberately not wired into pull-request CI,
+because a pull request's own commits cannot be in the snapshot committed before
+them, so the check could never be green there.
+
 Regeneration fails closed rather than guessing the boundary: the renderer
 refuses a shallow checkout, a released section that cannot be reconciled with
 a local reachable annotated tag (for example a `--no-tags` clone, a tag on an

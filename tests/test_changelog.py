@@ -218,6 +218,15 @@ class ReleaseBoundaryTests(unittest.TestCase):
             check=False,
         )
 
+    def run_check(self, root):
+        return subprocess.run(
+            (sys.executable, "scripts/render_changelog.py", "--check"),
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     def test_no_release_tag_means_no_boundary(self):
         self.commit("feat: add the controller (#4)")
         self.assertIsNone(changelog.release_tag(self.root))
@@ -280,6 +289,93 @@ class ReleaseBoundaryTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 1, completed.stderr)
         self.assertIn("shallow", completed.stderr)
         self.assertEqual((clone / "CHANGELOG.md").read_text(encoding="utf-8"), text)
+
+    def test_check_reports_a_stale_section_and_names_write(self):
+        released = (
+            "# Changelog\n\n## [Unreleased]\n\n"
+            "## [0.1.0] - 2026-11-09\n\n### Added\n\n- Add the controller.\n"
+        )
+        self.commit("feat: add the controller (#4)")
+        (self.root / "CHANGELOG.md").write_text(released, encoding="utf-8")
+        self.add_renderer()
+        self.git("add", "CHANGELOG.md", "scripts/render_changelog.py")
+        self.git("commit", "-q", "-m", "chore(release): prepare the 0.1.0 section")
+        self.git("tag", "-a", "v0.1.0", "-m", "v0.1.0")
+        self.commit("fix: correct the quote timeout (#9)", "fix.txt")
+
+        completed = self.run_check(self.root)
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertIn("- Correct the quote timeout", completed.stdout)
+        self.assertNotIn("controller", completed.stdout)
+        self.assertIn("stale", completed.stderr)
+        self.assertIn("python3 scripts/render_changelog.py --write", completed.stderr)
+        self.assertEqual(
+            (self.root / "CHANGELOG.md").read_text(encoding="utf-8"), released
+        )
+
+    def test_check_accepts_an_up_to_date_section(self):
+        section = (
+            "## [Unreleased]\n\n### Fixed\n\n"
+            "- Correct the quote timeout ([#9](https://github.com/mikomiel/ci-burst/pull/9)).\n"
+        )
+        text = (
+            "# Changelog\n\n"
+            + section
+            + "\n## [0.1.0] - 2026-11-09\n\n### Added\n\n- Add the controller.\n"
+        )
+        self.commit("feat: add the controller (#4)")
+        (self.root / "CHANGELOG.md").write_text(text, encoding="utf-8")
+        self.add_renderer()
+        self.git("add", "CHANGELOG.md", "scripts/render_changelog.py")
+        self.git("commit", "-q", "-m", "chore(release): prepare the 0.1.0 section")
+        self.git("tag", "-a", "v0.1.0", "-m", "v0.1.0")
+        self.commit("fix: correct the quote timeout (#9)", "fix.txt")
+
+        rendered = changelog.render_unreleased(
+            changelog.merged_subjects(self.root, since="v0.1.0")
+        )
+        self.assertEqual(rendered, section, "fixture must match the renderer")
+        completed = self.run_check(self.root)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(completed.stdout, "changelog is up to date\n")
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual((self.root / "CHANGELOG.md").read_text(encoding="utf-8"), text)
+
+    def test_check_refuses_a_shallow_clone(self):
+        self.commit("feat: add the controller")
+        text = "# Changelog\n\n## [Unreleased]\n"
+        (self.root / "CHANGELOG.md").write_text(text, encoding="utf-8")
+        self.add_renderer()
+        self.git("add", "CHANGELOG.md", "scripts/render_changelog.py")
+        self.git("commit", "-q", "-m", "chore: add the changelog")
+
+        clone = self.clone("shallow-check", "--depth", "1")
+        self.assertTrue(changelog.is_shallow(clone))
+        completed = self.run_check(clone)
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertIn("shallow", completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual((clone / "CHANGELOG.md").read_text(encoding="utf-8"), text)
+
+    def test_check_keeps_the_preparation_marker_refusal(self):
+        prepared = (
+            "# Changelog\n\n## [Unreleased]\n\n"
+            "## [0.1.0] - 2026-11-09\n\n<!-- release-pending: v0.1.0 -->\n\n"
+            "### Added\n\n- Add the controller.\n"
+        )
+        self.commit("feat: add the controller")
+        (self.root / "CHANGELOG.md").write_text(prepared, encoding="utf-8")
+        self.add_renderer()
+        self.git("add", "CHANGELOG.md", "scripts/render_changelog.py")
+        self.git("commit", "-q", "-m", "chore(release): prepare the 0.1.0 section")
+
+        completed = self.run_check(self.root)
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertIn("release preparation for v0.1.0 is pending", completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(
+            (self.root / "CHANGELOG.md").read_text(encoding="utf-8"), prepared
+        )
 
     def test_release_boundary_excludes_released_commits_from_unreleased(self):
         self.commit("feat: add the controller (#4)")

@@ -172,6 +172,12 @@ traffic for the ports above. If Forgejo's name resolves to a private address,
 pin it in `/etc/hosts` on the worker — only when your VPC DNS does not already
 resolve it correctly.
 
+If neither placement is available — a private subnet with no NAT device of any
+kind — the deployment can build its own router from
+[deploy/router/userdata.sh](../deploy/router/userdata.sh). [router.md](router.md)
+owns the procedure and the acceptance test: one registered worker per configured
+candidate, not one per deployment.
+
 ## 4. Launch template
 
 Create a launch template with a pinned, numeric version. ci-burst refuses a

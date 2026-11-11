@@ -49,6 +49,11 @@ cleanup bounds.
       verification is on and no redirect is followed.
 - [ ] Egress from the worker is limited to what the queue needs; the worker
       cannot reach unrelated private networks.
+- [ ] Every configured candidate produced one **registered** worker in a canary
+      run; a candidate that produced none was removed, not merely configured.
+- [ ] When the worker subnets route through a router instance, its boot
+      configuration forwards every candidate subnet CIDR, and it still does
+      after a reboot ([router.md](router.md)).
 
 ## 5. Identity, limits and state
 

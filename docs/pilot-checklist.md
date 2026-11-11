@@ -64,8 +64,8 @@ cleanup bounds.
 
 - [ ] A plan reports the exact template, Region, ordered candidates, selected
       zone and reservation.
-- [ ] One owned instance readback shows all four ownership tags and the expiry.
-- [ ] A refused or denied cleanup stays visible and does not free the slot.
+- [ ] A launched worker's readback shows all four ownership tags and the expiry.
+- [ ] A refused or denied cleanup stays visible and does not free its slot.
 - [ ] The operator knows that an accepted termination request is not confirmed
       removal and that residual charges may remain.
 

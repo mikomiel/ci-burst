@@ -48,7 +48,7 @@ Execution without an explicit apply operation MUST remain read-only toward Forge
 - **THEN** it does not call RunInstances or TerminateInstances even with an AWS dry-run parameter
 
 ### Requirement: Positive live admission
-A live launch MUST require explicit apply, fresh qualified demand, reconciled ownership, writable durable state, the free supported slot, valid lifetime settings, at least one eligible configured placement candidate with a fresh usable price, and a sufficient configured reservation allowance. Missing or contradictory inputs MUST deny the launch.
+A live launch MUST require explicit apply, fresh qualified demand, reconciled ownership, writable durable state, a free supported slot, valid lifetime settings, at least one eligible configured placement candidate with a fresh usable price, and a sufficient configured reservation allowance. Missing or contradictory inputs MUST deny the launch.
 
 #### Scenario: Complete live prerequisites
 - **WHEN** every live-admission condition holds for the same decision snapshot

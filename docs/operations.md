@@ -472,11 +472,12 @@ choice, so the accepted attempt is the placement that actually launched.
 No other failure falls through: a non-capacity definite rejection keeps today's
 `launch_failed` behaviour, and an uncertain response keeps the operation
 outstanding. If every candidate is rejected for capacity the operation is
-`failed` — the slot is free — the queue stays unserved, and the result carries
-the stable `capacity_exhausted` reason plus the final provider refusal. If the
-remaining candidates' price evidence expires during the attempt, the operation
-is also `failed` with a free slot and the stable `spot_price_stale` reason, and
-no new admission or reservation is created. Nothing is reported as launched.
+`failed` — its slot is free again — the queue stays unserved, and the result
+carries the stable `capacity_exhausted` reason plus the final provider refusal.
+If the remaining candidates' price evidence expires during the attempt, the
+operation is also `failed` with its slot free and the stable `spot_price_stale`
+reason, and no new admission or reservation is created. Nothing is reported as
+launched.
 
 ## Durable state and ownership
 
@@ -495,8 +496,8 @@ allocating a replacement operation. While an intent has no confirmed instance,
 the next apply resumes that **same** frozen request and client token; EC2
 idempotency makes the retry safe. A rejected **retry** keeps the operation
 uncertain, because rejecting the retry does not prove the original request
-created nothing. Only a definite rejection of the first attempt may release the
-slot, and ambiguous provider errors stay uncertain.
+created nothing. Only a definite rejection of the first attempt may release that
+worker's slot, and ambiguous provider errors stay uncertain.
 
 The frozen intent names the candidate currently being attempted. A definite
 capacity rejection is the one case that may replace it: the same operation
@@ -548,7 +549,7 @@ ownership claims and do not block.
 
 Observation opens the ledger read-only. It never creates, initializes or
 migrates the file; an existing but uninitialized, unsupported or corrupt ledger
-makes `plan` refuse instead of computing a free slot from zero consumption. The
+makes `plan` refuse instead of computing free slots from zero consumption. The
 ledger uses a rollback journal so a read-only observation creates no
 `-wal`/`-shm` side files. The state path is converted to an escaped file URI
 before it is opened read-only, so a filename containing URI metacharacters

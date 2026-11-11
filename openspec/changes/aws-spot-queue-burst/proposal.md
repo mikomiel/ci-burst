@@ -14,7 +14,8 @@ queue or a general-purpose multicloud platform.
 - Observe one Forgejo repository-scoped job queue. Qualify the supported API
   response and runnable-job semantics before accepting a live configuration.
 - Match configured runner labels, account for pending owned instances and
-  provision at most one additional Spot VM in the first version.
+  provision a bounded fleet of at most `controller.max_instances` (default one,
+  maximum four) additional Spot VMs.
 - Launch only an operator-prepared, version-pinned template whose image
   registers a one-job ephemeral runner and shuts down after that job.
 - Price an ordered list of configured availability-zone candidates, launch in

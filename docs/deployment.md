@@ -479,5 +479,5 @@ conditions). Reverting the source is a reviewed change, not a history rewrite.
 | `spot_price_above_cap`, `spot_price_stale` | the price evidence is above `max_spot_price` or older than `price_max_age_seconds` |
 
 `status` prints the last decision and the operation's state without mutating
-anything. A refused cleanup stays visible and does not free the slot; a
+anything. A refused cleanup stays visible and does not free its slot; a
 termination request is not evidence that the instance is gone.

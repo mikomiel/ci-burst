@@ -34,7 +34,8 @@ needs a credential.
   timed-out unit is still not by itself proof that the run ended.
 
 The container is not a scheduler. Forgejo owns job assignment and results;
-ci-burst launches at most one Spot instance per deployment.
+ci-burst launches up to the configured `controller.max_instances` Spot instances
+per deployment (an integer in 1..4, default 1).
 
 ## Prerequisites
 

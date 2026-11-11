@@ -27,6 +27,7 @@ from ci_burst.errors import ProviderRefusal  # noqa: E402
 
 PARAMETER = prerequisites.DEFAULT_REGISTRATION_PARAMETER
 BOOTSTRAP = ROOT / "deploy" / "runner" / "bootstrap.sh"
+ROUTER_ARTEFACT = ROOT / "deploy" / "router" / "userdata.sh"
 PROFILE = "example-runner-profile"
 ROLE = "example-runner-role"
 PROFILE_ARN = "arn:aws:iam::000000000000:instance-profile/workers/example-runner"
@@ -719,6 +720,14 @@ class PrerequisiteTests(unittest.TestCase):
     def test_router_mentioning_the_cidr_only_in_a_comment_is_drift(self):
         self.use_router(user_data=router_user_data(cidrs=(), extra=f"# forwards {SUBNET_CIDR}"))
         self.assert_drift(self.check(), "router_forwarding_missing_cidr")
+
+    def test_the_shipped_router_artefact_is_unverified_not_a_pass(self):
+        # The bytes this repository publishes, not a synthetic approximation:
+        # the artefact reads its CIDRs from SSM, so the check cannot see them.
+        self.use_router(user_data=base64.b64encode(ROUTER_ARTEFACT.read_bytes()).decode("ascii"))
+        result = self.check()
+        self.assert_unavailable(result, "router_forwarding_unverified")
+        self.assertEqual(self.records(result, "router")[0]["status"], "unavailable")
 
     def test_router_reading_its_cidrs_from_ssm_is_unavailable_not_a_pass(self):
         self.use_router(

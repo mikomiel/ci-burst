@@ -40,20 +40,20 @@ class RouterArtefactTests(unittest.TestCase):
         self.assertLess(self.text.index("placement/region"), self.text.index("aws ssm get-parameter"))
         self.assertIn('--region "${REGION}"', self.text)
 
-    def test_forwarding_survives_a_reboot(self):
+    def test_boot_unit_is_enabled_and_runs_the_forwarding_script(self):
         self.assertIn("systemctl enable --now ci-burst-router-forward.service", self.text)
         self.assertIn("RemainAfterExit=yes", self.text)
         self.assertIn("ExecStart=/usr/local/sbin/ci-burst-router-forward", self.text)
 
-    def test_rule_application_is_idempotent(self):
+    def test_rule_script_checks_the_rule_before_appending_it(self):
         self.assertIn("iptables -C", self.text)
         self.assertIn("worker-cidrs", self.text)
 
-    def test_wireguard_is_optional(self):
+    def test_wireguard_is_started_only_when_it_is_configured(self):
         self.assertIn('if [ -s "${WG_FILE}" ]', self.text)
         self.assertIn("systemctl enable --now wg-quick@wg0.service", self.text)
 
-    def test_the_configuration_file_never_survives_the_script(self):
+    def test_configuration_file_is_shredded_by_the_exit_trap(self):
         self.assertIn("shred -u", self.text)
         self.assertIn("chmod 600", self.text)
 

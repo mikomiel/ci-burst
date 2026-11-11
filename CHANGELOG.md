@@ -14,6 +14,22 @@ and the validation step that binds it to that tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- A terminated unrecorded instance stops blocking admission ([#54](https://github.com/mikomiel/ci-burst/pull/54)).
+- Compare the committed Unreleased region exactly.
+- Compare the committed bytes in --check.
+- Write the changelog as LF bytes.
+
+### Documentation
+
+- How to prove the cleanup identity terminates ([#55](https://github.com/mikomiel/ci-burst/pull/55)).
+- The policy names the subnets the deployment may use ([#56](https://github.com/mikomiel/ci-burst/pull/56)).
+
+### CI
+
+- Report a stale generated Unreleased section.
+
 ## [0.1.0] - 2026-11-10
 
 ### Added

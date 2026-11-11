@@ -8,7 +8,10 @@ of a subject is rendered as a link.
 The section starts after the latest annotated release tag, so an entry that
 already has a released section is not rendered again. A release preparation
 marker defers that tag until the preparation commit is on `main`;
-`--validate-release` verifies the published state.
+`--validate-release` verifies the published state, and `--check` reports a
+committed file that differs from what `--write` would produce. `--write` emits
+UTF-8 bytes with LF, so `--check`'s byte equality is platform-independent by
+construction.
 
 Rendering fails closed when the history is shallow, when a released heading
 cannot be reconciled with a local reachable annotated tag (for example in a
@@ -18,6 +21,7 @@ Standard library only, no network:
 
     python3 scripts/render_changelog.py                  # print the section
     python3 scripts/render_changelog.py --write          # replace it
+    python3 scripts/render_changelog.py --check          # report drift
     python3 scripts/render_changelog.py --validate-release
 """
 
@@ -415,6 +419,33 @@ def replace_unreleased(text, section):
     return "\n".join(updated).rstrip("\n") + "\n"
 
 
+def changelog_bytes(text, section):
+    """The exact bytes ``--write`` emits: the rewrite encoded as UTF-8 with LF.
+
+    Writing and checking share this one definition, so neither can drift from
+    the other. ``--write`` writes these bytes rather than text, so no
+    text-mode newline translation can apply and the comparison holds on every
+    platform.
+    """
+    return replace_unreleased(text, section).encode("utf-8")
+
+
+def changelog_is_current(text, section):
+    """True when ``--write`` would leave CHANGELOG.md byte-identical.
+
+    The committed bytes are compared with :func:`changelog_bytes`, the one
+    definition of what ``--write`` emits. Reading the section back as text
+    instead would hide a CRLF section, CRLF elsewhere in the file, a surplus
+    blank line before the next heading and a missing final newline: all of them
+    are drift that ``--write`` would rewrite.
+    """
+    try:
+        committed = CHANGELOG.read_bytes()
+    except FileNotFoundError:
+        return False
+    return committed == changelog_bytes(text, section)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     actions = parser.add_mutually_exclusive_group()
@@ -427,6 +458,11 @@ def main(argv=None):
         "--validate-release",
         action="store_true",
         help="require every released heading to have an annotated tag and no preparation marker",
+    )
+    actions.add_argument(
+        "--check",
+        action="store_true",
+        help="report a committed changelog that differs from what --write would produce and exit 1",
     )
     args = parser.parse_args(argv)
 
@@ -457,10 +493,21 @@ def main(argv=None):
         print(f"error: {blocked}", file=sys.stderr)
         return 1
     section = render_unreleased(merged_subjects(since=boundary))
+    if args.check:
+        if changelog_is_current(text, section):
+            print("changelog is up to date")
+            return 0
+        sys.stdout.write(section)
+        print(
+            "error: CHANGELOG.md differs from what --write would produce; "
+            "regenerate it with python3 scripts/render_changelog.py --write",
+            file=sys.stderr,
+        )
+        return 1
     if not args.write:
         sys.stdout.write(section)
         return 0
-    CHANGELOG.write_text(replace_unreleased(text, section), encoding="utf-8")
+    CHANGELOG.write_bytes(changelog_bytes(text, section))
     return 0
 
 

@@ -112,11 +112,12 @@ a template version fixed per candidate, fixed placement inputs and a stable
 `ClientToken`.
 Placement is the first eligible entry of the operator's ordered
 availability-zone candidate list. Within a fleet batch each worker starts at the
-next candidate (`index % len(candidates)`) and wraps through the order, so
-workers spread across the configured zones; each worker still starts at the first
-candidate in its rotation whose quote is still fresh. There is no On-Demand
-fallback and no automatic Region or AZ substitution: the only permitted placement
-change is the configured order, followed after a proved capacity rejection.
+next eligible candidate and wraps through the eligible order, so workers spread
+across the zones that survived admission; candidates rejected during admission
+are not part of the rotation. Each worker still starts at the first candidate in
+its rotation whose quote is still fresh. There is no On-Demand fallback and no
+automatic Region or AZ substitution: the only permitted placement change is the
+configured order, followed after a proved capacity rejection.
 
 Before the request, one SQLite transaction stores the deployment and operation
 identities. It records the frozen request parameters, their hash and the stable

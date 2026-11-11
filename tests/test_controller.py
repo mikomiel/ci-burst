@@ -917,9 +917,82 @@ class FleetTests(ControllerCase):
         result = controller.apply()
         self.assertEqual(result["decision"], "resumed")
         self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 2)
+        self.assertEqual(
+            [entry["operation"] for entry in result["resumes"]], ["first", "second"]
+        )
+        self.assertEqual(
+            [entry["decision"] for entry in result["resumes"]], ["resumed", "resumed"]
+        )
+        self.assertNotEqual(
+            result["resumes"][0]["instance_id"], result["resumes"][1]["instance_id"]
+        )
+        self.assertEqual(result["operation"], "second")
         operations = self.reopened().operations()
         self.assertEqual({operation.client_token for operation in operations}, {"ci-burst-first", "ci-burst-second"})
         self.assertEqual({operation.state for operation in operations}, {"starting"})
+
+    def test_resume_uncertainty_does_not_reuse_an_earlier_instance(self):
+        self.seed(state="intent", instance_id=None, operation_id="first", reservation=540_000)
+        self.seed(state="intent", instance_id=None, operation_id="second")
+        self.seed(state="intent", instance_id=None, operation_id="third")
+        controller = self.build(observation=observation_demand())
+        runs = []
+
+        def second_is_uncertain(request):
+            runs.append(request)
+            if len(runs) == 2:
+                self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+
+        self.aws.on_run = second_is_uncertain
+        result = controller.apply()
+        self.assertEqual(result["decision"], "uncertain")
+        self.assertEqual(result["operation"], "second")
+        self.assertNotIn("instance_id", result)
+        self.assertEqual(result["refusal"]["reason"], "AWS_UNCERTAIN")
+        # The third intent is not retried after the unsuccessful one.
+        self.assertEqual(len(runs), 2)
+        first, second = result["resumes"]
+        self.assertEqual([first["operation"], second["operation"]], ["first", "second"])
+        self.assertEqual(first["decision"], "resumed")
+        self.assertIsNotNone(first["instance_id"])
+        self.assertEqual(first["reservation"], "0.540000")
+        self.assertIsNone(second["instance_id"])
+        self.assertEqual(second["decision"], "uncertain")
+        self.assertEqual(second["refusal"]["reason"], "AWS_UNCERTAIN")
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation("first").state, "starting")
+        self.assertEqual(ledger.operation("first").instance_id, first["instance_id"])
+        self.assertEqual(ledger.operation("second").state, "uncertain")
+        self.assertEqual(ledger.operation("third").state, "intent")
+
+    def test_resume_stops_at_an_intent_whose_lifetime_elapsed(self):
+        self.seed(state="intent", instance_id=None, operation_id="first", reservation=540_000)
+        self.seed(
+            state="intent",
+            instance_id=None,
+            operation_id="second",
+            expires_at=self.clock.now + 60,
+        )
+        self.seed(state="intent", instance_id=None, operation_id="third")
+        controller = self.build(observation=observation_demand())
+        self.aws.on_run = lambda request: self.clock.advance(120)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("unresolved_intent_lifetime_elapsed", result["reasons"])
+        self.assertEqual(result["operation"], "second")
+        self.assertNotIn("instance_id", result)
+        runs = [call for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(runs), 1)
+        first, second = result["resumes"]
+        self.assertEqual([first["operation"], second["operation"]], ["first", "second"])
+        self.assertEqual(first["decision"], "resumed")
+        self.assertIsNotNone(first["instance_id"])
+        self.assertEqual(second["decision"], "refused")
+        self.assertIsNone(second["instance_id"])
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation("first").state, "starting")
+        self.assertEqual(ledger.operation("second").state, "intent")
+        self.assertEqual(ledger.operation("third").state, "intent")
 
     def test_lowered_limit_waits_and_never_terminates(self):
         self.seed(state="running", operation_id="busy-a", instance_id="i-busy-a")

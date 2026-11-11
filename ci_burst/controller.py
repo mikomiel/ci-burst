@@ -689,30 +689,67 @@ class Controller:
         result["attempts"] = attempts
 
     def _resume(self, slot, result):
-        """Retry every unresolved launch intent instead of replacing it."""
+        """Retry every unresolved launch intent instead of replacing it.
+
+        Each intent is sent into its own mapping so a later failure can never
+        inherit an earlier success's instance identity. The top-level result
+        describes the intent that decided the outcome; ``resumes`` keeps one
+        entry per attempted intent in creation order.
+        """
         pending = [operation for operation in slot["operations"] if not operation.get("instance_id")]
         if not pending:
             return False
+        resumes = []
+        result["resumes"] = resumes
         for entry in pending:
             operation = self.ledger.operation(entry["operation"])
+            attempt = {}
             now = self.clock()
             if now - operation.created_at > CLIENT_TOKEN_MAX_AGE_SECONDS:
-                result["decision"] = "refused"
-                result.setdefault("reasons", []).append("unresolved_intent_expired")
-                result["operation"] = operation.id
-                return True
-            if operation.expires_at <= now:
+                attempt["decision"] = "refused"
+                attempt["reasons"] = ["unresolved_intent_expired"]
+            elif operation.expires_at <= now:
                 # Sending an intent whose lifetime already elapsed would create
                 # an instance that is expired before it boots. Keep the
                 # unresolved ownership and block admission instead.
-                result["decision"] = "refused"
-                result.setdefault("reasons", []).append("unresolved_intent_lifetime_elapsed")
-                result["operation"] = operation.id
+                attempt["decision"] = "refused"
+                attempt["reasons"] = ["unresolved_intent_lifetime_elapsed"]
+            else:
+                self._send(operation, operation.request(), attempt, "resumed", first_attempt=False)
+            record = {
+                "operation": operation.id,
+                "decision": attempt["decision"],
+                "instance_id": attempt.get("instance_id"),
+                "expires_at": attempt.get("expires_at"),
+                "reservation": attempt.get("reservation"),
+                "attempts": attempt.get("attempts", []),
+            }
+            if "refusal" in attempt:
+                record["refusal"] = attempt["refusal"]
+            resumes.append(record)
+            if record["decision"] != "resumed":
+                self._report_resume(result, attempt, operation.id)
                 return True
-            self._send(operation, operation.request(), result, "resumed", first_attempt=False)
-            if result.get("decision") != "resumed":
-                return True
+        self._report_resume(result, attempt, operation.id)
         return True
+
+    def _report_resume(self, result, attempt, operation_id):
+        """Report one resumed intent at the top level without stale fields."""
+        for key in ("operation", "instance_id", "expires_at", "reservation", "attempts"):
+            result.pop(key, None)
+        result["operation"] = operation_id
+        result["decision"] = attempt["decision"]
+        if "reasons" in attempt:
+            result["reasons"] = attempt["reasons"]
+        else:
+            result.pop("reasons", None)
+        if "refusal" in attempt:
+            result["refusal"] = attempt["refusal"]
+        else:
+            result.pop("refusal", None)
+        for key in ("instance_id", "expires_at", "reservation", "attempts"):
+            if key in attempt:
+                result[key] = attempt[key]
 
     def _send(self, operation, request, result, success_decision, first_attempt=True, *, defer_capacity=False):
         """Send one frozen request and report what it proved.

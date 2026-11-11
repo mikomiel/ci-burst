@@ -12,6 +12,12 @@
       "Resource": "*"
     },
     {
+      "Sid": "ReadInstanceConsoleOutput",
+      "Effect": "Allow",
+      "Action": "ec2:GetConsoleOutput",
+      "Resource": "arn:aws:ec2:eu-central-1:123456789012:instance/*"
+    },
+    {
       "Sid": "LaunchOnlyTheApprovedTemplate",
       "Effect": "Allow",
       "Action": "ec2:RunInstances",

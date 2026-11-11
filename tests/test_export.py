@@ -1,0 +1,830 @@
+import io
+import json
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
+
+from ci_burst.aws import MAX_CONSOLE_BYTES, Aws
+from ci_burst.config import load
+from ci_burst.errors import ProviderRefusal
+from ci_burst.export import (
+    MAX_CONSOLE_READS,
+    MAX_EVENTS_BYTES,
+    Exporter,
+    load_state,
+    parse_console,
+    prune_state,
+)
+
+from support import FakeAws, instance, write_config
+
+NOW = 1_800_000_000.0
+
+CLEAN_BOOT = """\
+[    9.7] cloud-init[400]: STEP mount-options
+[   10.7] cloud-init[400]: STEP register
+[   10.8] cloud-init[400]: runner: burst-ip-10-0-0-1, with version: v1, ephemeral: true, declared successfully
+[   10.9] cloud-init[400]: STEP job
+[   24.0] cloud-init[400]: bootstrap exiting rc=0
+"""
+
+FAILED_PING = """\
+[   12.1] cloud-init[477]: level=error msg="Cannot ping the Forgejo instance server" error="deadline_exceeded: Post \\"https://forgejo.example/api\\": context deadline exceeded"
+[   12.2] cloud-init[477]: bootstrap exiting rc=1
+"""
+
+SSM_TIMEOUT = """\
+[    9.9] cloud-init[410]: level=error msg="Connect timeout on endpoint URL: \\"https://ssm.eu-central-1.amazonaws.com/\\""
+"""
+
+NOISE = """\
+[    1.0] kernel: random line that matches nothing
+[    1.1] kernel: another line
+"""
+
+
+class ParseConsoleTests(unittest.TestCase):
+    def test_clean_boot_yields_steps_and_clean_exit(self):
+        facts = parse_console(CLEAN_BOOT)
+        self.assertEqual(facts.steps, ("mount-options", "register", "job"))
+        self.assertEqual(facts.exit_code, 0)
+        self.assertEqual(facts.errors, ())
+        self.assertTrue(facts.registered)
+
+    def test_duplicated_serial_stream_is_deduplicated(self):
+        facts = parse_console(CLEAN_BOOT + CLEAN_BOOT)
+        self.assertEqual(facts.steps.count("register"), 1)
+        self.assertEqual(facts.exit_code, 0)
+
+    def test_ping_failure_names_the_kind_and_publishes_no_line(self):
+        facts = parse_console(FAILED_PING)
+        self.assertEqual(facts.errors, ("forgejo_ping",))
+        self.assertEqual(facts.exit_code, 1)
+        self.assertFalse(facts.registered)
+
+    def test_ssm_timeout_is_classified(self):
+        self.assertEqual(parse_console(SSM_TIMEOUT).errors, ("ssm_timeout",))
+
+    def test_unrelated_text_is_ignored(self):
+        facts = parse_console(NOISE)
+        self.assertEqual(facts.steps, ())
+        self.assertEqual(facts.errors, ())
+        self.assertIsNone(facts.exit_code)
+
+    def test_an_unshipped_step_name_is_not_a_marker(self):
+        # A closed set, not a pattern: an image cannot publish an arbitrary name.
+        facts = parse_console("cloud-init: STEP credential=synthetic-value\n")
+        self.assertEqual(facts.steps, ())
+        self.assertFalse(facts.registered)
+
+    def test_error_kinds_are_bounded_and_deduplicated(self):
+        text = "\n".join(
+            [
+                "level=error msg=\"Cannot ping the Forgejo instance server\"",
+                "level=error msg=\"Connect timeout on endpoint URL\"",
+                "level=error msg=\"Unable to locate package wireguard-tools\"",
+                "level=error msg=\"Failed to register runner\"",
+                "level=error msg=\"something else\"",
+                "level=error msg=\"Cannot ping the Forgejo instance server\"",
+            ]
+        )
+        facts = parse_console(text)
+        self.assertEqual(len(facts.errors), 3)
+        self.assertEqual(len(set(facts.errors)), 3)
+
+    def test_empty_console_has_no_facts(self):
+        facts = parse_console("")
+        self.assertEqual(facts.steps, ())
+        self.assertEqual(facts.errors, ())
+        self.assertIsNone(facts.exit_code)
+        self.assertFalse(facts.registered)
+
+
+class ExporterTests(unittest.TestCase):
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+        self.events = self.root / "state" / "export" / "worker-events.ndjson"
+        self.metrics = self.root / "textfile" / "ci-burst.prom"
+        self.state_file = self.root / "state" / "export" / "observed.json"
+
+    def build(self, instances, consoles, ledger=None):
+        config = load(write_config(self.root, config={"state": {"database": str(self.root / "state" / "state.sqlite3")}}))
+        aws = FakeAws(instances=instances)
+        aws.consoles = consoles
+        return Exporter(config, aws=aws, ledger=ledger, clock=lambda: NOW)
+
+    def run_export(self, exporter, now=NOW):
+        return exporter.run(
+            events_file=self.events,
+            metrics_file=self.metrics,
+            state_file=self.state_file,
+            now=now,
+        )
+
+    def events_read(self):
+        return [json.loads(line) for line in self.events.read_text().splitlines() if line]
+
+    def test_first_run_emits_one_event_per_marker_with_a_stable_identity(self):
+        exporter = self.build(
+            [instance("i-0123456789abcdef0", zone="eu-central-1a"), instance("i-0123456789abcdef1", state="terminated", zone="eu-central-1b")],
+            {"i-0123456789abcdef0": CLEAN_BOOT, "i-0123456789abcdef1": FAILED_PING},
+        )
+        result = self.run_export(exporter)
+        self.assertEqual(result["decision"], "reported")
+        events = self.events_read()
+        identities = [event["id"] for event in events]
+        self.assertIn("i-0123456789abcdef0:step:register", identities)
+        self.assertIn("i-0123456789abcdef1:error:forgejo_ping", identities)
+        self.assertEqual(len(identities), len(set(identities)))
+        register = next(event for event in events if event.get("step") == "register")
+        self.assertEqual(register["zone"], "eu-central-1a")
+        self.assertEqual(result["events_emitted"], len(events))
+
+    def test_second_run_emits_nothing_new(self):
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        self.run_export(exporter)
+        first = len(self.events_read())
+        result = self.run_export(exporter)
+        self.assertEqual(result["events_emitted"], 0)
+        self.assertEqual(len(self.events_read()), first)
+
+    def test_totals_distinguish_registered_from_unregistered(self):
+        exporter = self.build(
+            [instance("i-0123456789abcdef0"), instance("i-0123456789abcdef1", state="terminated")],
+            {"i-0123456789abcdef0": CLEAN_BOOT, "i-0123456789abcdef1": FAILED_PING},
+        )
+        result = self.run_export(exporter)
+        self.assertEqual(result["totals"], {"launches": 2, "registered": 1, "unregistered": 1})
+
+    def test_a_later_empty_console_does_not_unlearn_registration(self):
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        self.run_export(exporter)
+        ended = self.build([instance("i-0123456789abcdef0", state="terminated")], {"i-0123456789abcdef0": ""})
+        result = self.run_export(ended)
+        self.assertEqual(result["totals"]["registered"], 1)
+        self.assertEqual(result["totals"]["unregistered"], 0)
+
+    def test_counters_do_not_fall_when_records_are_pruned(self):
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        self.run_export(exporter)
+        later = self.build([], {})
+        result = self.run_export(later, now=NOW + 8 * 86400)
+        self.assertEqual(result["totals"]["launches"], 1)
+        self.assertEqual(result["totals"]["registered"], 1)
+        self.assertIn("ci_burst_worker_registered_total", self.metrics.read_text())
+
+    def test_metrics_textfile_names_the_deployment_and_is_complete(self):
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        self.run_export(exporter)
+        text = self.metrics.read_text()
+        self.assertIn("# TYPE ci_burst_worker_launches_total counter", text)
+        self.assertIn("# TYPE ci_burst_worker_registered_total counter", text)
+        self.assertIn('deployment="test-deployment"', text)
+        self.assertIn("ci_burst_export_last_run_timestamp_seconds", text)
+        self.assertFalse(list(self.metrics.parent.glob(".ci-burst-*")))
+
+    def test_ledger_series_appear_when_the_ledger_exists(self):
+        from ci_burst.ledger import Ledger
+
+        ledger = Ledger(self.root / "state" / "state.sqlite3", clock=lambda: NOW)
+        ledger.connect()
+        ledger.close()
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertEqual(result["ledger_consumed_micros"], 0)
+        self.assertIn("ci_burst_ledger_consumed_micros", self.metrics.read_text())
+        self.assertNotIn("ledger_omitted", result["notes"])
+
+    def test_absent_ledger_is_reported_not_fatal(self):
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIsNone(result["ledger_consumed_micros"])
+        self.assertIn("ledger_omitted", result["notes"])
+        text = self.metrics.read_text()
+        self.assertNotIn("ci_burst_ledger_consumed_micros", text)
+        self.assertIn("ci_burst_worker_launches_total", text)
+
+    def test_console_cap_refuses_before_writing_anything(self):
+        owned = [instance(f"i-0123456789abcde{index:02x}") for index in range(MAX_CONSOLE_READS + 1)]
+        exporter = self.build(owned, {})
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.run_export(exporter)
+        self.assertEqual(raised.exception.reason, "console_read_cap_exceeded")
+        self.assertFalse(self.events.exists())
+        self.assertFalse(self.metrics.exists())
+
+    def test_structurally_corrupt_records_are_rebuilt_and_reported(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": 3,
+                    "totals": {"launches": 1, "registered": 0, "unregistered": 0},
+                    "instances": {"i-0123456789abcdef0": {"emitted": None, "steps": None, "seen": NOW}},
+                }
+            )
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        self.assertTrue(self.events.exists())
+        # Three steps and one exit, re-emitted because the record was repaired.
+        self.assertEqual(result["events_emitted"], 4)
+
+    def test_undecodable_state_file_is_rebuilt(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_bytes(b"\xff\xfe\x00broken")
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+
+    def test_events_file_is_rotated_at_its_bound(self):
+        # Seed with VALID historical events: an invalid line would be pruned by
+        # the schema check, which would make this test pass without rotating.
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {
+                "id": "i-0123456789abcdef1:step:register",
+                "ts": "2026-11-11T00:00:00Z",
+                "deployment": "test-deployment",
+                "instance": "i-0123456789abcdef1",
+                "zone": "eu-central-1a",
+                "operation": None,
+                "event": "step",
+                "step": "register",
+            },
+            sort_keys=True,
+        )
+        count = MAX_EVENTS_BYTES // len(line) + 200
+        self.events.write_text((line + "\n") * count)
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        self.run_export(exporter)
+        self.assertLessEqual(self.events.stat().st_size, MAX_EVENTS_BYTES)
+        body = self.events.read_text()
+        self.assertIn('"instance": "i-0123456789abcdef0"', body)
+        self.assertLess(body.count(json.dumps(json.loads(line), sort_keys=True)), count)
+
+    def test_a_lost_record_repeats_events_with_the_same_identity(self):
+        # At-least-once: a crash between publishing an event and persisting the
+        # record repeats the event, and its identity is what lets a consumer
+        # drop the repeat.
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        self.run_export(exporter)
+        first = {event["id"] for event in self.events_read()}
+        self.state_file.unlink()
+        self.run_export(exporter)
+        events = self.events_read()
+        self.assertGreater(len(events), len(first))
+        self.assertEqual({event["id"] for event in events}, first)
+
+    def test_prune_drops_records_past_retention_and_keeps_totals(self):
+        state = {
+            "version": 2,
+            "console_reads": 0,
+            "totals": {"launches": 2, "registered": 1, "unregistered": 0},
+            "instances": {
+                "i-0123456789abcdefa": {"seen": NOW - 8 * 86400, "emitted": []},
+                "i-0123456789abcdefb": {"seen": NOW - 60, "emitted": []},
+            },
+        }
+        pruned = prune_state(state, NOW)
+        self.assertNotIn("i-0123456789abcdefa", pruned["instances"])
+        self.assertIn("i-0123456789abcdefb", pruned["instances"])
+        self.assertEqual(pruned["totals"]["launches"], 2)
+
+
+    def test_persisted_state_is_validated_against_the_closed_vocabulary(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": 1,
+                    "totals": {"launches": True, "registered": 0, "unregistered": 0},
+                    "instances": {
+                        "i-0123456789abcdef0": {
+                            "seen": NOW,
+                            "emitted": ["step:secret-step", "error:arbitrary"],
+                            "steps": ["secret-step"],
+                            "errors": ["arbitrary"],
+                            "exit_code": "boom",
+                            "registered": False,
+                        }
+                    },
+                }
+            )
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        published = self.events.read_text()
+        self.assertNotIn("secret-step", published)
+        self.assertNotIn("arbitrary", published)
+        metrics = self.metrics.read_text()
+        self.assertIn('ci_burst_worker_launches_total{deployment="test-deployment"}', metrics)
+        self.assertNotIn("True", metrics)
+
+    def test_error_kind_limit_holds_across_runs(self):
+        first = "\n".join(
+            [
+                "level=error msg=\"Cannot ping the Forgejo instance server\"",
+                "level=error msg=\"Connect timeout on endpoint URL\"",
+                "level=error msg=\"Unable to locate package wireguard-tools\"",
+            ]
+        )
+        second = "\n".join(
+            ["level=error msg=\"Failed to register runner\"", "level=error msg=\"something else\""]
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": first})
+        self.run_export(exporter)
+        later = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": second})
+        self.run_export(later)
+        error_events = [event for event in self.events_read() if event["event"] == "error"]
+        self.assertEqual(len(error_events), 3)
+
+    def test_a_poisoned_record_reaches_no_output(self):
+        secret = "SYNTHETIC-CONSOLE-SECRET-123"
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": True,
+                    "totals": {
+                        "launches": 0,
+                        "registered": 0,
+                        "unregistered": 0,
+                        "detail": secret,
+                    },
+                    "instances": {
+                        "i-0123456789abcdef0": {
+                            "seen": NOW,
+                            "emitted": ["step:register", "step:secret-step", f"error:{secret}"],
+                            "steps": ["register", "secret-step"],
+                            "errors": ["arbitrary"],
+                            "exit_code": "boom",
+                            "registered": True,
+                            "detail": secret,
+                        }
+                    },
+                }
+            )
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertEqual(set(result["totals"]), {"launches", "registered", "unregistered"})
+        for surface, text in (
+            ("events", self.events.read_text()),
+            ("metrics", self.metrics.read_text()),
+            ("result", json.dumps(result)),
+            ("state", self.state_file.read_text()),
+        ):
+            with self.subTest(surface=surface):
+                self.assertNotIn(secret, text)
+                self.assertNotIn("secret-step", text)
+                self.assertNotIn("arbitrary", text)
+
+    def test_no_console_text_reaches_any_output(self):
+        secret = "SYNTHETIC-CONSOLE-SECRET-123"
+        console = f"level=error token={secret} msg=\"Cannot ping the Forgejo instance server\"\nSTEP {secret}\n"
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": console})
+        result = self.run_export(exporter)
+        for surface, text in (
+            ("events", self.events.read_text()),
+            ("metrics", self.metrics.read_text()),
+            ("result", json.dumps(result)),
+            ("state", self.state_file.read_text()),
+        ):
+            with self.subTest(surface=surface):
+                self.assertNotIn(secret, text)
+
+    def test_persisted_metadata_and_foreign_keys_reach_no_output(self):
+        secret = "SYNTHETIC-CONSOLE-SECRET-123"
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": 0,
+                    "totals": {"launches": 1, "registered": 0, "unregistered": 0},
+                    "instances": {
+                        secret: {"seen": NOW, "state": secret, "zone": secret, "operation": secret},
+                        "i-0123456789abcdef0": {
+                            "seen": NOW,
+                            "state": secret,
+                            "zone": secret,
+                            "operation": secret,
+                            "emitted": [],
+                        },
+                    },
+                }
+            )
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        for surface, body in (
+            ("events", self.events.read_text()),
+            ("metrics", self.metrics.read_text()),
+            ("result", json.dumps(result)),
+            ("state", self.state_file.read_text()),
+        ):
+            with self.subTest(surface=surface):
+                self.assertNotIn(secret, body)
+
+    def test_malformed_exit_identities_are_dropped_not_fatal(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": 0,
+                    "totals": {"launches": 1, "registered": 0, "unregistered": 0},
+                    "instances": {
+                        "i-0123456789abcdef0": {
+                            "seen": NOW,
+                            "emitted": ["exit:\u00b2", "exit:9999", "exit:000", "exit:0"],
+                            "steps": [],
+                            "errors": [],
+                            "exit_code": 0,
+                            "registered": False,
+                        }
+                    },
+                }
+            )
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        persisted = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]
+        # Only the canonical identity the parser would generate survives.
+        self.assertIn("exit:0", persisted["emitted"])
+        self.assertNotIn("exit:000", persisted["emitted"])
+        for event in self.events_read():
+            self.assertNotIn(":exit:000", event["id"])
+
+    def test_a_foreign_operation_tag_is_not_published(self):
+        secret = "SYNTHETIC-CONSOLE-SECRET-123"
+        poisoned = instance("i-0123456789abcdef0", **{"ci-burst:operation": secret})
+        exporter = self.build([poisoned], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        for surface, body in (
+            ("events", self.events.read_text()),
+            ("result", json.dumps(result)),
+            ("state", self.state_file.read_text()),
+        ):
+            with self.subTest(surface=surface):
+                self.assertNotIn(secret, body)
+
+    def test_a_foreign_ledger_state_is_bucketed_not_published(self):
+        import sqlite3
+
+        from ci_burst.ledger import Ledger
+
+        secret = "SYNTHETIC-CONSOLE-SECRET-123"
+        database = self.root / "state" / "state.sqlite3"
+        ledger = Ledger(database, clock=lambda: NOW)
+        ledger.connect()
+        ledger.new_operation(
+            operation_id="a" * 32,
+            client_token="token-1",
+            request={"MinCount": 1},
+            request_sha256="0" * 64,
+            expires_at=NOW + 3600,
+            reservation_micros=1000,
+            window_start=0.0,
+            region="eu-central-1",
+            account="111122223333",
+        )
+        ledger.close()
+        connection = sqlite3.connect(database)
+        connection.execute("UPDATE operations SET state = ?", (secret,))
+        connection.commit()
+        connection.close()
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("ledger_state_unknown", result["notes"])
+        self.assertEqual(result["ledger_operations"], {"invalid": 1})
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertNotIn(secret, self.metrics.read_text())
+
+    def test_a_poisoned_historical_event_line_is_dropped(self):
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        valid = {
+            "id": "i-0123456789abcdef1:step:register",
+            "ts": "2026-11-11T00:00:00Z",
+            "deployment": "test-deployment",
+            "instance": "i-0123456789abcdef1",
+            "zone": "eu-central-1a",
+            "operation": None,
+            "event": "step",
+            "step": "register",
+        }
+        self.events.write_text(
+            json.dumps(valid) + "\n" + '{"id":"i-0123456789abcdef0:step:register","detail":"SYNTHETIC-CONSOLE-SECRET-123"}\n'
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("events_pruned", result["notes"])
+        body = self.events.read_text()
+        self.assertNotIn("SYNTHETIC-CONSOLE-SECRET-123", body)
+        self.assertIn("i-0123456789abcdef1:step:register", body)
+
+
+    def test_historical_event_values_are_validated_per_field(self):
+        secret = "SYNTHETIC-CONSOLE-SECRET-123"
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        base = {
+            "id": "i-0123456789abcdef1:step:register",
+            "ts": "2026-11-11T00:00:00Z",
+            "deployment": "test-deployment",
+            "instance": "i-0123456789abcdef1",
+            "zone": "eu-central-1a",
+            "operation": None,
+            "event": "step",
+            "step": "register",
+        }
+        poisoned = [
+            dict(base, operation=secret),
+            dict(base, deployment=secret),
+            dict(base, zone=secret),
+            dict(base, ts=secret),
+            dict(base, kind=secret),
+            dict(base, event="exit", rc=0),
+        ]
+        self.events.write_text("".join(json.dumps(item) + "\n" for item in poisoned))
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("events_pruned", result["notes"])
+        body = self.events.read_text()
+        self.assertNotIn(secret, body)
+        retained = [json.loads(line) for line in body.splitlines() if line]
+        # None of the poisoned history survives, including the kind-mismatched one.
+        self.assertEqual([event for event in retained if event["instance"] == "i-0123456789abcdef1"], [])
+
+    def test_malformed_nested_values_degrade_instead_of_failing(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": 0,
+                    "totals": {"launches": 1, "registered": 0, "unregistered": 0},
+                    "instances": {
+                        "i-0123456789abcdef0": {"seen": NOW, "state": [], "zone": [], "operation": [], "emitted": []}
+                    },
+                }
+            )
+        )
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        self.events.write_text('{"event":[]}\n{"instance":42}\n')
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        self.assertIn("events_pruned", result["notes"])
+
+    def test_a_non_finite_timestamp_is_dropped_for_an_absent_instance(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            '{"version": 2, "console_reads": 0, "totals": {"launches": 1, "registered": 0, "unregistered": 0},'
+            ' "instances": {"i-0123456789abcdef9": {"seen": 1e309, "emitted": []}}}'
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        state = json.loads(self.state_file.read_text())
+        self.assertNotIn("i-0123456789abcdef9", state["instances"])
+        self.assertNotIn("Infinity", self.state_file.read_text())
+
+    def test_an_unknown_provider_state_is_normalized(self):
+        exporter = self.build([instance("i-0123456789abcdef0", state="synthetic-state")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertEqual(result["worker_states"], {"unknown": 1})
+        self.assertIn('state="unknown"', self.metrics.read_text())
+
+
+    def test_a_retained_event_missing_a_required_field_is_dropped(self):
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        complete = {
+            "id": "i-0123456789abcdef1:step:register",
+            "ts": "2026-11-11T00:00:00Z",
+            "deployment": "test-deployment",
+            "instance": "i-0123456789abcdef1",
+            "zone": "eu-central-1a",
+            "operation": None,
+            "event": "step",
+            "step": "register",
+        }
+        # The complete line survives first, so a removal is the only variable.
+        self.events.write_text(json.dumps(complete) + "\n")
+        result = self.run_export(self.build([], {}))
+        self.assertNotIn("events_pruned", result["notes"])
+        self.assertIn("i-0123456789abcdef1", self.events.read_text())
+        for missing in ("id", "ts", "deployment", "instance", "zone", "operation", "event", "step"):
+            with self.subTest(missing=missing):
+                line = dict(complete)
+                line.pop(missing, None)
+                self.events.write_text(json.dumps(line) + "\n")
+                result = self.run_export(self.build([], {}))
+                self.assertIn("events_pruned", result["notes"])
+                self.assertNotIn("i-0123456789abcdef1", self.events.read_text())
+
+    def test_an_oversized_persisted_counter_is_reset(self):
+        huge = "9" * 4300
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            '{"version": 2, "console_reads": ' + huge + ","
+            ' "totals": {"launches": ' + huge + ', "registered": 0, "unregistered": 0},'
+            ' "instances": {}}'
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        self.assertEqual(result["totals"]["launches"], 1)
+        self.assertTrue(self.metrics.exists())
+        self.assertLess(len(self.state_file.read_text()), 4096)
+
+    def test_an_oversized_integer_timestamp_is_dropped(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            '{"version": 2, "console_reads": 0, "totals": {"launches": 1, "registered": 0, "unregistered": 0},'
+            ' "instances": {"i-0123456789abcdef9": {"seen": ' + str(10**400) + ', "emitted": []}}}'
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        self.assertNotIn("i-0123456789abcdef9", json.loads(self.state_file.read_text())["instances"])
+
+    def test_deeply_nested_json_degrades_instead_of_raising(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text("[" * 2000 + "0" + "]" * 2000)
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        self.events.write_text("[" * 2000 + "0" + "]" * 2000 + "\n")
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        self.assertIn("events_pruned", result["notes"])
+
+
+    def test_a_trailing_newline_in_a_persisted_key_is_rejected(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": 0,
+                    "totals": {"launches": 1, "registered": 0, "unregistered": 0},
+                    "instances": {
+                        "i-0123456789abcdef0\n": {"seen": NOW, "state": "running", "emitted": []},
+                    },
+                }
+            )
+        )
+        exporter = self.build([], {})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        # Compare against the parsed state: JSON would escape a newline even if
+        # the key survived, so a substring check on the file proves nothing.
+        self.assertEqual(json.loads(self.state_file.read_text())["instances"], {})
+
+    def test_one_unusable_counter_keeps_the_other_two(self):
+        huge = "9" * 4300
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            '{"version": 2, "console_reads": 0, "totals": {"launches": 7, "registered": 5, "unregistered": ' + huge + '},'
+            ' "instances": {}}'
+        )
+        exporter = self.build([], {})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        self.assertEqual(result["totals"], {"launches": 7, "registered": 5, "unregistered": 0})
+
+    def test_counters_saturate_at_their_bound(self):
+        from ci_burst.export import MAX_COUNTER
+
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": MAX_COUNTER,
+                    "totals": {"launches": MAX_COUNTER, "registered": MAX_COUNTER, "unregistered": MAX_COUNTER},
+                    "instances": {},
+                }
+            )
+        )
+        exporter = self.build(
+            [instance("i-0123456789abcdef0"), instance("i-0123456789abcdef1", state="terminated")],
+            {"i-0123456789abcdef0": CLEAN_BOOT, "i-0123456789abcdef1": FAILED_PING},
+        )
+        result = self.run_export(exporter)
+        # Every increment path is exercised: launch, registration and the
+        # ended-unregistered counter.
+        self.assertEqual(
+            result["totals"],
+            {"launches": MAX_COUNTER, "registered": MAX_COUNTER, "unregistered": MAX_COUNTER},
+        )
+        state = json.loads(self.state_file.read_text())
+        self.assertEqual(state["console_reads"], MAX_COUNTER)
+
+    def test_missing_state_starts_empty_without_a_note(self):
+        state, note = load_state(self.state_file)
+        self.assertIsNone(note)
+        self.assertEqual(state["instances"], {})
+        self.assertEqual(state["totals"], {"launches": 0, "registered": 0, "unregistered": 0})
+
+
+class ConsoleReadTests(unittest.TestCase):
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+        self.config = load(write_config(self.root))
+
+    def test_passes_plaintext_through_and_bounds_it(self):
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def get_console_output(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"Output": "x" * (MAX_CONSOLE_BYTES + 100)}
+
+        client = Client()
+        consoles = Aws(self.config, client=client).console_output(["i-0123456789abcdef0"])
+        self.assertEqual(len(consoles["i-0123456789abcdef0"]), MAX_CONSOLE_BYTES)
+        self.assertTrue(consoles["i-0123456789abcdef0"].startswith("x"))
+        self.assertEqual(client.calls[0]["InstanceId"], "i-0123456789abcdef0")
+        self.assertTrue(client.calls[0]["Latest"])
+
+    def test_aged_out_instance_is_skipped(self):
+        class Client:
+            def get_console_output(self, **kwargs):
+                error = RuntimeError("gone")
+                error.response = {"Error": {"Code": "InvalidInstanceID.NotFound"}}
+                raise error
+
+        self.assertEqual(Aws(self.config, client=Client()).console_output(["i-0123456789abcdefa"]), {})
+
+    def test_empty_or_non_string_output_is_empty_evidence(self):
+        class Client:
+            def __init__(self, value):
+                self.value = value
+
+            def get_console_output(self, **kwargs):
+                return {"Output": self.value}
+
+        for value in ("", None, b"bytes-not-a-string"):
+            with self.subTest(value=value):
+                self.assertEqual(Aws(self.config, client=Client(value)).console_output(["i-0123456789abcdef9"]), {"i-0123456789abcdef9": ""})
+
+
+class ExportCliTests(unittest.TestCase):
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+
+    def test_metrics_file_is_required(self):
+        from ci_burst.cli import main
+
+        with mock.patch("sys.stdout"):
+            with self.assertRaises(SystemExit) as raised:
+                main(["export", "--config", str(write_config(self.root))])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_export_exits_zero_on_a_reported_decision(self):
+        from ci_burst.cli import main
+
+        stub = type(
+            "StubExporter",
+            (),
+            {"__init__": lambda self, config: None, "run": lambda self, **kwargs: {"decision": "reported"}},
+        )
+        buffer = io.StringIO()
+        with mock.patch("ci_burst.cli.Exporter", stub), redirect_stdout(buffer):
+            code = main(
+                [
+                    "export",
+                    "--config",
+                    str(write_config(self.root, config={"state": {"database": str(self.root / "db.sqlite3")}})),
+                    "--metrics-file",
+                    str(self.root / "ci-burst.prom"),
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(buffer.getvalue())["decision"], "reported")
+
+    def test_the_exporter_builds_a_live_adapter_when_none_is_injected(self):
+        config = load(write_config(self.root))
+        exporter = Exporter(config)
+        self.assertIsInstance(exporter.aws, Aws)
+
+
+if __name__ == "__main__":
+    unittest.main()

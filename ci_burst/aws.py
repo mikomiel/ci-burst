@@ -25,6 +25,10 @@ EXPIRES_TAG = "ci-burst:expires-at"
 
 MAX_INVENTORY_PAGES = 20
 
+#: One console read is bounded so a single image cannot turn an observation run
+#: into an unbounded download. The provider caps the same call at this size.
+MAX_CONSOLE_BYTES = 64 * 1024
+
 #: The controller owns retries: an unresolved launch is resumed with its frozen
 #: client token. Botocore's transparent retries would hide that a launch may
 #: already have been sent, so the client is built without them.
@@ -129,6 +133,7 @@ class Instance:
     state: str
     tags: dict
     launch_time: float | None
+    availability_zone: str | None = None
 
     def as_dict(self):
         return {
@@ -136,6 +141,7 @@ class Instance:
             "state": self.state,
             "operation": self.tags.get(OPERATION_TAG),
             "expires_at": self.tags.get(EXPIRES_TAG),
+            "availability_zone": self.availability_zone,
         }
 
 
@@ -291,6 +297,34 @@ class Aws:
             raise _translate(error) from None
         return _instances(response)
 
+    def console_output(self, instance_ids):
+        """Read each owned instance's console once, bounded.
+
+        The SDK presents ``Output`` as plaintext (the EC2 model declares it a
+        string), so there is nothing to decode here. A response that is not a
+        string is treated as no evidence rather than as a payload to guess at.
+
+        An instance that aged out of the provider's record window is absent from
+        the result rather than an error: absence after termination is the normal
+        end of an instance, and the console evidence it produced was already
+        read while it existed.
+        """
+        consoles = {}
+        for instance_id in instance_ids:
+            try:
+                response = self._client().get_console_output(InstanceId=instance_id, Latest=True)
+            except Exception as error:  # noqa: BLE001 - classified below
+                if _error_code(error) == "InvalidInstanceID.NotFound":
+                    continue
+                raise _translate(error) from None
+            output = response.get("Output")
+            if not isinstance(output, str) or not output:
+                consoles[instance_id] = ""
+                continue
+            payload = output.encode("utf-8", "replace")[:MAX_CONSOLE_BYTES]
+            consoles[instance_id] = payload.decode("utf-8", "replace")
+        return consoles
+
     # -- mutations ------------------------------------------------------
     def run_spot(self, request):
         response = self._call("run_instances", **request)
@@ -382,12 +416,15 @@ def _instances(response):
         for item in reservation.get("Instances") or []:
             tags = {tag.get("Key"): tag.get("Value") for tag in item.get("Tags") or []}
             launch_time = item.get("LaunchTime")
+            placement = item.get("Placement") or {}
+            zone = placement.get("AvailabilityZone")
             result.append(
                 Instance(
                     instance_id=item.get("InstanceId", ""),
                     state=(item.get("State") or {}).get("Name", "unknown"),
                     tags=tags,
                     launch_time=_timestamp(launch_time),
+                    availability_zone=zone if isinstance(zone, str) and zone else None,
                 )
             )
     return result

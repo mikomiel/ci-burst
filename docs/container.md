@@ -264,6 +264,28 @@ systemctl enable --now ci-burst-apply.timer
 systemctl list-timers 'ci-burst-*'
 ```
 
+The observation unit is optional and independent of admission. It runs the same
+image with no token env-file, writes its textfile into the state directory, and
+publishes that file into the collector's directory from `ExecStartPost`:
+
+```sh
+# scaler host, optional
+install -m 0644 \
+  deploy/ci-burst-export.service deploy/ci-burst-export.timer \
+  /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now ci-burst-export.timer
+```
+
+The container runs as uid 10001 while the collector's textfile directory is
+root-owned, which is why publishing is a root step in the unit rather than a
+container mount: the container writes
+`/var/lib/ci-burst/export/ci-burst.prom`, and two `ExecStartPost` lines stage it
+beside the collector's file and rename it into place. A rename inside one
+directory is atomic, so a scrape sees either the previous sample set or the new
+one. Point both lines at your collector's directory if it is not
+`/var/lib/prometheus/node-exporter`.
+
 Install only the reap unit and timer on the independent cleanup host:
 
 ```sh

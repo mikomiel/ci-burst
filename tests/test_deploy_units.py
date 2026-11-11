@@ -230,6 +230,10 @@ class RefreshTests(unittest.TestCase):
         # not have.
         self.assertIn('[ -n "$TOKEN_ENV" ] && [ -f "$TOKEN_ENV" ]', self.script)
         self.assertIn('--env-file "$TOKEN_ENV"', self.script)
+        # No colon in the default: an explicitly empty value stays empty instead
+        # of falling back to the controller's token file on a host that opted out.
+        self.assertIn("TOKEN_ENV=${CI_BURST_TOKEN_ENV-/etc/ci-burst/forgejo.env}", self.script)
+        self.assertNotIn("TOKEN_ENV=${CI_BURST_TOKEN_ENV:-", self.script)
 
     def test_a_cleanup_only_host_has_a_versioned_drop_in(self):
         # A systemd drop-in may repeat Environment=, so the text is read as-is;
@@ -240,13 +244,28 @@ class RefreshTests(unittest.TestCase):
             "Environment=CI_BURST_AWS_DIR=/etc/ci-burst/aws-cleanup",
             "Environment=CI_BURST_SMOKE_NETWORK=host",
             "Environment=CI_BURST_TOKEN_ENV=",
-            "Environment=CI_BURST_UNITS=ci-burst-reap.service ci-burst-reap.timer",
+            # Quoted, because systemd splits an unquoted Environment= on spaces
+            # and would silently compare only the first unit name.
+            'Environment="CI_BURST_UNITS=ci-burst-reap.service ci-burst-reap.timer"',
         ):
             with self.subTest(assignment=assignment):
                 self.assertIn(assignment, drop_in)
+        self.assertIn("[Unit]", drop_in)
+        self.assertNotIn("Description=", drop_in.split("[Service]", 1)[1])
         container = (ROOT / "docs" / "container.md").read_text(encoding="utf-8")
         self.assertIn("ci-burst-refresh-cleanup.conf", container)
         self.assertIn("CI_BURST_UNITS", container)
+        # The smoke network must match the installed reap unit; the docs must say
+        # so, because the shipped unit uses the named network.
+        self.assertIn("The smoke network must match the installed reap unit", container)
+
+    def test_a_host_without_podman_egress_has_a_versioned_reap_override(self):
+        override = (DEPLOY / "ci-burst-reap-host-network.conf").read_text(encoding="utf-8")
+        self.assertIn("ExecStart=", override)
+        self.assertIn("--network=host", override)
+        self.assertIn("reap --apply", override)
+        container = (ROOT / "docs" / "container.md").read_text(encoding="utf-8")
+        self.assertIn("ci-burst-reap-host-network.conf", container)
 
     def test_compares_the_scaler_units_and_schedules_nothing(self):
         units_line = next(

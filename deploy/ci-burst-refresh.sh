@@ -38,7 +38,10 @@ SOURCE=${CI_BURST_SOURCE:-/opt/ci-burst-src}
 STATE=${CI_BURST_IMAGE_STATE:-/var/lib/ci-burst-image}
 CONFIG=${CI_BURST_CONFIG:-/etc/ci-burst/deployment.toml}
 AWS_CREDENTIALS=${CI_BURST_AWS_DIR:-/etc/ci-burst/aws-scaling}
-TOKEN_ENV=${CI_BURST_TOKEN_ENV:-/etc/ci-burst/forgejo.env}
+# No colon: an explicitly empty value must stay empty, because a cleanup-only
+# host opts out of the token file rather than falling back to one it may
+# have inherited from an earlier role.
+TOKEN_ENV=${CI_BURST_TOKEN_ENV-/etc/ci-burst/forgejo.env}
 IMAGE=localhost/ci-burst
 SMOKE_RETRY_SECONDS=${CI_BURST_SMOKE_RETRY_SECONDS:-20}
 SMOKE_COMMAND=${CI_BURST_SMOKE_COMMAND:-plan}

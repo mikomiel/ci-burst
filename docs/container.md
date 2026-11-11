@@ -359,14 +359,28 @@ systemctl enable --now ci-burst-refresh.timer
 systemctl list-timers 'ci-burst-*'
 ```
 
+If the host cannot use podman's named network, install
+`deploy/ci-burst-reap-host-network.conf` beside the reap unit at the same time and
+keep `CI_BURST_SMOKE_NETWORK=host` in the refresh drop-in; see the networking
+paragraph below. Without that drop-in, remove the line so the smoke uses the
+shipped unit's network.
+
 The drop-in is what makes the same unit safe on both hosts: the smoke runs
 `reap` without `--apply` (it reads this host's configuration, reaches the cleanup
-identity and selects nothing to terminate), the cleanup credentials mount where
-the scaling credentials mount on the controller host, the Forgejo token path is
-emptied so no `--env-file` is passed, host networking matches the reap unit, and
-the drift report compares that host's own units. The accepted decision there is
-`planned`; `wait` or `would_launch` would mean the smoke ran the wrong command
-and is refused.
+identity and selects expired instances without requesting their termination — a
+dry run may list them), the cleanup credentials mount where the scaling
+credentials mount on the controller host, the Forgejo token path is emptied so no
+`--env-file` is passed, and the drift report compares that host's own units. The
+accepted decision there is `planned`; `wait` or `would_launch` would mean the
+smoke ran the wrong command and is refused.
+
+**The smoke network must match the installed reap unit.** A host that keeps the
+shipped `ci-burst-reap.service` keeps the script's default (`ci-burst`) and must
+not carry the `CI_BURST_SMOKE_NETWORK=host` line. A host whose podman networking
+has no egress installs `deploy/ci-burst-reap-host-network.conf`, which moves the
+scheduled unit to host networking; the same host sets `host` for the smoke. A
+mismatch promotes an image the scheduled unit cannot run, which is the failure
+this gate exists to catch.
 
 What a promotion does and does not do:
 
@@ -453,8 +467,10 @@ back after it, not against it.
 
 The script is installed by hand from the checkout, so a change to the script
 needs that install step repeated; a change to the controller does not. The
-cleanup host runs no refresh timer: it needs the same image, and it is the
-scaler's job to prove a candidate starts before another host is pointed at it.
+cleanup host runs the same unit with the drop-in above, so it keeps the image
+current without a human copying one across. Its smoke is its own: a candidate
+that cannot read that host's configuration or reach the cleanup identity is never
+promoted there, even when the controller host promoted it.
 
 ### Verify the container cleanup
 

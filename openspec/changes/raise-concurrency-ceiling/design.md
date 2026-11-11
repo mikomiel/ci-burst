@@ -62,16 +62,21 @@ to be observable.
 
 Two changes keep the bound meaningful without weakening it:
 
-- a record is read only while it can carry new evidence: a live worker on every
-  run, and a terminating worker until the read that shows it terminal. A
-  finished record is never read again, so turnover costs nothing;
+- a record is read only while it can carry new evidence: a worker the provider
+  reports live or terminating on every run, and finished only after a read that
+  observed it `terminated` or `stopped`. A console exit marker is not that
+  signal, because the bootstrap can finish while the instance and its console
+  carry on. A finished record is never read again, so turnover costs nothing,
+  and live workers are read before termination history;
 - candidates beyond the per-run budget are deferred with a note, not refused. A
   deferred record is a candidate on the next run while the provider still knows
   it, so no evidence is lost and the provider work per run stays fixed.
 
 The refusal remains, re-pointed at the drift it was meant to catch: more
 non-terminal owned instances than the configured `controller.max_instances`
-means the ownership tags disagree with the deployment.
+means the ownership tags disagree with the deployment. Non-terminal is the
+controller's definition, not the console reader's: `shutting-down`, `stopping`
+and `stopped` still occupy a slot, and only `terminated` frees one.
 
 ### Rejected: several deployments as one fleet
 

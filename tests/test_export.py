@@ -271,14 +271,21 @@ class ExporterTests(unittest.TestCase):
         self.assertEqual(self.console_read_calls(again), [])
         self.assertEqual(result["events_emitted"], 0)
 
-    def test_a_terminating_worker_is_read_once_after_it_leaves_running(self):
+    def test_a_terminating_worker_is_read_until_a_final_state_is_observed(self):
         exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": NOISE})
         self.run_export(exporter)
-        ended = self.build(
+        # Terminating is not finished: the console and the lifecycle carry on.
+        for _ in range(2):
+            ending = self.build(
+                [instance("i-0123456789abcdef0", state="shutting-down")],
+                {"i-0123456789abcdef0": CLEAN_BOOT},
+            )
+            self.assertEqual(self.run_export(ending)["console_reads"], 1)
+        final = self.build(
             [instance("i-0123456789abcdef0", state="terminated")],
             {"i-0123456789abcdef0": CLEAN_BOOT},
         )
-        result = self.run_export(ended)
+        result = self.run_export(final)
         self.assertEqual(result["console_reads"], 1)
         self.assertEqual(result["totals"]["registered"], 1)
         settled = self.build(
@@ -286,6 +293,37 @@ class ExporterTests(unittest.TestCase):
             {"i-0123456789abcdef0": CLEAN_BOOT},
         )
         self.assertEqual(self.run_export(settled)["console_reads"], 0)
+
+    def test_an_exit_marker_while_running_does_not_finish_the_record(self):
+        running = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": FAILED_PING})
+        self.assertEqual(self.run_export(running)["console_reads"], 1)
+        still_running = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": FAILED_PING})
+        self.assertEqual(self.run_export(still_running)["console_reads"], 1)
+        final = self.build(
+            [instance("i-0123456789abcdef0", state="terminated")],
+            {"i-0123456789abcdef0": FAILED_PING},
+        )
+        self.assertEqual(self.run_export(final)["console_reads"], 1)
+
+    def test_a_shutting_down_worker_counts_toward_the_configured_limit(self):
+        owned = [
+            instance("i-0123456789abcdef0"),
+            instance("i-0123456789abcdef1", state="shutting-down"),
+        ]
+        exporter = self.build(owned, {}, max_instances=1)
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.run_export(exporter)
+        self.assertEqual(raised.exception.reason, "console_read_cap_exceeded")
+
+    def test_a_mixed_inventory_reads_every_live_worker_before_history(self):
+        live = [instance(f"i-0123456789abc0{index:02x}") for index in range(12)]
+        history = [instance(f"i-0123456789abc1{index:02x}", state="terminated") for index in range(16)]
+        exporter = self.build(live + history, {}, max_instances=12)
+        result = self.run_export(exporter)
+        self.assertEqual(result["console_reads"], MAX_CONSOLE_READS)
+        read = set(self.console_read_calls(exporter)[0])
+        self.assertEqual(read & {item.instance_id for item in live}, {item.instance_id for item in live})
+        self.assertIn("console_read_deferred", result["notes"])
 
     def test_structurally_corrupt_records_are_rebuilt_and_reported(self):
         self.state_file.parent.mkdir(parents=True, exist_ok=True)

@@ -190,16 +190,21 @@ stopped exporter.
 | event file | rotated at 4 MiB |
 | dedupe record | pruned after 7 days |
 
-A terminal worker keeps its ownership tags for about an hour after termination,
+A terminated worker keeps its ownership tags for about an hour after termination,
 so a busy fleet legitimately shows many terminal records at once. A record is
-read again only while it can change: a live worker every run, a terminating one
-until a read shows it left the live states. A run that finds more candidates
-than the budget defers the rest with the note `console_read_deferred`, and the
-next run picks them up while they are still visible.
+read again only while its console can still change: every run while the provider
+reports the instance live or terminating, and finished after the read that
+observed it `terminated` or `stopped`. An exit line on the console is not that
+signal — the bootstrap can finish while the instance and its console carry on.
+Live workers are read first, so the growing consoles are never the ones deferred.
 
-Only a deployment running more non-terminal workers than its own configured
-limit is refused (`console_read_cap_exceeded`, exit 2, nothing written): that is
-the ownership tags disagreeing with the deployment, not turnover.
+A run that finds more candidates than the budget defers the rest with the note
+`console_read_deferred`, and the next run picks them up while they are still
+visible. Only a deployment running more non-terminal workers than its own
+configured limit is refused (`console_read_cap_exceeded`, exit 2, nothing
+written): `shutting-down`, `stopping` and `stopped` still occupy a slot, so the
+count matches the controller's, and a disagreement there means the ownership
+tags say something the deployment does not.
 
 An instance without the ownership tags — a hand-launched canary — is invisible
 here on purpose; read its console directly with the provider CLI instead.

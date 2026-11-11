@@ -717,9 +717,9 @@ class PrerequisiteTests(unittest.TestCase):
         self.use_router(user_data="not base64!!")
         self.assert_unavailable(self.check(), "router_user_data_unavailable")
 
-    def test_router_mentioning_the_cidr_only_in_a_comment_is_drift(self):
+    def test_router_mentioning_the_cidr_only_in_a_comment_is_unverified(self):
         self.use_router(user_data=router_user_data(cidrs=(), extra=f"# forwards {SUBNET_CIDR}"))
-        self.assert_drift(self.check(), "router_forwarding_missing_cidr")
+        self.assert_unavailable(self.check(), "router_forwarding_unverified")
 
     def test_the_shipped_router_artefact_is_unverified_not_a_pass(self):
         # The bytes this repository publishes, not a synthetic approximation:
@@ -739,6 +739,17 @@ class PrerequisiteTests(unittest.TestCase):
         result = self.check()
         self.assert_unavailable(result, "router_forwarding_unverified")
         self.assertEqual(self.records(result, "router")[0]["status"], "unavailable")
+
+    def test_router_fetching_config_with_a_global_option_is_unverified(self):
+        # `aws --region X ssm get-parameter` is the same call as
+        # `aws ssm get-parameter --region X`; neither declares a CIDR here.
+        self.use_router(
+            user_data=router_user_data(
+                cidrs=(),
+                extra='aws --region eu-central-1 ssm get-parameter --name /ci-burst/router/config',
+            )
+        )
+        self.assert_unavailable(self.check(), "router_forwarding_unverified")
 
     def test_managed_gateway_target_skips_the_router_contract(self):
         result = self.check()

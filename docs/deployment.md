@@ -269,8 +269,9 @@ It checks, from read-only describe calls:
   running and its boot configuration names the candidate's subnet CIDR
   (`router_forwarding_missing_cidr` when a configured CIDR is absent,
   `router_user_data_unavailable` when it cannot be read, and
-  `router_forwarding_unverified` when the router reads its CIDRs from SSM at
-  boot; an unreadable or externally-configured router is never a pass);
+  `router_forwarding_unverified` when no CIDR is declared in its user data —
+  read from SSM or a baked image, for example. An unreadable, undeclared or
+  externally-configured router is never a pass and never drift);
 - the template's security groups exist;
 - the template's instance profile and its role exist;
 - the registration parameter exists — metadata only.

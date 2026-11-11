@@ -51,6 +51,11 @@ DEFINITE_LAUNCH_ERRORS = frozenset(
         "InvalidLaunchTemplateId.NotFound",
         "InvalidLaunchTemplateName.NotFoundException",
         "InsufficientInstanceCapacity",
+        # The account's Spot limit is an account-wide pre-flight refusal: the
+        # request never reached a placement, so nothing was created. It is
+        # definite, and it is not that candidate's capacity, so it must not
+        # advance to the next configured candidate.
+        "MaxSpotInstanceCountExceeded",
     }
 )
 

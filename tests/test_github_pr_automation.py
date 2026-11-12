@@ -11,7 +11,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import github_pr_automation as driver
-from test_pr_policy import BASE, HEAD, OTHER, checks, comparison, pull, review, statuses
+from test_pr_policy import (
+    BASE, HEAD, OTHER, checks, comparison, pull, release_pull, review, statuses,
+)
 
 
 class FakeGitHub:
@@ -22,6 +24,10 @@ class FakeGitHub:
         self.pull_reads = 0
         self.review_reads = 0
         self.check_reads = 0
+        self.file_reads = 0
+        self.files = [{"filename": path, "status": "modified"}
+                      for path in sorted(driver.policy.RELEASE_PATHS)]
+        self.fail_files = False
         self.change_head = False
         self.withdraw = False
         self.fail_check = False
@@ -41,6 +47,12 @@ class FakeGitHub:
         if self.change_head and self.pull_reads > len(self.prs):
             result["head"]["sha"] = OTHER
         return result
+
+    def pull_files(self, number):
+        self.file_reads += 1
+        if self.fail_files:
+            raise driver.ApiError("pull_files_unavailable")
+        return copy.deepcopy(self.files)
 
     def reviews(self, number):
         self.review_reads += 1
@@ -87,6 +99,56 @@ class GateTests(unittest.TestCase):
         api = FakeGitHub()
         driver.run_review(api, apply=True)
         self.assertEqual(api.published, [(HEAD, "success", "approved_at_head")])
+
+    def test_generated_release_pr_is_published_without_review(self):
+        api = FakeGitHub()
+        api.prs = [release_pull()]
+        result = driver.run_review(api, apply=True)
+        self.assertEqual(result[HEAD], ("success", "automated_release"))
+        self.assertEqual(api.published, [(HEAD, "success", "automated_release")])
+        self.assertEqual(api.file_reads, 1)
+
+    def test_ordinary_pr_does_not_read_a_file_list(self):
+        api = FakeGitHub()
+        driver.run_review(api)
+        self.assertEqual(api.file_reads, 0)
+
+    def test_release_shaped_pr_with_an_unexpected_path_keeps_the_review(self):
+        api = FakeGitHub()
+        api.prs = [release_pull()]
+        api.files = [{"filename": "CHANGELOG.md", "status": "modified"},
+                     {"filename": ".github/workflows/ci.yml", "status": "modified"}]
+        with mock.patch.object(api, "reviews", return_value=[]):
+            result = driver.run_review(api, apply=True)
+        self.assertEqual(result[HEAD], ("pending", "current_head_approval_required"))
+        self.assertEqual(api.published, [(HEAD, "pending", "current_head_approval_required")])
+
+    def test_a_change_request_on_a_release_pr_is_published_as_failure(self):
+        api = FakeGitHub()
+        api.prs = [release_pull()]
+        with mock.patch.object(api, "reviews", return_value=[review("CHANGES_REQUESTED")]):
+            result = driver.run_review(api, apply=True)
+        self.assertEqual(result[HEAD], ("failure", "changes_requested"))
+        self.assertEqual(api.published, [(HEAD, "failure", "changes_requested")])
+
+    def test_release_shaped_pr_with_a_deletion_or_rename_keeps_the_review(self):
+        api = FakeGitHub()
+        api.prs = [release_pull()]
+        for status in ("removed", "renamed", "added"):
+            with self.subTest(status=status):
+                api.published.clear()
+                api.files = [{"filename": "pyproject.toml", "status": status}]
+                with mock.patch.object(api, "reviews", return_value=[]):
+                    result = driver.run_review(api, apply=True)
+                self.assertEqual(result[HEAD], ("pending", "current_head_approval_required"))
+
+    def test_unreadable_release_file_list_fails_the_publication_closed(self):
+        api = FakeGitHub()
+        api.prs = [release_pull()]
+        api.fail_files = True
+        with self.assertRaises(driver.ApiError):
+            driver.run_review(api, apply=True)
+        self.assertEqual([item[:2] for item in api.published], [(HEAD, "pending")])
 
     def test_closed_event_head_is_revoked(self):
         api = FakeGitHub()

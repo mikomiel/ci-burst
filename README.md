@@ -66,10 +66,13 @@ Its requirements are promoted to the [capability
 specifications](openspec/specs/), and the next behavioural change needs its own
 proposal.
 
-A release exists. [CHANGELOG.md](CHANGELOG.md) records merged source history and
-[CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the release record and its
-boundary: an annotated semver tag on `main` plus a GitHub Release whose notes are
-that changelog section.
+A release exists. [release-please](https://github.com/googleapis/release-please)
+maintains the version, [CHANGELOG.md](CHANGELOG.md) and the annotated
+`v`-prefixed tag from merged conventional commits.
+[CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the release boundary: a
+maintainer merges the release pull request, and release-please creates the tag
+and the GitHub Release whose notes are that changelog section. A release is not
+a deployment.
 
 ## Checks
 

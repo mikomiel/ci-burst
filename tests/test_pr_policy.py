@@ -190,14 +190,23 @@ class MergeTests(unittest.TestCase):
         self.assertFalse(self.decide(runs=[])[0])
 
     def test_sensitive_paths_always_need_a_person(self):
-        paths = (".github/workflows/ci.yml", "scripts/pr_policy.py", "tests/test_pr_policy.py",
+        paths = (".github/workflows/ci.yml", ".github/workflows/release-please.yml",
+                 "scripts/pr_policy.py", "tests/test_pr_policy.py",
                  "AGENTS.md", "component/AGENTS.md", "CONTRIBUTING.md", "SECURITY.md",
                  "package.json", "package-lock.json", "pyproject.toml", "uv.lock",
+                 "release-please-config.json", ".release-please-manifest.json",
                  "tools/package.json", "component/pyproject.toml", "component/Dockerfile",
                  "Dockerfile", ".gitleaks.toml", ".gitignore", "openspec/config.yaml")
         for path in paths:
             with self.subTest(path=path):
                 self.assertEqual(self.decide(compare=comparison(path))[1], "sensitive_paths")
+
+    def test_a_release_pull_request_stays_human_despite_its_ordinary_changelog(self):
+        pr = pull()
+        pr["changed_files"] = 2
+        compare = comparison("CHANGELOG.md")
+        compare["files"].append({"filename": ".release-please-manifest.json"})
+        self.assertEqual(self.decide(pr=pr, compare=compare), (False, "sensitive_paths"))
 
     def test_unknown_dependency_packaging_and_script_paths_need_a_person(self):
         paths = (".npmrc", "requirements.in", "requirements-prod.txt", "Pipfile", "MANIFEST.in",

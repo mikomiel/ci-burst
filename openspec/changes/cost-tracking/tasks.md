@@ -11,6 +11,14 @@ no cloud change.
 - [x] 1.2 Cover accrual, the billing minimum, the lifetime cap, terminal freezing,
   the price fallback, incidentals and commitment arithmetic in
   `tests/test_cost.py`.
+- [x] 1.3 Record the incidental rate and the non-compute buffer on admission and
+  use them for accrued, remaining and committed cost; fall back to the
+  configured values only for a row that predates the record.
+- [x] 1.4 Count the 60-second billing minimum once: `billable_seconds` is the
+  floored billed duration, and remaining life starts there.
+- [x] 1.5 Cover the 0/1/59/60/61-second boundaries at a 60-second and a
+  3_600-second lifetime, the terminal minimum, the frozen basis, the
+  missing-basis fallback and the reservation floor in `tests/test_cost.py`.
 
 ## 2. Ledger
 
@@ -27,6 +35,17 @@ no cloud change.
 - [x] 2.6 Cover commitment, carryover, restart, read-only tolerance, migration,
   copy failure, size mismatch and the missing-parameter refusal in
   `tests/test_ledger.py`.
+- [x] 2.7 Raise `SCHEMA_VERSION` to 3 and add nullable
+  `admitted_incidental_per_hour_micros` and `admitted_buffer_micros`; migrate a
+  version-1 or version-2 file to version 3 in one transaction after the
+  `.pre-v3.` copy.
+- [x] 2.8 Backfill non-terminal rows from the configured parameters, keep
+  terminal rows and their settled cost untouched, and accept versions 1, 2 and 3
+  read-only.
+- [x] 2.9 Use each operation's recorded buffer in `window_totals`.
+- [x] 2.10 Cover the v1 and v2 upgrades, the single `.pre-v3.` copy, the
+  terminal/non-terminal backfill split, the read-only v2 path, the copy failure
+  and the restored backup in `tests/test_ledger.py`.
 
 ## 3. Controller
 
@@ -53,6 +72,12 @@ no cloud change.
 - [x] 3.9 Bind each operation's lifetime and price to the evidence stored at
   admission, so lowered configuration affects only later launches; cover a
   lowered lifetime between applies in `tests/test_controller.py`.
+- [x] 3.10 Price accrued and remaining cost from the admitted basis and the
+  frozen request ceiling, so a configuration edit cannot reprice an outstanding
+  operation; cover the changed-configuration case and the next admission in
+  `tests/test_controller.py`.
+- [x] 3.11 Settle an unobserved instance at the admitted ceiling rather than a
+  raised configured maximum.
 
 ## 4. Export
 
@@ -81,6 +106,10 @@ no cloud change.
   window and the rollback restore in `docs/container.md`.
 - [x] 6.4 Update the cost paragraph in `README.md`.
 - [x] 6.5 Regenerate the changelog with `scripts/render_changelog.py --write`.
+- [x] 6.6 Document the frozen admitted basis, the single-count rule, the surplus
+  CPU credit residual and the settlement bound in `docs/operations.md`; the
+  schema-3 `.pre-v3.` backup and restore in `docs/container.md`; and that cost
+  settings apply to new admissions in `docs/deployment.md`.
 
 ## 7. Verification
 

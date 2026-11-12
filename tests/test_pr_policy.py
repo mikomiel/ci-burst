@@ -29,7 +29,7 @@ def pull(number=1, head=HEAD):
 def checks():
     return [{"id": n, "name": name, "head_sha": HEAD, "app": {"id": 15368},
              "status": "completed", "conclusion": "success"}
-            for n, name in enumerate(("planning", "public-content"), 1)]
+            for n, name in enumerate(("planning", "public-content", "dependency-review"), 1)]
 
 
 def statuses():
@@ -118,6 +118,11 @@ class CheckTests(unittest.TestCase):
         for runs in (missing, failed, pending):
             with self.subTest(runs=runs):
                 self.assertFalse(policy.checks_green(runs, statuses(), HEAD)[0])
+
+    def test_skipped_dependency_review_refuses(self):
+        runs = checks()
+        runs[2].update(conclusion="skipped")
+        self.assertFalse(policy.checks_green(runs, statuses(), HEAD)[0])
 
     def test_required_check_cannot_come_from_another_app_or_head(self):
         for key, value in (("app", {"id": 7}), ("head_sha", OTHER)):

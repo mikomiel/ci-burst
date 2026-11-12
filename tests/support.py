@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from ci_burst.aws import Instance, SpotQuote, Template
+from ci_burst.errors import DeadlineRefusal
 from ci_burst.forgejo import Attempt, Observation
 
 
@@ -67,11 +68,12 @@ def instance(instance_id="i-0123456789abcdef0", state="running", operation="op",
 
 
 class FakeAws:
-    def __init__(self, *, template_facts=None, spot_quote=None, instances=None, error=None):
+    def __init__(self, *, template_facts=None, spot_quote=None, instances=None, error=None, clock=None):
         self.template_facts = template_facts if template_facts is not None else template()
         self.spot_quote_value = spot_quote
         self.instances_result = list(instances or [])
         self.error = error
+        self.clock = clock
         self.calls = []
         self.run_error = None
         self.run_result = None
@@ -83,10 +85,17 @@ class FakeAws:
         self.account = "111122223333"
         self.on_run = None
         self.on_quote = None
+        self.on_owned_instances = None
+        self.on_instances = None
+        self.on_console_output = None
 
     def _maybe_raise(self):
         if self.error is not None:
             raise self.error
+
+    def _check_deadline(self, deadline, detail):
+        if deadline is not None and self.clock is not None and self.clock() >= deadline:
+            raise DeadlineRefusal(detail)
 
     def account_id(self):
         self.calls.append(("account_id",))
@@ -100,7 +109,8 @@ class FakeAws:
             raise self.template_facts
         return self.template_facts
 
-    def spot_quote(self, instance_type, availability_zone):
+    def spot_quote(self, instance_type, availability_zone, *, deadline=None):
+        self._check_deadline(deadline, "Spot price read")
         self.calls.append(("spot_quote", instance_type, availability_zone))
         if self.on_quote is not None:
             self.on_quote()
@@ -112,18 +122,27 @@ class FakeAws:
             raise value
         return value
 
-    def owned_instances(self, deployment):
+    def owned_instances(self, deployment, *, deadline=None):
+        self._check_deadline(deadline, "DescribeInstances page")
         self.calls.append(("owned_instances", deployment))
+        if self.on_owned_instances is not None:
+            self.on_owned_instances()
         self._maybe_raise()
         return list(self.instances_result)
 
-    def console_output(self, instance_ids):
+    def console_output(self, instance_ids, *, deadline=None):
+        self._check_deadline(deadline, "GetConsoleOutput read")
         self.calls.append(("console_output", list(instance_ids)))
+        if self.on_console_output is not None:
+            self.on_console_output()
         self._maybe_raise()
         return {identifier: self.consoles.get(identifier, "") for identifier in instance_ids if identifier in self.consoles}
 
-    def instances(self, instance_ids):
+    def instances(self, instance_ids, *, deadline=None):
+        self._check_deadline(deadline, "DescribeInstances by-id read")
         self.calls.append(("instances", list(instance_ids)))
+        if self.on_instances is not None:
+            self.on_instances()
         return [self.instances_by_id[identifier] for identifier in instance_ids if identifier in self.instances_by_id]
 
     def run_spot(self, request):

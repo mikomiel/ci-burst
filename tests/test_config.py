@@ -30,6 +30,41 @@ class ConfigTests(unittest.TestCase):
         config = load(write_config(self.root, config={"controller": {"max_instances": 12}}))
         self.assertEqual(config.controller.max_instances, 12)
 
+    def test_pass_deadline_defaults_to_240_seconds(self):
+        self.assertEqual(load(write_config(self.root)).controller.pass_deadline_seconds, 240)
+
+    def test_accepts_the_pass_deadline_range(self):
+        for value in (30, 840):
+            with self.subTest(value=value):
+                config = load(
+                    write_config(
+                        self.root, config={"controller": {"pass_deadline_seconds": value}}
+                    )
+                )
+                self.assertEqual(config.controller.pass_deadline_seconds, value)
+
+    def test_refuses_a_pass_deadline_outside_the_range(self):
+        for value in (29, 841):
+            with self.subTest(value=value):
+                path = write_config(
+                    self.root, config={"controller": {"pass_deadline_seconds": value}}
+                )
+                with self.assertRaises(ConfigRefusal) as raised:
+                    load(path)
+                self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
+                self.assertEqual(
+                    raised.exception.detail,
+                    "controller.pass_deadline_seconds: must be between 30 and 840",
+                )
+
+    def test_refuses_a_non_integer_pass_deadline(self):
+        path = write_config(
+            self.root, config={"controller": {"pass_deadline_seconds": 240.0}}
+        )
+        with self.assertRaises(ConfigRefusal) as raised:
+            load(path)
+        self.assertIn("controller.pass_deadline_seconds", raised.exception.detail)
+
     def test_refuses_zero_instances(self):
         path = write_config(self.root, config={"controller": {"max_instances": 0}})
         with self.assertRaises(ConfigRefusal) as raised:

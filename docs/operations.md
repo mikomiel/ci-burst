@@ -58,12 +58,14 @@ database = "state.sqlite3"
 Optional keys: `forgejo.timeout_seconds` (10), `forgejo.max_response_bytes`
 (2,000,000), `aws.price_max_age_seconds` (900), `aws.profile`,
 `aws.availability_zones`, `aws.instance_types` (an ordered list of at most four
-type names), `controller.max_instances` (an integer in `1..12`, default `1`).
+type names), `controller.max_instances` (an integer in `1..12`, default `1`),
+`controller.pass_deadline_seconds` (an integer in `30..840`, default `240`).
 Relative state paths resolve against the configuration file directory. Unknown
 keys, floating-point money, a template-version alias, a non-`https` Forgejo URL,
-a `controller.max_instances` outside `1..12`, a malformed zone-candidate list
-(`ZONE_CANDIDATES_INVALID`) and a malformed instance-type list
-(`INSTANCE_TYPES_INVALID`) are refused.
+a `controller.max_instances` outside `1..12`, a
+`controller.pass_deadline_seconds` outside `30..840`, a malformed
+zone-candidate list (`ZONE_CANDIDATES_INVALID`) and a malformed instance-type
+list (`INSTANCE_TYPES_INVALID`) are refused.
 
 ### Availability-zone candidates
 
@@ -237,6 +239,13 @@ stopped exporter.
 | published console text | none |
 | event file | rotated at 4 MiB |
 | dedupe record | pruned after 7 days |
+
+The table above bounds one export run. The controller has a separate bound:
+`controller.pass_deadline_seconds` (30..840, default 240) caps one `apply`
+pass, including its provider reads. A pass that reaches it returns `refused`
+with `pass_deadline_exceeded` and a `phases_deferred` list instead of being
+killed at the unit's `TimeoutStartSec`; `reap`, `status` and `export` do not
+take it. § Scheduler, cleanup and rollback owns the full relation.
 
 A terminated worker keeps its ownership tags for about an hour after termination,
 so a busy fleet legitimately shows many terminal records at once. A record is
@@ -861,6 +870,28 @@ Run `apply` from an external scheduler. Schedule `reap --apply` separately,
 outside the scaler's process and host failure boundary, and test it while the
 scaler is stopped. A `reap` command in the repository is not evidence that this
 path is deployed.
+
+Three different times bound one admission pass:
+
+- `controller.pass_deadline_seconds` (30..840, default 240) is the controller's
+  own budget for one `apply` pass. Every AWS client call also has a connect
+  (10 s) and read (30 s) transport timeout. When the pass budget is reached,
+  the remaining phases are deferred and the pass reports `refused` with
+  `pass_deadline_exceeded` and `phases_deferred`; it does not send an expired
+  intent or a stale quote, and its mutation phases are not interrupted once
+  started.
+- `TimeoutStartSec=300` on the shipped apply unit is the outer systemd bound.
+  It is longer than the default pass budget, so a slow provider yields the
+  controller's JSON result before systemd kills the unit. With the shipped
+  defaults the order is `240 < 300 < max_lifetime_seconds (3600)`.
+- `aws.max_lifetime_seconds` is the worker instance's own lifetime, not the
+  pass duration. It may be shorter than a pass on a deliberately short-lived
+  worker; it must remain longer than the worker needs to run one job.
+
+`reap`, `status` and `export` keep their existing behaviour and do not take the
+pass deadline. `reap --apply` runs from its own unit and timer on the cleanup
+host, so expiry cleanup survives an `apply` pass that defers or a scaler that
+is stopped.
 
 Rollback order:
 

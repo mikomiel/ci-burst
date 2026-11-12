@@ -200,6 +200,9 @@ labels = ["cloud-ci:host", "strong-ci:host", "linux-arm64:host"]
 # Optional, integer 1..12, default 1. A worker launched for one job occupies one
 # slot until it terminates.
 max_instances = 4
+# Optional pass budget in seconds, integer 30..840, default 240. It ends one
+# apply pass before the shipped unit's TimeoutStartSec=300.
+pass_deadline_seconds = 240
 
 [aws]
 region = "eu-central-1"
@@ -235,6 +238,14 @@ defaults to `1`, so a deployment that omits it keeps the original one-slot
 behaviour. Raise it only after one burst is understood; the allowance still caps
 every batch, and § Fleet size and fan-out in
 [operations.md](operations.md#fleet-size-and-fan-out) owns the admission rule.
+
+`controller.pass_deadline_seconds` is optional: it bounds one `apply` pass to
+`30..840` seconds and defaults to `240`, below the shipped unit's
+`TimeoutStartSec=300`. A pass that reaches it returns `refused` with
+`pass_deadline_exceeded` and `phases_deferred`; `reap`, `status` and `export`
+are not bounded by it. § Scheduler, cleanup and rollback in
+[operations.md](operations.md#scheduler-cleanup-and-rollback) owns the relation
+to the systemd unit, the transport timeouts and `max_lifetime_seconds`.
 
 `budget.allowance` caps tracked spend in the anchored window.
 `budget.incidental_per_hour` is the estimated non-compute cost of one

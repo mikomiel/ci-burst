@@ -39,12 +39,31 @@ from .aws import (
 )
 from .config import ZoneCandidate
 from .cost import CostModel
-from .errors import ProviderRefusal, Refusal, StateRefusal
+from .errors import DeadlineRefusal, PASS_DEADLINE_EXCEEDED, ProviderRefusal, Refusal, StateRefusal
 from .forgejo import ForgejoObserver
 from .ledger import Ledger, current_window
 from .money import format_money
 
 WRITER_TOPOLOGY = "one deployment, one controller host, one durable ledger, one writer"
+
+#: Ordered phases of one apply pass. A pass deadline that reaches a phase
+#: defers that phase because it did not complete, and every phase after it.
+PHASE_INVENTORY = "inventory"
+PHASE_RECONCILE = "reconcile"
+PHASE_RESUME = "resume"
+PHASE_EXPIRE = "expire"
+PHASE_OBSERVE = "observe"
+PHASE_ADMISSION = "admission"
+PHASE_LAUNCH = "launch"
+PASS_PHASES = (
+    PHASE_INVENTORY,
+    PHASE_RECONCILE,
+    PHASE_RESUME,
+    PHASE_EXPIRE,
+    PHASE_OBSERVE,
+    PHASE_ADMISSION,
+    PHASE_LAUNCH,
+)
 
 #: Stable refusal reason for durable state that belongs to another scope.
 SCOPE_CHANGED = "SCOPE_CHANGED"
@@ -183,6 +202,7 @@ class Controller:
         """Take one bounded admission and launch decision."""
         result = self._base("apply")
         self.config.require_live_contract()
+        deadline = self.clock() + self.config.controller.pass_deadline_seconds
         # The writer lock precedes the connect: a version-1 file is copied and
         # upgraded by that connect, and that mutation may not race a second writer.
         self.ledger.acquire_writer()
@@ -191,10 +211,20 @@ class Controller:
                 create=True,
                 backfill=(self.config.aws.max_spot_price, self.config.budget.incidental_per_hour),
             )
+            if self._deadline_reached(deadline):
+                return self._deferred(result, PHASE_INVENTORY)
             account = self.aws.account_id()
-            instances = self.aws.owned_instances(self.config.deployment)
-            with self.ledger.transaction():
-                slot, discrepancies = self._reconcile(instances, account)
+            try:
+                instances = self.aws.owned_instances(self.config.deployment, deadline=deadline)
+            except DeadlineRefusal:
+                return self._deferred(result, PHASE_INVENTORY)
+            if self._deadline_reached(deadline):
+                return self._deferred(result, PHASE_RECONCILE)
+            try:
+                with self.ledger.transaction():
+                    slot, discrepancies = self._reconcile(instances, account, deadline=deadline)
+            except DeadlineRefusal:
+                return self._deferred(result, PHASE_RECONCILE)
             if discrepancies:
                 slot["discrepancies"] = discrepancies
             result["slot"] = slot
@@ -202,19 +232,36 @@ class Controller:
                 result["decision"] = "refused"
                 result.setdefault("reasons", []).append("owned_state_discrepancy")
                 return result
+            if self._deadline_reached(deadline):
+                return self._deferred(result, PHASE_RESUME)
             if self._resume(slot, result):
                 return result
-            if self._expire(slot, instances, result):
-                return result
+            if self._deadline_reached(deadline):
+                return self._deferred(result, PHASE_EXPIRE)
+            try:
+                if self._expire(slot, instances, result, deadline=deadline):
+                    return result
+            except DeadlineRefusal:
+                return self._deferred(result, PHASE_EXPIRE)
+            if self._deadline_reached(deadline):
+                return self._deferred(result, PHASE_OBSERVE)
             observation = self._observe_or_refuse(result)
             if observation is None:
                 return result
             result["observation"] = observation.as_dict()
-            decision, plans = self._decide(observation, slot)
+            try:
+                decision, plans = self._decide(observation, slot, deadline=deadline)
+            except DeadlineRefusal:
+                return self._deferred(result, PHASE_ADMISSION)
             result.update(decision)
             if decision["decision"] != "launch_ready":
                 result["decision"] = decision["decision"]
                 return result
+            # Mutations never take the deadline. Once the intent is committed
+            # and _send may have been accepted, the existing uncertain
+            # reconciliation path owns the outcome.
+            if self._deadline_reached(deadline):
+                return self._deferred(result, PHASE_LAUNCH)
             return self._launch(result, decision, plans, account)
         finally:
             self.ledger.close()
@@ -324,6 +371,20 @@ class Controller:
             "cost_scope": COST_SCOPE_NOTE,
         }
 
+    def _deadline_reached(self, deadline):
+        return deadline is not None and self.clock() >= deadline
+
+    def _check_deadline(self, deadline, phase):
+        if self._deadline_reached(deadline):
+            raise DeadlineRefusal(phase)
+
+    def _deferred(self, result, phase):
+        """Report an incomplete pass from ``phase`` onward, without mutating."""
+        result["decision"] = "refused"
+        result["reasons"] = [PASS_DEADLINE_EXCEEDED]
+        result["phases_deferred"] = list(PASS_PHASES[PASS_PHASES.index(phase):])
+        return result
+
     def _read_state(self, required):
         if required:
             self.ledger.connect(create=False)
@@ -370,21 +431,24 @@ class Controller:
             result["decision"] = "refused"
             return None
 
-    def _templates(self, decision):
+    def _templates(self, decision, *, deadline=None):
         """Read each distinct configured template version once."""
         templates = {}
         for candidate in self.config.aws.zones:
             version = candidate.launch_template_version
             if version in templates:
                 continue
+            self._check_deadline(deadline, PHASE_ADMISSION)
             try:
                 templates[version] = self.aws.template(self.config.aws.launch_template_name, version)
+            except DeadlineRefusal:
+                raise
             except Refusal as refusal:
                 decision["template_error"] = refusal.as_dict()
                 return None
         return templates
 
-    def _candidate_plans(self, templates):
+    def _candidate_plans(self, templates, *, deadline=None):
         """Price every pool in order, before any time-sensitive check.
 
         The order is type-major: every configured type keeps its configured
@@ -412,7 +476,8 @@ class Controller:
                 # A provider error here is not a candidate property: the price
                 # evidence itself is unavailable, so the whole plan refuses
                 # rather than silently dropping a configured candidate.
-                quote = self.aws.spot_quote(instance_type, candidate.availability_zone)
+                self._check_deadline(deadline, PHASE_ADMISSION)
+                quote = self.aws.spot_quote(instance_type, candidate.availability_zone, deadline=deadline)
                 if quote is None:
                     plans.append(
                         CandidatePlan(candidate, instance_type, template, None, "spot_price_unavailable")
@@ -421,8 +486,9 @@ class Controller:
                 plans.append(CandidatePlan(candidate, instance_type, template, quote, None))
         return plans
 
-    def _decide(self, observation, slot):
+    def _decide(self, observation, slot, *, deadline=None):
         """Return the decision block and the ordered candidate plans behind it."""
+        self._check_deadline(deadline, PHASE_ADMISSION)
         reasons, notes = [], []
         limit = slot["limit"]
         instances = slot["instances"]
@@ -451,13 +517,15 @@ class Controller:
             reasons.append("no_runnable_demand")
             return decision, ()
         requested = min(observation.demand, free)
-        templates = self._templates(decision)
+        templates = self._templates(decision, deadline=deadline)
         if templates is None:
             decision["decision"] = "refused"
             reasons.append("template_unusable")
             return decision, ()
         try:
-            plans = self._candidate_plans(templates)
+            plans = self._candidate_plans(templates, deadline=deadline)
+        except DeadlineRefusal:
+            raise
         except Refusal as refusal:
             decision["decision"] = "refused"
             decision["refusal"] = refusal.as_dict()
@@ -918,8 +986,11 @@ class Controller:
         result["reservation"] = format_money(operation.reservation_micros)
         return "accepted", None
 
-    def _expire(self, slot, instances, result):
+    def _expire(self, slot, instances, result, *, deadline=None):
         """Terminate only an expired instance whose current ownership is verified."""
+        # The deadline stops this phase before selection; once selected, the
+        # termination request and its ledger write complete as one mutation.
+        self._check_deadline(deadline, PHASE_EXPIRE)
         now = self.clock()
         expired = [operation for operation in slot["operations"] if operation["expires_at"] <= now]
         if not expired:
@@ -954,8 +1025,9 @@ class Controller:
         result.setdefault("reasons", []).append("expiry_cleanup_requested")
         return True
 
-    def _reconcile(self, instances, account):
+    def _reconcile(self, instances, account, *, deadline=None):
         """Reconcile durable operations with the complete owned inventory."""
+        self._check_deadline(deadline, PHASE_RECONCILE)
         operations = {operation.id: operation for operation in self.ledger.operations()}
         nonterminal = {operation.id: operation for operation in self.ledger.nonterminal_operations()}
         grouped = {}
@@ -1039,7 +1111,10 @@ class Controller:
         identifiers = [operation.instance_id for operation in missing if operation.instance_id]
         by_id = {}
         if identifiers:
-            by_id = {instance.instance_id: instance for instance in self.aws.instances(identifiers)}
+            by_id = {
+                instance.instance_id: instance
+                for instance in self.aws.instances(identifiers, deadline=deadline)
+            }
         for operation in missing:
             instance = by_id.get(operation.instance_id) if operation.instance_id else None
             if operation.instance_id and instance is not None:

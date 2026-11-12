@@ -80,14 +80,19 @@ class WorkerConfig:
 
 @dataclass(frozen=True)
 class ControllerConfig:
-    """How many owned workers one deployment may run at once.
+    """How many owned workers one deployment may run at once, and for how long.
 
     The default of one preserves the original single-slot behaviour; the
     supported range is small on purpose, because every slot is a separate
     reservation against the same allowance.
+
+    ``pass_deadline_seconds`` bounds one ``apply`` pass, including its provider
+    reads, below the shipped unit's ``TimeoutStartSec``. ``reap``, ``status``
+    and ``export`` keep their own behaviour and do not take it.
     """
 
     max_instances: int
+    pass_deadline_seconds: int
 
 
 @dataclass(frozen=True)
@@ -359,11 +364,24 @@ def load(path):
 
     deployment = _string(raw, "deployment", "config", pattern=_DEPLOYMENT, pattern_name="a tag-safe name")
 
-    controller_table = _table(raw.get("controller", {}), "controller", ("max_instances",))
+    controller_table = _table(
+        raw.get("controller", {}), "controller", ("max_instances", "pass_deadline_seconds")
+    )
     max_instances = _integer(
         controller_table, "max_instances", "controller", minimum=1, maximum=12, required=False
     )
-    controller = ControllerConfig(max_instances=1 if max_instances is None else max_instances)
+    pass_deadline_seconds = _integer(
+        controller_table,
+        "pass_deadline_seconds",
+        "controller",
+        minimum=30,
+        maximum=840,
+        required=False,
+    )
+    controller = ControllerConfig(
+        max_instances=1 if max_instances is None else max_instances,
+        pass_deadline_seconds=240 if pass_deadline_seconds is None else pass_deadline_seconds,
+    )
 
     forgejo_table = _table(
         raw.get("forgejo", {}),

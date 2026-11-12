@@ -709,6 +709,88 @@ class ApplyTests(ControllerCase):
         self.assertNotIn("Authorization", dumped)
 
 
+class PassDeadlineTests(ControllerCase):
+    def slow_quote(self, seconds=300):
+        aws = FakeAws(spot_quote=quote(clock=self.clock), clock=self.clock)
+        aws.on_quote = lambda: self.clock.advance(seconds)
+        return aws
+
+    def test_a_slow_quote_read_defers_the_launch_without_mutation(self):
+        controller = self.build(observation=observation_demand(), aws=self.slow_quote())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["launch"])
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_a_deadline_between_candidate_quotes_defers_admission(self):
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "aws": {
+                        "availability_zones": [
+                            {"zone": "eu-central-1a", "subnet_id": "subnet-0123456789abcdef0"},
+                            {"zone": "eu-central-1b", "subnet_id": "subnet-0123456789abcdef1"},
+                        ]
+                    }
+                },
+            )
+        )
+        quotes = {
+            ("t4g.small", "eu-central-1a"): quote(clock=self.clock),
+            ("t4g.small", "eu-central-1b"): quote(clock=self.clock),
+        }
+        aws = FakeAws(spot_quote=quotes, clock=self.clock)
+        aws.on_quote = lambda: self.clock.advance(300)
+        controller = self.build(observation=observation_demand(), aws=aws, config=config)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["admission", "launch"])
+        self.assertEqual(aws.mutations(), [])
+
+    def test_a_deadline_before_expiry_cleanup_terminates_nothing(self):
+        operation_id = self.seed(state="running", expires_at=self.clock.now - 10)
+        aws = FakeAws(spot_quote=quote(clock=self.clock), clock=self.clock)
+        aws.instances_result = [
+            instance(instance_id="i-seed", operation=operation_id, expires_at=self.clock.now - 10)
+        ]
+        aws.on_owned_instances = lambda: self.clock.advance(300)
+        controller = self.build(observation=observation_demand(), aws=aws)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertIn("expire", result["phases_deferred"])
+        self.assertEqual(aws.terminated, [])
+        self.assertEqual([call for call in aws.calls if call[0] == "terminate"], [])
+
+    def test_a_deadline_after_a_possibly_accepted_launch_keeps_the_intent_for_resume(self):
+        aws = FakeAws(spot_quote=quote(clock=self.clock), clock=self.clock)
+        aws.on_run = lambda request: self.clock.advance(300)
+        aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        controller = self.build(observation=observation_demand(), aws=aws)
+        first = controller.apply()
+        self.assertEqual(first["decision"], "uncertain")
+        self.assertNotIn("pass_deadline_exceeded", first.get("reasons", []))
+        operation = self.reopened().operation(first["operation"])
+        self.assertEqual(operation.state, "uncertain")
+        token = operation.client_token
+        aws.run_error = None
+        aws.on_run = None
+        second = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(second["decision"], "resumed")
+        runs = [call for call in aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[0][1], runs[1][1])
+        self.assertEqual(runs[1][1]["ClientToken"], token)
+
+    def test_a_fast_pass_is_unchanged(self):
+        result = self.build(observation=observation_demand()).apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertNotIn("phases_deferred", result)
+
+
 class IntentScopeTests(ControllerCase):
     def test_a_deployment_rename_refuses_the_frozen_intent(self):
         controller = self.build(observation=observation_demand())

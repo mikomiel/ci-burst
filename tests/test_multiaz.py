@@ -107,7 +107,7 @@ class MultiZoneAws(FakeAws):
         self.calls.append(("template", name, version))
         return template(version=version)
 
-    def spot_quote(self, instance_type, availability_zone):
+    def spot_quote(self, instance_type, availability_zone, *, deadline=None):
         self.calls.append(("spot_quote", instance_type, availability_zone))
         value = self.quotes.get(
             (instance_type, availability_zone), self.quotes.get(availability_zone)

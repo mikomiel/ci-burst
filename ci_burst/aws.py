@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .errors import ProviderRefusal
+from .errors import DeadlineRefusal, ProviderRefusal
 from .money import parse_money
 
 MANAGED_TAG = "ci-burst:managed"
@@ -33,6 +33,11 @@ MAX_CONSOLE_BYTES = 64 * 1024
 #: client token. Botocore's transparent retries would hide that a launch may
 #: already have been sent, so the client is built without them.
 RETRY_POLICY = {"total_max_attempts": 1, "mode": "standard"}
+
+#: Transport bounds for one provider call. They stop a stalled connection or
+#: response from consuming the pass budget; retry counts stay unchanged.
+CONNECT_TIMEOUT_SECONDS = 10
+READ_TIMEOUT_SECONDS = 30
 
 #: Only these client error codes prove that RunInstances did not create an
 #: instance. Everything else -- throttling, service errors, unknown codes --
@@ -173,17 +178,28 @@ class Aws:
         self._session_cache = boto3.Session(profile_name=self._config.aws.profile)
         return self._session_cache
 
+    def _client_config(self):
+        from botocore.config import Config
+
+        return Config(
+            retries=RETRY_POLICY,
+            connect_timeout=CONNECT_TIMEOUT_SECONDS,
+            read_timeout=READ_TIMEOUT_SECONDS,
+        )
+
     def _client(self):
         if self._client_cache is not None:
             return self._client_cache
-        from botocore.config import Config
-
         self._client_cache = self._session().client(
             "ec2",
             region_name=self._config.aws.region,
-            config=Config(retries=RETRY_POLICY),
+            config=self._client_config(),
         )
         return self._client_cache
+
+    def _check_deadline(self, deadline, detail):
+        if deadline is not None and self._clock() >= deadline:
+            raise DeadlineRefusal(detail)
 
     def _call(self, method, **kwargs):
         client = self._client()
@@ -196,9 +212,9 @@ class Aws:
         """Return the AWS account the configured credential route reaches."""
         if self._account_cache is not None:
             return self._account_cache
-        from botocore.config import Config
-
-        sts = self._session().client("sts", region_name=self._config.aws.region, config=Config(retries=RETRY_POLICY))
+        sts = self._session().client(
+            "sts", region_name=self._config.aws.region, config=self._client_config()
+        )
         try:
             response = sts.get_caller_identity()
         except Exception as error:  # noqa: BLE001 - classified below
@@ -248,7 +264,8 @@ class Aws:
             placement_zone=placement_zone if isinstance(placement_zone, str) and placement_zone else None,
         )
 
-    def spot_quote(self, instance_type, availability_zone):
+    def spot_quote(self, instance_type, availability_zone, *, deadline=None):
+        self._check_deadline(deadline, "Spot price read")
         start = datetime.fromtimestamp(self._clock() - self._config.aws.price_max_age_seconds, timezone.utc)
         response = self._call(
             "describe_spot_price_history",
@@ -264,13 +281,14 @@ class Aws:
             self._clock(),
         )
 
-    def owned_instances(self, deployment):
+    def owned_instances(self, deployment, *, deadline=None):
         filters = [
             {"Name": "tag:" + MANAGED_TAG, "Values": ["true"]},
             {"Name": "tag:" + DEPLOYMENT_TAG, "Values": [deployment]},
         ]
         items, token, pages = [], None, 0
         while True:
+            self._check_deadline(deadline, "DescribeInstances page")
             arguments = {"Filters": filters}
             if token:
                 arguments["NextToken"] = token
@@ -283,7 +301,7 @@ class Aws:
             if pages >= MAX_INVENTORY_PAGES:
                 raise ProviderRefusal("AWS_INVENTORY_INCOMPLETE", "DescribeInstances pagination limit reached")
 
-    def instances(self, instance_ids):
+    def instances(self, instance_ids, *, deadline=None):
         """Read the named instances; an aged-out record is an empty result.
 
         `InvalidInstanceID.NotFound` is not proof that the instance never
@@ -293,6 +311,7 @@ class Aws:
         """
         if not instance_ids:
             return []
+        self._check_deadline(deadline, "DescribeInstances by-id read")
         client = self._client()
         try:
             response = client.describe_instances(InstanceIds=list(instance_ids))
@@ -302,7 +321,7 @@ class Aws:
             raise _translate(error) from None
         return _instances(response)
 
-    def console_output(self, instance_ids):
+    def console_output(self, instance_ids, *, deadline=None):
         """Read each owned instance's console once, bounded.
 
         The SDK presents ``Output`` as plaintext (the EC2 model declares it a
@@ -316,6 +335,7 @@ class Aws:
         """
         consoles = {}
         for instance_id in instance_ids:
+            self._check_deadline(deadline, "GetConsoleOutput read")
             try:
                 response = self._client().get_console_output(InstanceId=instance_id, Latest=True)
             except Exception as error:  # noqa: BLE001 - classified below

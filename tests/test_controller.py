@@ -4,13 +4,15 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from ci_burst.config import load
-from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller
+from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment
 from ci_burst.errors import ConfigRefusal, ProviderRefusal, StateRefusal
-from ci_burst.aws import SpotQuote
+from ci_burst.aws import DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
 from ci_burst.ledger import Ledger, current_window
+from ci_burst.money import format_money
 
 from support import (
     Clock,
@@ -55,13 +57,22 @@ class ControllerCase(unittest.TestCase):
         window = current_window(self.clock.now, controller.config.budget.window_seconds)
         return self.reopened().window_totals(window, controller.cost, self.clock.now)
 
-    def seed(self, *, state="running", operation_id="existing-op", expires_at=None, reservation=1_000_000, instance_id="i-seed"):
+    def seed(
+        self,
+        *,
+        state="running",
+        operation_id="existing-op",
+        expires_at=None,
+        reservation=1_000_000,
+        instance_id="i-seed",
+        request=None,
+    ):
         ledger = Ledger(self.config.state.database, clock=self.clock).connect()
         with ledger.transaction():
             ledger.new_operation(
                 operation_id=operation_id,
                 client_token="ci-burst-" + operation_id,
-                request={"seed": True},
+                request={"seed": True} if request is None else request,
                 request_sha256="0" * 64,
                 expires_at=expires_at if expires_at is not None else self.clock.now + 3600,
                 reservation_micros=reservation,
@@ -755,6 +766,197 @@ class ApplyTests(ControllerCase):
         self.assertNotIn("Authorization", dumped)
 
 
+class IntentScopeTests(ControllerCase):
+    def test_a_deployment_rename_refuses_the_frozen_intent(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        self.assertEqual(first["decision"], "uncertain")
+        operation_id = first["operation"]
+        frozen = self.reopened().operation(operation_id)
+        sends_before = len([call for call in self.aws.calls if call[0] == "run_spot"])
+
+        changed = load(write_config(self.root, config={"deployment": "different-deployment"}))
+        self.aws.run_error = None
+        result = self.build(observation=observation_empty(), aws=self.aws, config=changed).apply()
+
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        scope = [
+            entry for entry in result["slot"]["discrepancies"] if entry["reason"] == "SCOPE_CHANGED"
+        ]
+        self.assertEqual(
+            scope,
+            [
+                {
+                    "operation": operation_id,
+                    "reason": "SCOPE_CHANGED",
+                    "region": "eu-central-1",
+                    "account": "111122223333",
+                    "deployment": "test-deployment",
+                }
+            ],
+        )
+        # The refusal names the scope without disclosing the frozen request.
+        self.assertNotIn(frozen.client_token, json.dumps(result))
+        self.assertNotIn("TagSpecifications", json.dumps(result))
+        self.assertEqual(
+            len([call for call in self.aws.calls if call[0] == "run_spot"]), sends_before
+        )
+        self.assertEqual(self.aws.terminated, [])
+        self.assertNotIn("resumes", result)
+        self.assertNotIn("operation", result)
+
+        unchanged = self.reopened().operation(operation_id)
+        self.assertEqual(unchanged.state, "uncertain")
+        self.assertEqual(unchanged.updated_at, frozen.updated_at)
+        self.assertEqual(unchanged.client_token, frozen.client_token)
+        self.assertEqual(unchanged.request_sha256, frozen.request_sha256)
+        self.assertEqual(unchanged.request_json, frozen.request_json)
+
+    def test_plan_refuses_a_deployment_rename_without_an_aws_call(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        operation_id = first["operation"]
+        frozen = self.reopened().operation(operation_id)
+        calls_before = list(self.aws.calls)
+
+        changed = load(write_config(self.root, config={"deployment": "different-deployment"}))
+        result = self.build(observation=observation_demand(), aws=self.aws, config=changed).plan()
+
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["refusal"]["reason"], "SCOPE_CHANGED")
+        self.assertEqual(self.aws.calls, calls_before)
+        unchanged = self.reopened().operation(operation_id)
+        self.assertEqual(unchanged.state, "uncertain")
+        self.assertEqual(unchanged.updated_at, frozen.updated_at)
+        self.assertEqual(unchanged.client_token, frozen.client_token)
+        self.assertEqual(unchanged.request_sha256, frozen.request_sha256)
+        self.assertEqual(unchanged.request_json, frozen.request_json)
+
+    def test_the_same_deployment_still_resumes_idempotently(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        self.assertEqual(first["decision"], "uncertain")
+        self.aws.run_error = None
+        second = self.build(observation=observation_demand(), aws=self.aws).apply()
+        self.assertEqual(second["decision"], "resumed")
+        self.assertEqual(second["operation"], first["operation"])
+        sends = [call[1] for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(sends), 2)
+        self.assertEqual(sends[0], sends[1])
+        ledger = self.reopened()
+        self.assertEqual(len(ledger.operations()), 1)
+        self.assertEqual(ledger.operation(first["operation"]).state, "starting")
+
+    def test_a_drained_ledger_serves_a_new_deployment_and_keeps_a_bound_history(self):
+        frozen_request = {
+            "TagSpecifications": [
+                {
+                    "ResourceType": "instance",
+                    "Tags": [
+                        {"Key": MANAGED_TAG, "Value": "true"},
+                        {"Key": DEPLOYMENT_TAG, "Value": "test-deployment"},
+                        {"Key": OPERATION_TAG, "Value": "old-op"},
+                    ],
+                }
+            ]
+        }
+        old = self.seed(
+            state="terminal",
+            operation_id="old-op",
+            instance_id="i-old",
+            request=frozen_request,
+        )
+        self.reopened().settle(old, 2_500_000, self.clock.now)
+        retained = self.reopened().operation(old)
+        # The retained row carries a real deployment tag, not an unbound seed.
+        self.assertEqual(_frozen_deployment(retained), "test-deployment")
+        changed = load(write_config(self.root, config={"deployment": "different-deployment"}))
+
+        result = self.build(observation=observation_demand(), config=changed).apply()
+
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(result["launches"]), 1)
+        request = [call[1] for call in self.aws.calls if call[0] == "run_spot"][0]
+        tags = {tag["Key"]: tag["Value"] for tag in request["TagSpecifications"][0]["Tags"]}
+        self.assertEqual(tags[DEPLOYMENT_TAG], "different-deployment")
+        ledger = self.reopened()
+        self.assertEqual(len(ledger.operations()), 2)
+        old_row = ledger.operation(old)
+        self.assertEqual(old_row.state, "terminal")
+        self.assertEqual(old_row.request_json, retained.request_json)
+        self.assertEqual(old_row.request_sha256, retained.request_sha256)
+        self.assertEqual(old_row.reservation_micros, retained.reservation_micros)
+        self.assertEqual(old_row.settled_micros, retained.settled_micros)
+        self.assertEqual(old_row.settled_at, retained.settled_at)
+        self.assertEqual(json.loads(old_row.request_json), frozen_request)
+
+    def test_a_drained_ledger_tolerates_an_unbound_history_row(self):
+        old = self.seed(state="failed", operation_id="unbound-op", instance_id=None)
+        retained = self.reopened().operation(old)
+        self.assertIsNone(_frozen_deployment(retained))
+        changed = load(write_config(self.root, config={"deployment": "different-deployment"}))
+
+        result = self.build(observation=observation_demand(), config=changed).apply()
+
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(result["launches"]), 1)
+        ledger = self.reopened()
+        self.assertEqual(len(ledger.operations()), 2)
+        self.assertEqual(ledger.operation(old).state, "failed")
+        self.assertEqual(ledger.operation(old).request_json, retained.request_json)
+        self.assertEqual(ledger.operation(old).request_sha256, retained.request_sha256)
+
+
+class FrozenDeploymentTests(unittest.TestCase):
+    """``_frozen_deployment`` reads only a well-formed deployment tag."""
+
+    @staticmethod
+    def operation(request_json):
+        return SimpleNamespace(request=lambda: json.loads(request_json))
+
+    @staticmethod
+    def tagged(tags):
+        return json.dumps(
+            {"TagSpecifications": [{"ResourceType": "instance", "Tags": tags}]}
+        )
+
+    def test_a_tagged_request_returns_its_deployment(self):
+        request = self.tagged(
+            [
+                {"Key": MANAGED_TAG, "Value": "true"},
+                {"Key": DEPLOYMENT_TAG, "Value": "test-deployment"},
+            ]
+        )
+        self.assertEqual(_frozen_deployment(self.operation(request)), "test-deployment")
+
+    def test_a_request_without_tag_specifications_is_unbound(self):
+        request = json.dumps({"InstanceType": "t3.micro"})
+        self.assertIsNone(_frozen_deployment(self.operation(request)))
+
+    def test_null_tags_are_unbound(self):
+        self.assertIsNone(_frozen_deployment(self.operation(self.tagged(None))))
+
+    def test_numeric_tags_are_unbound(self):
+        self.assertIsNone(_frozen_deployment(self.operation(self.tagged(42))))
+
+    def test_a_tag_entry_that_is_not_a_dict_is_ignored(self):
+        self.assertIsNone(_frozen_deployment(self.operation(self.tagged(["not-a-tag"]))))
+
+    def test_a_deployment_tag_with_an_empty_value_is_unbound(self):
+        self.assertIsNone(
+            _frozen_deployment(
+                self.operation(self.tagged([{"Key": DEPLOYMENT_TAG, "Value": ""}]))
+            )
+        )
+
+    def test_invalid_request_json_is_unbound(self):
+        self.assertIsNone(_frozen_deployment(self.operation("not json")))
+
+
 class FleetTests(ControllerCase):
     def fleet_config(self, max_instances=4):
         return load(write_config(self.root, config={"controller": {"max_instances": max_instances}}))
@@ -1304,6 +1506,82 @@ class FleetTests(ControllerCase):
         self.assertEqual(result["budget"]["busy_instances"], 1)
         self.assertEqual(result["budget"]["hourly_ceiling"], "0.160000")
 
+
+
+class BudgetHeadroomTests(ControllerCase):
+    def headroom_config(self, *, max_instances, allowance):
+        return load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": max_instances},
+                    "budget": {"allowance": allowance},
+                },
+            )
+        )
+
+    def test_a_zero_worker_plan_reports_the_unspent_allowance(self):
+        controller = self.build(
+            observation=observation_demand(3),
+            config=self.headroom_config(max_instances=3, allowance="0.1000"),
+        )
+        result = controller.plan()
+        self.assertEqual(result["launch_count"], 0)
+        self.assertEqual(result["budget"]["remaining_after"], "0.100000")
+        self.assertEqual(
+            result["budget"]["remaining_after"], result["budget"]["remaining"]
+        )
+
+    def test_a_one_worker_plan_subtracts_one_reservation(self):
+        controller = self.build(
+            observation=observation_demand(1),
+            config=self.headroom_config(max_instances=3, allowance="10.00"),
+        )
+        result = controller.plan()
+        self.assertEqual(result["launch_count"], 1)
+        expected = format_money(
+            controller.config.budget.allowance - controller.cost.per_launch_micros()
+        )
+        self.assertEqual(result["budget"]["remaining_after"], expected)
+        self.assertEqual(result["budget"]["remaining_after"], "9.460000")
+
+    def test_a_multi_worker_plan_subtracts_the_whole_batch(self):
+        controller = self.build(
+            observation=observation_demand(3),
+            config=self.headroom_config(max_instances=3, allowance="10.00"),
+        )
+        result = controller.plan()
+        self.assertEqual(result["launch_count"], 3)
+        expected = format_money(
+            controller.config.budget.allowance - 3 * controller.cost.per_launch_micros()
+        )
+        self.assertEqual(result["budget"]["remaining_after"], expected)
+        self.assertEqual(result["budget"]["remaining_after"], "8.380000")
+
+    def test_a_budget_capped_plan_subtracts_only_the_admitted_batch(self):
+        controller = self.build(
+            observation=observation_demand(3),
+            config=self.headroom_config(max_instances=3, allowance="1.30"),
+        )
+        result = controller.plan()
+        self.assertEqual(result["launch_count"], 2)
+        self.assertIn("budget_capped_batch", result["notes"])
+        expected = format_money(
+            controller.config.budget.allowance - 2 * controller.cost.per_launch_micros()
+        )
+        self.assertEqual(result["budget"]["remaining_after"], expected)
+        self.assertEqual(result["budget"]["remaining_after"], "0.220000")
+
+    def test_admission_still_launches_only_the_planned_batch(self):
+        config = self.headroom_config(max_instances=4, allowance="1.30")
+        controller = self.build(observation=observation_demand(6), config=config)
+        planned = controller.plan()
+        self.assertEqual(planned["launch_count"], 2)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_count"], planned["launch_count"])
+        self.assertEqual(len(result["launches"]), planned["launch_count"])
+        self.assertLessEqual(self.totals(controller)["committed"], config.budget.allowance)
 
 
 class CostTrackingTests(ControllerCase):

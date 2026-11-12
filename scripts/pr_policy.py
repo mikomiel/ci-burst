@@ -2,7 +2,9 @@
 
 The trusted status publisher and merger use these same rules. The pattern is
 adapted from advisory-radar's MIT-licensed review/status and sensitive-path
-controls; there is deliberately no dependency-update review exemption.
+controls; there is deliberately no dependency-update review exemption. The one
+review exemption is the generated release-please pull request, and it is
+recognised only by the exact branch, author and changed-path shape below.
 """
 
 import re
@@ -18,6 +20,20 @@ DECISIVE = {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
 REVIEW_STATES = DECISIVE | {"COMMENTED", "PENDING"}
 ORDINARY_ROOT_DOCS = {"README.md", "CHANGELOG.md"}
 ORDINARY_CHANGE_DOCS = {"proposal.md", "design.md", "tasks.md", ".openspec.yaml"}
+
+# release-please generates this branch from the package name and the base
+# branch; the PR is opened with the maintainer's token, and only these files
+# are version- or changelog-managed. Any other shape keeps the normal review
+# requirement. If the token owner or the package name changes, update this
+# together with release-please-config.json and the workflow comment.
+RELEASE_BRANCH = "release-please--branches--main--components--ci-burst"
+RELEASE_AUTHOR = "mikomiel"
+RELEASE_PATHS = frozenset({
+    ".release-please-manifest.json",
+    "CHANGELOG.md",
+    "ci_burst/__init__.py",
+    "pyproject.toml",
+})
 
 
 class Unusable(ValueError):
@@ -85,8 +101,52 @@ def pull_scope(pr):
     )
 
 
+def release_candidate(pr):
+    """The generated release PR shape, before its changed paths are checked.
+
+    ``pull_scope`` already requires an open PR against this repository's
+    ``main``. The head must be the release-please branch in this repository,
+    opened by the token owner; a fork or another writer is not the generator.
+    """
+    if not pull_scope(pr) or pr.get("draft") is not False:
+        return False
+    head, user = pr.get("head"), pr.get("user")
+    if not isinstance(head, dict) or not isinstance(user, dict):
+        return False
+    return (
+        head.get("ref") == RELEASE_BRANCH
+        and (head.get("repo") or {}).get("full_name") == REPOSITORY
+        and user.get("login") == RELEASE_AUTHOR
+    )
+
+
+def release_scope(pr):
+    """True only for a generated release PR that changes release-managed files.
+
+    ``release_paths`` is attached by the trusted publisher from the pull
+    request's immutable file list, both sides of a rename included. A missing,
+    empty or unexpected path falls back to the normal review requirement.
+    """
+    if not release_candidate(pr):
+        return False
+    paths = pr.get("release_paths")
+    return (
+        isinstance(paths, list)
+        and bool(paths)
+        and all(isinstance(path, str) and path in RELEASE_PATHS for path in paths)
+    )
+
+
 def review_plan(prs):
-    """One verdict per SHA, worst open-PR verdict winning for a shared head."""
+    """One verdict per SHA, worst open-PR verdict winning for a shared head.
+
+    A generated release pull request is the only PR whose review status is
+    published without an independent approval. It is a deterministic artifact
+    of merged commits and still needs exact-head CI and a human merge; the merge
+    decision below never auto-merges it because it always changes a sensitive
+    path. An explicit change request from an eligible reviewer is still a
+    failure: the exemption removes the approval requirement, not a veto.
+    """
     if not isinstance(prs, list):
         raise Unusable("invalid_pull_snapshot")
     result = {}
@@ -98,6 +158,8 @@ def review_plan(prs):
         state, reason = review_verdict(
             pr.get("reviews"), head, pr["user"]["login"], pr.get("maintainers", ())
         )
+        if release_scope(pr) and state != "failure":
+            state, reason = "success", "automated_release"
         if pr["draft"]:
             state, reason = "pending", "pull_request_is_draft"
         if head not in result or severity[state] > severity[result[head][0]]:

@@ -321,13 +321,15 @@ is therefore accepted and counted defensively — a server that starts returning
 it is not treated as an unknown status — but no live record has been observed
 and a deployment cannot qualify against one.
 
-The `labels` query is mandatory, not an optimisation: the server answers JSON
-`null` when it is absent. The adapter sends the worker's bare label names (the
-part before the executor suffix, so `strong-ci` for `strong-ci:host`) and reads
-`null` as an empty queue, because the server also answers `null` for a filter
-that matches nothing. The filter is a union prefilter, so a job selected by one
-shared label is still compared against its complete `runs_on` set above; it never
-substitutes for that comparison.
+The `labels` query is mandatory, not an optimisation: the server applies no
+label filter when it is absent and admits every waiting or running job in the
+repository. The adapter sends the worker's bare label names (the part before the
+executor suffix, so `strong-ci` for `strong-ci:host`) and reads `null` as an
+empty queue, because the server marshals an empty selection — a filter that
+matches nothing, or no waiting or running job at all — as `null`. The filter is
+a union prefilter, so a job selected by one shared label is still compared
+against its complete `runs_on` set above; it never substitutes for that
+comparison.
 
 Attempts are deduplicated by `handle`. A retry is a new handle and remains
 distinguishable. ci-burst never assigns, requeues or reserves a job, and it does
@@ -349,14 +351,46 @@ To qualify a deployment, the operator must, with an owner-scoped read token:
 4. only then set `qualification = "live-verified"`.
 
 Observed on `forgejo 17.0.1+gitea-1.22.0`: `runs_on` holds bare label names
-(`strong-ci`, `homelab`), an absent `labels` parameter returns `null`, a
-non-matching filter also returns `null`, and the filter is a union over the job's
-labels. Statuses observed in one run (`mikolajm/ai-agents` run 25336,
-2026-11-10): a job waiting for a runner reports `waiting` and still lists the
-dependency that already succeeded, while a dependent job reports `blocked`
-until it does. A changed response shape or a different Forgejo version needs a
-new contract identifier, not a re-declaration; correcting how the adapter reads
-an unchanged shape does not.
+(`strong-ci`, `homelab`), a non-matching filter returns `null`, and the filter
+is a union over the job's labels. Statuses observed in one run
+(`mikolajm/ai-agents` run 25336, 2026-11-10): a job waiting for a runner reports
+`waiting` and still lists the dependency that already succeeded, while a
+dependent job reports `blocked` until it does. A changed response shape or a
+different Forgejo version needs a new contract identifier, not a
+re-declaration; correcting how the adapter reads an unchanged shape does not.
+
+#### Replayable contract reading
+
+`tests/fixtures/forgejo/contract.json` is the versioned contract reading. It
+names the pinned upstream project and tag (`forgejo` `v17.0.1`), the handler
+(`GetActionRunJobs` in `routers/api/v1/shared/runners.go`), the response record,
+the request variant behind every fixture in `tests/fixtures/forgejo/`, and the
+demand, counters, notes or refusal the parser must produce for it. Each fixture
+is marked as a shape the pinned handler can emit or as a defensive shape that
+only exercises the parser. The manifest states that it is a reading of the
+source, not a live observation: no server, request, token or credential produced
+it. The reading shows that the handler selects only `waiting` and `running`
+jobs, and that an absent `labels` parameter applies no filter at all, so the
+response can list every waiting and running job in the repository rather than
+`null`.
+
+`tests/test_forgejo.py` replays every fixture through the real observer and
+compares the result with the manifest. The matrix therefore proves the parser's
+classification against the pinned contract — including shapes the endpoint does
+not emit — and that the adapter always sends an explicit, non-empty `labels`
+parameter. It proves nothing about a running server.
+
+Only an isolated operator canary can establish live compatibility: a
+repository-scoped ephemeral runner registers, takes exactly one job to
+completion and exits, and an idle worker expires without taking a job. The
+canary must record the exact Forgejo server version and the exact runner version
+it ran. This change ran no server and no runner, and the matrix does not set
+`qualification = "live-verified"`.
+
+Requalification is required when either recorded version changes, or when a
+server returns a response shape no fixture pins. A changed shape or a different
+Forgejo version needs a new contract identifier and a new manifest reading;
+passing the matrix does not re-qualify a server the operator has not run.
 
 ## Worker image and launch template
 

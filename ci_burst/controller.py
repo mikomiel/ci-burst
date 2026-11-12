@@ -146,11 +146,11 @@ class Controller:
         # The writer lock precedes the connect: a version-1 file is copied and
         # upgraded by that connect, and that mutation may not race a second writer.
         self.ledger.acquire_writer()
-        self.ledger.connect(
-            create=True,
-            backfill=(self.config.aws.max_spot_price, self.config.budget.incidental_per_hour),
-        )
         try:
+            self.ledger.connect(
+                create=True,
+                backfill=(self.config.aws.max_spot_price, self.config.budget.incidental_per_hour),
+            )
             account = self.aws.account_id()
             instances = self.aws.owned_instances(self.config.deployment)
             with self.ledger.transaction():

@@ -82,14 +82,21 @@ class CostModel:
         )
 
     def remaining_micros(self, operation, now):
-        """Worst-case cost of the life this worker has left."""
+        """Worst-case cost of the life this worker has left.
+
+        The accepted price is a floor as well as the configured maximum: a later
+        configuration change that lowers the ceiling must not shrink the
+        commitment of an operation already accepted above it, because that
+        operation still settles at its accepted price.
+        """
         if operation.state in TERMINAL_STATES:
             return 0
         if operation.instance_id is None:
             seconds = self.max_lifetime_seconds
         else:
             seconds = max(0, self.max_lifetime_seconds - self.elapsed_seconds(operation, now))
-        return hourly_cost_micros(self.price_cap_micros, seconds) + hourly_cost_micros(
+        price = max(self.price_cap_micros, operation.price_micros or 0)
+        return hourly_cost_micros(price, seconds) + hourly_cost_micros(
             self.incidental_per_hour_micros, seconds
         )
 

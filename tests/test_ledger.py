@@ -321,6 +321,10 @@ class MigrationTests(unittest.TestCase):
         connection = sqlite3.connect(self.path)
         self.addCleanup(connection.close)
         self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
+        self.assertNotIn("price_micros", columns)
+        ledger.connect(create=True, backfill=(40_000, 0))
+        self.assertEqual(ledger.version, SCHEMA_VERSION)
 
     def test_a_refused_upgrade_can_be_retried(self):
         ledger = Ledger(self.path, clock=lambda: self.now)

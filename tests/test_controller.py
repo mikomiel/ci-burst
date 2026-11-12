@@ -1,12 +1,14 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from ci_burst.config import load
 from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller
-from ci_burst.errors import ConfigRefusal, ProviderRefusal
+from ci_burst.errors import ConfigRefusal, ProviderRefusal, StateRefusal
 from ci_burst.aws import SpotQuote
 from ci_burst.ledger import Ledger, current_window
 
@@ -1320,6 +1322,120 @@ class CostTrackingTests(ControllerCase):
         totals = ledger.window_totals(window, controller.cost, self.clock.now)
         self.assertEqual(totals["spend"], 300_000)
         self.assertLessEqual(totals["spend"], config.budget.allowance)
+
+    def test_a_lowered_ceiling_keeps_the_commitment_above_settlement(self):
+        path = write_config(
+            self.root,
+            config={
+                "budget": {"allowance": "0.2500"},
+                "aws": {"max_spot_price": "0.2000"},
+                "controller": {"max_instances": 2},
+            },
+        )
+        path.write_text(
+            path.read_text().replace(
+                'non_compute_allowance = "0.50"', 'non_compute_allowance = "0.000001"'
+            )
+        )
+        config = load(path)
+        ledger = Ledger(config.state.database, clock=self.clock).connect()
+        with ledger.transaction():
+            ledger.new_operation(
+                operation_id="a",
+                client_token="ci-burst-a",
+                request={"seed": True},
+                request_sha256="0" * 64,
+                expires_at=self.clock.now + 3000,
+                reservation_micros=200_001,
+                window_start=current_window(self.clock.now, config.budget.window_seconds),
+                region=config.aws.region,
+                account="111122223333",
+                price_micros=200_000,
+            )
+        ledger.set_instance("a", "i-a")
+        ledger.set_launch_time("a", self.clock.now - 600)
+        ledger.set_state("a", "running", instance_id="i-a")
+        ledger.close()
+        controller = self.build(observation=observation_demand(2), config=config)
+        self.aws.instances_result = []
+        self.assertEqual(controller.apply()["launch_count"], 0)
+        lowered_path = write_config(
+            self.root,
+            config={
+                "budget": {"allowance": "0.2500"},
+                "aws": {"max_spot_price": "0.1000"},
+                "controller": {"max_instances": 2},
+            },
+        )
+        lowered_path.write_text(
+            lowered_path.read_text().replace(
+                'non_compute_allowance = "0.50"', 'non_compute_allowance = "0.000001"'
+            )
+        )
+        controller = self.build(observation=observation_demand(2), config=load(lowered_path))
+        self.aws.instances_result = []
+        # The accepted price floors the remaining commitment, so lowering the
+        # ceiling cannot make a second worker look affordable.
+        lowered = controller.apply()
+        self.assertEqual(lowered["launch_count"], 0)
+        self.clock.advance(INSTANCE_RETENTION_SECONDS + 1)
+        controller.apply()
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation("a").settled_micros, 200_000)
+        window = current_window(self.clock.now, controller.config.budget.window_seconds)
+        totals = ledger.window_totals(window, controller.cost, self.clock.now)
+        self.assertEqual(totals["spend"], 200_000)
+        self.assertLessEqual(totals["spend"], controller.config.budget.allowance)
+
+    def test_a_failed_migration_releases_the_writer_lock(self):
+        schema = """
+            CREATE TABLE operations (
+                id TEXT PRIMARY KEY,
+                client_token TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                reservation_micros INTEGER NOT NULL,
+                reservation_window REAL NOT NULL,
+                region TEXT NOT NULL,
+                account TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                request_sha256 TEXT NOT NULL,
+                instance_id TEXT,
+                detail TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX operations_state ON operations (state);
+            PRAGMA user_version = 1;
+        """
+        for name, effect in (
+            ("copy", OSError("denied")),
+            ("size", lambda source, target: Path(target).write_bytes(b"")),
+        ):
+            with self.subTest(name):
+                path = self.config.state.database
+                path.parent.mkdir(parents=True, exist_ok=True)
+                for suffix in ("", ".lock"):
+                    try:
+                        Path(str(path) + suffix).unlink()
+                    except FileNotFoundError:
+                        pass
+                connection = sqlite3.connect(path)
+                connection.executescript(schema)
+                connection.close()
+                controller = self.build(observation=observation_demand())
+                with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=effect):
+                    with self.assertRaises(StateRefusal):
+                        controller.apply()
+                # The failed writable connect must release the writer lock that
+                # the controller took before it, or a retry cannot start.
+                fresh = Ledger(path, clock=self.clock)
+                fresh.acquire_writer()
+                fresh.release_writer()
+                fresh.close()
+                connection = sqlite3.connect(path)
+                self.addCleanup(connection.close)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
 
     def test_settlement_is_written_once(self):
         operation_id = self.seed(state="running", operation_id="live", reservation=540_000)

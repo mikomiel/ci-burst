@@ -35,8 +35,11 @@ day late and needs a permission the scaling identity does not carry.
 ### Unlived time is committed at the maximum, not at the quote
 
 Admission needs an upper bound, not an estimate. For a non-terminal operation the
-commitment is its accrued cost plus the remaining lifetime priced at the
-configured maximum plus the non-compute buffer. An admitted worker is therefore
+commitment is its accrued cost plus the remaining lifetime priced at the higher
+of the configured maximum and the operation's accepted price, plus the
+non-compute buffer. The accepted-price floor matters because an operator can
+lower the ceiling while a worker is alive; without it the commitment would shrink
+below the settlement that worker will still incur. An admitted worker is therefore
 priced at `max_spot_price × max_lifetime + buffer` exactly as before; the
 difference is that its commitment shrinks with every second it has lived, and
 disappears when it settles. A settled operation keeps only its settled cost.

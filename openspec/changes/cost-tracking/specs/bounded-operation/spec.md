@@ -53,28 +53,37 @@ MUST settle at zero.
 
 ### Requirement: Forward cost commitment
 
-Budget admission MUST use the window's tracked spend plus the worst-case
-remaining cost of every non-terminal operation plus the configured buffer, and
-MUST price one newly admitted worker at the configured maximum price for its
-whole lifetime. The unspent part of a non-terminal commitment MUST become
-available as the operation ages and MUST be released when it settles. Money
-already spent MUST NOT be refunded, and a completed operation MUST be charged to
-the window it started in.
+Admission MUST use tracked spend plus every non-terminal operation's worst-case
+remaining cost plus the configured buffer, and MUST price a newly admitted worker
+at the configured maximum for its lifetime. Remaining cost MUST be priced at no
+less than the recorded accepted price, so lowering the configured maximum cannot
+under-count an outstanding operation.
 
 #### Scenario: The allowance admits fewer workers than the free slots
 - **WHEN** the window's commitment plus one worst-case worker exceeds the allowance
 - **THEN** the batch is capped or refused with the budget reason
 - **AND** the decision reports spend, commitment and remaining allowance
 
-#### Scenario: A worker settles
-- **WHEN** an operation reaches a terminal state
-- **THEN** its remaining commitment is released
-- **AND** its settled cost stays charged to the window it started in
+#### Scenario: The ceiling is lowered while a worker is alive
+- **WHEN** the configured maximum price drops below an outstanding operation's accepted price
+- **THEN** its remaining commitment stays at the accepted price
+- **AND** the lowered ceiling cannot make another worker look affordable on the shortfall
 
 #### Scenario: Restart with an outstanding operation
 - **WHEN** the process restarts with a non-terminal operation
 - **THEN** its accrued cost and remaining commitment are unchanged by the restart
 - **AND** restart does not reset the admission allowance
+
+### Requirement: Release of committed cost
+
+Unspent commitment MUST be released as a non-terminal operation ages and MUST be
+released when it settles. Money already spent MUST NOT be refunded, and a
+completed operation MUST be charged to the window it started in.
+
+#### Scenario: A worker settles
+- **WHEN** an operation reaches a terminal state
+- **THEN** its remaining commitment is released
+- **AND** its settled cost stays charged to the window it started in
 
 ### Requirement: Upgrade from the reservation schema
 

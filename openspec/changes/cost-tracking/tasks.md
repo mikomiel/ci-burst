@@ -37,15 +37,19 @@ no cloud change.
 - [x] 3.3 Settle on the terminal transition, attach an identity observed only at
   termination before settling, settle a full lifetime at the accepted price for
   an unobserved instance, and settle zero for a definite pre-launch failure.
-- [x] 3.4 Admit against spend plus commitment plus one worst-case worker.
+- [x] 3.4 Admit against spend plus commitment plus one worst-case worker, with
+  an operation's remaining life floored at its accepted price.
 - [x] 3.5 Report `spend`, `committed` and `remaining` from `apply`, `plan` and
   `status`; include the incidental rate in `hourly_ceiling`.
 - [x] 3.6 Rewrite the cost-scope note and keep the "estimate, not a bill cap"
   language.
 - [x] 3.7 Cover price recording, settlement, the unobserved case, one-shot
-  settlement, an uncertain launch first observed terminated, and admission
-  through the age-out settlement in `tests/test_controller.py`; move the batch
-  and status expectations to the new accounting.
+  settlement, an uncertain launch first observed terminated, admission through
+  the age-out settlement, and a ceiling lowered between applies in
+  `tests/test_controller.py`; move the batch and status expectations to the new
+  accounting.
+- [x] 3.8 Release the writer lock when a writable connect fails, covered by a
+  controller test that retries through a fresh ledger.
 
 ## 4. Export
 

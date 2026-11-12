@@ -543,6 +543,7 @@ conditions). Reverting the source is a reviewed change, not a history rewrite.
 | `FORGEJO_TOKEN_MISSING` | the env-file is not mounted or lacks the variable |
 | `FORGEJO_CONTRACT_UNQUALIFIED` | `qualification` is still `fixtures-only`; `apply` is refused |
 | `FORGEJO_UNEXPECTED_SHAPE` | the endpoint returned something other than an array or `null` |
+| `AWS_SDK_UNAVAILABLE` | the `boto3` runtime dependency is not installed in the command's environment |
 | `AWS_REFUSED` | the identity lacks a permission, or a condition (tag, template, subnet) does not match |
 | `AWS_UNCERTAIN` | the provider outcome is unknown; the recorded client token resumes the same operation |
 | `UNRECORDED_OWNED_INSTANCE`, `OWNERSHIP_TAGS_MISSING`, `OPERATION_TAG_INVALID` | an owned instance needs reconciliation before another launch |

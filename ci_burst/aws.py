@@ -176,12 +176,10 @@ class Aws:
     def _client(self):
         if self._client_cache is not None:
             return self._client_cache
-        from botocore.config import Config
-
         self._client_cache = self._session().client(
             "ec2",
             region_name=self._config.aws.region,
-            config=Config(retries=RETRY_POLICY),
+            config=_sdk_config(),
         )
         return self._client_cache
 
@@ -196,9 +194,7 @@ class Aws:
         """Return the AWS account the configured credential route reaches."""
         if self._account_cache is not None:
             return self._account_cache
-        from botocore.config import Config
-
-        sts = self._session().client("sts", region_name=self._config.aws.region, config=Config(retries=RETRY_POLICY))
+        sts = self._session().client("sts", region_name=self._config.aws.region, config=_sdk_config())
         try:
             response = sts.get_caller_identity()
         except Exception as error:  # noqa: BLE001 - classified below
@@ -284,22 +280,39 @@ class Aws:
                 raise ProviderRefusal("AWS_INVENTORY_INCOMPLETE", "DescribeInstances pagination limit reached")
 
     def instances(self, instance_ids):
-        """Read the named instances; an aged-out record is an empty result.
+        """Read the named instances, establishing absence per identifier.
+
+        An EC2 by-ID read is rejected for the whole batch when any one
+        identifier is unknown, so a rejected batch proves nothing about its
+        other members. Absence is therefore established only for an identifier
+        read on its own: a record that exists is returned even beside an
+        aged-out one, and any other per-identifier read failure refuses rather
+        than reporting the set as empty.
 
         `InvalidInstanceID.NotFound` is not proof that the instance never
         existed or that it terminated at a particular time; the controller
         applies its own retained-visibility window before treating absence as
         terminal.
         """
-        if not instance_ids:
+        identifiers = list(instance_ids)
+        if not identifiers:
             return []
         client = self._client()
         try:
-            response = client.describe_instances(InstanceIds=list(instance_ids))
+            response = client.describe_instances(InstanceIds=identifiers)
         except Exception as error:  # noqa: BLE001 - classified below
-            if _error_code(error) == "InvalidInstanceID.NotFound":
-                return []
-            raise _translate(error) from None
+            if _error_code(error) != "InvalidInstanceID.NotFound":
+                raise _translate(error) from None
+            found = []
+            for instance_id in identifiers:
+                try:
+                    response = client.describe_instances(InstanceIds=[instance_id])
+                except Exception as member:  # noqa: BLE001 - classified below
+                    if _error_code(member) == "InvalidInstanceID.NotFound":
+                        continue
+                    raise _translate(member) from None
+                found.extend(_instances(response))
+            return found
         return _instances(response)
 
     def console_output(self, instance_ids):
@@ -343,6 +356,20 @@ class Aws:
         if not instance_ids:
             return {}
         return self._call("terminate_instances", InstanceIds=list(instance_ids))
+
+
+def _sdk_config():
+    """Build the client configuration, refusing when the runtime SDK is absent.
+
+    The lazy import guard belongs at every entry point that needs an SDK type,
+    not only at the session: a checkout without ``boto3`` must report the
+    documented refusal instead of an import traceback.
+    """
+    try:
+        from botocore.config import Config
+    except ImportError:
+        raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
+    return Config(retries=RETRY_POLICY)
 
 
 def _translate(error):

@@ -195,7 +195,8 @@ class Aws:
         """Return the AWS account the configured credential route reaches."""
         if self._account_cache is not None:
             return self._account_cache
-        sts = self._session().client("sts", region_name=self._config.aws.region, config=_sdk_config())
+        config = _sdk_config()
+        sts = self._session().client("sts", region_name=self._config.aws.region, config=config)
         try:
             response = sts.get_caller_identity()
         except Exception as error:  # noqa: BLE001 - classified below

@@ -28,7 +28,8 @@ no cloud change.
 
 - [x] 3.1 Adapter: a mixed not-found batch returns only the live record and
   makes one batch call plus one call per identifier.
-- [x] 3.2 Adapter: a per-identifier unclassified failure raises `AWS_UNCERTAIN`
+- [x] 3.2 Adapter: a per-identifier read failure raises an uncertain refusal (the
+  translated reason is kept; an unclassified code becomes `AWS_UNCERTAIN`)
   and never an empty list; the existing aged-out single identifier still returns
   an empty result.
 - [x] 3.3 Adapter and CLI: a missing `boto3`/`botocore.config` returns

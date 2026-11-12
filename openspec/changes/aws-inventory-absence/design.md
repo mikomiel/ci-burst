@@ -36,7 +36,11 @@ The batch call is the normal, cheapest path and is unchanged. It is repeated per
 identifier only after EC2 rejects the batch with `InvalidInstanceID.NotFound`. A
 per-identifier `InvalidInstanceID.NotFound` means absence for that identifier
 only; every other per-identifier failure is translated exactly as the batch
-failure is today, which is a `ProviderRefusal("AWS_UNCERTAIN", ..., uncertain=True)`.
+failure is today. The adapter translates the provider error with the shared
+translator, so a known code keeps its own reason (for example `AWS_REFUSED` for
+an authorisation error) and an unclassified one becomes `AWS_UNCERTAIN`; the read
+path then forces `uncertain=True`, because a failed read leaves the operation's
+state unknown whatever the provider's code was.
 The caller's list is bounded by `controller.max_instances`, so the fallback is
 bounded by the caller and needs no new constant or pagination.
 

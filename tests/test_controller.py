@@ -1582,6 +1582,11 @@ class ReapTests(ControllerCase):
         self.assertEqual(result["termination_requested"], ["i-expired"])
         self.assertEqual(result["refused_resources"], [])
         self.assertEqual(result["refusal"]["reason"], "AWS_REFUSED")
+        self.assertNotIn("confirmation", result)
+        self.assertEqual(result["cleanup"]["requested"], 1)
+        self.assertEqual(result["cleanup"]["denied"], 1)
+        self.assertEqual(result["cleanup"]["unresolved"], 1)
+        self.assertEqual(result["cleanup"]["terminated"], 0)
 
     def test_reap_apply_requests_termination_and_does_not_claim_confirmation(self):
         controller = self.build()
@@ -1620,6 +1625,111 @@ class ReapTests(ControllerCase):
         self.aws.instances_result = [instance(instance_id="i-expired", operation="a", expires_at=self.clock.now - 5)]
         controller.reap(apply=True)
         self.assertEqual([call[0] for call in self.aws.mutations()], ["terminate"])
+
+    def test_reap_apply_reports_an_all_refused_inventory_as_degraded(self):
+        controller = self.build()
+        self.aws.instances_result = [instance(instance_id="i-bad-expiry", operation="a")]
+        result = controller.reap(apply=True)
+        self.assertEqual(result["decision"], "cleanup_degraded")
+        self.assertEqual(result["termination_requested"], [])
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertNotIn("confirmation", result)
+        self.assertEqual(
+            {
+                key: result["cleanup"][key]
+                for key in ("inventory_verified", "observed", "expired", "requested", "refused", "denied", "unresolved")
+            },
+            {
+                "inventory_verified": True,
+                "observed": 1,
+                "expired": 0,
+                "requested": 0,
+                "refused": 1,
+                "denied": 0,
+                "unresolved": 1,
+            },
+        )
+
+    def test_reap_apply_mixed_inventory_keeps_both_outcomes(self):
+        controller = self.build()
+        self.aws.instances_result = [
+            instance(instance_id="i-expired", operation="a", expires_at=self.clock.now - 5),
+            instance(instance_id="i-bad-expiry", operation="b"),
+        ]
+        result = controller.reap(apply=True)
+        self.assertEqual(result["decision"], "cleanup_degraded")
+        self.assertEqual(self.aws.terminated, ["i-expired"])
+        self.assertEqual(result["termination_requested"], ["i-expired"])
+        self.assertEqual([item["instance_id"] for item in result["expired"]], ["i-expired"])
+        self.assertEqual([item["instance_id"] for item in result["refused_resources"]], ["i-bad-expiry"])
+        self.assertEqual(result["cleanup"]["requested"], 1)
+        self.assertEqual(result["cleanup"]["refused"], 1)
+        self.assertIn("not confirmed removal", result["confirmation"])
+
+    def test_reap_apply_with_a_verified_empty_inventory_succeeds(self):
+        controller = self.build()
+        self.aws.instances_result = []
+        result = controller.reap(apply=True)
+        self.assertEqual(result["decision"], "termination_requested")
+        self.assertEqual(result["termination_requested"], [])
+        self.assertNotIn("confirmation", result)
+        self.assertTrue(result["cleanup"]["inventory_verified"])
+        self.assertEqual(result["cleanup"]["observed"], 0)
+        self.assertEqual(result["cleanup"]["unresolved"], 0)
+        self.assertEqual(result["cleanup"]["attempted_at"], self.clock.now)
+        self.assertEqual(result["cleanup"]["completed_at"], self.clock.now)
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_reap_apply_never_terminates_malformed_ownership_or_expiry(self):
+        controller = self.build()
+        self.aws.instances_result = [
+            instance(instance_id="i-pending", operation="pending", expires_at=self.clock.now - 5),
+            instance(instance_id="i-bad-expiry", operation="a", **{"ci-burst:expires-at": "not-a-number"}),
+        ]
+        result = controller.reap(apply=True)
+        self.assertEqual(result["decision"], "cleanup_degraded")
+        self.assertEqual(result["termination_requested"], [])
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(result["cleanup"]["requested"], 0)
+        self.assertEqual(result["cleanup"]["refused"], 2)
+        self.assertEqual(
+            [item["reason"] for item in result["refused_resources"]],
+            ["OPERATION_TAG_INVALID", "EXPIRY_TAG_INVALID"],
+        )
+
+    def test_reap_delayed_readback_never_claims_confirmed_removal(self):
+        controller = self.build()
+        self.aws.instances_result = [
+            instance(instance_id="i-expired", operation="a", expires_at=self.clock.now - 5)
+        ]
+        requested = controller.reap(apply=True)
+        self.assertEqual(requested["decision"], "termination_requested")
+        self.assertEqual(requested["cleanup"]["requested"], 1)
+        self.assertEqual(requested["cleanup"]["terminating"], 0)
+        self.assertEqual(requested["cleanup"]["terminated"], 0)
+        self.assertEqual(requested["cleanup"]["unresolved"], 1)
+
+        self.aws.instances_result = [
+            instance(
+                instance_id="i-expired", operation="a", state="shutting-down", expires_at=self.clock.now - 5
+            )
+        ]
+        stopping = controller.reap(apply=True)
+        self.assertEqual(stopping["cleanup"]["requested"], 0)
+        self.assertEqual(stopping["cleanup"]["skipped"], 1)
+        self.assertEqual(stopping["cleanup"]["terminating"], 1)
+        self.assertEqual(stopping["cleanup"]["terminated"], 0)
+        self.assertEqual(stopping["cleanup"]["unresolved"], 1)
+
+        self.aws.instances_result = [
+            instance(instance_id="i-expired", operation="a", state="terminated", expires_at=self.clock.now - 5)
+        ]
+        terminated = controller.reap(apply=True)
+        self.assertEqual(terminated["decision"], "termination_requested")
+        self.assertEqual(terminated["cleanup"]["skipped"], 1)
+        self.assertEqual(terminated["cleanup"]["terminating"], 0)
+        self.assertEqual(terminated["cleanup"]["terminated"], 1)
+        self.assertEqual(terminated["cleanup"]["unresolved"], 0)
 
 
 class StatusTests(ControllerCase):

@@ -246,14 +246,43 @@ class Controller:
         return result
 
     def reap(self, apply=False):
-        """Select expired owned instances without Forgejo or the scaling ledger."""
+        """Select expired owned instances without Forgejo or the scaling ledger.
+
+        ``planned`` is a dry run. With ``apply``, ``termination_requested`` is a
+        clean pass -- including a verified empty inventory -- ``cleanup_degraded``
+        when at least one owned resource was refused, and ``cleanup_failed``
+        when the provider refused the termination call. A refusal never
+        authorises termination; only an expired, well-formed ownership record
+        does, and a mixed inventory still terminates the proven targets.
+
+        The top-level ``cleanup`` block is built from the same single
+        ``owned_instances`` read as the rest of the result: ``inventory_verified``
+        (true only when that read completed), ``attempted_at``/``completed_at``
+        (Unix epoch seconds from this host's clock), ``observed``, ``skipped``
+        (already shutting-down or terminated), ``terminated``, ``terminating``,
+        ``expired``, ``requested``, ``refused``, ``denied`` and ``unresolved``.
+        ``requested`` counts the identifiers sent to the provider and
+        ``terminated`` only a terminal state read back from this same inventory,
+        so a requested instance is never counted as a confirmed removal. A
+        ``cleanup`` block with ``inventory_verified: true`` and zero counts
+        proves only that one complete inventory read returned no owned records;
+        it is not a zero AWS bill and not proof that an earlier request reached
+        termination. An absent or stale heartbeat proves nothing at all:
+        journald rotation, a down host and a timer that was never installed all
+        look the same.
+        """
         result = self._base("reap")
         result["apply"] = bool(apply)
-        now = self.clock()
+        attempted_at = now = self.clock()
         instances = self.aws.owned_instances(self.config.deployment)
         expired, refused = [], []
+        terminating = terminated = 0
         for instance in instances:
             if instance.state in ("shutting-down", "terminated"):
+                if instance.state == "terminated":
+                    terminated += 1
+                else:
+                    terminating += 1
                 continue
             operation = instance.tags.get(OPERATION_TAG)
             if not isinstance(operation, str) or not operation or operation == "pending":
@@ -267,23 +296,47 @@ class Controller:
                 expired.append(instance.as_dict())
         result["expired"] = expired
         result["refused_resources"] = refused
+        cleanup = {
+            "inventory_verified": True,
+            "attempted_at": attempted_at,
+            "completed_at": None,
+            "observed": len(instances),
+            "skipped": terminating + terminated,
+            "terminated": terminated,
+            "terminating": terminating,
+            "expired": len(expired),
+            "requested": 0,
+            "refused": len(refused),
+            "denied": 0,
+            "unresolved": len(expired) + len(refused) + terminating,
+        }
+        result["cleanup"] = cleanup
         if not apply:
             result["decision"] = "planned"
             result["termination_requested"] = []
+            cleanup["completed_at"] = self.clock()
             return result
         identifiers = [item["instance_id"] for item in expired]
         result["termination_requested"] = identifiers
+        cleanup["requested"] = len(identifiers)
         if identifiers:
             try:
                 self.aws.terminate(identifiers)
             except ProviderRefusal as refusal:
+                cleanup["denied"] = len(identifiers)
+                cleanup["completed_at"] = self.clock()
                 result["decision"] = "cleanup_failed"
                 result["refusal"] = refusal.as_dict()
                 return result
-        result["decision"] = "termination_requested"
-        result["confirmation"] = (
-            "a termination request is not confirmed removal; re-run status or reap to observe terminal state"
-        )
+        cleanup["completed_at"] = self.clock()
+        if refused:
+            result["decision"] = "cleanup_degraded"
+        else:
+            result["decision"] = "termination_requested"
+        if identifiers:
+            result["confirmation"] = (
+                "a termination request is not confirmed removal; re-run status or reap to observe terminal state"
+            )
         return result
 
     # -- internals ------------------------------------------------------

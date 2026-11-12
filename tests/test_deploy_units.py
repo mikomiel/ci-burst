@@ -129,6 +129,15 @@ class CleanupUnitTests(unittest.TestCase):
         self.assertIn("--force", cleanup)
         self.assertIn("--ignore", cleanup)
 
+    def test_its_exit_status_is_not_masked(self):
+        # The unit's exit status is the only completion signal the scheduler
+        # sees: a refused or degraded cleanup must be able to fail the run.
+        raw = (DEPLOY / "ci-burst-reap.service").read_text(encoding="utf-8")
+        self.assertNotIn("SuccessExitStatus", raw)
+        for masking in ("||", "&&", "sh -c", "exit 0"):
+            with self.subTest(masking=masking):
+                self.assertNotIn(masking, raw)
+
 
 class ExportUnitTests(unittest.TestCase):
     """The observation unit reads evidence; it must gain no queue credential."""

@@ -426,24 +426,33 @@ To see it work, arrange for the reaper to be the only actor that may act:
    production input;
 3. observe the termination. The reap timer is already enabled here, so it may act
    before a manual command does, and either route is evidence — but only a
-   **successful** one. The same four conditions apply to a scheduled
+   **successful** one. The same conditions apply to a scheduled
    `ci-burst-reap` journal entry and to a manual `reap --apply`:
 
    - `"decision": "termination_requested"`;
    - the canary's id in `termination_requested`;
    - `"refused_resources": []`;
+   - a top-level `cleanup` object with `inventory_verified: true`, `observed`
+     at least `1`, `refused: 0`, `denied: 0`, `requested` at least `1` and
+     `terminated: 0` — a request is not a confirmed removal;
    - **no top-level `refusal`**.
 
-   The last one is not redundant. `termination_requested` is filled in before the
-   provider call, so a denied termination returns `"decision": "cleanup_failed"`
-   with a top-level `refusal` and still lists the id with an empty
-   `refused_resources`, which describes tag validation rather than the call. A
-   Spot instance later reclaimed by the provider would then satisfy the terminal
-   check below without the cleanup identity ever having terminated anything. If
-   no scheduled run has happened, run `reap --apply` by hand and read all four
-   fields;
+   `"decision": "cleanup_degraded"` (exit `1`) is **not** success, even when a
+   different instance was terminated in the same run: the reaper refused at
+   least one owned resource, and the scheduled unit reports a failure until it
+   is resolved. The last condition is not redundant. `termination_requested` is
+   filled in before the provider call, so a denied termination returns
+   `"decision": "cleanup_failed"` with a top-level `refusal`, a `cleanup.denied`
+   count and an empty `refused_resources`, which describes tag validation rather
+   than the call. A Spot instance later reclaimed by the provider would then
+   satisfy the terminal check below without the cleanup identity ever having
+   terminated anything. If no scheduled run has happened, run `reap --apply` by
+   hand and read all of these fields;
 4. confirm the instance reaches `terminated` with `status` or
-   `describe-instances`: a termination request is not confirmed removal;
+   `describe-instances`: a termination request is not confirmed removal. A later
+   `reap` run — a dry run is enough — adds inventory evidence: the canary is
+   counted in `cleanup.terminated`, `cleanup.unresolved` drops, and `requested`
+   is zero because that run sent no request;
 5. re-enable admission only if it was enabled before this test **and** the
    deployment has completed qualification (Step 8).
 

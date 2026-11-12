@@ -16,7 +16,7 @@ from .controller import Controller
 from .errors import Refusal
 from .export import Exporter
 
-FAILED_DECISIONS = ("launch_failed", "cleanup_failed", "uncertain")
+FAILED_DECISIONS = ("launch_failed", "cleanup_failed", "cleanup_degraded", "uncertain")
 
 
 def build_parser():

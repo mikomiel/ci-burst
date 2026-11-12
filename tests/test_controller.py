@@ -894,6 +894,63 @@ class ApplyTests(ControllerCase):
         controller.apply()
         self.assertEqual(self.reopened().operation(operation_id).state, "terminal")
 
+    def test_a_mixed_not_found_batch_keeps_the_live_operation_and_slot(self):
+        from ci_burst.aws import Aws
+
+        class NotFound(Exception):
+            response = {"Error": {"Code": "InvalidInstanceID.NotFound"}}
+
+        class MixedClient:
+            """The filtered inventory misses both; the live one is still running."""
+
+            def describe_instances(self, **kwargs):
+                identifiers = kwargs.get("InstanceIds")
+                if identifiers is None:  # the deployment-filtered inventory
+                    return {"Reservations": []}
+                if len(identifiers) > 1:
+                    raise NotFound()
+                if identifiers == ["i-old"]:
+                    raise NotFound()
+                return {
+                    "Reservations": [
+                        {"Instances": [{"InstanceId": "i-live", "State": {"Name": "running"}}]}
+                    ]
+                }
+
+        aged = self.seed(
+            operation_id="op-aged",
+            instance_id="i-old",
+            expires_at=self.clock.now + 2 * INSTANCE_RETENTION_SECONDS,
+        )
+        live = self.seed(
+            operation_id="op-live",
+            instance_id="i-live",
+            expires_at=self.clock.now + 2 * INSTANCE_RETENTION_SECONDS,
+        )
+        self.clock.advance(INSTANCE_RETENTION_SECONDS + 1)
+        controller = self.build(
+            observation=observation_empty(),
+            aws=Aws(self.config, client=MixedClient(), clock=self.clock, account="111122223333"),
+        )
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertEqual(
+            [entry["reason"] for entry in result["slot"]["discrepancies"]],
+            ["OWNERSHIP_TAGS_MISSING"],
+        )
+        self.assertEqual(result["slot"]["discrepancies"][0]["instance_id"], "i-live")
+        # The live operation keeps its slot; the refused decision is not proof
+        # of termination.
+        self.assertEqual([entry["operation"] for entry in result["slot"]["operations"]], [live])
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation(live).state, "running")
+        self.assertIsNone(ledger.operation(live).settled_micros)
+        # The genuinely aged-out identifier keeps the conservative settlement.
+        self.assertEqual(ledger.operation(aged).state, "terminal")
+        self.assertEqual(ledger.operation(aged).detail, "instance_not_retained")
+        self.assertIsNotNone(ledger.operation(aged).settled_micros)
+
     def test_no_secret_or_user_data_in_launch_output(self):
         controller = self.build(observation=observation_demand())
         result = controller.apply()
@@ -1043,6 +1100,178 @@ class PassDeadlineTests(ControllerCase):
         result = self.build(observation=observation_demand()).apply()
         self.assertEqual(result["decision"], "launched")
         self.assertNotIn("phases_deferred", result)
+
+class InventoryClient:
+    """One queued response per EC2 call, so a defect path can run to completion."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def _respond(self, name, kwargs):
+        self.calls.append((name, dict(kwargs)))
+        entry = self.responses.pop(0)
+        if isinstance(entry, Exception):
+            raise entry
+        return entry
+
+    def describe_instances(self, **kwargs):
+        return self._respond("describe_instances", kwargs)
+
+    def describe_launch_template_versions(self, **kwargs):
+        return self._respond("describe_launch_template_versions", kwargs)
+
+    def describe_spot_price_history(self, **kwargs):
+        return self._respond("describe_spot_price_history", kwargs)
+
+    def run_instances(self, **kwargs):
+        return self._respond("run_instances", kwargs)
+
+
+class InventoryIntegrityTests(ControllerCase):
+    """A response that cannot be parsed is a refusal, not an empty fleet."""
+
+    def controller_with(self, *responses):
+        from ci_burst.aws import Aws
+
+        client = InventoryClient(responses)
+        aws = Aws(self.config, client=client, clock=self.clock, account="111122223333")
+        controller = Controller(
+            self.config,
+            observer=FakeObserver(observation_demand()),
+            aws=aws,
+            ledger=Ledger(self.config.state.database, clock=self.clock),
+            clock=self.clock,
+        )
+        return controller, client
+
+    def launch_template_response(self):
+        return {
+            "LaunchTemplateVersions": [
+                {
+                    "LaunchTemplateId": "lt-0123456789abcdef0",
+                    "VersionNumber": 3,
+                    "LaunchTemplateData": {
+                        "ImageId": "ami-0123456789abcdef0",
+                        "InstanceType": "t4g.small",
+                        "InstanceInitiatedShutdownBehavior": "terminate",
+                        "UserData": "AAAA",
+                    },
+                }
+            ]
+        }
+
+    def spot_history_response(self):
+        return {
+            "SpotPriceHistory": [
+                {
+                    "InstanceType": "t4g.small",
+                    "AvailabilityZone": "eu-central-1a",
+                    "ProductDescription": "Linux/UNIX",
+                    "SpotPrice": "0.020000",
+                    "Timestamp": datetime.fromtimestamp(self.clock.now, timezone.utc),
+                }
+            ]
+        }
+
+    def test_a_malformed_inventory_cannot_release_a_running_operation(self):
+        operation_id = self.seed(state="running")
+        self.clock.advance(3601)
+        controller, client = self.controller_with(
+            {},  # owned inventory: no Reservations
+            {},  # by-id read for the confirmed instance
+            self.launch_template_response(),
+            self.spot_history_response(),
+            {"Instances": [{"InstanceId": "i-replacement"}]},
+        )
+        with self.assertRaises(ProviderRefusal) as raised:
+            controller.apply()
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertTrue(raised.exception.uncertain)
+        self.assertEqual([name for name, _ in client.calls], ["describe_instances"])
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "running")
+        self.assertIsNone(operation.settled_micros)
+        self.assertEqual(len(self.reopened().operations()), 1)
+
+    def test_a_malformed_reservation_cannot_release_a_running_operation(self):
+        operation_id = self.seed(state="running")
+        self.clock.advance(3601)
+        controller, client = self.controller_with(
+            {"Reservations": [{}]},
+            {},
+            self.launch_template_response(),
+            self.spot_history_response(),
+            {"Instances": [{"InstanceId": "i-replacement"}]},
+        )
+        with self.assertRaises(ProviderRefusal) as raised:
+            controller.apply()
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertEqual([name for name, _ in client.calls], ["describe_instances"])
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "running")
+        self.assertIsNone(operation.settled_micros)
+
+    def test_an_entry_without_an_instance_id_cannot_be_adopted(self):
+        operation_id = self.seed(state="uncertain", instance_id=None, operation_id="uncertain")
+        inventory = {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {
+                            "State": {"Name": "running"},
+                            "Tags": [
+                                {"Key": MANAGED_TAG, "Value": "true"},
+                                {"Key": DEPLOYMENT_TAG, "Value": "test-deployment"},
+                                {"Key": OPERATION_TAG, "Value": operation_id},
+                                {"Key": "ci-burst:expires-at", "Value": str(int(self.clock.now) + 3600)},
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+        controller, client = self.controller_with(
+            inventory,
+            {"Instances": [{"InstanceId": "i-resumed"}]},
+        )
+        with self.assertRaises(ProviderRefusal) as raised:
+            controller.apply()
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertTrue(raised.exception.uncertain)
+        self.assertEqual([name for name, _ in client.calls], ["describe_instances"])
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "uncertain")
+        self.assertIsNone(operation.instance_id)
+
+    def test_an_empty_reservations_list_is_a_verified_empty_inventory(self):
+        operation_id = self.seed(state="running")
+        self.clock.advance(3601)
+        controller, client = self.controller_with(
+            {"Reservations": []},
+            {"Reservations": []},
+            self.launch_template_response(),
+            self.spot_history_response(),
+            {"Instances": [{"InstanceId": "i-replacement"}]},
+        )
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(
+            [name for name, _ in client.calls],
+            [
+                "describe_instances",
+                "describe_instances",
+                "describe_launch_template_versions",
+                "describe_spot_price_history",
+                "run_instances",
+            ],
+        )
+        operations = self.reopened().operations()
+        self.assertEqual(len(operations), 2)
+        settled = self.reopened().operation(operation_id)
+        self.assertEqual(settled.state, "terminal")
+        self.assertEqual(settled.detail, "instance_not_retained")
+        self.assertIsNotNone(settled.settled_micros)
 
 
 class IntentScopeTests(ControllerCase):

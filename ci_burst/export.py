@@ -43,8 +43,9 @@ from .ledger import NONTERMINAL, TERMINAL, Ledger, current_window
 
 #: One run reads at most this many consoles. The budget is spent on records that
 #: can still carry new evidence, live workers first; a run with more candidates
-#: than this defers the rest to the next run rather than refusing. The configured
-#: ceiling is inside the budget, so every live worker is read in every run.
+#: than this defers the terminal surplus to the next run rather than refusing.
+#: Only more unfinished live candidates than the budget refuses, because then the
+#: live evidence itself cannot be covered in one run.
 MAX_CONSOLE_READS = 16
 
 #: A console never changes again once a read observes the provider in one of
@@ -96,6 +97,9 @@ EXIT_IDENTITIES = frozenset(f"exit:{status}" for status in range(256))
 EVENT_SCHEMA = {
     "step": frozenset({"id", "ts", "deployment", "instance", "zone", "operation", "event", "step"}),
     "exit": frozenset({"id", "ts", "deployment", "instance", "zone", "operation", "event", "rc"}),
+    "job-process": frozenset(
+        {"id", "ts", "deployment", "instance", "zone", "operation", "event", "outcome", "rc"}
+    ),
     "error": frozenset({"id", "ts", "deployment", "instance", "zone", "operation", "event", "kind"}),
 }
 TIMESTAMP_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
@@ -124,6 +128,42 @@ KNOWN_ERROR_KINDS = frozenset(kind for kind, _ in ERROR_RULES)
 STEP_PATTERN = re.compile(r"\bSTEP ([a-z][a-z0-9-]{0,31})\b")
 EXIT_PATTERN = re.compile(r"\bbootstrap exiting rc=(\d{1,3})\b")
 
+#: The bootstrap's own one-job process marker, matched before ``EXIT_PATTERN``.
+#: It reports the runner process's outcome, never the Forgejo job's result: a
+#: runner may exit 0 after a job that failed, and the job result stays with
+#: Forgejo. ``completed`` is status 0, a timeout is the kernel's 124 or 137,
+#: and every other status is a failure.
+ONE_JOB_PATTERN = re.compile(r"\bbootstrap one-job (completed|failed|timeout) rc=(\d{1,3})\b")
+ONE_JOB_OUTCOMES = frozenset({"completed", "failed", "timeout"})
+ONE_JOB_TIMEOUT_CODES = frozenset({124, 137})
+
+
+def _job_process(outcome, status):
+    """Return True when ``(outcome, status)`` is a marker the bootstrap emits.
+
+    The outcome and the status are one vocabulary, not two: the script routes 0
+    to ``completed``, 124 and 137 to ``timeout`` and every other status to
+    ``failed``, so a pair from another route is not a marker.
+    """
+    if outcome not in ONE_JOB_OUTCOMES or not 0 <= status <= 255:
+        return False
+    if outcome == "completed":
+        return status == 0
+    if outcome == "timeout":
+        return status in ONE_JOB_TIMEOUT_CODES
+    return status != 0 and status not in ONE_JOB_TIMEOUT_CODES
+
+
+#: Every job-process identity the command can produce. Membership replaces
+#: parsing for the same reason ``EXIT_IDENTITIES`` does: a Unicode digit, an
+#: oversized number or a padded zero never matches.
+JOB_PROCESS_IDENTITIES = frozenset(
+    f"job-process:{outcome}:{status}"
+    for outcome in sorted(ONE_JOB_OUTCOMES)
+    for status in range(256)
+    if _job_process(outcome, status)
+)
+
 
 @dataclass(frozen=True)
 class ConsoleFacts:
@@ -132,13 +172,19 @@ class ConsoleFacts:
     steps: tuple
     exit_code: int | None
     errors: tuple
+    job_process: tuple | None = None
 
     @property
     def registered(self):
         return "register" in self.steps
 
     def as_dict(self):
-        return {"steps": list(self.steps), "exit_code": self.exit_code, "errors": list(self.errors)}
+        return {
+            "steps": list(self.steps),
+            "exit_code": self.exit_code,
+            "errors": list(self.errors),
+            "job_process": list(self.job_process) if self.job_process is not None else None,
+        }
 
 
 def parse_console(text):
@@ -148,10 +194,17 @@ def parse_console(text):
     line typically appears twice; markers are deduplicated by name, never by
     position.
     """
-    steps, errors, exit_code = [], [], None
+    steps, errors, exit_code, job_process = [], [], None, None
     for raw_line in (text or "").splitlines():
         line = raw_line.strip()
         if not line:
+            continue
+        match = ONE_JOB_PATTERN.search(line)
+        if match is not None:
+            outcome = match.group(1)
+            status = int(match.group(2))
+            if _job_process(outcome, status):
+                job_process = (outcome, status)
             continue
         match = EXIT_PATTERN.search(line)
         if match is not None:
@@ -173,7 +226,7 @@ def parse_console(text):
                 if kind not in errors:
                     errors.append(kind)
                 break
-    return ConsoleFacts(tuple(steps), exit_code, tuple(errors))
+    return ConsoleFacts(tuple(steps), exit_code, tuple(errors), job_process)
 
 
 def _empty_totals():
@@ -277,6 +330,8 @@ def _marker_key_is_valid(key):
         return value in KNOWN_ERROR_KINDS
     if prefix == "exit":
         return key in EXIT_IDENTITIES
+    if prefix == "job-process":
+        return key in JOB_PROCESS_IDENTITIES
     return False
 
 
@@ -327,6 +382,17 @@ def _sanitize_record(record):
     if exit_code is not None and (type(exit_code) is not int or not 0 <= exit_code <= 255):
         exit_code = None
         changed = True
+    job_process = record.get("job_process")
+    if not (
+        isinstance(job_process, list)
+        and len(job_process) == 2
+        and isinstance(job_process[0], str)
+        and type(job_process[1]) is int
+        and _job_process(job_process[0], job_process[1])
+    ):
+        job_process = None
+    if job_process != record.get("job_process"):
+        changed = True
     emitted = record.get("emitted")
     emitted = [key for key in emitted if _marker_key_is_valid(key)] if isinstance(emitted, list) else []
     if not isinstance(record.get("emitted"), list) or len(emitted) != len(record.get("emitted") or []):
@@ -347,6 +413,7 @@ def _sanitize_record(record):
         "steps": kept_steps,
         "errors": kept_kinds,
         "exit_code": exit_code,
+        "job_process": job_process,
         "registered": bool(registered),
         "emitted": emitted,
         "counted_registered": bool(record.get("counted_registered")),
@@ -436,16 +503,13 @@ class Exporter:
             summary.notes.append("no_owned_instances")
         # The console-read bound is a bound per run, not a bound on what the
         # provider still remembers: a terminating worker keeps its tags for about
-        # an hour, so a busy fleet legitimately shows many terminal records. Only
-        # a deployment running more non-terminal workers than its own configured
-        # limit is a disagreement worth refusing.
+        # an hour, so a busy fleet legitimately shows many terminal records. The
+        # admission ceiling is not a read bound either: lowering it is a supported
+        # drain that evicts nothing, so its surplus is reported, never refused.
         limit = self.config.controller.max_instances
         live = [item for item in instances if _normalize_state(item.state) != "terminated"]
         if len(live) > limit:
-            raise ProviderRefusal(
-                "console_read_cap_exceeded",
-                f"{len(live)} non-terminal owned instances exceeds the configured limit of {limit}",
-            )
+            summary.notes.append("above_configured_limit")
 
         state, note = load_state(state_file)
         if note is not None:
@@ -457,12 +521,25 @@ class Exporter:
         # read that shows it left the live states. Finished records are never
         # read again, so normal turnover cannot spend the per-run budget.
         candidates = [item for item in instances if not _read_finished(state, item)]
-        # Live workers first: their consoles are the ones still growing, and the
-        # configured ceiling is inside the budget, so they always fit. Termination
-        # history waits for the remaining capacity.
+        # Live workers first: their consoles are the ones still growing, so every
+        # live worker fits whenever the live candidates fit the whole budget.
+        # Termination history waits for the remaining capacity.
         candidates.sort(key=lambda item: _normalize_state(item.state) == "terminated")
+        # The one condition worth refusing: more unfinished live candidates than
+        # the whole budget means live evidence cannot be covered in one run.
+        unread_live = [
+            item for item in candidates if _normalize_state(item.state) != "terminated"
+        ]
+        if len(unread_live) > MAX_CONSOLE_READS:
+            raise ProviderRefusal(
+                "console_read_cap_exceeded",
+                f"{len(unread_live)} unfinished non-terminal owned instances exceed the "
+                f"per-run console read budget of {MAX_CONSOLE_READS}",
+            )
         reading = candidates[:MAX_CONSOLE_READS]
         if len(candidates) > len(reading):
+            # The run is partial: recording the deferral is what stops a consumer
+            # from reading it as complete observation.
             summary.notes.append("console_read_deferred")
         read_ids = {item.instance_id for item in reading}
         consoles = self.aws.console_output([item.instance_id for item in reading]) if reading else {}
@@ -556,7 +633,15 @@ def _operation_of(instance):
 def _record_for(state, instance_id, now):
     record = state["instances"].get(instance_id)
     if record is None:
-        record = {"first_seen": now, "emitted": [], "steps": [], "errors": [], "registered": False, "exit_code": None}
+        record = {
+            "first_seen": now,
+            "emitted": [],
+            "steps": [],
+            "errors": [],
+            "registered": False,
+            "exit_code": None,
+            "job_process": None,
+        }
         state["instances"][instance_id] = record
         return record, True
     return record, False
@@ -586,6 +671,8 @@ def _merge_record(record, instance, facts, now, provider_state):
             record["errors"].append(kind)
     if facts.exit_code is not None and record.get("exit_code") is None:
         record["exit_code"] = facts.exit_code
+    if facts.job_process is not None and record.get("job_process") is None:
+        record["job_process"] = list(facts.job_process)
     record["registered"] = bool(record.get("registered")) or facts.registered
 
 
@@ -632,6 +719,13 @@ def _events_for(instance, record, now, deployment):
         publish("step:" + step, {"event": "step", "step": step})
     if record.get("exit_code") is not None:
         publish(f"exit:{record['exit_code']}", {"event": "exit", "rc": record["exit_code"]})
+    job_process = record.get("job_process")
+    if job_process is not None:
+        outcome, status = job_process
+        publish(
+            f"job-process:{outcome}:{status}",
+            {"event": "job-process", "outcome": outcome, "rc": status},
+        )
     for kind in record["errors"]:
         publish("error:" + kind, {"event": "error", "kind": kind})
     return events
@@ -678,6 +772,12 @@ def _event_line_is_valid(event, deployment):
     if kind == "exit":
         status = event.get("rc")
         return type(status) is int and 0 <= status <= 255 and marker == f"exit:{status}"
+    if kind == "job-process":
+        outcome = event.get("outcome")
+        status = event.get("rc")
+        if not isinstance(outcome, str) or type(status) is not int:
+            return False
+        return marker == f"job-process:{outcome}:{status}" and marker in JOB_PROCESS_IDENTITIES
     error_kind = event.get("kind")
     return isinstance(error_kind, str) and error_kind in KNOWN_ERROR_KINDS and marker == f"error:{error_kind}"
 

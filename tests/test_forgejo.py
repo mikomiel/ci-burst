@@ -11,6 +11,7 @@ from ci_burst.forgejo import ForgejoObserver, UrllibTransport, _RefuseRedirects
 from support import write_config
 
 FIXTURES = Path(__file__).parent / "fixtures" / "forgejo"
+CONTRACT_MANIFEST = FIXTURES / "contract.json"
 
 
 class StubTransport:
@@ -368,6 +369,132 @@ class ObserverTests(unittest.TestCase):
     def test_observation_dict_has_no_secret(self):
         observation, _ = self.observe(fixture("jobs_runnable.json"))
         self.assertNotIn("secret-token", json.dumps(observation.as_dict()))
+
+
+class ForgejoContractMatrixTests(unittest.TestCase):
+    """Replay the pinned contract reading; no server, token or credential."""
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+        self.config = load(write_config(self.root))
+        self.manifest = json.loads(CONTRACT_MANIFEST.read_text(encoding="utf-8"))
+
+    def observe(self, body):
+        transport = StubTransport(body=body)
+        observer = ForgejoObserver(
+            self.config, transport=transport, environ={"CI_BURST_TEST_TOKEN": "secret-token"}
+        )
+        return observer.observe(), transport
+
+    def test_the_manifest_is_a_pinned_contract_reading(self):
+        manifest = self.manifest
+        self.assertEqual(manifest["manifest_version"], 1)
+        self.assertEqual(manifest["kind"], "contract-reading")
+        self.assertIn("not a live observation", manifest["statement"])
+        self.assertEqual(manifest["contract"], "forgejo-17.0.1-runners-jobs")
+        self.assertEqual(manifest["upstream"]["project"], "forgejo")
+        self.assertEqual(manifest["upstream"]["tag"], "v17.0.1")
+        self.assertEqual(manifest["upstream"]["source_path"], "routers/api/v1/shared/runners.go")
+        self.assertEqual(manifest["upstream"]["handler"], "GetActionRunJobs")
+        self.assertEqual(
+            manifest["adapter_filter"],
+            ",".join(sorted({label.split(":", 1)[0] for label in self.config.worker.labels})),
+        )
+        legend = manifest["provenance_legend"]
+        self.assertEqual(set(legend), {"upstream-shape", "defensive-synthetic"})
+        for entry in manifest["fixtures"]:
+            with self.subTest(fixture=entry["fixture"]):
+                self.assertIn(entry["provenance"], legend)
+                self.assertTrue(entry["pins"])
+                self.assertIn(entry["expect"]["outcome"], {"observation", "refusal"})
+                variant = entry["request_variant"]
+                if variant["labels_parameter"] == "absent":
+                    self.assertNotIn("labels", variant)
+                else:
+                    self.assertEqual(variant["labels_parameter"], "explicit")
+                    self.assertTrue(variant["labels"])
+
+    def test_the_manifest_covers_every_fixture_once(self):
+        pinned = [entry["fixture"] for entry in self.manifest["fixtures"]]
+        self.assertEqual(len(pinned), len(set(pinned)))
+        self.assertEqual(
+            set(pinned),
+            {path.name for path in FIXTURES.glob("*.json")} - {CONTRACT_MANIFEST.name},
+        )
+
+    def test_every_fixture_classifies_as_the_manifest_expects(self):
+        for entry in self.manifest["fixtures"]:
+            with self.subTest(fixture=entry["fixture"]):
+                expect = entry["expect"]
+                if expect["outcome"] == "refusal":
+                    with self.assertRaises(ObservationRefusal) as raised:
+                        self.observe(fixture(entry["fixture"]))
+                    self.assertEqual(raised.exception.reason, expect["reason"])
+                    continue
+                observation, transport = self.observe(fixture(entry["fixture"]))
+                self.assertEqual(observation.contract, self.manifest["contract"])
+                self.assertEqual(observation.demand, expect["demand"])
+                self.assertEqual(
+                    [attempt.handle for attempt in observation.attempts], expect["attempts"]
+                )
+                self.assertEqual(observation.seen, expect["seen"])
+                self.assertEqual(observation.blocked, expect["blocked"])
+                self.assertEqual(observation.assigned, expect["assigned_or_finished"])
+                self.assertEqual(observation.incompatible, expect["incompatible_labels"])
+                self.assertEqual(observation.duplicates, expect["duplicate_records"])
+                self.assertEqual(list(observation.notes), expect["notes"])
+                self.assertEqual(observation.status, "demand" if expect["demand"] else "empty")
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(transport.calls[0][0]).query)
+                self.assertEqual(query.get("labels"), [self.manifest["adapter_filter"]])
+
+    def test_upstream_shapes_match_the_pinned_handler(self):
+        # The pinned handler selects only waiting and running jobs, and its
+        # response record always marshals `needs` and `runs_on`, possibly null.
+        for entry in self.manifest["fixtures"]:
+            if entry["provenance"] != "upstream-shape":
+                continue
+            with self.subTest(fixture=entry["fixture"]):
+                payload = json.loads(fixture(entry["fixture"]))
+                if payload is None:
+                    continue
+                self.assertIsInstance(payload, list)
+                self.assertTrue(payload)
+                for record in payload:
+                    self.assertIn(record["status"], {"waiting", "running"})
+                    self.assertIn("needs", record)
+                    self.assertIn("runs_on", record)
+
+    def test_the_absent_filter_shape_is_unreachable(self):
+        # Source: an absent `labels` parameter applies no filter at all, so the
+        # response can list every waiting and running job in the repository.
+        observation, transport = self.observe(fixture("jobs_filter_absent.json"))
+        self.assertEqual(observation.seen, 3)
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(transport.calls[0][0]).query, keep_blank_values=True
+        )
+        self.assertEqual(query.get("labels"), [self.manifest["adapter_filter"]])
+        self.assertTrue(query["labels"][0])
+
+    def test_every_label_configuration_sends_a_non_empty_labels_parameter(self):
+        for labels in (
+            ["ci-burst:host", "homelab:host"],
+            ["homelab:host"],
+            ["homelab", "homelab:host"],
+        ):
+            with self.subTest(labels=labels):
+                config = load(write_config(self.root, config={"worker": {"labels": labels}}))
+                transport = StubTransport(body=b"null")
+                observer = ForgejoObserver(
+                    config, transport=transport, environ={"CI_BURST_TEST_TOKEN": "secret-token"}
+                )
+                observer.observe()
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlsplit(transport.calls[0][0]).query, keep_blank_values=True
+                )
+                self.assertTrue(query.get("labels"))
+                self.assertNotEqual(query["labels"], [""])
 
 
 if __name__ == "__main__":

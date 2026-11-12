@@ -12,6 +12,7 @@ use to exercise pagination and response parsing without any SDK.
 """
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -191,10 +192,8 @@ class Aws:
         return self._session_cache
 
     def _client_config(self):
-        from botocore.config import Config
-
-        return Config(
-            retries=RETRY_POLICY,
+        """The one client configuration: guarded SDK import plus transport bounds."""
+        return _sdk_config(
             connect_timeout=CONNECT_TIMEOUT_SECONDS,
             read_timeout=READ_TIMEOUT_SECONDS,
         )
@@ -202,10 +201,13 @@ class Aws:
     def _client(self):
         if self._client_cache is not None:
             return self._client_cache
+        # Resolve the guarded configuration first: a checkout without the SDK
+        # must refuse here, before the session is touched.
+        config = self._client_config()
         self._client_cache = self._session().client(
             "ec2",
             region_name=self._config.aws.region,
-            config=self._client_config(),
+            config=config,
         )
         return self._client_cache
 
@@ -224,9 +226,8 @@ class Aws:
         """Return the AWS account the configured credential route reaches."""
         if self._account_cache is not None:
             return self._account_cache
-        sts = self._session().client(
-            "sts", region_name=self._config.aws.region, config=self._client_config()
-        )
+        config = self._client_config()
+        sts = self._session().client("sts", region_name=self._config.aws.region, config=config)
         try:
             response = sts.get_caller_identity()
         except Exception as error:  # noqa: BLE001 - classified below
@@ -315,23 +316,43 @@ class Aws:
                 raise ProviderRefusal("AWS_INVENTORY_INCOMPLETE", "DescribeInstances pagination limit reached")
 
     def instances(self, instance_ids, *, deadline=None):
-        """Read the named instances; an aged-out record is an empty result.
+        """Read the named instances, establishing absence per identifier.
+
+        An EC2 by-ID read is rejected for the whole batch when any one
+        identifier is unknown, so a rejected batch proves nothing about its
+        other members. Absence is therefore established only for an identifier
+        read on its own: a record that exists is returned even beside an
+        aged-out one, and any other read failure -- of the batch or of one
+        identifier -- refuses with an uncertain refusal, because the state of
+        that identifier cannot be established, rather than reporting the set
+        as empty.
 
         `InvalidInstanceID.NotFound` is not proof that the instance never
         existed or that it terminated at a particular time; the controller
         applies its own retained-visibility window before treating absence as
         terminal.
         """
-        if not instance_ids:
+        identifiers = list(instance_ids)
+        if not identifiers:
             return []
         self._check_deadline(deadline, "DescribeInstances by-id read")
         client = self._client()
         try:
-            response = client.describe_instances(InstanceIds=list(instance_ids))
+            response = client.describe_instances(InstanceIds=identifiers)
         except Exception as error:  # noqa: BLE001 - classified below
-            if _error_code(error) == "InvalidInstanceID.NotFound":
-                return []
-            raise _translate(error) from None
+            if _error_code(error) != "InvalidInstanceID.NotFound":
+                raise _translate_read(error) from None
+            found = []
+            for instance_id in identifiers:
+                self._check_deadline(deadline, "DescribeInstances by-id read")
+                try:
+                    response = client.describe_instances(InstanceIds=[instance_id])
+                except Exception as member:  # noqa: BLE001 - classified below
+                    if _error_code(member) == "InvalidInstanceID.NotFound":
+                        continue
+                    raise _translate_read(member) from None
+                found.extend(_instances(response))
+            return found
         return _instances(response)
 
     def console_output(self, instance_ids, *, deadline=None):
@@ -378,6 +399,20 @@ class Aws:
         return self._call("terminate_instances", InstanceIds=list(instance_ids))
 
 
+def _sdk_config(**overrides):
+    """Build the client configuration, refusing when the runtime SDK is absent.
+
+    The lazy import guard belongs at every entry point that needs an SDK type,
+    not only at the session: a checkout without ``boto3`` must report the
+    documented refusal instead of an import traceback.
+    """
+    try:
+        from botocore.config import Config
+    except ImportError:
+        raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
+    return Config(retries=RETRY_POLICY, **overrides)
+
+
 def _translate(error):
     """Map SDK failures to refusals without importing the SDK for tests."""
     try:
@@ -394,6 +429,18 @@ def _translate(error):
     # A response-parser failure or another unclassified exception can occur
     # after the service accepted the request. It is never proof of non-creation.
     return ProviderRefusal("AWS_UNCERTAIN", type(error).__name__, uncertain=True)
+
+
+def _translate_read(error):
+    """Map a read failure to an uncertain refusal.
+
+    A read that failed cannot establish the state of the identifier it asked
+    about, whatever the provider's error code would mean for a launch. The
+    translated reason code and detail are preserved so the failure stays
+    diagnosable.
+    """
+    refusal = _translate(error)
+    return ProviderRefusal(refusal.reason, refusal.detail, uncertain=True)
 
 
 def _error_code(error):
@@ -474,16 +521,40 @@ def _spot_quote(entries, instance_type, availability_zone, observed_at):
 
 
 def _instances(response):
+    """Parse one DescribeInstances response, refusing an incomplete record.
+
+    An empty ``Reservations`` list is a complete empty inventory. Anything else
+    that cannot be read as reservations of identified instances is not: a
+    missing ``Reservations`` key is not proof that nothing is owned, and an
+    entry without an identity cannot be reconciled, resumed or terminated. The
+    adapter therefore refuses such a response as uncertain instead of
+    substituting an empty record for it.
+    """
+    if not isinstance(response, Mapping):
+        raise _incomplete_inventory("DescribeInstances returned no response mapping")
+    reservations = response.get("Reservations")
+    if not isinstance(reservations, list):
+        raise _incomplete_inventory("DescribeInstances returned no Reservations list")
     result = []
-    for reservation in response.get("Reservations") or []:
-        for item in reservation.get("Instances") or []:
+    for reservation in reservations:
+        if not isinstance(reservation, Mapping):
+            raise _incomplete_inventory("DescribeInstances returned a reservation that is not a mapping")
+        entries = reservation.get("Instances")
+        if not isinstance(entries, list):
+            raise _incomplete_inventory("DescribeInstances returned no Instances list")
+        for item in entries:
+            if not isinstance(item, Mapping):
+                raise _incomplete_inventory("DescribeInstances returned an instance entry that is not a mapping")
+            instance_id = item.get("InstanceId")
+            if not isinstance(instance_id, str) or not instance_id:
+                raise _incomplete_inventory("DescribeInstances returned an instance entry without an InstanceId")
             tags = {tag.get("Key"): tag.get("Value") for tag in item.get("Tags") or []}
             launch_time = item.get("LaunchTime")
             placement = item.get("Placement") or {}
             zone = placement.get("AvailabilityZone")
             result.append(
                 Instance(
-                    instance_id=item.get("InstanceId", ""),
+                    instance_id=instance_id,
                     state=(item.get("State") or {}).get("Name", "unknown"),
                     tags=tags,
                     launch_time=_timestamp(launch_time),
@@ -491,3 +562,7 @@ def _instances(response):
                 )
             )
     return result
+
+
+def _incomplete_inventory(detail):
+    return ProviderRefusal("AWS_INVENTORY_INCOMPLETE", detail, uncertain=True)

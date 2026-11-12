@@ -1,0 +1,413 @@
+{
+  "manifest_version": 1,
+  "kind": "contract-reading",
+  "statement": "A reading of the pinned upstream source and its response marshalling; not a live observation. No server, request, token or credential produced it.",
+  "contract": "forgejo-17.0.1-runners-jobs",
+  "adapter_filter": "ci-burst,homelab",
+  "upstream": {
+    "project": "forgejo",
+    "tag": "v17.0.1",
+    "handler": "GetActionRunJobs",
+    "source_path": "routers/api/v1/shared/runners.go",
+    "response_type": "modules/structs/action.go ActionRunJob",
+    "reference": "https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/shared/runners.go"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/repos/{owner}/{repo}/actions/runners/jobs",
+    "labels_parameter": "comma-separated bare label names; the adapter always sends the parameter",
+    "status_filter": "the handler selects only waiting and running jobs",
+    "absent_labels": "no label filter: every waiting or running job in the repository is admitted",
+    "empty_selection": "JSON null: the handler marshals a nil slice"
+  },
+  "provenance_legend": {
+    "upstream-shape": "the pinned handler can emit this body for the stated request variant",
+    "defensive-synthetic": "a synthetic body no conforming handler emits for that variant; the parser must still classify or refuse it"
+  },
+  "fixtures": [
+    {
+      "fixture": "jobs_runnable.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "upstream-shape",
+      "pins": "one waiting job whose complete runs_on set is inside the filter",
+      "expect": {
+        "outcome": "observation",
+        "demand": 1,
+        "attempts": [
+          "h-1-1"
+        ],
+        "seen": 1,
+        "blocked": 0,
+        "assigned_or_finished": 0,
+        "incompatible_labels": 0,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_empty.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "an empty JSON array is also a verified empty queue",
+      "expect": {
+        "outcome": "observation",
+        "demand": 0,
+        "attempts": [],
+        "seen": 0,
+        "blocked": 0,
+        "assigned_or_finished": 0,
+        "incompatible_labels": 0,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_assigned.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "upstream-shape",
+      "pins": "a running job is assigned work, not demand",
+      "expect": {
+        "outcome": "observation",
+        "demand": 0,
+        "attempts": [],
+        "seen": 1,
+        "blocked": 0,
+        "assigned_or_finished": 1,
+        "incompatible_labels": 0,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_waiting_with_needs.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "upstream-shape",
+      "pins": "populated static needs do not make a waiting job ineligible",
+      "expect": {
+        "outcome": "observation",
+        "demand": 1,
+        "attempts": [
+          "h-3-1"
+        ],
+        "seen": 1,
+        "blocked": 0,
+        "assigned_or_finished": 0,
+        "incompatible_labels": 0,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_blocked.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "a blocked record is counted but is never eligible demand",
+      "expect": {
+        "outcome": "observation",
+        "demand": 0,
+        "attempts": [],
+        "seen": 1,
+        "blocked": 1,
+        "assigned_or_finished": 0,
+        "incompatible_labels": 0,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_incompatible.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "a waiting job with an unadvertised label is incompatible",
+      "expect": {
+        "outcome": "observation",
+        "demand": 0,
+        "attempts": [],
+        "seen": 1,
+        "blocked": 0,
+        "assigned_or_finished": 0,
+        "incompatible_labels": 1,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_duplicate.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "a repeated record with the same handle and signature counts once",
+      "expect": {
+        "outcome": "observation",
+        "demand": 1,
+        "attempts": [
+          "h-5-1"
+        ],
+        "seen": 2,
+        "blocked": 0,
+        "assigned_or_finished": 0,
+        "incompatible_labels": 0,
+        "duplicate_records": 1,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_inconsistent_attempt.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "a repeated handle with a conflicting signature is refused",
+      "expect": {
+        "outcome": "refusal",
+        "reason": "FORGEJO_INCONSISTENT_ATTEMPT"
+      }
+    },
+    {
+      "fixture": "jobs_retry.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "a retry is a new handle; only the waiting attempt is demand",
+      "expect": {
+        "outcome": "observation",
+        "demand": 1,
+        "attempts": [
+          "h-6-2"
+        ],
+        "seen": 2,
+        "blocked": 0,
+        "assigned_or_finished": 1,
+        "incompatible_labels": 0,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_sparse.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "a record without runs_on is a shape refusal",
+      "expect": {
+        "outcome": "refusal",
+        "reason": "FORGEJO_UNEXPECTED_SHAPE"
+      }
+    },
+    {
+      "fixture": "jobs_unknown_status.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "an unknown status makes demand unavailable",
+      "expect": {
+        "outcome": "refusal",
+        "reason": "FORGEJO_UNKNOWN_STATUS"
+      }
+    },
+    {
+      "fixture": "jobs_filter_absent.json",
+      "request_variant": {
+        "labels_parameter": "absent"
+      },
+      "provenance": "upstream-shape",
+      "pins": "without labels the handler returns a list of every waiting or running job",
+      "expect": {
+        "outcome": "observation",
+        "demand": 1,
+        "attempts": [
+          "h-21-1"
+        ],
+        "seen": 3,
+        "blocked": 0,
+        "assigned_or_finished": 1,
+        "incompatible_labels": 1,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_filter_no_match.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "does-not-match"
+      },
+      "provenance": "upstream-shape",
+      "pins": "an explicit non-matching filter returns null, a verified empty queue",
+      "expect": {
+        "outcome": "observation",
+        "demand": 0,
+        "attempts": [],
+        "seen": 0,
+        "blocked": 0,
+        "assigned_or_finished": 0,
+        "incompatible_labels": 0,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_missing_needs.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "an absent needs key is a shape refusal, not no dependencies",
+      "expect": {
+        "outcome": "refusal",
+        "reason": "FORGEJO_UNEXPECTED_SHAPE"
+      }
+    },
+    {
+      "fixture": "jobs_null_needs.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "upstream-shape",
+      "pins": "null needs mean no dependencies",
+      "expect": {
+        "outcome": "observation",
+        "demand": 1,
+        "attempts": [
+          "h-24-1"
+        ],
+        "seen": 1,
+        "blocked": 0,
+        "assigned_or_finished": 0,
+        "incompatible_labels": 0,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_empty_runs_on.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "an empty runs_on list is incompatible and noted",
+      "expect": {
+        "outcome": "observation",
+        "demand": 0,
+        "attempts": [],
+        "seen": 1,
+        "blocked": 0,
+        "assigned_or_finished": 0,
+        "incompatible_labels": 1,
+        "duplicate_records": 0,
+        "notes": [
+          "job_without_labels"
+        ]
+      }
+    },
+    {
+      "fixture": "jobs_terminal_and_waiting.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "success, cancelled and skipped records are counted as finished",
+      "expect": {
+        "outcome": "observation",
+        "demand": 1,
+        "attempts": [
+          "h-26-1"
+        ],
+        "seen": 4,
+        "blocked": 0,
+        "assigned_or_finished": 3,
+        "incompatible_labels": 0,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_mixed_waiting_running.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "upstream-shape",
+      "pins": "a mixed list keeps the waiting record as the only demand",
+      "expect": {
+        "outcome": "observation",
+        "demand": 1,
+        "attempts": [
+          "h-30-1"
+        ],
+        "seen": 2,
+        "blocked": 0,
+        "assigned_or_finished": 1,
+        "incompatible_labels": 0,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_retry_new_handle.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "a retry after cancellation is a new handle; only attempt two is demand",
+      "expect": {
+        "outcome": "observation",
+        "demand": 1,
+        "attempts": [
+          "h-32-2"
+        ],
+        "seen": 2,
+        "blocked": 0,
+        "assigned_or_finished": 1,
+        "incompatible_labels": 0,
+        "duplicate_records": 0,
+        "notes": []
+      }
+    },
+    {
+      "fixture": "jobs_partial_record.json",
+      "request_variant": {
+        "labels_parameter": "explicit",
+        "labels": "ci-burst,homelab"
+      },
+      "provenance": "defensive-synthetic",
+      "pins": "a partial record without a handle is a shape refusal",
+      "expect": {
+        "outcome": "refusal",
+        "reason": "FORGEJO_UNEXPECTED_SHAPE"
+      }
+    }
+  ]
+}

@@ -140,11 +140,12 @@ maintainer merge and a merge by the repository's own automation. Merging the
 release pull request is the release decision; release-please then creates the
 annotated `v`-prefixed tag and the GitHub Release. Never tag by hand.
 
-Before 1.0, a `feat` commit is a minor release, a `fix` a patch, and a
-breaking change a minor release. `docs`, `ci`, `chore`, `test` and `refactor`
-commits appear in the changelog as configured but do not by themselves open a
-release pull request. The release pull request always changes a sensitive
-path, so the merge policy never auto-merges it: a maintainer merges it.
+Before 1.0, a `feat` commit is a minor release, a `fix` or `perf` commit is a
+patch, and a breaking change is a minor release. `docs`, `ci`, `chore`, `test`
+and `refactor` commits appear in the changelog as configured but do not by
+themselves open a release pull request. The release pull request always changes
+a sensitive path, so the merge policy never auto-merges it: a maintainer merges
+it.
 
 `release-please-config.json` and `.release-please-manifest.json` are part of
 the release boundary. The workflow authenticates as the fine-grained personal

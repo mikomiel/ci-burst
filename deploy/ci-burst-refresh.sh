@@ -93,7 +93,8 @@ fi
 
 work=$(mktemp -d)
 record_tmp=
-trap 'rm -rf "$work"; [ -z "$record_tmp" ] || rm -f "$record_tmp"' EXIT INT TERM
+reference_tmp=
+trap 'rm -rf "$work"; [ -z "$record_tmp" ] || rm -f "$record_tmp"; [ -z "$reference_tmp" ] || rm -f "$reference_tmp"' EXIT INT TERM
 mkdir "$work/src"
 if ! git -C "$SOURCE" archive --format=tar --output "$work/tree.tar" "$want"; then
     log "archive_failed: $want"
@@ -183,6 +184,27 @@ if [ -z "$candidate" ]; then
     exit 2
 fi
 
+# The record is keyed by image identity, because one source SHA can be built
+# more than once: a retry after an interrupted promotion is exactly that. A
+# source-keyed record would let that retry replace the record of the image
+# still serving. The engine generates the image ID but it becomes a path
+# component, so validate it against a path-safe alphabet rather than
+# sanitizing it: sanitizing could map two different IDs onto one file and
+# defeat the immutability this exists for. A case pattern is used because it
+# also rejects an embedded newline, which a line-based matcher would accept.
+case "$candidate" in
+    sha256:*[!A-Za-z0-9._-]*)
+        image_key= ;;
+    sha256:*)
+        image_key=${candidate#sha256:} ;;
+    *)
+        image_key= ;;
+esac
+if [ -z "$image_key" ] || [ "${#image_key}" -gt 128 ]; then
+    log "build_inputs_failed: unusable image identity: $candidate"
+    exit 2
+fi
+
 tree=$(git -C "$SOURCE" rev-parse "$want^{tree}") || {
     log "build_inputs_failed: cannot resolve the tree of $want"
     exit 2
@@ -219,13 +241,23 @@ if ! podman run --rm --network=none --entrypoint python "$IMAGE:candidate" \
     exit 2
 fi
 
-mkdir -p "$STATE/builds" || {
-    log "build_inputs_failed: cannot create $STATE/builds"
+# The image-keyed record is the authoritative, immutable copy; the source-keyed
+# file is a reference to whichever image this source most recently recorded, so
+# a retry moves the reference and never the inputs. Both names are published by
+# a rename inside their own directory and both are written before promotion.
+records="$STATE/builds/images"
+if ! mkdir -p "$records"; then
+    log "build_inputs_failed: cannot create $records"
+    exit 2
+fi
+record="$records/$image_key.json"
+reference="$STATE/builds/sha-$short.json"
+record_tmp=$(mktemp "$records/.$image_key.XXXXXX") || {
+    log "build_inputs_failed: cannot create a temporary record"
     exit 2
 }
-record="$STATE/builds/sha-$short.json"
-record_tmp=$(mktemp "$STATE/builds/.sha-$short.XXXXXX") || {
-    log "build_inputs_failed: cannot create a temporary record"
+reference_tmp=$(mktemp "$STATE/builds/.sha-$short.XXXXXX") || {
+    log "build_inputs_failed: cannot create a temporary reference"
     exit 2
 }
 if ! SOURCE_SHA="$want" TREE_SHA="$tree" DOCKERFILE_SHA256="$dockerfile_sha256" \
@@ -261,12 +293,96 @@ then
     exit 2
 fi
 chmod 0644 "$record_tmp"
-if ! mv -f "$record_tmp" "$record"; then
-    log "build_inputs_failed: cannot publish $record"
+if [ -e "$record" ]; then
+    # Never replace an existing image record. A retry that resolved the same
+    # image is the same record apart from the recording timestamp, so the
+    # first publication and its timestamp are kept. Anything else contradicts
+    # the image identity: keep the first record, keep the candidate beside it
+    # as evidence, and refuse to promote rather than silently overwrite.
+    compare_rc=0
+    python3 - "$record" "$record_tmp" <<'PY' || compare_rc=$?
+import json
+import sys
+
+
+def inputs(path):
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+    if not isinstance(document, dict):
+        raise SystemExit(2)
+    document.pop("created_at", None)
+    return document
+
+
+try:
+    first = inputs(sys.argv[1])
+    second = inputs(sys.argv[2])
+except (OSError, ValueError):
+    raise SystemExit(2)
+raise SystemExit(0 if first == second else 1)
+PY
+    case "$compare_rc" in
+        0)
+            rm -f "$record_tmp"
+            record_tmp=
+            log "build_inputs_kept: $record"
+            ;;
+        1)
+            conflict="$record.conflict"
+            if ! mv -f "$record_tmp" "$conflict"; then
+                rm -f "$record_tmp"
+                record_tmp=
+                log "build_inputs_failed: image record conflict at $record, and $conflict cannot be written"
+                exit 2
+            fi
+            record_tmp=
+            log "build_inputs_failed: image record conflict at $record; kept the first record, wrote $conflict"
+            exit 2
+            ;;
+        *)
+            rm -f "$record_tmp"
+            record_tmp=
+            log "build_inputs_failed: cannot compare with the existing record at $record"
+            exit 2
+            ;;
+    esac
+else
+    if ! mv -f "$record_tmp" "$record"; then
+        log "build_inputs_failed: cannot publish $record"
+        exit 2
+    fi
+    record_tmp=
+    log "build_inputs: $record"
+fi
+
+if ! SOURCE_SHA="$want" IMAGE_ID="$candidate" RECORD="images/$image_key.json" \
+        python3 - >"$reference_tmp" <<'PY'
+import json
+import os
+import sys
+
+document = {
+    "schema": "ci-burst.build-inputs-ref.v1",
+    "source_sha": os.environ["SOURCE_SHA"],
+    "image_id": os.environ["IMAGE_ID"],
+    "record": os.environ["RECORD"],
+}
+json.dump(document, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PY
+then
+    rm -f "$reference_tmp"
+    reference_tmp=
+    log "build_inputs_failed: cannot render $reference"
     exit 2
 fi
-record_tmp=
-log "build_inputs: $record"
+chmod 0644 "$reference_tmp"
+if ! mv -f "$reference_tmp" "$reference"; then
+    log "build_inputs_failed: cannot publish $reference"
+    exit 2
+fi
+reference_tmp=
+log "build_inputs_ref: $reference"
 
 if ! podman tag "$IMAGE:candidate" "$IMAGE:sha-$short"; then
     log "tag_failed: $want"

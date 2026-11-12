@@ -417,14 +417,20 @@ What a promotion does and does not do:
   refresh too, when the serving image is a hand-built one with no `sha-<12>` tag
   of its own;
 - it records the deployed commit in `/var/lib/ci-burst-image/deployed-sha`, and
-  writes a build record after the smoke passes and before `latest` moves, at
-  `/var/lib/ci-burst-image/builds/sha-<12>.json`: the source and tree SHA, the
-  `Dockerfile` sha256 and its `FROM` line, the base-image digest, the built
-  image ID, the podman version, the Python distribution set read from the
-  candidate with `--network=none`, and a UTC timestamp; the JSON carries
-  `schema: ci-burst.build-inputs.v1`. The same run logs
-  `build_inputs: <path>`. A record that cannot be written fails the run before
-  promotion, so an image that serves is an image whose inputs were recorded;
+  writes an immutable build record after the smoke passes and before `latest`
+  moves, at `/var/lib/ci-burst-image/builds/images/<image-id>.json` (the image
+  ID without its `sha256:` prefix): the source and tree SHA, the `Dockerfile`
+  sha256 and its `FROM` line, the base-image digest, the built image ID, the
+  podman version, the Python distribution set read from the candidate with
+  `--network=none`, and a UTC timestamp; the JSON carries
+  `schema: ci-burst.build-inputs.v1`. A source-keyed reference,
+  `/var/lib/ci-burst-image/builds/sha-<12>.json`, names the record that source
+  currently builds; it carries `schema: ci-burst.build-inputs-ref.v1` with the
+  source SHA, the image ID and the record path, and never the inputs
+  themselves. The run logs `build_inputs: <record>` and
+  `build_inputs_ref: <reference>`. A record or reference that cannot be
+  written fails the run before promotion, so an image that serves is an image
+  whose inputs were recorded;
 - it **reports** unit drift instead of installing it: the repository's
   `deploy/` units are compared with the installed ones, and a difference logs
   `units_drift: <names>` (or `units_current`). Installing a changed unit stays
@@ -489,7 +495,8 @@ Three identities describe a deployment, and none substitutes for another:
   `localhost/ci-burst:sha-<12>` tag. It identifies the source commit the build
   context came from;
 - the **image identity** — the image ID that `podman image inspect` reports and
-  the build record beside it. It identifies the bytes that serve.
+  the immutable build record under `builds/images/`. It identifies the bytes
+  that serve.
 
 An unchanged source SHA can still build different bytes: the base image was a
 moving `python:3.12-slim` tag before the digest pin, and the dependency range
@@ -497,13 +504,36 @@ moving `python:3.12-slim` tag before the digest pin, and the dependency range
 and the build record captures the dependency set the candidate actually
 resolved, so an image can be traced to its inputs. That is recording, not
 reproducibility: a rebuild of the same source is expected to produce a new
-record, and it may produce a different image ID.
+record, and it may produce a different image ID. If the rebuild resolves
+exactly the same image, the existing record is kept as it is, including its
+original timestamp, and only the source-keyed reference moves.
 
 A base-image digest bump or a dependency change is therefore a reviewed input
 change in a pull request. It is not a relabel of an unchanged source SHA onto
 new bytes; the `sha-<12>` tag always means "built from this commit", never
 "built from these inputs". Rollback retags an image that already exists, so it
 restores the bytes that tag names without changing the recorded inputs.
+
+The image-keyed record is immutable, because a source SHA can be built more
+than once: an interrupted promotion is retried by the next scheduled refresh,
+which sees the old deployed SHA and rebuilds the same source. A retry that
+resolves different bytes writes a second record and leaves the serving image's
+record untouched, so a failure after recording cannot destroy the only record
+of the image that still serves. If an image ID already has a record that differs
+in anything but the recording timestamp, the run keeps the first record, writes
+`<image-id>.json.conflict` beside it with the new candidate, and refuses
+promotion: the image identity and the recorded inputs disagree, and resolving
+that contradiction is a human decision rather than a silent overwrite.
+
+Records are retained, not replaced, and nothing prunes them automatically. Each
+record is a few kilobytes of JSON, so the accumulation cost is one file per
+successful build; the pruning cost is operator time, because a deleted record
+cannot be reconstructed from the image. They are pruned manually, in the same
+sweep as unused image tags, keeping the record for every image ID that
+`latest`, `previous` or a `sha-<12>` tag still names. The source-keyed
+reference is safe to overwrite: it is a pointer, and after a failed promotion
+it can name a candidate that never served, which is why the serving image is
+identified by `podman image inspect` rather than by the reference.
 
 Rollback retags a previous image, and it must not race a refresh: the timer only
 schedules, and a run that started before the operator acted would move `latest`
@@ -527,9 +557,13 @@ flock /var/lib/ci-burst-image/refresh.lock \
 ```
 
 A rollback restores bytes that an existing image tag already names; it does not
-rebuild, so it cannot change the recorded inputs. If no build record exists for
-a tag (an image built by hand before this record did), treat the source SHA as
-unknown provenance for those bytes rather than assuming it describes them.
+rebuild, so it cannot change the recorded inputs. The record for the bytes that
+serve is the one keyed by the image ID that
+`podman image inspect localhost/ci-burst:latest` reports, under
+`builds/images/`; the source-keyed `builds/sha-<12>.json` only points at it.
+If that image-keyed record is absent (an image built by hand before this record
+did), treat the source SHA as unknown provenance for those bytes rather than
+assuming it describes them.
 
 `systemctl is-active ci-burst-refresh.service` reports the launcher, not a
 build: a promotion that already finished has already moved `latest`, so roll

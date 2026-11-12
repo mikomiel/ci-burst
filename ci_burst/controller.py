@@ -39,6 +39,7 @@ from .aws import (
 )
 from .config import ZoneCandidate
 from .cost import CostModel
+from .credit import evidence as credit_evidence
 from .errors import ProviderRefusal, Refusal, StateRefusal
 from .forgejo import ForgejoObserver
 from .ledger import Ledger, current_window
@@ -127,6 +128,9 @@ class CandidatePlan:
             "launch_template_version": self.candidate.launch_template_version,
             "status": "eligible" if self.eligible else "skipped",
             "price": self.quote.as_dict() if self.quote is not None else None,
+            # CPU-credit evidence only: the launch request never sets a credit
+            # mode, because the operator's launch template owns that choice.
+            "credit": credit_evidence(self.instance_type, self.template.credit_specification),
         }
         if self.reason is not None:
             data["reason"] = self.reason

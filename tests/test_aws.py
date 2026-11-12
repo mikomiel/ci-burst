@@ -5,6 +5,7 @@ from pathlib import Path
 
 from ci_burst.aws import Aws, _definite_launch_error, _instances, _spot_quote, is_capacity_failure
 from ci_burst.config import load
+from ci_burst.credit import CreditSpecification
 from ci_burst.errors import ProviderRefusal
 
 from support import write_config
@@ -287,6 +288,57 @@ class AdapterTests(unittest.TestCase):
         template = self.aws().template("runner", 3)
         self.assertEqual(template.placement_zone, "eu-central-1a")
         self.assertTrue(template.has_user_data)
+
+    def test_template_credit_specification_keeps_presence_and_bounded_value(self):
+        def response(credit):
+            data = {
+                "ImageId": "ami-1",
+                "InstanceType": "t4g.small",
+                "InstanceInitiatedShutdownBehavior": "terminate",
+                "UserData": "AAAA",
+            }
+            if credit is not None:
+                data["CreditSpecification"] = credit
+            return {
+                "LaunchTemplateVersions": [
+                    {
+                        "LaunchTemplateId": "lt-1",
+                        "VersionNumber": 3,
+                        "LaunchTemplateData": data,
+                    }
+                ]
+            }
+
+        self.client.responses = [response({"CpuCredits": "standard"})]
+        self.assertEqual(
+            self.aws().template("runner", 3).credit_specification,
+            CreditSpecification(present=True, value="standard"),
+        )
+        # An unrecognized value is still the template's value. Dropping it here
+        # would report the family default as if the template had chosen it.
+        self.client.responses = [response({"CpuCredits": "burst"})]
+        self.assertEqual(
+            self.aws().template("runner", 3).credit_specification,
+            CreditSpecification(present=True, value="burst"),
+        )
+        # Absence is the only state that carries neither presence nor a value.
+        self.client.responses = [response(None)]
+        self.assertEqual(self.aws().template("runner", 3).credit_specification, CreditSpecification())
+        # A present value the adapter cannot represent keeps its presence: it is
+        # unknown evidence, never absence and never the family default.
+        for invalid in (
+            {"CpuCredits": "x" * 40},  # over the display bound
+            {"CpuCredits": ""},  # empty
+            {"CpuCredits": "\u00e9"},  # non-ASCII
+            {"CpuCredits": "stan\ndard"},  # non-printable
+            {"CpuCredits": 7},  # not a token
+            {},  # a specification with no value at all
+        ):
+            self.client.responses = [response(invalid)]
+            self.assertEqual(
+                self.aws().template("runner", 3).credit_specification,
+                CreditSpecification(present=True, value=None),
+            )
 
     def test_template_must_terminate_on_shutdown(self):
         self.client.responses = [

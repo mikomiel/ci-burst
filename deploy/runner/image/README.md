@@ -7,42 +7,73 @@ old launch-template version.
 | File | Purpose |
 |---|---|
 | [`provision.sh`](provision.sh) | The build recipe: OS packages, the pinned toolchain, the unprivileged runner account and a post-install inventory check. Run it as root on a fresh Debian 13 arm64 builder. |
-| [`../bootstrap.sh`](../bootstrap.sh) | The runtime user data published as the launch-template version. It installs nothing; it reads the registration token, registers one ephemeral runner, runs one job and terminates. |
-
-## Provenance
-
-Recovered on 2026-11-12 from the deployment's launch-template version that
-built the 2026-11-10 worker image. The 2026-11-11 image is that image plus
-`jq`, `podman`, `make`, `gcc` and `libc6-dev`; the two incremental build
-scripts were not recorded. `provision.sh` reconstructs the full recipe,
-including those additions. It does not reproduce the earlier image's warm CI
-caches: a from-scratch build starts cold, which is slower but correct.
+| [`../bootstrap.sh`](../bootstrap.sh) | The recorded deployment's captured runtime user data, published as its launch-template version. It installs nothing; it reads the registration token, registers one ephemeral runner, runs one job and terminates. |
 
 ## Pins
 
-| Tool | Version |
+### Portable prerequisites
+
+An independent operator needs nothing outside this directory for these:
+
+| Input | Value |
 |---|---|
+| Base image | a fresh Debian 13 arm64 instance with cloud-init |
+| Privilege | root on the builder; the recipe installs packages and writes under `/usr/local` |
+| Egress | the builder's Debian apt repositories, `github.com`, `nodejs.org` and `code.forgejo.org` |
+
+### Inputs and pinned versions
+
+| Item | Value |
+|---|---|
+| `RUFF_VERSION` | the ruff release to install, for example `0.17.4`; the build exits when it is unset |
 | uv | 0.13.7 |
 | node | 24.22.1 |
-| ruff | input — the persistent fleet's `ruff_version` |
 | promtool | 3.16.0 |
 | forgejo-runner | 13.2.1 |
 
-The ruff pin is an input, not a literal. Set it from the persistent fleet's
-source pin (`ansible-homelab/inventory/group_vars/all.yml`, `ruff_version`) so
-the image and the fleet cannot drift silently. The current image carries
-0.17.3; the source pin after the 2026-11-11 bump is 0.17.4.
+Set `RUFF_VERSION` to the ruff release this image should carry and record it
+with the image, so a rebuild does not depend on a value held somewhere else.
+The recipe refuses to guess it, because a hard-coded value is how an image
+drifts from the version its jobs were tested against. The four tool downloads
+are literals in [`provision.sh`](provision.sh), each beside its release
+checksum.
 
-The tool downloads are version- and checksum-pinned. The apt packages are not:
-they resolve from the builder's configured Debian repositories at build time,
-so a later rebuild can carry different OS package versions even with the same
-tool pins. Pin a Debian snapshot repository if the OS layer must be
-reproducible.
+The apt packages are not pinned: they resolve from the builder's configured
+Debian repositories at build time, so a later rebuild can carry different OS
+package versions even with the same tool pins. Pin a Debian snapshot
+repository if the OS layer must be reproducible.
+
+## Deployment-specific provenance
+
+The recipe was recovered on 2026-11-12 from the deployment's launch-template
+version that built the 2026-11-10 worker image. The 2026-11-11 image is that
+image plus `jq`, `podman`, `make`, `gcc` and `libc6-dev`; the two incremental
+build scripts were not recorded. `provision.sh` reconstructs the full recipe,
+including those additions. It does not reproduce the earlier image's warm CI
+caches: a from-scratch build starts cold, which is slower but correct. The
+recorded 2026-11-10 image carries ruff 0.17.3; the deployment moved to 0.17.4
+afterwards.
+
+That history explains the recorded pins; it is not a requirement on your
+build. A different deployment may use another Debian revision, choose another
+ruff release and publish another bootstrap, and the prerequisites above still
+describe a complete build.
+
+The [`../bootstrap.sh`](../bootstrap.sh) here is the recorded deployment's
+captured user data and the exact bytes its template pins. A fork that changes
+the URL, token parameter or labels is the operator's own artefact: validate it,
+version it with the launch-template version that carries it, and keep it with
+that deployment. This repository does not maintain a second copy.
+
+The job-account permission and inventory-check notes below record failure modes
+from the same deployment; they describe what a build must keep, not an input
+value.
 
 ## Build
 
-1. Launch a disposable builder matching the worker architecture (the current
-   deployment uses Debian 13 arm64) in the deployment's subnet with
+1. Launch a disposable builder matching the worker architecture — a fresh
+   Debian 13 arm64 instance satisfies the recipe's base-image prerequisite — in
+   the deployment's subnet with
    `InstanceInitiatedShutdownBehavior=terminate` and delete-on-termination
    storage. The recipe's watchdog and EXIT trap run `shutdown -h now`; with the
    default `stop`, a finished or failed build would stop the instance and keep
@@ -61,12 +92,12 @@ reproducible.
    it, or cloud-init runs the user data with `/bin/sh` and the recipe's process
    substitution fails.
 
-   Use the persistent fleet's current `ruff_version`; 0.17.4 is the source pin,
-   0.17.3 reproduces the current image. The script prints `STEP` markers and a
-   `PROBE end have=N miss=M` line; any `MISS` fails the build. The 3600 s
-   watchdog and the EXIT trap run `shutdown -h now`; with the launch behaviour
-   above that terminates the builder, so snapshot it while it is still
-   running.
+   Choose the ruff release this image should carry; the example above uses
+   0.17.4, and 0.17.3 reproduces the recorded 2026-11-10 image. The script
+   prints `STEP` markers and a `PROBE end have=N miss=M` line; any `MISS` fails
+   the build. The 3600 s watchdog and the EXIT trap run `shutdown -h now`; with
+   the launch behaviour above that terminates the builder, so snapshot it while
+   it is still running.
 3. Create the image without rebooting the builder:
 
    ```sh
@@ -78,8 +109,9 @@ reproducible.
 
 4. Create a new launch-template version from the current one with the new
    `ImageId`, then move the deployment TOML's `launch_template_version` to it.
-   The user data is unchanged: [`../bootstrap.sh`](../bootstrap.sh) is the
-   published bytes.
+   If you keep the recorded bootstrap, the user data is unchanged:
+   [`../bootstrap.sh`](../bootstrap.sh) is the published bytes. A different
+   bootstrap is your own fork; see § Deployment-specific provenance.
 5. Run the toolchain check from the pilot checklist on a launched worker as the
    `runner` account, and record the result with the deployment. This
    repository's CI does not qualify an image.

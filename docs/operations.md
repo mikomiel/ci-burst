@@ -15,9 +15,9 @@ scheduler:
 - ci-burst owns launch intent, ownership metadata and a conservative forward
   cost commitment.
 
-The source ships an annotated release tag (`v0.1.0`) but no published image,
-deployment or live-qualified Forgejo contract. A green validation run proves
-source behavior only.
+The source is released under annotated semantic-version tags but publishes no
+image, deployment or live-qualified Forgejo contract. A green validation run
+proves source behavior only.
 
 ## Configuration
 
@@ -306,13 +306,20 @@ is therefore accepted and counted defensively — a server that starts returning
 it is not treated as an unknown status — but no live record has been observed
 and a deployment cannot qualify against one.
 
-The `labels` query is mandatory, not an optimisation: the server answers JSON
-`null` when it is absent. The adapter sends the worker's bare label names (the
-part before the executor suffix, so `strong-ci` for `strong-ci:host`) and reads
-`null` as an empty queue, because the server also answers `null` for a filter
-that matches nothing. The filter is a union prefilter, so a job selected by one
-shared label is still compared against its complete `runs_on` set above; it never
-substitutes for that comparison.
+The `labels` query narrows the observation deliberately; it is not a server
+requirement. In the v17.0.1 handler (`routers/api/v1/shared/runners.go`, tag
+`v17.0.1`) the label slice starts empty and, when no `labels` parameter is
+supplied, stays empty; an empty slice admits every `waiting` or `running` job.
+An absent parameter therefore returns the runnable set — a list — not JSON
+`null`. `null` is the handler's empty result (a nil slice) when nothing
+matched: an explicit filter with no match, or an empty queue. This adapter
+always sends the worker's bare label names (the part before the executor
+suffix, so `strong-ci` for `strong-ci:host`) and reads `null` as an empty
+queue. Omitting the filter would widen the observation to every runnable job in
+the repository, so the explicit request is a requirement of this adapter, not
+evidence that the server needs it. The filter is a union prefilter, so a job
+selected by one shared label is still compared against its complete `runs_on`
+set above; it never substitutes for that comparison.
 
 Attempts are deduplicated by `handle`. A retry is a new handle and remains
 distinguishable. ci-burst never assigns, requeues or reserves a job, and it does
@@ -325,23 +332,28 @@ must match a bounded identifier shape or is reported as `<redacted>`.
 `qualification = "fixtures-only"` is the shipped default and blocks `apply`.
 To qualify a deployment, the operator must, with an owner-scoped read token:
 
-1. confirm the endpoint returns the shape above for the repository, including
-   the mandatory `labels` filter and `null` for no match;
+1. confirm the endpoint returns the shape above for the repository when the
+   adapter's explicit `labels` filter is sent — this qualification does not use
+   an unfiltered request;
 2. observe one known waiting job and one running job, and verify the demand
    classification. Dependency-blocked work cannot be part of this evidence: the
    endpoint does not list it (see § Queue contract);
 3. record the evidence with the deployment;
 4. only then set `qualification = "live-verified"`.
 
-Observed on `forgejo 17.0.1+gitea-1.22.0`: `runs_on` holds bare label names
-(`strong-ci`, `homelab`), an absent `labels` parameter returns `null`, a
-non-matching filter also returns `null`, and the filter is a union over the job's
-labels. Statuses observed in one run (`mikolajm/ai-agents` run 25336,
-2026-11-10): a job waiting for a runner reports `waiting` and still lists the
-dependency that already succeeded, while a dependent job reports `blocked`
-until it does. A changed response shape or a different Forgejo version needs a
-new contract identifier, not a re-declaration; correcting how the adapter reads
-an unchanged shape does not.
+Observed on one deployment running `forgejo 17.0.1+gitea-1.22.0` — deployment
+evidence, not the upstream contract: `runs_on` holds bare label names
+(`strong-ci`, `homelab`), an absent `labels` parameter returned `null` in that
+record, a non-matching filter also returns `null`, and the filter is a union
+over the job's labels. The upstream handler above treats `null` as the empty
+result and admits every `waiting` or `running` job when the parameter is
+absent, so that observation does not establish a different contract; no
+unfiltered request is claimed here. Statuses observed in one run
+(`mikolajm/ai-agents` run 25336, 2026-11-10): a job waiting for a runner
+reports `waiting` and still lists the dependency that already succeeded, while
+a dependent job reports `blocked` until it does. A changed response shape or a
+different Forgejo version needs a new contract identifier, not a
+re-declaration; correcting how the adapter reads an unchanged shape does not.
 
 ## Worker image and launch template
 

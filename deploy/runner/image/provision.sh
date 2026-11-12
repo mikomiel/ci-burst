@@ -40,12 +40,14 @@ systemd-run --on-active=3600 --unit=image-build-lifetime /sbin/shutdown -h now
 
 mount -o remount,noatime / || echo "WARNING: noatime remount refused"
 
-# Required input: the persistent fleet's ruff pin. The build fails rather than
-# guessing, because a literal here is how the image drifted from the source
-# pin. Read it from the deployment repository's ruff_version value.
+# Required input: the ruff release to install, for example 0.17.4. The build
+# fails rather than guessing, because a hard-coded value is how an image drifts
+# from the version its jobs were tested against. Set it to the ruff release you
+# intend this image to carry and record it with the image; the image README's
+# pins section lists the inputs.
 RUFF_VERSION="${RUFF_VERSION:-}"
 if [ -z "${RUFF_VERSION}" ]; then
-  echo "provision: RUFF_VERSION must be set to the persistent fleet's ruff_version (ansible-homelab/inventory/group_vars/all.yml)" >&2
+  echo "provision: RUFF_VERSION must be set to the ruff release to install (for example 0.17.4); see deploy/runner/image/README.md#pins" >&2
   exit 1
 fi
 

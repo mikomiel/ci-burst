@@ -100,8 +100,10 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(headers["Authorization"], "token secret-token")
 
     def test_label_filter_is_mandatory_and_bare(self):
-        # The endpoint answers null without `labels`; the configured executor
-        # suffix (`name:host`) is not a job label and must not be sent.
+        # The adapter always sends the explicit filter. An absent `labels`
+        # parameter is not a no-match in the v17.0.1 handler (it admits every
+        # waiting or running job), and the configured executor suffix
+        # (`name:host`) is not a job label and must not be sent.
         _, transport = self.observe(fixture("jobs_runnable.json"))
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(transport.calls[0][0]).query)
         self.assertEqual(query, {"labels": ["ci-burst,homelab"]})

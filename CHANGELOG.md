@@ -34,6 +34,7 @@ and the validation step that binds it to that tag.
 
 - Relicense ci-burst under GPL-3.0-only ([#67](https://github.com/mikomiel/ci-burst/pull/67)).
 - Require the queue toolchain in every worker image ([#71](https://github.com/mikomiel/ci-burst/pull/71)).
+- Include the incidental term in the per-launch commitment ([#73](https://github.com/mikomiel/ci-burst/pull/73)).
 
 ## [0.2.0] - 2026-11-11
 

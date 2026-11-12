@@ -537,6 +537,19 @@ affordable = (allowance - committed) // per_launch
 `spend` is the settled cost of completed operations plus the accrued cost of
 operations still running; `committed` is `spend` plus the forward commitment.
 
+The launch decision reports `budget.remaining` as the allowance minus
+`committed`, and `budget.remaining_after` as the allowance left after the
+reported batch is admitted:
+
+```
+remaining_after = allowance - committed - launch_count * per_launch
+```
+
+A zero-worker decision therefore reports `remaining_after` equal to
+`remaining`, and a budget-capped batch subtracts only the workers it admitted.
+The field is planned headroom for the decision, not evidence that those launches
+completed or that the provider billed that amount.
+
 An operation settles once, when a reconcile observes its instance `terminated`.
 An instance that disappears before the provider retention window settles at a
 full configured lifetime at the price the launch was accepted at (the configured
@@ -712,8 +725,9 @@ launched.
 ## Durable state and ownership
 
 One SQLite ledger records operation identity, frozen request, request hash,
-client token, expiry, reservation, the instance id and the verified AWS scope
-(Region and account). A process-wide file lock
+client token, expiry, reservation, the instance id, the verified AWS scope
+(Region and account) and the deployment carried by the frozen request's
+`ci-burst:deployment` tag. A process-wide file lock
 admits exactly one writer; a second writer refuses before any cloud mutation.
 The supported topology is one deployment, one controller host and one ledger
 copy. Tags are ownership metadata, not a distributed lock.
@@ -786,11 +800,24 @@ outstanding until EC2's retained-visibility window has elapsed; a recent
 The scope is part of ownership. `apply` resolves the account with
 `sts:GetCallerIdentity` over the **same SDK session** that reads and launches
 EC2, so identity and inventory cannot resolve different credentials; it refuses
-with `SCOPE_CHANGED` while any outstanding operation belongs to another Region
-or account; an inventory from a different
-scope can never establish that such an operation terminated. `plan` performs
-the same Region check without an AWS call. Resolve or clean up the outstanding
-operation in its original scope before changing the credential route.
+with `SCOPE_CHANGED` while any outstanding operation belongs to another Region,
+another account or another deployment; an inventory from a different scope can
+never establish that such an operation terminated. The deployment is read from
+the frozen request's `ci-burst:deployment` tag, so changing `deployment` in the
+configuration while any operation is nonterminal is an explicit refusal, not a
+resume: the frozen request, its hash, its token and its tags stay untouched, the
+operation keeps its recorded state, and the discrepancy payload names the
+recorded `deployment` without printing the frozen payload or a secret. A row
+with no readable deployment tag is unbound, because the controller never writes
+one. `plan` performs the same Region and deployment checks without an AWS call.
+Resolve or clean up the outstanding operation in its original scope before
+changing the credential route or the deployment name.
+
+Terminal and failed rows are history and settled cost, not a scope claim. A
+ledger may serve a new deployment once every row is terminal or failed
+(drain-and-retain): the new deployment's operations append their own rows while
+the old rows keep their state, request, hash and reservation. Do not delete a
+ledger or its rows to change the name.
 An unclassified provider or response-parsing exception is uncertain, never a
 definite failure, because it can occur after the service accepted a request.
 

@@ -5,6 +5,12 @@ archived, and the next behavioural change needs its own proposal before
 implementation. Keep changes small and testable without a private platform,
 cloud account or production credentials.
 
+## Reporting an issue
+
+Open an issue before a behaviour change; a bug fix can go straight to a pull
+request. Use the issue form and keep reports synthetic: no cloud account
+identifiers, queue or host names, or credentials.
+
 ## Pull requests
 
 Use an isolated branch/worktree with one writer. After bootstrap, do not push
@@ -22,7 +28,9 @@ is authorized by a source PR.
 ## Review and merge
 
 After maintainer-controlled activation, main requires the exact-head
-`planning`, `public-content` and `review` checks. The `review` status comes
+`planning`, `public-content`, `review` and `dependency-review` checks.
+`dependency-review` fails a pull request that introduces a known-vulnerable
+dependency. The `review` status comes
 from the trusted default-branch publisher and is distinct from its publisher
 job completing successfully. Native approval requirements remain additional
 constraints: a posted App approval is not proof that GitHub counted it.
@@ -85,8 +93,8 @@ Source tests do not establish an active merge gate. Use this order:
    path; an authoring agent does not self-merge or invent a green status.
 2. Verify the default-branch publisher runs successfully and posts `review`
    on the exact current PR head. Verify a changed or unapproved head is refused.
-3. Require `planning`, `public-content` and the semantic `review` status from
-   GitHub Actions (App 15368). Preserve the configured native approval count,
+3. Require `planning`, `public-content`, `dependency-review` and the semantic
+   `review` status from GitHub Actions (App 15368). Preserve the configured native approval count,
    stale-review dismissal, strict freshness, administrator enforcement,
    conversation resolution and force-push/deletion bans. If the App approval
    does not satisfy the native count, stop for a separate owner policy decision;
@@ -112,6 +120,12 @@ python3 scripts/github_pr_automation.py merge
 `--apply` is refused outside the expected default-branch GitHub workflow
 context. Do not use it from an authoring session. No policy operation creates
 a release, deployment or cloud resource.
+
+## Response expectations
+
+This is a spare-time project with one maintainer. Expect an acknowledgement
+within a few days, not an immediate review. A new commit restarts CI and the
+review cycle; an approval from before the latest commit does not count.
 
 ## Releases
 

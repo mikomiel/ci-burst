@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a defect in ci-burst or in a decision it makes.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, cloud account identifiers, private queue or host names,
+        or deployment details. Use synthetic values and redact logs before posting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, and which command or decision was wrong.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: v0.2.0 or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The command, configuration shape and synthetic fixtures needed to reproduce it.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, Forgejo version and runner OS. No account identifiers.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Optional. Redact before posting.
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I removed credentials, cloud account identifiers, private addresses and deployment details from this report.
+          required: true

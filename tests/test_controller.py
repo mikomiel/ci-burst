@@ -28,6 +28,33 @@ from support import (
     write_config,
 )
 
+#: A version-2 ledger row seeded before the writable run upgrades it to version 3.
+_V2_SCHEMA = """
+    CREATE TABLE operations (
+        id TEXT PRIMARY KEY,
+        client_token TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        expires_at REAL NOT NULL,
+        reservation_micros INTEGER NOT NULL,
+        reservation_window REAL NOT NULL,
+        region TEXT NOT NULL,
+        account TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        instance_id TEXT,
+        detail TEXT NOT NULL DEFAULT '',
+        price_micros INTEGER NOT NULL DEFAULT 0,
+        launch_time REAL,
+        settled_micros INTEGER,
+        settled_at REAL
+    );
+    CREATE INDEX operations_state ON operations (state);
+    CREATE INDEX operations_window ON operations (reservation_window);
+    PRAGMA user_version = 2;
+"""
+
 
 class ControllerCase(unittest.TestCase):
     def setUp(self):
@@ -1350,7 +1377,7 @@ class FleetTests(ControllerCase):
         self.assertEqual(len(result["launches"]), 2)
         self.assertIn("budget_capped_batch", result["notes"])
         totals = self.totals(controller)
-        self.assertGreaterEqual(totals["committed"], 1_080_000)
+        self.assertEqual(totals["committed"], 1_079_336)
         self.assertLess(totals["spend"], 2_000)
         window = current_window(self.clock.now, config.budget.window_seconds)
         self.assertEqual(self.reopened().window_launches(window), 2)
@@ -1609,8 +1636,8 @@ class FleetTests(ControllerCase):
         self.assertEqual(result["budget"]["window_seconds"], 86400)
         self.assertEqual(result["budget"]["allowance"], "10.000000")
         self.assertEqual(result["budget"]["spend"], "0.000667")
-        self.assertEqual(result["budget"]["committed"], "0.540667")
-        self.assertEqual(result["budget"]["remaining"], "9.459333")
+        self.assertEqual(result["budget"]["committed"], "0.540001")
+        self.assertEqual(result["budget"]["remaining"], "9.459999")
         self.assertEqual(result["budget"]["launches"], 1)
         self.assertEqual(result["budget"]["busy_instances"], 1)
         self.assertEqual(result["budget"]["hourly_ceiling"], "0.160000")
@@ -1996,6 +2023,222 @@ class CostTrackingTests(ControllerCase):
         first = self.reopened().operation(operation_id).settled_micros
         controller.apply()
         self.assertEqual(self.reopened().operation(operation_id).settled_micros, first)
+
+    def test_the_billing_minimum_is_committed_once_for_a_two_worker_batch(self):
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 2},
+                    "aws": {"max_spot_price": "0.060000", "max_lifetime_seconds": 60},
+                    "budget": {"allowance": "0.002002", "non_compute_allowance": "0.000001"},
+                },
+            )
+        )
+        controller = self.build(
+            observation=observation_demand(2),
+            aws=FakeAws(spot_quote=quote(price_micros=60_000, clock=self.clock)),
+            config=config,
+        )
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_count"], 2)
+        self.assertEqual(controller.cost.per_launch_micros(), 1_001)
+        totals = self.totals(controller)
+        # Each worker commits its one billed minute plus its buffer, once.
+        self.assertEqual(totals["spend"], 2_000)
+        self.assertEqual(totals["committed"], 2_002)
+
+    def test_a_later_worker_in_a_batch_gets_no_inferred_floor(self):
+        # One admission gives the batch a shared expiry, but each operation is
+        # timestamped when it is created, so the second worker's recorded
+        # lifetime is two seconds shorter. Treating that ordinary latency as a
+        # backfilled basis pinned its commitment at the reservation until
+        # settlement, above accrued + remaining + buffer.
+        controller = self.build(
+            observation=observation_demand(2),
+            aws=FakeAws(spot_quote=quote(price_micros=20_000, clock=self.clock)),
+            config=load(write_config(self.root, config={"controller": {"max_instances": 2}})),
+        )
+        controller.aws.on_run = lambda request: self.clock.advance(2)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_count"], 2)
+        ledger = self.reopened()
+        first, later = (ledger.operation(item["operation"]) for item in result["launches"])
+        self.assertEqual(later.created_at - first.created_at, 2)
+        self.assertEqual(later.expires_at, first.expires_at)
+        model = controller.cost
+        accrued = model.accrued_micros(later, self.clock.now)
+        remaining = model.remaining_micros(later, self.clock.now)
+        self.assertEqual(accrued, 334)
+        self.assertEqual(remaining, 39_312)
+        self.assertEqual(model.reservation_floor_micros(later), 0)
+        # Exactly accrued + remaining + buffer, below the 0.540000 reservation.
+        self.assertEqual(model.committed_micros(later, self.clock.now), 539_646)
+        self.assertEqual(model.committed_micros(later, self.clock.now), accrued + remaining + 500_000)
+        self.assertLess(model.committed_micros(later, self.clock.now), later.reservation_micros)
+        # It settles at its accepted price, below the reservation, with no floor.
+        self.clock.advance(600)
+        controller.aws.on_run = None
+        controller.aws.instances_result = [
+            replace(
+                instance(instance_id=later.instance_id, operation=later.id, state="terminated"),
+                launch_time=later.created_at,
+            )
+        ]
+        controller.apply()
+        settled = self.reopened().operation(later.id).settled_micros
+        # 602 seconds at the accepted 0.020000, below the 0.040000 ceiling.
+        self.assertEqual(settled, 3_345)
+        self.assertLess(settled, later.reservation_micros)
+
+    def test_a_raised_ceiling_does_not_release_a_backfilled_commitment(self):
+        # A version-2 file is upgraded by the first writable run, which marks the
+        # non-terminal row as backfilled. Raising max_spot_price afterwards must
+        # not switch that row's reservation floor off and release allowance.
+        now = self.clock.now
+        path = self.config.state.database
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path)
+        connection.executescript(_V2_SCHEMA)
+        connection.execute(
+            "INSERT INTO operations (id, client_token, state, created_at, updated_at, expires_at,"
+            " reservation_micros, reservation_window, region, account, request_json, request_sha256,"
+            " instance_id, detail, price_micros, launch_time)"
+            " VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)",
+            (
+                "live",
+                "ci-burst-live",
+                now - 600,
+                now - 600,
+                now + 3000,
+                590_000,
+                current_window(now, 86_400),
+                "eu-central-1",
+                "111122223333",
+                json.dumps(
+                    {"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": "0.040000"}}}
+                ),
+                "0" * 64,
+                "i-live",
+                20_000,
+                now - 600,
+            ),
+        )
+        connection.commit()
+        connection.close()
+        live = instance(instance_id="i-live", operation="live", expires_at=now + 3000)
+
+        def config_with(*, max_spot_price, max_lifetime_seconds):
+            # Drop the optional buffer row: the backfill then records zero, which
+            # keeps the reproducer's arithmetic exact.
+            rendered = write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 2},
+                    "aws": {
+                        "max_spot_price": max_spot_price,
+                        "max_lifetime_seconds": max_lifetime_seconds,
+                    },
+                    "budget": {"allowance": "0.55"},
+                },
+            )
+            rendered.write_text(
+                "\n".join(
+                    line
+                    for line in rendered.read_text().splitlines()
+                    if "non_compute_allowance" not in line
+                )
+            )
+            return load(rendered)
+
+        migrating = self.build(
+            observation=observation_empty(),
+            config=config_with(max_spot_price="0.0400", max_lifetime_seconds=3600),
+        )
+        migrating.aws.instances_result = [live]
+        self.assertEqual(migrating.apply()["decision"], "wait")
+        # 0.011668 accrued plus the 0.578332 unaccrued part of the reservation.
+        self.assertEqual(
+            self.reopened().window_totals(current_window(now, 86_400), migrating.cost, now)["committed"],
+            590_000,
+        )
+        raised = self.build(
+            observation=observation_demand(1),
+            config=config_with(max_spot_price="0.5900", max_lifetime_seconds=60),
+            aws=FakeAws(spot_quote=quote(price_micros=20_000, clock=self.clock)),
+        )
+        raised.aws.instances_result = [live]
+        result = raised.apply()
+        # 0.590000 stays committed; the released 0.495001 would have afforded a
+        # 0.009834 launch out of the 0.550000 allowance.
+        self.assertEqual(result["budget"]["committed"], "0.590000")
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("budget_allowance_exhausted", result["reasons"])
+
+    def test_a_lowered_configuration_does_not_reprice_an_admitted_operation(self):
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 2},
+                    "aws": {"max_spot_price": "0.0400", "max_lifetime_seconds": 3600},
+                    "budget": {"incidental_per_hour": "0.05", "non_compute_allowance": "0.5"},
+                },
+            )
+        )
+        controller = self.build(observation=observation_demand(1), config=config)
+        first = controller.apply()
+        self.assertEqual(first["decision"], "launched")
+        operation_id = first["operation"]
+        self.assertEqual(first["budget"]["per_launch_reservation"], "0.590000")
+        self.clock.advance(600)
+        lowered_path = write_config(
+            self.root,
+            config={
+                "controller": {"max_instances": 2},
+                "aws": {"max_spot_price": "0.0100", "max_lifetime_seconds": 3600},
+                "budget": {"allowance": "10.00"},
+            },
+        )
+        # Dropping the optional rows is the configuration edit under test.
+        lowered_path.write_text(
+            "\n".join(
+                line
+                for line in lowered_path.read_text().splitlines()
+                if "non_compute_allowance" not in line and "incidental_per_hour" not in line
+            )
+        )
+        lowered = load(lowered_path)
+        changed = self.build(
+            config=lowered,
+            observation=observation_demand(1),
+            aws=FakeAws(spot_quote=quote(price_micros=10_000, clock=self.clock)),
+        )
+        status = changed.status()
+        # The admitted basis, not the lowered configuration, prices the outstanding
+        # operation: accrued 0.011668 and committed 0.586669 before and after.
+        self.assertEqual(status["budget"]["spend"], "0.011668")
+        self.assertEqual(status["budget"]["committed"], "0.586669")
+        admitted = self.reopened().operation(operation_id)
+        self.assertEqual(admitted.reservation_micros, 590_000)
+        self.assertEqual(
+            json.loads(admitted.request_json)["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"],
+            "0.040000",
+        )
+        # The new settings apply to the next admission only.
+        second = changed.apply()
+        self.assertEqual(second["decision"], "launched")
+        self.assertEqual(second["budget"]["per_launch_reservation"], "0.010000")
+        fresh = self.reopened().operation(second["operation"])
+        self.assertEqual(fresh.reservation_micros, 10_000)
+        self.assertEqual(fresh.admitted_incidental_per_hour_micros, 0)
+        self.assertEqual(fresh.admitted_buffer_micros, 0)
+        self.assertEqual(
+            json.loads(fresh.request_json)["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"],
+            "0.010000",
+        )
 
 
 class ReapTests(ControllerCase):

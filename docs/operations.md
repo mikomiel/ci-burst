@@ -310,16 +310,16 @@ The `labels` query narrows the observation deliberately; it is not a server
 requirement. In the v17.0.1 handler (`routers/api/v1/shared/runners.go`, tag
 `v17.0.1`) the label slice starts empty and, when no `labels` parameter is
 supplied, stays empty; an empty slice admits every `waiting` or `running` job.
-An absent parameter therefore returns the runnable set — a list — not JSON
-`null`. `null` is the handler's empty result (a nil slice) when nothing
-matched: an explicit filter with no match, or an empty queue. This adapter
-always sends the worker's bare label names (the part before the executor
-suffix, so `strong-ci` for `strong-ci:host`) and reads `null` as an empty
-queue. Omitting the filter would widen the observation to every runnable job in
-the repository, so the explicit request is a requirement of this adapter, not
-evidence that the server needs it. The filter is a union prefilter, so a job
-selected by one shared label is still compared against its complete `runs_on`
-set above; it never substitutes for that comparison.
+An absent parameter therefore returns the runnable set as a list when eligible
+jobs exist, and `null` otherwise. `null` is the handler's empty result (a nil
+slice) when nothing matched: an explicit filter with no match, or an empty
+queue. This adapter always sends the worker's bare label names (the part before
+the executor suffix, so `strong-ci` for `strong-ci:host`) and reads `null` as
+an empty queue. Omitting the filter would widen the observation to every
+runnable job in the repository, so the explicit request is a requirement of
+this adapter, not evidence that the server needs it. The filter is a union
+prefilter, so a job selected by one shared label is still compared against its
+complete `runs_on` set above; it never substitutes for that comparison.
 
 Attempts are deduplicated by `handle`. A retry is a new handle and remains
 distinguishable. ci-burst never assigns, requeues or reserves a job, and it does
@@ -341,14 +341,18 @@ To qualify a deployment, the operator must, with an owner-scoped read token:
 3. record the evidence with the deployment;
 4. only then set `qualification = "live-verified"`.
 
-Observed on one deployment running `forgejo 17.0.1+gitea-1.22.0` — deployment
-evidence, not the upstream contract: `runs_on` holds bare label names
-(`strong-ci`, `homelab`), an absent `labels` parameter returned `null` in that
-record, a non-matching filter also returns `null`, and the filter is a union
-over the job's labels. The upstream handler above treats `null` as the empty
-result and admits every `waiting` or `running` job when the parameter is
-absent, so that observation does not establish a different contract; no
-unfiltered request is claimed here. Statuses observed in one run
+This change separates two kinds of evidence. The recorded observation is
+deployment evidence from one deployment running `forgejo 17.0.1+gitea-1.22.0`,
+not the upstream contract: `runs_on` holds bare label names (`strong-ci`,
+`homelab`), an absent `labels` parameter returned `null` in that record, a
+non-matching filter also returns `null`, and the filter is a union over the
+job's labels. This change verified the handler above from source rather than
+from that record: it treats `null` as the empty result and admits every
+`waiting` or `running` job when the parameter is absent. The recorded `null` is
+therefore the empty result — consistent with no eligible job at that moment —
+and it does not establish a different contract. No live unfiltered request is
+claimed for this change: the absent-parameter reading above comes from the
+handler, not from a new observation. Statuses observed in one run
 (`mikolajm/ai-agents` run 25336, 2026-11-10): a job waiting for a runner
 reports `waiting` and still lists the dependency that already succeeded, while
 a dependent job reports `blocked` until it does. A changed response shape or a

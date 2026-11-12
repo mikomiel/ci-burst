@@ -231,10 +231,14 @@ the operator steps at
 [`deploy/runner/image/README.md`](../deploy/runner/image/README.md), but it
 neither builds nor publishes the image. The build inputs are portable and
 listed there: a fresh Debian 13 arm64 base, root on the builder, egress to the
-Debian apt repositories, GitHub, `nodejs.org` and `code.forgejo.org`, and one
-value the recipe takes as input — `RUFF_VERSION`, the ruff release to install
-(for example `0.17.4`). The other tool versions are literal pins in the recipe.
-Nothing in that section needs a private repository or an existing fleet.
+Debian apt repositories, GitHub, `nodejs.org`, `code.forgejo.org` and the
+Python package index (`pypi.org` and `files.pythonhosted.org`), including the
+redirect targets of those hosts, and one value the recipe takes as input —
+`RUFF_VERSION`, the ruff release to install (for example `0.17.4`). The index
+is needed because the recipe installs ruff with `uv tool install` on a fresh
+builder with no cached wheel. The other tool versions are literal pins in the
+recipe. Nothing in that section needs a private repository or an existing
+fleet.
 
 The image must provide what the bootstrap below assumes:
 

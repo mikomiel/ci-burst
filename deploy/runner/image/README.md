@@ -19,7 +19,15 @@ An independent operator needs nothing outside this directory for these:
 |---|---|
 | Base image | a fresh Debian 13 arm64 instance with cloud-init |
 | Privilege | root on the builder; the recipe installs packages and writes under `/usr/local` |
-| Egress | the builder's Debian apt repositories, `github.com`, `nodejs.org` and `code.forgejo.org` |
+| Egress | the builder's Debian apt repositories, `github.com`, `nodejs.org`, `code.forgejo.org`, and the Python package index (`pypi.org` and `files.pythonhosted.org`) |
+
+The package index is an input because the recipe installs ruff with `uv tool
+install`, which resolves the release from the index and downloads it from the
+artifact host on a builder that has no cached wheel. Redirect targets of the
+listed hosts are included — the GitHub release downloads in particular resolve
+to GitHub's asset hosts — so allow the redirect host as well as the URL the
+recipe names. A build that cannot reach one of these fails at that step, and
+the exit trap shuts the builder down before `IMAGE_READY`.
 
 ### Inputs and pinned versions
 

@@ -46,6 +46,9 @@ from .money import format_money
 
 WRITER_TOPOLOGY = "one deployment, one controller host, one durable ledger, one writer"
 
+#: Stable refusal reason for durable state that belongs to another scope.
+SCOPE_CHANGED = "SCOPE_CHANGED"
+
 #: EC2 documents a client token as valid for 24 hours. Beyond that a retry is
 #: no longer idempotent, so the unresolved intent blocks and needs an operator.
 CLIENT_TOKEN_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -66,6 +69,28 @@ COST_SCOPE_NOTE = (
 
 def _sha256(payload):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _frozen_deployment(operation):
+    """The deployment recorded in an operation's frozen launch request.
+
+    The frozen request is the immutable record, so a deployment rename is
+    detected without another ledger column. ``None`` means the row carries no
+    readable deployment tag: ``_request`` never writes one, so the row is
+    unbound rather than evidence of another deployment.
+    """
+    try:
+        tags = operation.request()["TagSpecifications"][0]["Tags"]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    if not isinstance(tags, list):
+        return None
+    for tag in tags:
+        if isinstance(tag, dict) and tag.get("Key") == DEPLOYMENT_TAG:
+            value = tag.get("Value")
+            if isinstance(value, str) and value:
+                return value
+    return None
 
 
 @dataclass(frozen=True)
@@ -133,10 +158,13 @@ class Controller:
             result["decision"] = "refused"
             return result
         slot = self._slot_from_state(state)
+        operations = self.ledger.nonterminal_operations() if self.ledger.available else ()
         if any(
-            operation["region"] != self.config.aws.region for operation in slot["operations"]
+            operation.region != self.config.aws.region
+            or self._deployment_changed(operation) is not None
+            for operation in operations
         ):
-            result["refusal"] = {"reason": "SCOPE_CHANGED"}
+            result["refusal"] = {"reason": SCOPE_CHANGED}
             result["decision"] = "refused"
             return result
         result["slot"] = slot
@@ -380,6 +408,13 @@ class Controller:
             "discrepancies": [],
         }
 
+    def _deployment_changed(self, operation):
+        """The recorded deployment when it conflicts with the configured one."""
+        recorded = _frozen_deployment(operation)
+        if recorded is None or recorded == self.config.deployment:
+            return None
+        return recorded
+
     def _observe_or_refuse(self, result):
         try:
             return self.observer.observe()
@@ -536,7 +571,9 @@ class Controller:
             "required_reservation": format_money(per_launch),
             "per_launch_reservation": format_money(per_launch),
             "launch_count": launch_count,
-            "remaining_after": format_money(self.config.budget.allowance - committed - per_launch),
+            "remaining_after": format_money(
+                self.config.budget.allowance - committed - launch_count * per_launch
+            ),
         }
         if affordable < requested:
             notes.append("budget_capped_batch")
@@ -1034,15 +1071,21 @@ class Controller:
         now = self.clock()
         scoped = {}
         for operation in nonterminal.values():
-            if operation.region != self.config.aws.region or operation.account != account:
-                discrepancies.append(
-                    {
-                        "operation": operation.id,
-                        "reason": "SCOPE_CHANGED",
-                        "region": operation.region,
-                        "account": operation.account,
-                    }
-                )
+            deployment = self._deployment_changed(operation)
+            if (
+                operation.region != self.config.aws.region
+                or operation.account != account
+                or deployment is not None
+            ):
+                entry = {
+                    "operation": operation.id,
+                    "reason": SCOPE_CHANGED,
+                    "region": operation.region,
+                    "account": operation.account,
+                }
+                if deployment is not None:
+                    entry["deployment"] = deployment
+                discrepancies.append(entry)
                 continue
             scoped[operation.id] = operation
         missing = [operation for operation in scoped.values() if operation.id not in by_operation]
@@ -1159,7 +1202,7 @@ class Controller:
                 continue
             if known[operation_id][1] != self.config.aws.region:
                 discrepancies.append(
-                    {"instance_id": instance.instance_id, "operation": operation_id, "reason": "SCOPE_CHANGED"}
+                    {"instance_id": instance.instance_id, "operation": operation_id, "reason": SCOPE_CHANGED}
                 )
                 continue
             if instance.state == "terminated":

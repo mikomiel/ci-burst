@@ -461,9 +461,10 @@ remaining_seconds = max(0, max_lifetime_seconds - elapsed)
 remaining_price = max(max_spot_price, accepted_price or 0)
 ```
 
-so a newly admitted worker commits the same `max_spot_price * max_lifetime +
-non_compute_allowance` as before, and that commitment shrinks every second it
-lives. The accepted price is a floor on `remaining_price`: lowering
+so a newly admitted worker commits `max_spot_price * max_lifetime +
+incidental_per_hour * max_lifetime + non_compute_allowance` — the earlier
+reservation plus the incidental term, which is zero unless configured — and that
+commitment shrinks every second it lives. The accepted price is a floor on `remaining_price`: lowering
 `max_spot_price` below a live operation's accepted price does not shrink that
 operation's commitment, because it still settles at the accepted price. A batch is affordable while the window's `spend` plus the forward
 commitment plus one new worker's worst case stays inside `allowance`:

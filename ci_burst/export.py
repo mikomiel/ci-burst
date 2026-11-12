@@ -43,8 +43,9 @@ from .ledger import NONTERMINAL, TERMINAL, Ledger, current_window
 
 #: One run reads at most this many consoles. The budget is spent on records that
 #: can still carry new evidence, live workers first; a run with more candidates
-#: than this defers the rest to the next run rather than refusing. The configured
-#: ceiling is inside the budget, so every live worker is read in every run.
+#: than this defers the terminal surplus to the next run rather than refusing.
+#: Only more unfinished live candidates than the budget refuses, because then the
+#: live evidence itself cannot be covered in one run.
 MAX_CONSOLE_READS = 16
 
 #: A console never changes again once a read observes the provider in one of
@@ -502,16 +503,13 @@ class Exporter:
             summary.notes.append("no_owned_instances")
         # The console-read bound is a bound per run, not a bound on what the
         # provider still remembers: a terminating worker keeps its tags for about
-        # an hour, so a busy fleet legitimately shows many terminal records. Only
-        # a deployment running more non-terminal workers than its own configured
-        # limit is a disagreement worth refusing.
+        # an hour, so a busy fleet legitimately shows many terminal records. The
+        # admission ceiling is not a read bound either: lowering it is a supported
+        # drain that evicts nothing, so its surplus is reported, never refused.
         limit = self.config.controller.max_instances
         live = [item for item in instances if _normalize_state(item.state) != "terminated"]
         if len(live) > limit:
-            raise ProviderRefusal(
-                "console_read_cap_exceeded",
-                f"{len(live)} non-terminal owned instances exceeds the configured limit of {limit}",
-            )
+            summary.notes.append("above_configured_limit")
 
         state, note = load_state(state_file)
         if note is not None:
@@ -523,12 +521,25 @@ class Exporter:
         # read that shows it left the live states. Finished records are never
         # read again, so normal turnover cannot spend the per-run budget.
         candidates = [item for item in instances if not _read_finished(state, item)]
-        # Live workers first: their consoles are the ones still growing, and the
-        # configured ceiling is inside the budget, so they always fit. Termination
-        # history waits for the remaining capacity.
+        # Live workers first: their consoles are the ones still growing, so every
+        # live worker fits whenever the live candidates fit the whole budget.
+        # Termination history waits for the remaining capacity.
         candidates.sort(key=lambda item: _normalize_state(item.state) == "terminated")
+        # The one condition worth refusing: more unfinished live candidates than
+        # the whole budget means live evidence cannot be covered in one run.
+        unread_live = [
+            item for item in candidates if _normalize_state(item.state) != "terminated"
+        ]
+        if len(unread_live) > MAX_CONSOLE_READS:
+            raise ProviderRefusal(
+                "console_read_cap_exceeded",
+                f"{len(unread_live)} unfinished non-terminal owned instances exceed the "
+                f"per-run console read budget of {MAX_CONSOLE_READS}",
+            )
         reading = candidates[:MAX_CONSOLE_READS]
         if len(candidates) > len(reading):
+            # The run is partial: recording the deferral is what stops a consumer
+            # from reading it as complete observation.
             summary.notes.append("console_read_deferred")
         read_ids = {item.instance_id for item in reading}
         consoles = self.aws.console_output([item.instance_id for item in reading]) if reading else {}

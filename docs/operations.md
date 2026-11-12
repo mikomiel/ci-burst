@@ -237,7 +237,8 @@ stopped exporter.
 | Bound | Value |
 | --- | --- |
 | console reads per run | 16, over the records that can still carry new evidence |
-| non-terminal owned instances | refused above `controller.max_instances` |
+| non-terminal owned instances | above `controller.max_instances`: reported with `above_configured_limit` |
+| unfinished live workers per run | refused above 16 (`console_read_cap_exceeded`) |
 | bytes read per console | 64 KiB |
 | error kinds per instance | 3 |
 | published console text | none |
@@ -252,13 +253,21 @@ observed it `terminated` or `stopped`. An exit line on the console is not that
 signal — the bootstrap can finish while the instance and its console carry on.
 Live workers are read first, so the growing consoles are never the ones deferred.
 
-A run that finds more candidates than the budget defers the rest with the note
-`console_read_deferred`, and the next run picks them up while they are still
-visible. Only a deployment running more non-terminal workers than its own
-configured limit is refused (`console_read_cap_exceeded`, exit 2, nothing
-written): `shutting-down`, `stopping` and `stopped` still occupy a slot, so the
-count matches the controller's, and a disagreement there means the ownership
-tags say something the deployment does not.
+A run whose unfinished non-terminal candidates fit within the budget but whose
+candidate list exceeds it defers the surplus terminal history with the note
+`console_read_deferred`, and the next run picks it up while it is still visible.
+Above that budget the run refuses instead, because live evidence cannot be
+covered in one run. A deferred run is partial observation: the note is the
+signal, and the run must not be read as complete evidence.
+
+The read budget is independent of the admission ceiling. A deployment running
+more non-terminal owned workers than its configured `controller.max_instances`
+is a supported drain, not a refusal: the run reports `above_configured_limit` and
+still writes both artefacts. `shutting-down`, `stopping` and `stopped` still
+occupy a slot, so the count matches the controller's. The only refusal is the
+read budget itself: when more than 16 unfinished non-terminal workers are
+candidates, live evidence cannot be covered in one run and the command refuses
+(`console_read_cap_exceeded`, exit 2, nothing written).
 
 An instance without the ownership tags — a hand-launched canary — is invisible
 here on purpose; read its console directly with the provider CLI instead.
@@ -720,7 +729,9 @@ with no fresh candidate stops the same way with `spot_price_stale`.
 Lowering `controller.max_instances` below the number of live owned workers never
 terminates anything. New admission waits with `slot_busy` and the decision
 carries the note `above_configured_limit` until enough workers finish on their own
-lifetime; expiry cleanup remains the only owner of termination.
+lifetime; expiry cleanup remains the only owner of termination. Observation
+reports the same condition and keeps reading the draining workers' consoles, so
+the drain stays visible while it lasts.
 
 ## Launch decision and capacity fallback
 
@@ -958,3 +969,7 @@ supported: concurrent controllers, multiple ledgers, warm pools, On-Demand
 fallback, automatic zone or Region discovery and substitution, provider
 selection, job retries, workflow rewrites, image construction and secret
 distribution.
+
+Observation has its own bound. Its per-run console-read budget is independent of
+`controller.max_instances`: a supported drain above the ceiling is reported, not
+refused, and only more than 16 unfinished non-terminal candidates refuse a run.

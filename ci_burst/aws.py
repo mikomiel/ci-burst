@@ -12,6 +12,7 @@ use to exercise pagination and response parsing without any SDK.
 """
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -454,16 +455,40 @@ def _spot_quote(entries, instance_type, availability_zone, observed_at):
 
 
 def _instances(response):
+    """Parse one DescribeInstances response, refusing an incomplete record.
+
+    An empty ``Reservations`` list is a complete empty inventory. Anything else
+    that cannot be read as reservations of identified instances is not: a
+    missing ``Reservations`` key is not proof that nothing is owned, and an
+    entry without an identity cannot be reconciled, resumed or terminated. The
+    adapter therefore refuses such a response as uncertain instead of
+    substituting an empty record for it.
+    """
+    if not isinstance(response, Mapping):
+        raise _incomplete_inventory("DescribeInstances returned no response mapping")
+    reservations = response.get("Reservations")
+    if not isinstance(reservations, list):
+        raise _incomplete_inventory("DescribeInstances returned no Reservations list")
     result = []
-    for reservation in response.get("Reservations") or []:
-        for item in reservation.get("Instances") or []:
+    for reservation in reservations:
+        if not isinstance(reservation, Mapping):
+            raise _incomplete_inventory("DescribeInstances returned a reservation that is not a mapping")
+        entries = reservation.get("Instances")
+        if not isinstance(entries, list):
+            raise _incomplete_inventory("DescribeInstances returned no Instances list")
+        for item in entries:
+            if not isinstance(item, Mapping):
+                raise _incomplete_inventory("DescribeInstances returned an instance entry that is not a mapping")
+            instance_id = item.get("InstanceId")
+            if not isinstance(instance_id, str) or not instance_id:
+                raise _incomplete_inventory("DescribeInstances returned an instance entry without an InstanceId")
             tags = {tag.get("Key"): tag.get("Value") for tag in item.get("Tags") or []}
             launch_time = item.get("LaunchTime")
             placement = item.get("Placement") or {}
             zone = placement.get("AvailabilityZone")
             result.append(
                 Instance(
-                    instance_id=item.get("InstanceId", ""),
+                    instance_id=instance_id,
                     state=(item.get("State") or {}).get("Name", "unknown"),
                     tags=tags,
                     launch_time=_timestamp(launch_time),
@@ -471,3 +496,7 @@ def _instances(response):
                 )
             )
     return result
+
+
+def _incomplete_inventory(detail):
+    return ProviderRefusal("AWS_INVENTORY_INCOMPLETE", detail, uncertain=True)

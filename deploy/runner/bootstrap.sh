@@ -62,7 +62,11 @@ timeout --signal=TERM --kill-after=60 3600 \
     CI_PROFILE_CACHE_ROOT=/var/lib/forgejo-runner/cache/validation \
     /usr/local/bin/forgejo-runner one-job --wait -c /etc/forgejo-runner/config.yml || JOB_RC=$?
 echo "STEP job"
-rm -f /var/lib/forgejo-runner/.runner
+# The runner account owns this directory, so job code can replace the
+# registration file with something `rm -f` refuses. The removal must not
+# decide the exit status: under `set -e` it would exit here, skipping the
+# one-job marker and reporting this cleanup's failure as the job result.
+rm -f /var/lib/forgejo-runner/.runner || echo "WARNING: runner registration file not removed"
 case "$JOB_RC" in
   0) echo "bootstrap one-job completed rc=0" ;;
   124|137) echo "bootstrap one-job timeout rc=$JOB_RC" ;;

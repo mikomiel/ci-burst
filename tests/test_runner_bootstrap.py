@@ -45,7 +45,7 @@ PUBLISHED_TEMPLATE_SHA256 = (
 #: both PENDING values become ``None``).
 PENDING_TEMPLATE_VERSION = 5
 PENDING_TEMPLATE_SHA256 = (
-    "735fcfe896d52c31e89f53ab059ab301d7ef6b4096fec3e6c24b22dda3ab52fe"
+    "645a16d8c9576549039cc22667d79368622a411486676b5efcf553ad49eb4852"
 )
 
 
@@ -286,8 +286,20 @@ class BootstrapTailTests(unittest.TestCase):
         self.assertIn("/var/lib/forgejo-runner/.runner", tail)
         return tail.replace("/var/lib/forgejo-runner", str(self.work))
 
-    def _run(self, status):
-        (self.work / ".runner").write_text("registration", encoding="utf-8")
+    def _run(self, status, *, registration_file=True):
+        """Run the extracted tail for *status* and return it with the trap log.
+
+        ``registration_file=False`` puts a non-empty directory where the
+        registration file lives, which makes the tail's real ``rm -f`` fail:
+        the bootstrap hands that directory to the ``runner`` account, so job
+        code can make the removal fail. No command is stubbed.
+        """
+        registration = self.work / ".runner"
+        if registration_file:
+            registration.write_text("registration", encoding="utf-8")
+        else:
+            registration.mkdir()
+            (registration / "config.yml").write_text("stale", encoding="utf-8")
         cleanup = self.root / f"cleanup-{status}.log"
         script = self.root / f"tail-{status}.sh"
         script.write_text(
@@ -305,7 +317,8 @@ class BootstrapTailTests(unittest.TestCase):
             encoding="utf-8",
         )
         completed = subprocess.run(["/bin/bash", str(script)], capture_output=True, text=True, check=False)
-        self.assertEqual(completed.stderr, "")
+        if registration_file:
+            self.assertEqual(completed.stderr, "")
         return completed, cleanup.read_text(encoding="utf-8") if cleanup.exists() else ""
 
     def test_each_process_status_reaches_the_marker_and_the_exit_status(self):
@@ -331,6 +344,30 @@ class BootstrapTailTests(unittest.TestCase):
                     (self.work / ".runner").exists(),
                     "the registration file must be removed before the marker",
                 )
+
+    def test_a_failed_registration_cleanup_cannot_replace_the_job_result(self):
+        # The removal of `.runner` can fail: the bootstrap hands
+        # /var/lib/forgejo-runner to the `runner` user, so job code can make
+        # the path a directory. Under `set -e` that failure used to become the
+        # shell's exit status: no one-job marker, no `exit "$JOB_RC"`, and the
+        # trap reported rc=1 — destroying the evidence this tail preserves.
+        completed, cleanup = self._run(42, registration_file=False)
+        self.assertIn("cannot remove", completed.stderr, "the removal must really fail")
+        self.assertIn("STEP job", completed.stdout)
+        markers = [
+            line.strip()
+            for line in completed.stdout.splitlines()
+            if line.strip().startswith("bootstrap one-job")
+        ]
+        self.assertEqual(markers, ["bootstrap one-job failed rc=42"])
+        self.assertIn(
+            "WARNING: runner registration file not removed",
+            completed.stdout,
+            "the failed cleanup must be reported as plain text, not as a marker",
+        )
+        self.assertEqual(completed.returncode, 42)
+        self.assertEqual(cleanup, "cleanup", "the EXIT trap must still run")
+        self.assertTrue((self.work / ".runner").is_dir())
 
 
 if __name__ == "__main__":

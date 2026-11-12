@@ -181,9 +181,11 @@ class FaultMatrixCase(unittest.TestCase):
 class MalformedProviderResponseTests(FaultMatrixCase):
     """Partial DescribeInstances / template / Spot responses at the adapter edge."""
 
-    def test_a_reservation_without_instances_fabricates_nothing(self):
-        # The key is present and the reservation is simply empty; the adapter
-        # reports no record for it and still parses the sibling reservation.
+    def test_a_reservation_without_instances_refuses_the_inventory(self):
+        # A reservation that carries no Instances key is a malformed response,
+        # not a reservation with zero members: since the inventory-integrity
+        # fix, the parser refuses rather than silently dropping the sibling
+        # reservation (a partial inventory must never read as a complete one).
         aws = self.adapter(
             [
                 {
@@ -194,9 +196,12 @@ class MalformedProviderResponseTests(FaultMatrixCase):
                 }
             ]
         )
-        self.assertEqual([item.instance_id for item in aws.owned_instances("test-deployment")], ["i-1"])
+        with self.assertRaises(ProviderRefusal) as raised:
+            aws.owned_instances("test-deployment")
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
 
-        aws = self.adapter([{"Reservations": [{"ReservationId": "r-empty"}]}])
+        # An explicit empty Instances list is the valid "no members" shape.
+        aws = self.adapter([{"Reservations": [{"ReservationId": "r-empty", "Instances": []}]}])
         self.assertEqual(aws.owned_instances("test-deployment"), [])
 
     def test_an_unknown_instance_state_is_never_terminal_evidence(self):

@@ -259,6 +259,25 @@ same change: the policy — not the TOML — is what decides which placements ar
 allowed, so a candidate the policy omits is a denied launch rather than a
 fallback. A zone without a subnet cannot be used at all.
 
+### Change the deployment name
+
+The deployment name is the ownership scope of every frozen launch request, so
+`apply` refuses with `SCOPE_CHANGED` while any operation started under the old
+name is still nonterminal. Rename in this order:
+
+1. Stop admission (disable or stop the `apply` unit) and leave expiry cleanup
+   running.
+2. Drain the old scope: run `status` until every operation is `terminal` or
+   `failed`, and resolve every unresolved intent and every owned instance under
+   the old name. Do not edit, retag or delete the ledger rows.
+3. Confirm the old scope is clean: `status` reports no nonterminal operation and
+   `reap` has nothing left to terminate.
+4. Change `deployment` in the TOML and restart the apply unit.
+
+The ledger keeps the old rows as history and settled cost; new operations append
+their own rows under the new name. A rename with outstanding intent launches
+nothing and changes nothing, so clean up the old scope first.
+
 ## Verify the prerequisites
 
 The worker prerequisites in [runner-setup.md](runner-setup.md) stay
@@ -304,25 +323,38 @@ It checks, from read-only describe calls:
   `deploy/runner/bootstrap.sh` byte for byte, trailing newlines aside;
 - every configured candidate's subnet exists in that zone and Region, and its
   route table (or the VPC's main route table) has an active default route;
-- when that default route targets a network interface, the owning instance is
-  running and its boot configuration names the candidate's subnet CIDR
-  (`router_forwarding_missing_cidr` when a configured CIDR is absent,
-  `router_user_data_unavailable` when it cannot be read, and
+- when that default route targets a network interface or an instance, the
+  owning instance is running and its boot configuration names the candidate's
+  subnet CIDR (`router_forwarding_missing_cidr` when a configured CIDR is
+  absent, `router_user_data_unavailable` when it cannot be read, and
   `router_forwarding_unverified` when no CIDR is declared in its user data —
   read from SSM or a baked image, for example. An unreadable, undeclared or
   externally-configured router is never a pass and never drift);
+- that router's source/destination check is read for either target kind: an
+  enabled setting is drift (`router_source_dest_check_enabled`), and a disabled
+  setting does not prove reachability. An interface target's setting comes from
+  `DescribeNetworkInterfaces`, so a refused read there is
+  `router_read_unavailable`; an instance target's setting comes from
+  `DescribeInstanceAttribute`, so a refused read there, an absent field or a
+  non-boolean value is `router_source_dest_check_unavailable`. Both codes mean
+  the check is incomplete and exit 3;
 - the template's security groups exist;
 - the template's instance profile and its role exist;
 - the registration parameter exists — metadata only.
 
-The output is one JSON document with stable reason codes. Exit `0` means every
-check passed, `2` means drift, and `3` means the check could not run
-completely. An incomplete check takes precedence over drift: if any check is
-unavailable the command exits `3`, while the drift reasons are still listed in
-`reasons`. A missing `ec2:DescribeSubnets`, `ssm:DescribeParameters` or
-`iam:GetInstanceProfile` permission, and an expected credential, session or
-session-configuration failure such as `ProfileNotFound` or `ConfigParseError`,
-are reported as `unavailable` and exit `3`; they are neither a pass nor drift.
+The output is one JSON document with stable reason codes and two top-level
+lists: `reasons` collects drift and `unavailable` collects every reason a check
+could not run. A check record that proved drift before a later read failed
+keeps the drift in its own `drift_reasons` list; the aggregation copies those
+codes into the top-level `reasons`, so a drift code never appears in
+`unavailable`. Exit `0` means every check passed, `2` means drift, and `3`
+means the check could not run completely. An incomplete check takes precedence
+over drift: if any check is unavailable the command exits `3`, while the drift
+reasons are still listed in `reasons`. A missing `ec2:DescribeSubnets`,
+`ssm:DescribeParameters` or `iam:GetInstanceProfile` permission, and an
+expected credential, session or session-configuration failure such as
+`ProfileNotFound` or `ConfigParseError`, are reported as `unavailable` and exit
+`3`; they are neither a pass nor drift.
 
 What it does not prove: nothing about a worker's runtime behaviour — boot,
 registration, job execution or termination; network reachability (security

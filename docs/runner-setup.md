@@ -184,7 +184,8 @@ Create a launch template with a pinned, numeric version. ci-burst refuses a
 template that is missing any of these:
 
 - a literal `ImageId`, never `resolve:ssm:` or another alias;
-- an `InstanceType` (the controller prices exactly that type);
+- an `InstanceType` — the default pool, and the shape anchor when
+  `aws.instance_types` names a list;
 - `InstanceInitiatedShutdownBehavior = terminate`;
 - bootstrap `UserData`.
 

@@ -541,14 +541,28 @@ class PrerequisiteTests(unittest.TestCase):
         result = self.check()
         self.assert_drift(result, "instance_type_shape_mismatch")
 
-    def test_incomplete_instance_type_facts_are_unavailable(self):
-        self.use_instance_types(
-            "t4g.small",
-            metadata={"t4g.small": {"vcpus": None, "memory": None, "architectures": ["arm64"]}},
-        )
+    def assert_incomplete_instance_type_facts_are_unavailable(self, facts):
+        self.use_instance_types("t4g.small", metadata={"t4g.small": facts})
         result = self.check()
         self.assert_unavailable(result, "instance_types_unavailable")
-        self.assertIn("incomplete instance type facts", self.records(result, "pools")[0]["detail"])
+        self.assertIn(
+            "incomplete instance type facts", self.records(result, "pools")[0]["detail"]
+        )
+
+    def test_missing_vcpu_facts_are_unavailable(self):
+        self.assert_incomplete_instance_type_facts_are_unavailable(
+            {"vcpus": None, "memory": 2048, "architectures": ["arm64"]}
+        )
+
+    def test_missing_memory_facts_are_unavailable(self):
+        self.assert_incomplete_instance_type_facts_are_unavailable(
+            {"vcpus": 2, "memory": None, "architectures": ["arm64"]}
+        )
+
+    def test_missing_architecture_support_is_unavailable(self):
+        self.assert_incomplete_instance_type_facts_are_unavailable(
+            {"vcpus": 2, "memory": 2048, "architectures": []}
+        )
 
     def test_a_missing_image_description_is_unavailable(self):
         self.use_instance_types("t4g.small")

@@ -538,11 +538,18 @@ deployment, one controller (scaler) host and one ledger copy is the supported
 topology.
 
 - Do not copy `state.sqlite3`, or the directory, to run a second controller.
-  A copied file is a second ledger with its own reservation budget: each copy
-  can admit an instance the other cannot see.
+  A copied file is a second ledger with its own cost commitment: each copy can
+  admit an instance the other cannot see.
 - Do not mount the directory into two containers that may run `apply`. The
   writer lock is a file lock on one host, not a distributed lock, and the
-  reservation budget is local.
+  commitment budget is local.
+- A writable run upgrades a version-1 ledger once, while holding the writer
+  lock: it copies the file to `state.sqlite3.pre-v2.<epoch>`, checks the copy's
+  size, then changes the schema in one transaction. If the copy fails it
+  refuses before the first schema write. `plan`, `status` and `export` accept
+  either version and never create or migrate the file. Rolling the image back
+  after an upgrade requires restoring that copy first, because the previous
+  release refuses the new version.
 - `reap` never needs this directory, which is why cleanup keeps working when
   the ledger is unavailable.
 - To migrate hosts, stop admission as in rollback step 1, including the

@@ -108,6 +108,10 @@ class BudgetConfig:
     window_seconds: int
     allowance: int
     non_compute_allowance: int
+    #: Estimated non-compute cost of one instance-hour (public IPv4 and EBS),
+    #: added to tracked cost. Zero keeps a deployment that never configured it
+    #: tracking compute only.
+    incidental_per_hour: int
 
 
 @dataclass(frozen=True)
@@ -366,11 +370,16 @@ def load(path):
         profile=profile,
     )
 
-    budget_table = _table(raw.get("budget", {}), "budget", ("window_seconds", "allowance", "non_compute_allowance"))
+    budget_table = _table(
+        raw.get("budget", {}),
+        "budget",
+        ("window_seconds", "allowance", "non_compute_allowance", "incidental_per_hour"),
+    )
     budget = BudgetConfig(
         window_seconds=_integer(budget_table, "window_seconds", "budget", minimum=60, maximum=31_536_000),
         allowance=_money(budget_table, "allowance", "budget"),
         non_compute_allowance=_money(budget_table, "non_compute_allowance", "budget", required=False) or 0,
+        incidental_per_hour=_money(budget_table, "incidental_per_hour", "budget", required=False) or 0,
     )
 
     state_table = _table(raw.get("state", {}), "state", ("database",))

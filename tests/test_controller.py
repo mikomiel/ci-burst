@@ -1,10 +1,11 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from ci_burst.config import load
-from ci_burst.controller import Controller
+from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller
 from ci_burst.errors import ConfigRefusal, ProviderRefusal
 from ci_burst.aws import SpotQuote
 from ci_burst.ledger import Ledger, current_window
@@ -47,6 +48,10 @@ class ControllerCase(unittest.TestCase):
         ledger = Ledger(self.config.state.database, clock=self.clock).connect()
         self.addCleanup(ledger.close)
         return ledger
+
+    def totals(self, controller):
+        window = current_window(self.clock.now, controller.config.budget.window_seconds)
+        return self.reopened().window_totals(window, controller.cost, self.clock.now)
 
     def seed(self, *, state="running", operation_id="existing-op", expires_at=None, reservation=1_000_000, instance_id="i-seed"):
         ledger = Ledger(self.config.state.database, clock=self.clock).connect()
@@ -138,11 +143,16 @@ class PlanTests(ControllerCase):
         self.assertIn("spot_price_unavailable", result["reasons"])
 
     def test_plan_refuses_exhausted_allowance(self):
-        self.seed(state="terminal", operation_id="spent", reservation=9_800_000)
-        result = self.build(observation=observation_demand()).plan()
+        config = load(
+            write_config(
+                self.root, config={"budget": {"allowance": "0.50"}, "controller": {"max_instances": 4}}
+            )
+        )
+        self.seed(state="running", operation_id="live", reservation=540_000)
+        result = self.build(observation=observation_demand(), config=config).plan()
         self.assertEqual(result["decision"], "refused")
         self.assertIn("budget_allowance_exhausted", result["reasons"])
-        self.assertEqual(result["budget"]["remaining_after"].startswith("-"), True)
+        self.assertEqual(result["budget"]["remaining"].startswith("-"), True)
 
     def test_admission_recomputes_time_after_a_slow_quote_read(self):
         config = load(write_config(self.root, config={"aws": {"max_lifetime_seconds": 60}}))
@@ -278,16 +288,14 @@ class ApplyTests(ControllerCase):
         # between them cannot leave a failed operation still charging the window.
         self.assertEqual(operation.reservation_micros, 0)
         self.assertEqual(operation.detail, "AWS_REFUSED")
-        window = current_window(self.clock.now, self.config.budget.window_seconds)
-        self.assertEqual(self.reopened().consumed_micros(window), 0)
+        self.assertEqual(self.totals(controller)["committed"], 0)
 
     def test_a_definite_non_capacity_refusal_releases_the_allowance(self):
         controller = self.build(observation=observation_demand())
         self.aws.run_error = ProviderRefusal("AWS_REFUSED", "UnauthorizedOperation")
         result = controller.apply()
         self.assertEqual(result["decision"], "launch_failed")
-        window = current_window(self.clock.now, self.config.budget.window_seconds)
-        self.assertEqual(self.reopened().consumed_micros(window), 0)
+        self.assertEqual(self.totals(controller)["committed"], 0)
 
     def test_an_uncertain_launch_keeps_the_allowance(self):
         # The provider may have created the instance: the reservation stays
@@ -298,10 +306,8 @@ class ApplyTests(ControllerCase):
         self.assertEqual(result["decision"], "uncertain")
         operation = self.reopened().operation(result["operation"])
         self.assertGreater(operation.reservation_micros, 0)
-        window = current_window(self.clock.now, self.config.budget.window_seconds)
-        self.assertEqual(
-            self.reopened().consumed_micros(window), operation.reservation_micros
-        )
+        # No instance was confirmed, so the whole lifetime stays committed.
+        self.assertEqual(self.totals(controller)["committed"], controller.cost.per_launch_micros())
 
     def test_lost_response_is_uncertain_then_adopted_without_a_second_launch(self):
         controller = self.build(observation=observation_demand())
@@ -930,8 +936,10 @@ class FleetTests(ControllerCase):
         self.assertEqual(result["launch_count"], 2)
         self.assertEqual(len(result["launches"]), 2)
         self.assertIn("budget_capped_batch", result["notes"])
+        totals = self.totals(controller)
+        self.assertGreaterEqual(totals["committed"], 1_080_000)
+        self.assertLess(totals["spend"], 2_000)
         window = current_window(self.clock.now, config.budget.window_seconds)
-        self.assertEqual(self.reopened().consumed_micros(window), 1_080_000)
         self.assertEqual(self.reopened().window_launches(window), 2)
 
     def test_unresolved_intents_resume_in_creation_order(self):
@@ -1187,10 +1195,64 @@ class FleetTests(ControllerCase):
         )
         self.assertEqual(result["budget"]["window_seconds"], 86400)
         self.assertEqual(result["budget"]["allowance"], "10.000000")
-        self.assertEqual(result["budget"]["consumed"], "0.540000")
+        self.assertEqual(result["budget"]["spend"], "0.000667")
+        self.assertEqual(result["budget"]["committed"], "0.540667")
+        self.assertEqual(result["budget"]["remaining"], "9.459333")
         self.assertEqual(result["budget"]["launches"], 1)
         self.assertEqual(result["budget"]["busy_instances"], 1)
         self.assertEqual(result["budget"]["hourly_ceiling"], "0.160000")
+
+
+
+class CostTrackingTests(ControllerCase):
+    def test_launch_records_the_quoted_price(self):
+        controller = self.build(observation=observation_demand())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        operation = self.reopened().operation(result["operation"])
+        self.assertEqual(operation.price_micros, 20_000)
+
+    def test_termination_records_the_launch_time_and_settles_the_cost(self):
+        operation_id = self.seed(state="running", operation_id="live", reservation=540_000)
+        launched_at = self.clock.now - 600
+        controller = self.build(observation=observation_empty())
+        self.aws.instances_result = [
+            replace(
+                instance(instance_id="i-seed", operation=operation_id, state="terminated"),
+                launch_time=launched_at,
+            )
+        ]
+        controller.apply()
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "terminal")
+        self.assertEqual(operation.launch_time, launched_at)
+        # 600 seconds at the configured cap; the seed row carries no accepted price.
+        self.assertEqual(operation.settled_micros, 6_667)
+
+    def test_an_unobserved_instance_settles_a_full_lifetime(self):
+        operation_id = self.seed(state="running", operation_id="live", reservation=540_000)
+        self.clock.advance(INSTANCE_RETENTION_SECONDS + 1)
+        controller = self.build(observation=observation_empty())
+        self.aws.instances_result = []
+        controller.apply()
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "terminal")
+        self.assertEqual(operation.settled_micros, 40_000)
+
+    def test_settlement_is_written_once(self):
+        operation_id = self.seed(state="running", operation_id="live", reservation=540_000)
+        launched_at = self.clock.now - 600
+        controller = self.build(observation=observation_empty())
+        self.aws.instances_result = [
+            replace(
+                instance(instance_id="i-seed", operation=operation_id, state="terminated"),
+                launch_time=launched_at,
+            )
+        ]
+        controller.apply()
+        first = self.reopened().operation(operation_id).settled_micros
+        controller.apply()
+        self.assertEqual(self.reopened().operation(operation_id).settled_micros, first)
 
 
 class ReapTests(ControllerCase):

@@ -100,6 +100,19 @@ class ConfigTests(unittest.TestCase):
             load(path)
         self.assertIn("budget.allowance", raised.exception.detail)
 
+    def test_incidental_rate_defaults_to_zero(self):
+        self.assertEqual(load(write_config(self.root)).budget.incidental_per_hour, 0)
+
+    def test_incidental_rate_is_parsed_in_micros(self):
+        path = write_config(self.root, config={"budget": {"incidental_per_hour": "0.005"}})
+        self.assertEqual(load(path).budget.incidental_per_hour, 5_000)
+
+    def test_incidental_rate_refuses_a_float(self):
+        path = write_config(self.root, config={"budget": {"incidental_per_hour": 0.005}})
+        with self.assertRaises(ConfigRefusal) as raised:
+            load(path)
+        self.assertIn("budget.incidental_per_hour", raised.exception.detail)
+
     def test_refuses_missing_lifetime(self):
         path = write_config(self.root)
         path.write_text(path.read_text().replace("max_lifetime_seconds = 3600\n", ""))

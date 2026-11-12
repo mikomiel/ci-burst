@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .aws import Aws
+from .cost import CostModel
 from .errors import ProviderRefusal
 from .ledger import NONTERMINAL, TERMINAL, Ledger, current_window
 
@@ -389,7 +390,10 @@ class RunSummary:
     console_reads: int = 0
     states: dict = field(default_factory=dict)
     totals: dict = field(default_factory=_empty_totals)
-    ledger_consumed_micros: int | None = None
+    spend_micros: int | None = None
+    committed_micros: int | None = None
+    allowance_micros: int | None = None
+    remaining_micros: int | None = None
     ledger_operations: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
     duration: float = 0.0
@@ -402,7 +406,10 @@ class RunSummary:
             "events_emitted": self.new_events,
             "worker_states": dict(sorted(self.states.items())),
             "totals": dict(sorted(self.totals.items())),
-            "ledger_consumed_micros": self.ledger_consumed_micros,
+            "spend_micros": self.spend_micros,
+            "committed_micros": self.committed_micros,
+            "allowance_micros": self.allowance_micros,
+            "remaining_micros": self.remaining_micros,
             "ledger_operations": dict(sorted(self.ledger_operations.items())),
             "duration_seconds": round(self.duration, 3),
             "notes": list(self.notes),
@@ -510,7 +517,12 @@ class Exporter:
             if created:
                 ledger.connect(create=False, read_only=True)
             window = current_window(now, self.config.budget.window_seconds)
-            summary.ledger_consumed_micros = ledger.consumed_micros(window)
+            cost = CostModel.from_config(self.config)
+            totals = ledger.window_totals(window, cost, now)
+            summary.spend_micros = totals["spend"]
+            summary.committed_micros = totals["committed"]
+            summary.allowance_micros = self.config.budget.allowance
+            summary.remaining_micros = self.config.budget.allowance - totals["committed"]
             counts = {}
             for operation in ledger.operations():
                 # The ledger column is unrestricted text; only its own
@@ -521,7 +533,10 @@ class Exporter:
             if "invalid" in counts and "ledger_state_unknown" not in summary.notes:
                 summary.notes.append("ledger_state_unknown")
         except Exception:  # noqa: BLE001 - an absent ledger must not fail the run
-            summary.ledger_consumed_micros = None
+            summary.spend_micros = None
+            summary.committed_micros = None
+            summary.allowance_micros = None
+            summary.remaining_micros = None
             summary.ledger_operations = {}
             if "ledger_omitted" not in summary.notes:
                 summary.notes.append("ledger_omitted")
@@ -780,12 +795,30 @@ def render_metrics(summary, now, console_reads_total):
         "Workers that ended without ever showing the registration step.",
         [({}, total("unregistered"))],
     )
-    if summary.ledger_consumed_micros is not None:
+    if summary.spend_micros is not None:
         emit(
-            "ci_burst_ledger_consumed_micros",
+            "ci_burst_spend_micros",
             "gauge",
-            "Allowance committed in the current budget window, in micros of currency.",
-            [({}, summary.ledger_consumed_micros)],
+            "Tracked cost of operations admitted in the current budget window, in micros.",
+            [({}, summary.spend_micros)],
+        )
+        emit(
+            "ci_burst_committed_micros",
+            "gauge",
+            "Tracked window cost plus the worst-case remaining life of every non-terminal operation.",
+            [({}, summary.committed_micros)],
+        )
+        emit(
+            "ci_burst_allowance_micros",
+            "gauge",
+            "Configured allowance of the current budget window, in micros.",
+            [({}, summary.allowance_micros)],
+        )
+        emit(
+            "ci_burst_remaining_micros",
+            "gauge",
+            "Allowance minus the current commitment; admission needs this to stay positive.",
+            [({}, summary.remaining_micros)],
         )
         emit(
             "ci_burst_ledger_operations",

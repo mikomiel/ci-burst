@@ -38,10 +38,11 @@ from .aws import (
     is_capacity_failure,
 )
 from .config import ZoneCandidate
+from .cost import CostModel
 from .errors import ProviderRefusal, Refusal, StateRefusal
 from .forgejo import ForgejoObserver
 from .ledger import Ledger, current_window
-from .money import format_money, hourly_cost_micros
+from .money import format_money
 
 WRITER_TOPOLOGY = "one deployment, one controller host, one durable ledger, one writer"
 
@@ -55,10 +56,11 @@ CLIENT_TOKEN_MAX_AGE_SECONDS = 24 * 60 * 60
 INSTANCE_RETENTION_SECONDS = 60 * 60
 
 COST_SCOPE_NOTE = (
-    "The reservation estimates compute at the configured maximum Spot price for the configured "
-    "maximum lifetime, plus the configured non-compute allowance. It does not bound EBS, data "
-    "transfer, public addressing, log delivery, minimum billing increments, failed cleanup or "
-    "other charges, and it is not a guaranteed cap on the AWS bill."
+    "Tracked cost estimates compute at the Spot price taken when the launch was accepted, plus "
+    "one configured hourly incidental rate; the forward commitment prices unlived time at the "
+    "configured maximum Spot price. The estimate does not bound EBS, data transfer, log delivery, "
+    "minimum billing increments, failed cleanup or price movement, and it is not a guaranteed cap "
+    "on the AWS bill."
 )
 
 
@@ -99,6 +101,7 @@ class Controller:
         self.observer = observer or ForgejoObserver(config)
         self.aws = aws or Aws(config, clock=clock)
         self.ledger = ledger or Ledger(config.state.database, clock=clock)
+        self.cost = CostModel.from_config(config)
 
     # -- operation ------------------------------------------------------
     def plan(self):
@@ -140,8 +143,13 @@ class Controller:
         """Take one bounded admission and launch decision."""
         result = self._base("apply")
         self.config.require_live_contract()
-        self.ledger.connect(create=True)
+        # The writer lock precedes the connect: a version-1 file is copied and
+        # upgraded by that connect, and that mutation may not race a second writer.
         self.ledger.acquire_writer()
+        self.ledger.connect(
+            create=True,
+            backfill=(self.config.aws.max_spot_price, self.config.budget.incidental_per_hour),
+        )
         try:
             account = self.aws.account_id()
             instances = self.aws.owned_instances(self.config.deployment)
@@ -184,18 +192,25 @@ class Controller:
         result["state"] = state
         result["slot"] = self._slot_from_state(state)
         window_start = current_window(self.clock(), self.config.budget.window_seconds)
-        consumed = self.ledger.consumed_micros(window_start) if self.ledger.available else 0
+        totals = (
+            self.ledger.window_totals(window_start, self.cost, self.clock())
+            if self.ledger.available
+            else {"spend": 0, "committed": 0}
+        )
         launches = self.ledger.window_launches(window_start) if self.ledger.available else 0
         result["controller"] = {"max_instances": self.config.controller.max_instances}
         result["budget"] = {
             "window_start": window_start,
             "window_seconds": self.config.budget.window_seconds,
             "allowance": format_money(self.config.budget.allowance),
-            "consumed": format_money(consumed),
+            "spend": format_money(totals["spend"]),
+            "committed": format_money(totals["committed"]),
+            "remaining": format_money(self.config.budget.allowance - totals["committed"]),
             "launches": launches,
             "busy_instances": result["slot"]["instances"],
             "hourly_ceiling": format_money(
-                self.config.aws.max_spot_price * self.config.controller.max_instances
+                (self.config.aws.max_spot_price + self.config.budget.incidental_per_hour)
+                * self.config.controller.max_instances
             ),
         }
         try:
@@ -416,26 +431,31 @@ class Controller:
             reasons.append("no_eligible_candidate")
             return decision, plans
         window_start = current_window(now, self.config.budget.window_seconds)
-        per_launch = hourly_cost_micros(
-            self.config.aws.max_spot_price, self.config.aws.max_lifetime_seconds
-        ) + self.config.budget.non_compute_allowance
-        consumed = self.ledger.consumed_micros(window_start) if self.ledger.available else 0
-        # A consumed amount above the allowance permits no launch; the count of
-        # affordable reservations is never negative.
-        affordable = max(0, (self.config.budget.allowance - consumed) // per_launch)
+        per_launch = self.cost.per_launch_micros()
+        totals = (
+            self.ledger.window_totals(window_start, self.cost, now)
+            if self.ledger.available
+            else {"spend": 0, "committed": 0}
+        )
+        committed = totals["committed"]
+        # A commitment above the allowance permits no launch; the count of
+        # affordable worst-case workers is never negative.
+        affordable = max(0, (self.config.budget.allowance - committed) // per_launch)
         launch_count = min(requested, min(affordable, free))
         decision["launch_count"] = launch_count
         decision["budget"] = {
             "window_start": window_start,
             "window_seconds": self.config.budget.window_seconds,
             "allowance": format_money(self.config.budget.allowance),
-            "consumed": format_money(consumed),
-            # Kept for consumers that predate the fleet: the reservation one
+            "spend": format_money(totals["spend"]),
+            "committed": format_money(committed),
+            "remaining": format_money(self.config.budget.allowance - committed),
+            # Kept for consumers that predate the fleet: the worst case one
             # worker costs. ``per_launch_reservation`` is the clearer name.
             "required_reservation": format_money(per_launch),
             "per_launch_reservation": format_money(per_launch),
             "launch_count": launch_count,
-            "remaining_after": format_money(self.config.budget.allowance - consumed - per_launch),
+            "remaining_after": format_money(self.config.budget.allowance - committed - per_launch),
         }
         if affordable < requested:
             notes.append("budget_capped_batch")
@@ -542,6 +562,7 @@ class Controller:
                     region=self.config.aws.region,
                     account=account,
                     detail=request_sha256,
+                    price_micros=selected.quote.price_micros,
                 )
             # Intent is committed before the request, so a lost response is
             # recoverable and never a reason to allocate a second operation for
@@ -652,6 +673,7 @@ class Controller:
                         request_sha256=_sha256(request),
                         client_token=request["ClientToken"],
                         detail="capacity_fallback:" + plans[index - 1].candidate.availability_zone,
+                        price_micros=plan.quote.price_micros,
                     )
                 operation = self.ledger.operation(operation.id)
             else:
@@ -923,6 +945,7 @@ class Controller:
                     )
             elif operation.instance_id:
                 if now - operation.updated_at >= INSTANCE_RETENTION_SECONDS:
+                    self._settle_unretained(operation)
                     self.ledger.set_state(operation.id, "terminal", detail="instance_not_retained")
                 # Inside the retained-visibility window, absence is not yet
                 # proof of termination: keep the slot occupied.
@@ -938,8 +961,14 @@ class Controller:
         return slot, discrepancies
 
     def _reconcile_present(self, operation, instance):
+        # A provider launch time is a real timestamp; zero or absent means the
+        # adapter could not read one, and creation time stays the substitute.
+        if instance.launch_time and operation.launch_time is None:
+            self.ledger.set_launch_time(operation.id, instance.launch_time)
+            operation = self.ledger.operation(operation.id)
         state = instance.state
         if state == "terminated":
+            self._settle(operation)
             self.ledger.set_state(operation.id, "terminal", instance_id=instance.instance_id, detail="instance_terminated")
         elif state in ("shutting-down", "stopping", "stopped"):
             self.ledger.set_state(operation.id, "terminating", instance_id=instance.instance_id)
@@ -949,6 +978,24 @@ class Controller:
             self.ledger.set_state(operation.id, "running", instance_id=instance.instance_id)
         else:
             self.ledger.set_state(operation.id, "starting", instance_id=instance.instance_id)
+
+    def _settle(self, operation):
+        """Write the final tracked cost for an operation whose instance ended."""
+        if operation.settled_micros is not None:
+            return
+        now = self.clock()
+        self.ledger.settle(operation.id, self.cost.accrued_micros(operation, now), now)
+
+    def _settle_unretained(self, operation):
+        """Charge a full lifetime when the provider record aged out unobserved.
+
+        The worker was last seen non-terminal at least the retention window ago
+        and its own lifetime is shorter than that, so the full configured
+        lifetime is the only defensible estimate; it never under-counts.
+        """
+        if operation.settled_micros is not None:
+            return
+        self.ledger.settle(operation.id, self.cost.full_lifetime_micros(), self.clock())
 
     def _discrepancies(self, operations, instances):
         known = {

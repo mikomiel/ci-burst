@@ -1,5 +1,6 @@
 import io
 import json
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -74,6 +75,13 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("confirmation", payload)
         self.assertEqual(aws.mutations(), [])
         self.assertFalse((self.root / "state.sqlite3").exists())
+
+    def test_apply_without_the_aws_sdk_reports_the_documented_refusal(self):
+        missing = {"boto3": None, "botocore": None, "botocore.config": None}
+        with mock.patch.dict(sys.modules, missing):
+            code, payload = self.run_cli(["apply", "--config", str(write_config(self.root))])
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error"]["reason"], "AWS_SDK_UNAVAILABLE")
 
     def test_unknown_command_is_a_usage_error(self):
         with redirect_stdout(io.StringIO()):

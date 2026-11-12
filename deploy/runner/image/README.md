@@ -24,14 +24,14 @@ caches: a from-scratch build starts cold, which is slower but correct.
 |---|---|
 | uv | 0.13.7 |
 | node | 24.22.1 |
-| ruff | 0.17.3 |
+| ruff | input — the persistent fleet's `ruff_version` |
 | promtool | 3.16.0 |
 | forgejo-runner | 13.2.1 |
 
-The persistent fleet's source pin is the contract. `ruff` is the one value that
-currently differs: the fleet's source pin is 0.17.4 while this image carries
-0.17.3. Bump both together when the fleet is converged; a changed image is a new
-launch-template version, never an in-place edit.
+The ruff pin is an input, not a literal. Set it from the persistent fleet's
+source pin (`ansible-homelab/inventory/group_vars/all.yml`, `ruff_version`) so
+the image and the fleet cannot drift silently. The current image carries
+0.17.3; the source pin after the 2026-11-11 bump is 0.17.4.
 
 ## Build
 
@@ -39,10 +39,18 @@ launch-template version, never an in-place edit.
    deployment uses Debian 13 arm64) in the deployment's subnet. The provision
    script needs no Forgejo credential and no instance profile; the worker's
    registration is the runtime bootstrap's job, after the image is published.
-2. Publish `provision.sh` as the builder's user data and wait for `IMAGE_READY`
-   on the serial console. The script prints `STEP` markers and a `PROBE end
-   have=N miss=M` line; any `MISS` fails the build. The builder self-terminates
-   after 3600 s, so snapshot it while it is still running.
+2. Build the user data with the ruff pin prepended, publish it, and wait for
+   `IMAGE_READY` on the serial console:
+
+   ```sh
+   { printf 'export RUFF_VERSION=0.17.4\n'; cat deploy/runner/image/provision.sh; } \
+     > /tmp/worker-image-user-data.sh
+   ```
+
+   Use the persistent fleet's current `ruff_version`; 0.17.4 is the source pin,
+   0.17.3 reproduces the current image. The script prints `STEP` markers and a
+   `PROBE end have=N miss=M` line; any `MISS` fails the build. The builder
+   self-terminates after 3600 s, so snapshot it while it is still running.
 3. Create the image without rebooting the builder:
 
    ```sh
@@ -63,6 +71,21 @@ launch-template version, never an in-place edit.
 The image build is operator-owned. `provision.sh` does not register a runner,
 read a secret, create an image or publish anything; IAM and network changes
 remain operator actions.
+
+## Job account permissions
+
+`uv tool install` creates the tool environment with the build's `umask` (077 in
+this recipe). The launcher is then present for root but not traversable by the
+`runner` account, and a job's `shutil.which("ruff")` returns `None` while a
+root inventory check reports the tool present. The recipe makes the installed
+trees world-readable and executes the `ruff`/`uv`/`node` checks as `runner`; a
+future edit must keep both.
+
+## Attribution
+
+The image ships no journal. A job's journald records stay on the worker and are
+lost when it terminates, so a run visible only on burst capacity has no central
+attribution record.
 
 ## Why the inventory check exists
 

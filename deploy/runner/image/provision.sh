@@ -35,6 +35,15 @@ systemd-run --on-active=3600 --unit=image-build-lifetime /sbin/shutdown -h now
 
 mount -o remount,noatime / || echo "WARNING: noatime remount refused"
 
+# Required input: the persistent fleet's ruff pin. The build fails rather than
+# guessing, because a literal here is how the image drifted from the source
+# pin. Read it from the deployment repository's ruff_version value.
+RUFF_VERSION="${RUFF_VERSION:-}"
+if [ -z "${RUFF_VERSION}" ]; then
+  echo "provision: RUFF_VERSION must be set to the persistent fleet's ruff_version (ansible-homelab/inventory/group_vars/all.yml)" >&2
+  exit 1
+fi
+
 apt-get update -y
 # libc6-dev is explicit on purpose. --no-install-recommends suppresses the
 # recommendation that would supply it, and gcc alone then fails to link with
@@ -79,7 +88,6 @@ RUNNER_VERSION=13.2.1
 RUNNER_SHA=eeddb7902f79abe488972f4189fbe3ea02762ee827d1b406b469420bf0d62dd9
 PROMTOOL_VERSION=3.16.0
 PROMTOOL_SHA=fd8571b8162f4020232d886f17340bcf92e1722985ae3b4c1d096157826c0fbe
-RUFF_VERSION=0.17.3
 ARCH=arm64
 
 curl -fsSL --max-time 60 -o /tmp/uv.tar.gz \
@@ -105,8 +113,11 @@ echo "STEP node"
 
 # Both directories, never only the bin directory: the launcher is a symlink
 # into the tool environment, so an environment only root can traverse is a
-# launcher the job account cannot execute. This is the same lesson as the
-# persistent fleet's uv-tool install.
+# launcher the job account cannot execute. `uv tool install` honours the
+# build's umask (077 here) and creates that environment 0700 root, which is
+# exactly the "present to root, absent to the job" shape the runner check
+# below exists to catch. This is the same lesson as the persistent fleet's
+# uv-tool install.
 install -d -m 0755 /usr/local/lib/uv-tools
 UV_TOOL_DIR=/usr/local/lib/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin \
   uv tool install "ruff==${RUFF_VERSION}"

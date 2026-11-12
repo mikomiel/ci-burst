@@ -70,9 +70,15 @@ def _sha256(payload):
 
 @dataclass(frozen=True)
 class CandidatePlan:
-    """One ordered placement candidate and the evidence gathered for it."""
+    """One ordered placement pool and the evidence gathered for it.
+
+    A pool is one configured zone and one configured instance type. When no type
+    list is configured the pool is the launch template's own type, so the
+    original single-type form keeps one plan per candidate.
+    """
 
     candidate: ZoneCandidate
+    instance_type: str
     template: Template
     quote: SpotQuote | None
     reason: str | None
@@ -81,9 +87,15 @@ class CandidatePlan:
     def eligible(self):
         return self.reason is None
 
+    @property
+    def label(self):
+        """The pool identity used in attempt records and fallback detail."""
+        return f"{self.candidate.availability_zone}/{self.instance_type}"
+
     def as_dict(self):
         data = {
             "zone": self.candidate.availability_zone,
+            "instance_type": self.instance_type,
             "subnet_id": self.candidate.subnet_id,
             "launch_template_version": self.candidate.launch_template_version,
             "status": "eligible" if self.eligible else "skipped",
@@ -338,24 +350,40 @@ class Controller:
         return templates
 
     def _candidate_plans(self, templates):
-        """Price every candidate in order, before any time-sensitive check."""
-        plans = []
+        """Price every pool in order, before any time-sensitive check.
+
+        The order is type-major: every configured type keeps its configured
+        priority, and within one type the configured zone order is the fallback
+        order. A candidate's own template prerequisites are evaluated once and
+        repeated for each type, so a pool is reported with the reason it cannot
+        be used instead of being silently dropped.
+        """
+        candidates = []
         for candidate in self.config.aws.zones:
             template = templates[candidate.launch_template_version]
+            reason = None
             if not template.has_user_data:
-                plans.append(CandidatePlan(candidate, template, None, "template_bootstrap_missing"))
-                continue
-            if template.placement_zone is not None and template.placement_zone != candidate.availability_zone:
-                plans.append(CandidatePlan(candidate, template, None, "template_placement_mismatch"))
-                continue
-            # A provider error here is not a candidate property: the price
-            # evidence itself is unavailable, so the whole plan refuses rather
-            # than silently dropping a configured candidate.
-            quote = self.aws.spot_quote(template.instance_type, candidate.availability_zone)
-            if quote is None:
-                plans.append(CandidatePlan(candidate, template, None, "spot_price_unavailable"))
-                continue
-            plans.append(CandidatePlan(candidate, template, quote, None))
+                reason = "template_bootstrap_missing"
+            elif template.placement_zone is not None and template.placement_zone != candidate.availability_zone:
+                reason = "template_placement_mismatch"
+            candidates.append((candidate, template, reason))
+        plans = []
+        for configured_type in self.config.aws.instance_types or (None,):
+            for candidate, template, reason in candidates:
+                instance_type = configured_type or template.instance_type
+                if reason is not None:
+                    plans.append(CandidatePlan(candidate, instance_type, template, None, reason))
+                    continue
+                # A provider error here is not a candidate property: the price
+                # evidence itself is unavailable, so the whole plan refuses
+                # rather than silently dropping a configured candidate.
+                quote = self.aws.spot_quote(instance_type, candidate.availability_zone)
+                if quote is None:
+                    plans.append(
+                        CandidatePlan(candidate, instance_type, template, None, "spot_price_unavailable")
+                    )
+                    continue
+                plans.append(CandidatePlan(candidate, instance_type, template, quote, None))
         return plans
 
     def _decide(self, observation, slot):
@@ -413,7 +441,7 @@ class Controller:
                 judged.append(replace(plan, reason="spot_price_stale"))
             elif (
                 plan.quote.availability_zone != plan.candidate.availability_zone
-                or plan.quote.instance_type != plan.template.instance_type
+                or plan.quote.instance_type != plan.instance_type
             ):
                 judged.append(replace(plan, reason="spot_price_wrong_scope"))
             elif plan.quote.price_micros > self.config.aws.max_spot_price:
@@ -474,12 +502,16 @@ class Controller:
         return decision, plans
 
     def _request(self, plan, expires_at, operation_id):
-        """Build the one launch request for a candidate."""
+        """Build the one launch request for a pool."""
         request = {
             "LaunchTemplate": {
                 "LaunchTemplateId": plan.template.template_id,
                 "Version": str(plan.template.version),
             },
+            # The pool's type is sent explicitly even when it equals the
+            # template's own value: one code path, and the frozen request says
+            # exactly which pool was requested.
+            "InstanceType": plan.instance_type,
             "Placement": {"AvailabilityZone": plan.candidate.availability_zone},
             "InstanceMarketOptions": {
                 "MarketType": "spot",
@@ -516,15 +548,27 @@ class Controller:
     def _launch(self, result, decision, plans, account):
         """Launch the admitted workers, one operation and token per worker.
 
-        The candidate order is rotated cyclically by the worker index, and each
-        worker starts at the first candidate whose quote is still fresh; earlier
-        candidates in that rotation are recorded as skipped. A worker is
-        committed only while the shared admission lifetime remains, so a slow
-        earlier request cannot create an intent that is already expired. A
-        launch that does not end accepted stops the rest of the batch; the
-        workers already launched stay in place.
+        The pool order is rotated cyclically by the worker index within the
+        first eligible type's block, and each worker starts at the first pool
+        whose quote is still fresh; earlier pools in that rotation are recorded
+        as skipped. Rotating inside the preferred type keeps the batch spread
+        across zones, while a later type is reached only by a definite capacity
+        rejection, so the order stays the preference. A worker is committed only
+        while the shared admission lifetime remains, so a slow earlier request
+        cannot create an intent that is already expired. A launch that does not
+        end accepted stops the rest of the batch; the workers already launched
+        stay in place.
         """
         eligible = [plan for plan in plans if plan.eligible]
+        preferred = eligible[0].instance_type
+        block = 0
+        while block < len(eligible) and eligible[block].instance_type == preferred:
+            block += 1
+        # A configured type list makes the first block the preferred type, so
+        # rotation stays inside it and the later blocks remain fallbacks. Without
+        # a list each candidate's type comes from its own template version, which
+        # is not a preference order: keep the original whole-list rotation.
+        width = block if self.config.aws.instance_types else len(eligible)
         launches = []
         result["launches"] = launches
         for index in range(decision["launch_count"]):
@@ -535,9 +579,14 @@ class Controller:
                 result["decision"] = "launched" if launches else "refused"
                 result.setdefault("reasons", []).append("admission_expired")
                 return result
-            start = index % len(eligible)
-            rotated = eligible[start:] + eligible[:start]
-            position, skipped = self._first_fresh(rotated)
+            start = index % width
+            rotated = eligible[start:width] + eligible[:start] + eligible[width:]
+            # With a configured list only the preferred block may supply the
+            # starting pool: a worker must never begin on a fallback type
+            # without a capacity rejection. The later blocks stay in ``order``
+            # so such a rejection can still reach them.
+            search = rotated[:width] if self.config.aws.instance_types else rotated
+            position, skipped = self._first_fresh(search)
             if position is None:
                 # No remaining worker can start on fresh evidence, and nothing
                 # was committed for this one.
@@ -570,11 +619,13 @@ class Controller:
             attempt = {}
             self._send_candidates(operation, order, attempt, decision)
             attempts = skipped + attempt.get("attempts", [])
+            accepted_zone, accepted_type = self._accepted_pool(attempts, operation)
             launches.append(
                 {
                     "operation": operation.id,
                     "instance_id": attempt.get("instance_id"),
-                    "zone": self._accepted_zone(attempts, operation),
+                    "zone": accepted_zone,
+                    "instance_type": accepted_type,
                     "reservation": attempt.get(
                         "reservation", format_money(operation.reservation_micros)
                     ),
@@ -605,7 +656,7 @@ class Controller:
         return result
 
     def _first_fresh(self, plans):
-        """Return the first fresh candidate's position and the skipped ones."""
+        """Return the first fresh pool's position and the skipped ones."""
         now = self.clock()
         skipped = []
         for position, plan in enumerate(plans):
@@ -613,6 +664,7 @@ class Controller:
                 skipped.append(
                     {
                         "zone": plan.candidate.availability_zone,
+                        "instance_type": plan.instance_type,
                         "outcome": "skipped",
                         "reason": "spot_price_stale",
                     }
@@ -621,24 +673,29 @@ class Controller:
             return position, skipped
         return None, skipped
 
-    def _accepted_zone(self, attempts, operation):
-        """The placement that accepted this worker, else its final frozen request."""
+    def _accepted_pool(self, attempts, operation):
+        """The pool that accepted this worker, else its final frozen request."""
         for attempt in attempts:
             if attempt.get("outcome") == "accepted":
-                return attempt["zone"]
+                return attempt["zone"], attempt["instance_type"]
         final = self.ledger.operation(operation.id) or operation
-        return final.request()["Placement"]["AvailabilityZone"]
+        request = final.request()
+        return request["Placement"]["AvailabilityZone"], request.get("InstanceType", "")
 
     def _send_candidates(self, operation, plans, result, decision):
-        """Attempt the ordered candidates within one admission.
+        """Attempt the ordered pools within one admission.
 
         Only a definite capacity rejection, which proves that no instance was
-        created, advances to the next candidate. The operation identity,
-        reservation, expiry and admission window stay; the frozen request, its
-        hash and its own idempotency token advance with the placement, so the
-        same demand is never admitted twice.
+        created, advances to the next pool. The operation identity, reservation,
+        expiry and admission window stay; the frozen request, its hash and its
+        own idempotency token advance with the placement, so the same demand is
+        never admitted twice.
         """
         attempts = []
+        # The pool the previous request actually went to. A plan skipped for
+        # stale evidence was never attempted, so it must not be reported as the
+        # pool the fallback left.
+        attempted = None
         for index, plan in enumerate(plans):
             if index:
                 now = self.clock()
@@ -660,6 +717,7 @@ class Controller:
                     attempts.append(
                         {
                             "zone": plan.candidate.availability_zone,
+                            "instance_type": plan.instance_type,
                             "outcome": "skipped",
                             "reason": "spot_price_stale",
                         }
@@ -672,19 +730,27 @@ class Controller:
                         request=request,
                         request_sha256=_sha256(request),
                         client_token=request["ClientToken"],
-                        detail="capacity_fallback:" + plans[index - 1].candidate.availability_zone,
+                        detail="capacity_fallback:" + attempted.label,
                         price_micros=plan.quote.price_micros,
                     )
                 operation = self.ledger.operation(operation.id)
             else:
                 request = operation.request()
+            attempted = plan
             outcome, refusal = self._send(operation, request, result, "launched", defer_capacity=True)
             if outcome == "accepted":
-                attempts.append({"zone": plan.candidate.availability_zone, "outcome": "accepted"})
+                attempts.append(
+                    {
+                        "zone": plan.candidate.availability_zone,
+                        "instance_type": plan.instance_type,
+                        "outcome": "accepted",
+                    }
+                )
                 result["attempts"] = attempts
                 return
             attempt = {
                 "zone": plan.candidate.availability_zone,
+                "instance_type": plan.instance_type,
                 "outcome": {"capacity": "capacity_rejected", "refused": "rejected"}.get(outcome, outcome),
             }
             attempt.update(refusal.as_dict())

@@ -702,22 +702,25 @@ class FleetTests(ControllerCase):
     def fleet_config(self, max_instances=4):
         return load(write_config(self.root, config={"controller": {"max_instances": max_instances}}))
 
-    def zone_config(self, *, max_instances=2, zones=("eu-central-1a", "eu-central-1b")):
+    def zone_config(
+        self,
+        *,
+        max_instances=2,
+        zones=("eu-central-1a", "eu-central-1b"),
+        instance_types=None,
+    ):
+        aws = {
+            "availability_zones": [
+                {"zone": zone, "subnet_id": f"subnet-0123456789abcdef{index:x}"}
+                for index, zone in enumerate(zones)
+            ]
+        }
+        if instance_types is not None:
+            aws["instance_types"] = list(instance_types)
         return load(
             write_config(
                 self.root,
-                config={
-                    "controller": {"max_instances": max_instances},
-                    "aws": {
-                        "availability_zones": [
-                            {
-                                "zone": zone,
-                                "subnet_id": f"subnet-0123456789abcdef{index:x}",
-                            }
-                            for index, zone in enumerate(zones)
-                        ]
-                    },
-                },
+                config={"controller": {"max_instances": max_instances}, "aws": aws},
             )
         )
 
@@ -863,8 +866,13 @@ class FleetTests(ControllerCase):
         self.assertEqual(
             second["attempts"],
             [
-                {"zone": "eu-central-1b", "outcome": "skipped", "reason": "spot_price_stale"},
-                {"zone": "eu-central-1a", "outcome": "accepted"},
+                {
+                    "zone": "eu-central-1b",
+                    "instance_type": "t4g.small",
+                    "outcome": "skipped",
+                    "reason": "spot_price_stale",
+                },
+                {"zone": "eu-central-1a", "instance_type": "t4g.small", "outcome": "accepted"},
             ],
         )
 
@@ -885,16 +893,18 @@ class FleetTests(ControllerCase):
         result = controller.apply()
         launch = result["launches"][0]
         self.assertEqual(launch["zone"], "eu-central-1b")
+        self.assertEqual(launch["instance_type"], "t4g.small")
         self.assertEqual(
             launch["attempts"],
             [
                 {
                     "zone": "eu-central-1a",
+                    "instance_type": "t4g.small",
                     "outcome": "capacity_rejected",
                     "reason": "AWS_REFUSED",
                     "detail": "InsufficientInstanceCapacity",
                 },
-                {"zone": "eu-central-1b", "outcome": "accepted"},
+                {"zone": "eu-central-1b", "instance_type": "t4g.small", "outcome": "accepted"},
             ],
         )
         operation = self.reopened().operation(result["operation"])
@@ -922,6 +932,39 @@ class FleetTests(ControllerCase):
             ["eu-central-1a", "eu-central-1b", "eu-central-1a", "eu-central-1b"],
         )
         self.assertEqual(len({entry["instance_id"] for entry in result["launches"]}), 4)
+
+    def test_a_batch_stays_on_the_preferred_type_and_still_alternates_zones(self):
+        config = self.zone_config(
+            max_instances=4, instance_types=["t4g.small", "c7g.large"]
+        )
+        quotes = {
+            (instance_type, zone): quote(
+                clock=self.clock, availability_zone=zone, instance_type=instance_type
+            )
+            for instance_type in ("t4g.small", "c7g.large")
+            for zone in ("eu-central-1a", "eu-central-1b")
+        }
+        controller = self.build(
+            observation=observation_demand(4),
+            aws=FakeAws(spot_quote=quotes),
+            config=config,
+        )
+        result = controller.apply()
+        runs = [call[1] for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(
+            [(run["InstanceType"], run["Placement"]["AvailabilityZone"]) for run in runs],
+            [
+                ("t4g.small", "eu-central-1a"),
+                ("t4g.small", "eu-central-1b"),
+                ("t4g.small", "eu-central-1a"),
+                ("t4g.small", "eu-central-1b"),
+            ],
+        )
+        self.assertEqual(
+            [entry["instance_type"] for entry in result["launches"]],
+            ["t4g.small"] * 4,
+        )
 
     def test_allowance_caps_a_batch_and_notes_the_cap(self):
         config = load(

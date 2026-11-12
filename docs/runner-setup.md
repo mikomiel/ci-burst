@@ -184,7 +184,8 @@ Create a launch template with a pinned, numeric version. ci-burst refuses a
 template that is missing any of these:
 
 - a literal `ImageId`, never `resolve:ssm:` or another alias;
-- an `InstanceType` (the controller prices exactly that type);
+- an `InstanceType` — the default pool, and the shape anchor when
+  `aws.instance_types` names a list;
 - `InstanceInitiatedShutdownBehavior = terminate`;
 - bootstrap `UserData`.
 
@@ -193,7 +194,7 @@ Set these values:
 | Setting | Value |
 | --- | --- |
 | Image | an image matching the instance architecture, with cloud-init and the runner preinstalled (see [The worker image](#the-worker-image)) |
-| Instance type | sized like your existing runners; arm64 images need `t4g`/`c7g`/`m7g`/`r7g` |
+| Instance type | sized like your existing runners; arm64 images need `t4g`/`c7g`/`m7g`/`r7g`. A deployment may also list further types of the same shape and architecture in `aws.instance_types` |
 | IAM instance profile | `forgejo-runner` |
 | Metadata options | IMDSv2 required (`HttpTokens=required`), hop limit 1 |
 | Network | the subnet and security group from section 3 |
@@ -217,6 +218,11 @@ Without it, launches fail with
 `AuthFailure.ServiceLinkedRoleCreationNotPermitted`.
 
 ### The worker image
+
+When a deployment configures `aws.instance_types`, the image is shared by every
+type in that list, so every type must be the same architecture as the image and
+must still boot it. The prerequisite check proves architecture support only; a
+canary launch per new type proves boot and registration.
 
 The template boots a prebuilt image, not a stock distribution. The image is an
 operator-owned prerequisite; this repository carries the build recipe at

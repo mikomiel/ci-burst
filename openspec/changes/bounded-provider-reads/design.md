@@ -11,10 +11,11 @@ later phases need. The deployed unit eventually kills the container at
 
 ## Goals / Non-Goals
 
-**Goals:** bound a single transport call; bound the whole pass below the
-systemd unit's start timeout; make an interrupted pass explicit and
-deterministic; preserve the frozen intent and token on every mutation path;
-keep the independent reaper outside the scaler's budget.
+**Goals:** add transport timeouts to each provider request; run one `apply`
+pass under a cooperative deadline that stays below the systemd unit's start
+timeout; make an interrupted pass explicit and deterministic; preserve the
+frozen intent and token on every mutation path; keep the independent reaper
+outside the scaler's budget.
 
 **Non-Goals:** a new scheduler, a background cancellation thread, a provider
 plugin framework, changing retry counts, changing `reap`, `status` or `export`,
@@ -42,14 +43,29 @@ not complete. A local `DeadlineRefusal` is the one control-flow signal; it is a
 small `Refusal` subclass with the reason `pass_deadline_exceeded`, not a second
 error mechanism.
 
-### Transport bounds are not the pass bound
+### Transport timeouts and a cooperative pass deadline
 
 The EC2 and STS clients carry `connect_timeout=10` and `read_timeout=30`
-alongside the existing `total_max_attempts=1` policy. These bound one in-flight
-call; they do not change retries or the number of calls. The pass deadline
-bounds the sequence of calls. A call already in flight is not interrupted; the
-next phase check, or the next page or identifier check, refuses after it
-returns.
+alongside the existing `total_max_attempts=1` policy; these do not change
+retries or the number of calls. A socket read timeout is not a total-response
+deadline: it bounds one connect or read step, and a slow trickle or a call
+already in flight can still outlast the budget. Together with the pass
+deadline this is a cooperative bound, not a guaranteed whole-call bound: the
+deadline is checked between phases and before each read, so the controller
+stops starting work when the budget is spent, and the transport timeouts stop a
+single stalled step from waiting indefinitely. A call already in flight is not
+interrupted; the next phase check, or the next page or identifier check,
+refuses after it returns.
+
+### The accepted pass budget stays below the unit timeout
+
+`controller.pass_deadline_seconds` accepts `30..290`, default `240`. The whole
+accepted range stays below the shipped `TimeoutStartSec=300`, so the longest
+configured budget keeps headroom for the process to report its result instead
+of being killed at the unit's outer bound. A deployment that needs a longer
+pass must raise the unit timeout; the configuration does not offer a value
+above `290`, because accepting one would let the unit kill the process without
+the structured deferral this change promises.
 
 ### Mutations never take the deadline
 
@@ -74,11 +90,14 @@ shapes and behaviour. Expiry cleanup therefore remains available when an
   unresolved until the next scheduled run; `phases_deferred` says so. That is
   safer than sending a mutation without budget for its reconciliation.
 - A provider call that starts just before the deadline can run to its transport
-  timeout (30 s). The next check catches the overrun; the pass does not claim
-  the read finished within budget.
+  timeouts. The next check catches the overrun; the pass does not claim the
+  read finished within budget. At the top of the accepted range that overrun
+  can reach the unit's kill time, which is why a longer pass needs a raised
+  unit timeout rather than a larger setting.
 - The deadline uses the controller's clock. In production that is wall-clock
   time, so a large clock change could shorten or extend one pass; the systemd
   `TimeoutStartSec` remains the outer bound.
-- The default 240 s is below the shipped `TimeoutStartSec=300` but above the
-  smallest allowed `max_lifetime_seconds=60`. The pass deadline and worker
-  lifetime are different bounds; a deliberately short-lived worker is allowed.
+- The accepted pass budget (30..290, default 240) is below the shipped
+  `TimeoutStartSec=300` but above the smallest allowed
+  `max_lifetime_seconds=60`. The pass deadline and worker lifetime are
+  different bounds; a deliberately short-lived worker is allowed.

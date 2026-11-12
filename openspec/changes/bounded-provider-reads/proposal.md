@@ -16,8 +16,11 @@ evidence than an explicit incomplete pass.
 - Add an optional deadline to `owned_instances`, `instances`, `spot_quote` and
   `console_output`, checked before each paginated page and each per-identifier
   read. A call without a deadline behaves exactly as before.
-- Bound one `apply` pass with `controller.pass_deadline_seconds` (30..840,
-  default 240). A reached deadline returns `decision="refused"`,
+- Bound one `apply` pass with `controller.pass_deadline_seconds` (30..290,
+  default 240). The accepted range stays below the shipped unit's
+  `TimeoutStartSec=300`, so the whole range leaves the process headroom to
+  report; a deployment that needs a longer pass raises the unit timeout rather
+  than a larger setting. A reached deadline returns `decision="refused"`,
   `reasons=["pass_deadline_exceeded"]` and a `phases_deferred` list naming the
   phases that did not complete.
 - Check the deadline between phases and before the first mutation. A phase that

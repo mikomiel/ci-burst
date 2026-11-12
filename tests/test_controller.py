@@ -9,7 +9,7 @@ from unittest import mock
 
 from ci_burst.config import load
 from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment
-from ci_burst.errors import ConfigRefusal, ProviderRefusal, StateRefusal
+from ci_burst.errors import ConfigRefusal, DeadlineRefusal, ProviderRefusal, StateRefusal
 from ci_burst.aws import DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
 from ci_burst.ledger import Ledger, current_window
 from ci_burst.money import format_money
@@ -749,6 +749,67 @@ class PassDeadlineTests(ControllerCase):
         self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
         self.assertEqual(result["phases_deferred"], ["admission", "launch"])
         self.assertEqual(aws.mutations(), [])
+
+    def slow_final_read(self, seconds=300, **overrides):
+        """A pass whose last Spot read returns after the deadline."""
+        aws = FakeAws(clock=self.clock, **overrides)
+        aws.on_quote = lambda: self.clock.advance(seconds)
+        return aws
+
+    def test_a_final_slow_read_without_a_quote_defers_admission(self):
+        aws = self.slow_final_read(spot_quote=None)
+        result = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["admission", "launch"])
+        self.assertNotIn("refusal", result)
+        self.assertEqual(aws.mutations(), [])
+
+    def test_a_final_slow_read_with_an_above_cap_quote_defers_admission(self):
+        aws = self.slow_final_read(spot_quote=quote(price_micros=50_000, clock=self.clock))
+        result = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["admission", "launch"])
+        self.assertNotIn("refusal", result)
+        self.assertEqual(aws.mutations(), [])
+
+    def test_a_provider_refusal_during_the_final_slow_read_defers_admission(self):
+        aws = self.slow_final_read(
+            spot_quote=ProviderRefusal("AWS_REFUSED", "DescribeSpotPriceHistory")
+        )
+        result = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["admission", "launch"])
+        self.assertNotIn("refusal", result)
+        self.assertEqual(aws.mutations(), [])
+
+    def test_a_refusal_before_the_deadline_is_unchanged(self):
+        aws = FakeAws(spot_quote=quote(price_micros=50_000, clock=self.clock), clock=self.clock)
+        result = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("spot_price_above_cap", result["reasons"])
+        self.assertNotIn("pass_deadline_exceeded", result["reasons"])
+        self.assertNotIn("phases_deferred", result)
+
+    def test_a_deadline_refusal_from_the_by_id_read_rolls_back_reconciliation(self):
+        operation_id = self.seed(state="running", expires_at=self.clock.now + 3600)
+        aws = FakeAws(spot_quote=quote(clock=self.clock), clock=self.clock)
+
+        def refuse_by_id(instance_ids, *, deadline=None):
+            aws.calls.append(("instances", list(instance_ids)))
+            raise DeadlineRefusal("DescribeInstances by-id read")
+
+        aws.instances = refuse_by_id
+        result = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"][0], "reconcile")
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "running")
+        self.assertIsNone(operation.settled_micros)
+        self.assertEqual(operation.reservation_micros, 1_000_000)
 
     def test_a_deadline_before_expiry_cleanup_terminates_nothing(self):
         operation_id = self.seed(state="running", expires_at=self.clock.now - 10)

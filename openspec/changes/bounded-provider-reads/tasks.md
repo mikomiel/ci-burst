@@ -15,13 +15,17 @@ no cloud change.
 
 ## 2. Bounded apply pass
 
-- [x] 2.1 Add `controller.pass_deadline_seconds` (integer 30..840, default 240)
-  to the controller table and its key allowlist.
+- [x] 2.1 Add `controller.pass_deadline_seconds` (integer 30..290, default 240)
+  to the controller table and its key allowlist, keeping the accepted range
+  below the shipped `TimeoutStartSec=300`.
 - [x] 2.2 Compute one deadline in `apply` and thread it through `_reconcile`,
   `_decide` and `_expire` and their provider reads.
 - [x] 2.3 On a reached deadline return `decision="refused"`,
   `reasons=["pass_deadline_exceeded"]` and `phases_deferred`; do not start a
-  later phase or send an expired intent or stale quote.
+  later phase or send an expired intent or stale quote. Exhaust the deadline
+  after `_decide` for every non-mutating outcome, so a final slow admission
+  read that returns no quote, an ineligible quote or a provider refusal
+  reports the deferral; a refusal decided before the deadline is unchanged.
 - [x] 2.4 Never pass the deadline into `_send`, `_launch`, `run_spot` or
   `terminate`; a mutation already started keeps its frozen intent and token, and
   the existing uncertain reconciliation path is unchanged.
@@ -36,17 +40,22 @@ no cloud change.
   optional read hooks with the existing defaults.
 - [x] 3.3 `tests/test_controller.py`: a slow quote read and a deadline between
   candidate quotes produce the bounded incomplete pass with no mutation; a
+  final slow read that returns no quote, an above-cap quote or a provider
+  refusal reports the deadline result, not the ordinary refusal; a pre-deadline
+  refusal is unchanged; a by-id deadline refusal rolls reconciliation back; a
   deadline before expiry terminates nothing; a deadline after a possibly
   accepted launch keeps the frozen operation for resume with the same token; a
   fast pass is unchanged.
-- [x] 3.4 `tests/test_config.py`: the default, both range boundaries and the
-  refusals outside the range and for a non-integer value.
+- [x] 3.4 `tests/test_config.py`: the default, both accepted range boundaries and
+  the refusals outside the range and for a non-integer value.
 
 ## 4. Documentation and OpenSpec
 
 - [x] 4.1 `docs/operations.md`: the pass bound in § Bounds and the deadline versus
   `TimeoutStartSec` versus worker lifetime relation in § Scheduler, cleanup and
   rollback.
-- [x] 4.2 `docs/deployment.md`: the new TOML key and its default.
+- [x] 4.2 `docs/deployment.md`: the new TOML key, its default and accepted
+  range, and the relation to `TimeoutStartSec` and `max_lifetime_seconds`,
+  including that a longer pass raises the unit timeout.
 - [x] 4.3 `docs/container.md`: the systemd relation and the independent reaper.
 - [x] 4.4 This change's `bounded-operation` delta spec.

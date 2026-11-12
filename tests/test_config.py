@@ -34,7 +34,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(load(write_config(self.root)).controller.pass_deadline_seconds, 240)
 
     def test_accepts_the_pass_deadline_range(self):
-        for value in (30, 840):
+        for value in (30, 290):
             with self.subTest(value=value):
                 config = load(
                     write_config(
@@ -44,7 +44,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.controller.pass_deadline_seconds, value)
 
     def test_refuses_a_pass_deadline_outside_the_range(self):
-        for value in (29, 841):
+        for value in (29, 291):
             with self.subTest(value=value):
                 path = write_config(
                     self.root, config={"controller": {"pass_deadline_seconds": value}}
@@ -54,7 +54,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
                 self.assertEqual(
                     raised.exception.detail,
-                    "controller.pass_deadline_seconds: must be between 30 and 840",
+                    "controller.pass_deadline_seconds: must be between 30 and 290",
                 )
 
     def test_refuses_a_non_integer_pass_deadline(self):

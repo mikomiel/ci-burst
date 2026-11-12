@@ -3,7 +3,7 @@
 ## ADDED Requirements
 
 ### Requirement: Provider reads and the pass are bounded
-Every AWS client MUST carry bounded connect and read timeouts without changing retry counts. `owned_instances`, `instances`, `spot_quote` and `console_output` MUST accept an optional deadline and MUST refuse before the next page or identifier once it is reached. One `apply` MUST bound its pass by `controller.pass_deadline_seconds` (30..840, default 240). A read called without a deadline MUST behave as before.
+Every AWS client MUST carry bounded connect and read timeouts without changing retry counts. `owned_instances`, `instances`, `spot_quote` and `console_output` MUST accept an optional deadline and MUST refuse before the next page or identifier once it is reached. One `apply` MUST bound its pass by `controller.pass_deadline_seconds` (30..290, default 240), an accepted range below the shipped unit's `TimeoutStartSec=300`. A read called without a deadline MUST behave as before.
 
 #### Scenario: Inventory pagination reaches the deadline
 - **WHEN** the clock reaches the pass deadline between two `DescribeInstances` pages
@@ -14,14 +14,29 @@ Every AWS client MUST carry bounded connect and read timeouts without changing r
 - **WHEN** a read is called without a deadline
 - **THEN** it consumes every page and identifier exactly as before
 
+#### Scenario: A deployment needs a longer pass
+- **WHEN** a deployment needs a pass longer than `290` seconds
+- **THEN** it raises the unit's `TimeoutStartSec` instead of setting a larger `pass_deadline_seconds`
+- **AND** a larger value is refused as invalid configuration
+
 ### Requirement: A slow provider produces a bounded incomplete pass
-When the pass deadline is reached, `apply` MUST return `decision="refused"` with `reasons=["pass_deadline_exceeded"]` and a `phases_deferred` list naming the phases that did not complete. It MUST NOT send an expired intent or a quote the deadline interrupted, and it MUST NOT terminate an instance it did not select. A phase that has already started MUST complete.
+When the pass deadline is reached, `apply` MUST return `decision="refused"` with `reasons=["pass_deadline_exceeded"]` and a `phases_deferred` list naming the phases that did not complete, including when the read that crossed it returned no usable quote. It MUST NOT send an expired intent or a quote the deadline interrupted, and it MUST NOT terminate an instance it did not select. A phase that has already started MUST complete.
 
 #### Scenario: A slow quote read exhausts the pass
 - **WHEN** a Spot quote read advances the clock past the pass deadline
 - **THEN** `apply` refuses with `pass_deadline_exceeded`
 - **AND** no `RunInstances` or `TerminateInstances` call is made
 - **AND** `phases_deferred` names the phases that did not complete
+
+#### Scenario: A final admission read exhausts the pass
+- **WHEN** the last admission read returns after the pass deadline with no quote, an above-cap quote or a provider refusal
+- **THEN** `apply` reports `pass_deadline_exceeded` and defers `admission` and `launch` instead of returning the ordinary refusal
+- **AND** no `RunInstances` or `TerminateInstances` call is made
+
+#### Scenario: A refusal is decided before the deadline
+- **WHEN** the last admission read returns before the pass deadline with no usable quote
+- **THEN** `apply` returns the ordinary refusal
+- **AND** the result has no `pass_deadline_exceeded` reason and no `phases_deferred`
 
 #### Scenario: The deadline reaches before expiry cleanup
 - **WHEN** the pass deadline is reached before `expire` starts

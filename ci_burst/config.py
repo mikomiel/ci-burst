@@ -87,8 +87,12 @@ class ControllerConfig:
     reservation against the same allowance.
 
     ``pass_deadline_seconds`` bounds one ``apply`` pass, including its provider
-    reads, below the shipped unit's ``TimeoutStartSec``. ``reap``, ``status``
-    and ``export`` keep their own behaviour and do not take it.
+    reads. Its accepted range (30..290) keeps the complete range below the
+    shipped unit's ``TimeoutStartSec=300``, so a pass reports an incomplete
+    result instead of being killed at the unit's outer bound. A deployment that
+    needs a longer pass must raise the unit timeout; a larger value is not
+    offered here. ``reap``, ``status`` and ``export`` keep their own behaviour
+    and do not take it.
     """
 
     max_instances: int
@@ -375,7 +379,7 @@ def load(path):
         "pass_deadline_seconds",
         "controller",
         minimum=30,
-        maximum=840,
+        maximum=290,
         required=False,
     )
     controller = ControllerConfig(

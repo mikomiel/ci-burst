@@ -253,10 +253,18 @@ class Controller:
                 decision, plans = self._decide(observation, slot, deadline=deadline)
             except DeadlineRefusal:
                 return self._deferred(result, PHASE_ADMISSION)
-            result.update(decision)
+            # Every earlier mutating phase returns on its own action and the
+            # launch is still ahead, so no provider mutation has run in this
+            # pass. A refusal decided by evidence read after the deadline
+            # therefore reports the deadline instead of a decision the pass
+            # had no budget left to complete.
             if decision["decision"] != "launch_ready":
+                if self._deadline_reached(deadline):
+                    return self._deferred(result, PHASE_ADMISSION)
+                result.update(decision)
                 result["decision"] = decision["decision"]
                 return result
+            result.update(decision)
             # Mutations never take the deadline. Once the intent is committed
             # and _send may have been accepted, the existing uncertain
             # reconciliation path owns the outcome.

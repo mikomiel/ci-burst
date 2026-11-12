@@ -457,8 +457,9 @@ commitment = accrued cost
            + ceil(remaining_price * remaining_seconds / 3600)
            + ceil(incidental_per_hour * remaining_seconds / 3600)
            + non_compute_allowance
-remaining_seconds = max(0, max_lifetime_seconds - elapsed)
+remaining_seconds = max(0, lifetime_seconds - elapsed)
 remaining_price = max(max_spot_price, accepted_price or 0)
+lifetime_seconds = max(60, ceil(expires_at - created_at))
 ```
 
 so a newly admitted worker commits `max_spot_price * max_lifetime +
@@ -466,7 +467,10 @@ incidental_per_hour * max_lifetime + non_compute_allowance` — the earlier
 reservation plus the incidental term, which is zero unless configured — and that
 commitment shrinks every second it lives. The accepted price is a floor on `remaining_price`: lowering
 `max_spot_price` below a live operation's accepted price does not shrink that
-operation's commitment, because it still settles at the accepted price. A batch is affordable while the window's `spend` plus the forward
+operation's commitment, because it still settles at the accepted price. The
+lifetime comes from the operation's own durable expiry window, so lowering
+`max_lifetime_seconds` applies to the next launch and never shortens a worker
+that is already admitted. A batch is affordable while the window's `spend` plus the forward
 commitment plus one new worker's worst case stays inside `allowance`:
 
 ```

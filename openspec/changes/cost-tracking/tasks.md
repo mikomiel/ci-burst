@@ -50,6 +50,9 @@ no cloud change.
   accounting.
 - [x] 3.8 Release the writer lock when a writable connect fails, covered by a
   controller test that retries through a fresh ledger.
+- [x] 3.9 Bind each operation's lifetime and price to the evidence stored at
+  admission, so lowered configuration affects only later launches; cover a
+  lowered lifetime between applies in `tests/test_controller.py`.
 
 ## 4. Export
 

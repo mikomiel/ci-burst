@@ -37,22 +37,36 @@ class CostModel:
             buffer_micros=config.budget.non_compute_allowance,
         )
 
-    def full_lifetime_micros(self, price_micros=0):
-        """Cost of one whole configured lifetime at a price, cap by default.
+    def full_lifetime_micros(self, price_micros=0, lifetime_seconds=None):
+        """Cost of one whole lifetime at a price, cap by default.
 
-        The age-out settlement uses the operation's accepted price, because that
-        price is the only evidence it has; a row without one uses the cap. The
-        caller passing the accepted price keeps the settlement inside the
-        forward commitment, which prices unlived time at the cap.
+        The age-out settlement uses the operation's own lifetime and accepted
+        price, because those are the only evidence it has; a row without a price
+        uses the cap. That keeps the settlement inside the forward commitment,
+        which prices unlived time at the higher of the cap and the accepted price.
         """
+        seconds = self.max_lifetime_seconds if lifetime_seconds is None else lifetime_seconds
         price = price_micros or self.price_cap_micros
-        return hourly_cost_micros(price, self.max_lifetime_seconds) + hourly_cost_micros(
-            self.incidental_per_hour_micros, self.max_lifetime_seconds
+        return hourly_cost_micros(price, seconds) + hourly_cost_micros(
+            self.incidental_per_hour_micros, seconds
         )
 
     def per_launch_micros(self):
         """Worst case one newly admitted worker can cost, plus its buffer."""
         return self.full_lifetime_micros() + self.buffer_micros
+
+    def lifetime_seconds(self, operation):
+        """The operation's own lifetime bound, from its durable expiry window.
+
+        A configuration change applies to the next launch, not to a worker that is
+        already admitted: that worker and the reaper use the expiry it stored.
+        Rounding up keeps the bound no shorter than the configured lifetime that
+        produced it.
+        """
+        return max(
+            MINIMUM_BILLABLE_SECONDS,
+            int(math.ceil(operation.expires_at - operation.created_at)),
+        )
 
     def elapsed_seconds(self, operation, now):
         """Seconds of instance life that may already be billed.
@@ -69,7 +83,7 @@ class CostModel:
         seconds = end - start
         if seconds <= 0:
             return 0
-        return int(math.ceil(min(seconds, self.max_lifetime_seconds)))
+        return int(math.ceil(min(seconds, self.lifetime_seconds(operation))))
 
     def accrued_micros(self, operation, now):
         """Tracked cost so far; zero until an instance may exist."""
@@ -91,10 +105,11 @@ class CostModel:
         """
         if operation.state in TERMINAL_STATES:
             return 0
+        lifetime = self.lifetime_seconds(operation)
         if operation.instance_id is None:
-            seconds = self.max_lifetime_seconds
+            seconds = lifetime
         else:
-            seconds = max(0, self.max_lifetime_seconds - self.elapsed_seconds(operation, now))
+            seconds = max(0, lifetime - self.elapsed_seconds(operation, now))
         price = max(self.price_cap_micros, operation.price_micros or 0)
         return hourly_cost_micros(price, seconds) + hourly_cost_micros(
             self.incidental_per_hour_micros, seconds

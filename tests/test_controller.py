@@ -1272,8 +1272,8 @@ class CostTrackingTests(ControllerCase):
         path = write_config(
             self.root,
             config={
-                "budget": {"allowance": "0.3003"},
-                "aws": {"max_spot_price": "0.2000"},
+                "budget": {"allowance": "0.1503"},
+                "aws": {"max_spot_price": "0.2000", "max_lifetime_seconds": 1800},
                 "controller": {"max_instances": 2},
             },
         )
@@ -1290,17 +1290,18 @@ class CostTrackingTests(ControllerCase):
                 client_token="ci-burst-a",
                 request={"seed": True},
                 request_sha256="0" * 64,
-                expires_at=self.clock.now,
-                reservation_micros=200_001,
+                expires_at=self.clock.now + 1800,
+                reservation_micros=100_001,
                 window_start=current_window(self.clock.now, config.budget.window_seconds),
                 region=config.aws.region,
                 account="111122223333",
                 price_micros=100_000,
             )
         ledger.set_instance("a", "i-a")
-        ledger.set_launch_time("a", self.clock.now - 3600)
+        ledger.set_launch_time("a", self.clock.now)
         ledger.set_state("a", "running", instance_id="i-a")
         ledger.close()
+        self.clock.advance(1800)
         controller = self.build(
             observation=observation_demand(2),
             aws=FakeAws(spot_quote=quote(price_micros=200_000, clock=self.clock)),
@@ -1316,11 +1317,11 @@ class CostTrackingTests(ControllerCase):
         self.clock.advance(INSTANCE_RETENTION_SECONDS + 1)
         controller.apply()
         ledger = self.reopened()
-        self.assertEqual(ledger.operation("a").settled_micros, 100_000)
-        self.assertEqual(ledger.operation(second).settled_micros, 200_000)
+        self.assertEqual(ledger.operation("a").settled_micros, 50_000)
+        self.assertEqual(ledger.operation(second).settled_micros, 100_000)
         window = current_window(self.clock.now, config.budget.window_seconds)
         totals = ledger.window_totals(window, controller.cost, self.clock.now)
-        self.assertEqual(totals["spend"], 300_000)
+        self.assertEqual(totals["spend"], 150_000)
         self.assertLessEqual(totals["spend"], config.budget.allowance)
 
     def test_a_lowered_ceiling_keeps_the_commitment_above_settlement(self):
@@ -1345,7 +1346,7 @@ class CostTrackingTests(ControllerCase):
                 client_token="ci-burst-a",
                 request={"seed": True},
                 request_sha256="0" * 64,
-                expires_at=self.clock.now + 3000,
+                expires_at=self.clock.now + 3600,
                 reservation_micros=200_001,
                 window_start=current_window(self.clock.now, config.budget.window_seconds),
                 region=config.aws.region,
@@ -1386,6 +1387,63 @@ class CostTrackingTests(ControllerCase):
         totals = ledger.window_totals(window, controller.cost, self.clock.now)
         self.assertEqual(totals["spend"], 200_000)
         self.assertLessEqual(totals["spend"], controller.config.budget.allowance)
+
+    def test_a_lowered_lifetime_does_not_shrink_a_live_worker(self):
+        path = write_config(
+            self.root,
+            config={
+                "budget": {"allowance": "0.2030"},
+                "aws": {"max_spot_price": "0.2000"},
+                "controller": {"max_instances": 2},
+            },
+        )
+        path.write_text(
+            path.read_text().replace(
+                'non_compute_allowance = "0.50"', 'non_compute_allowance = "0.000001"'
+            )
+        )
+        config = load(path)
+        controller = self.build(
+            observation=observation_demand(1),
+            aws=FakeAws(spot_quote=quote(price_micros=200_000, clock=self.clock)),
+            config=config,
+        )
+        self.aws.instances_result = []
+        first = controller.apply()
+        self.assertEqual(first["decision"], "launched")
+        worker = first["launches"][0]
+        self.clock.advance(600)
+        lowered_path = write_config(
+            self.root,
+            config={
+                "budget": {"allowance": "0.2030"},
+                "aws": {"max_spot_price": "0.2000", "max_lifetime_seconds": 60},
+                "controller": {"max_instances": 2},
+            },
+        )
+        lowered_path.write_text(
+            lowered_path.read_text().replace(
+                'non_compute_allowance = "0.50"', 'non_compute_allowance = "0.000001"'
+            )
+        )
+        controller = self.build(
+            observation=observation_demand(2),
+            aws=FakeAws(spot_quote=quote(price_micros=200_000, clock=self.clock)),
+            config=load(lowered_path),
+        )
+        self.aws.instances_result = []
+        # The admitted worker keeps its own 3_600-second expiry window, so the
+        # lowered configuration cannot release its remaining commitment.
+        self.assertEqual(controller.apply()["launch_count"], 0)
+        self.aws.instances_result = [
+            replace(
+                instance(instance_id=worker["instance_id"], operation=worker["operation"], state="terminated"),
+                launch_time=self.clock.now - 600,
+            )
+        ]
+        controller.apply()
+        # It also keeps its elapsed cost: 600 seconds, not the lowered 60-second cap.
+        self.assertEqual(self.reopened().operation(worker["operation"]).settled_micros, 33_334)
 
     def test_a_failed_migration_releases_the_writer_lock(self):
         schema = """

@@ -1004,7 +1004,11 @@ class Controller:
         # The accepted price is inside the commitment the operation carried while
         # it was unresolved; the cap would settle above what admission reserved.
         self.ledger.settle(
-            operation.id, self.cost.full_lifetime_micros(operation.price_micros), self.clock()
+            operation.id,
+            self.cost.full_lifetime_micros(
+                operation.price_micros, self.cost.lifetime_seconds(operation)
+            ),
+            self.clock(),
         )
 
     def _discrepancies(self, operations, instances):

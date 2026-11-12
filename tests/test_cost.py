@@ -90,6 +90,26 @@ class CommitmentTests(unittest.TestCase):
         settled = operation(state="terminal", settled_micros=12_345)
         self.assertEqual(model().committed_micros(settled, 1_003_600.0), 12_345)
 
+    def test_an_operation_keeps_the_lifetime_it_was_admitted_with(self):
+        shorter = CostModel(
+            price_cap_micros=200_000,
+            incidental_per_hour_micros=0,
+            max_lifetime_seconds=60,
+            buffer_micros=0,
+        )
+        live = operation()  # expires_at - created_at = 3_600
+        self.assertEqual(shorter.lifetime_seconds(live), 3600)
+        self.assertEqual(shorter.accrued_micros(live, 1_000_600.0), 16_667)
+        self.assertEqual(shorter.remaining_micros(live, 1_000_600.0), 166_667)
+        self.assertEqual(
+            shorter.full_lifetime_micros(100_000, shorter.lifetime_seconds(live)), 100_000
+        )
+
+    def test_a_shorter_stored_lifetime_bounds_a_longer_configuration(self):
+        live = operation(expires_at=1_000_060.0)
+        self.assertEqual(model().lifetime_seconds(live), 60)
+        self.assertEqual(model().remaining_micros(live, 1_000_030.0), 1_667)
+
     def test_a_lowered_ceiling_does_not_shrink_a_live_commitment(self):
         low = CostModel(
             price_cap_micros=100_000,

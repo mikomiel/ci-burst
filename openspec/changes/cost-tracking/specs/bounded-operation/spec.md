@@ -14,7 +14,7 @@ making the window report the money the fleet is expected to be billed.
 The controller MUST record the accepted request's Spot price and the provider's
 launch time for every operation and MUST compute tracked cost from them in exact
 integer micro-units. Cost MUST use a minimum billable duration of 60 seconds and
-MUST NOT exceed the configured maximum lifetime. A row without a recorded price
+MUST NOT exceed the operation's stored lifetime. A row without a recorded price
 MUST be costed at the configured maximum.
 
 #### Scenario: A worker is launched
@@ -56,8 +56,9 @@ MUST settle at zero.
 Admission MUST use tracked spend plus every non-terminal operation's worst-case
 remaining cost plus the configured buffer, and MUST price a newly admitted worker
 at the configured maximum for its lifetime. Remaining cost MUST be priced at no
-less than the recorded accepted price, so lowering the configured maximum cannot
-under-count an outstanding operation.
+less than the recorded accepted price, and the lifetime bound MUST come from the
+operation's durable expiry window, so a configuration change applies only to
+later operations.
 
 #### Scenario: The allowance admits fewer workers than the free slots
 - **WHEN** the window's commitment plus one worst-case worker exceeds the allowance

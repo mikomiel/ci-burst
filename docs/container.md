@@ -416,7 +416,15 @@ What a promotion does and does not do:
   `localhost/ci-burst:previous`. That is the rollback handle for the first
   refresh too, when the serving image is a hand-built one with no `sha-<12>` tag
   of its own;
-- it records the deployed commit in `/var/lib/ci-burst-image/deployed-sha`;
+- it records the deployed commit in `/var/lib/ci-burst-image/deployed-sha`, and
+  writes a build record after the smoke passes and before `latest` moves, at
+  `/var/lib/ci-burst-image/builds/sha-<12>.json`: the source and tree SHA, the
+  `Dockerfile` sha256 and its `FROM` line, the base-image digest, the built
+  image ID, the podman version, the Python distribution set read from the
+  candidate with `--network=none`, and a UTC timestamp; the JSON carries
+  `schema: ci-burst.build-inputs.v1`. The same run logs
+  `build_inputs: <path>`. A record that cannot be written fails the run before
+  promotion, so an image that serves is an image whose inputs were recorded;
 - it **reports** unit drift instead of installing it: the repository's
   `deploy/` units are compared with the installed ones, and a difference logs
   `units_drift: <names>` (or `units_current`). Installing a changed unit stays
@@ -449,10 +457,11 @@ What a promotion does and does not do:
   exercises exactly the networking that unit uses;
 - a fetch, archive, build or smoke failure keeps the previous image in place and
   logs one line with a reason code (`fetch_failed`, `archive_failed`,
-  `unpack_failed`, `build_failed`, `smoke_failed`, `tag_failed`,
-  `inspect_failed`, `exists_failed`, `previous_tag_failed`, `promote_failed`,
-  plus the informational `units_drift`, `units_not_installed` and
-  `units_current`) in `journalctl -u ci-burst-refresh.service`. Only a confirmed absent
+  `unpack_failed`, `build_failed`, `build_inputs_failed`, `smoke_failed`,
+  `tag_failed`, `inspect_failed`, `exists_failed`, `previous_tag_failed`,
+  `promote_failed`, plus the informational `units_drift`,
+  `units_not_installed` and `units_current`) in
+  `journalctl -u ci-burst-refresh.service`. Only a confirmed absent
   `localhost/ci-burst:latest` (podman's "absent" status) may skip the rollback
   handle; a failed inspection or a storage error fails the run instead;
 - the smoke run is one execution of the command this host's scheduled unit runs,
@@ -469,6 +478,32 @@ What a promotion does and does not do:
   once after 20 seconds (`CI_BURST_SMOKE_RETRY_SECONDS`), because an unreachable
   Forgejo or AWS is not evidence about the image; a second failure keeps the
   previous image.
+
+### Source identity and image identity
+
+Three identities describe a deployment, and none substitutes for another:
+
+- the **release version** — a released source history; `CHANGELOG.md` and the
+  annotated release tag own it. It does not name the image a host built;
+- the **deployed source SHA** — `/var/lib/ci-burst-image/deployed-sha` and the
+  `localhost/ci-burst:sha-<12>` tag. It identifies the source commit the build
+  context came from;
+- the **image identity** — the image ID that `podman image inspect` reports and
+  the build record beside it. It identifies the bytes that serve.
+
+An unchanged source SHA can still build different bytes: the base image was a
+moving `python:3.12-slim` tag before the digest pin, and the dependency range
+`boto3>=1.34,<2` resolves at build time. The base is now pinned by index digest,
+and the build record captures the dependency set the candidate actually
+resolved, so an image can be traced to its inputs. That is recording, not
+reproducibility: a rebuild of the same source is expected to produce a new
+record, and it may produce a different image ID.
+
+A base-image digest bump or a dependency change is therefore a reviewed input
+change in a pull request. It is not a relabel of an unchanged source SHA onto
+new bytes; the `sha-<12>` tag always means "built from this commit", never
+"built from these inputs". Rollback retags an image that already exists, so it
+restores the bytes that tag names without changing the recorded inputs.
 
 Rollback retags a previous image, and it must not race a refresh: the timer only
 schedules, and a run that started before the operator acted would move `latest`
@@ -490,6 +525,11 @@ available as `localhost/ci-burst:sha-<12>`:
 flock /var/lib/ci-burst-image/refresh.lock \
   podman tag localhost/ci-burst:sha-<12> localhost/ci-burst:latest
 ```
+
+A rollback restores bytes that an existing image tag already names; it does not
+rebuild, so it cannot change the recorded inputs. If no build record exists for
+a tag (an image built by hand before this record did), treat the source SHA as
+unknown provenance for those bytes rather than assuming it describes them.
 
 `systemctl is-active ci-burst-refresh.service` reports the launcher, not a
 build: a promotion that already finished has already moved `latest`, so roll

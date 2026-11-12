@@ -16,7 +16,13 @@
 #   * the Forgejo token arrives in an --env-file, which is visible in
 #     `podman inspect`. A token-file option is a follow-up, not part of this
 #     change.
-FROM python:3.12-slim
+# The base is pinned by its multi-arch index digest, not the moving
+# `python:3.12-slim` tag: the tag resolved to different bytes over time, so the
+# same source commit could build against a different interpreter base. The
+# digest below was resolved from the registry's manifest response on 2026-11-12;
+# bumping it is a reviewed input change, and the refresh build record names the
+# FROM line it actually built with.
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

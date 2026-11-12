@@ -92,7 +92,8 @@ if [ "$want" = "$recorded" ]; then
 fi
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT INT TERM
+record_tmp=
+trap 'rm -rf "$work"; [ -z "$record_tmp" ] || rm -f "$record_tmp"' EXIT INT TERM
 mkdir "$work/src"
 if ! git -C "$SOURCE" archive --format=tar --output "$work/tree.tar" "$want"; then
     log "archive_failed: $want"
@@ -167,6 +168,106 @@ if document.get("decision") not in accepted:
 fi
 
 short=$(printf '%s' "$want" | cut -c1-12)
+
+# A source commit identifies the source, not the bytes. The base image and the
+# Python dependency set are resolved when the image is built, so two builds of
+# one commit can differ. Record what this build actually resolved, and do it
+# before any promotion tag moves, so the image on the host can be traced to its
+# inputs instead of to the commit alone.
+candidate=$(podman image inspect --format '{{.Id}}' "$IMAGE:candidate") || {
+    log "inspect_failed: $IMAGE:candidate"
+    exit 2
+}
+if [ -z "$candidate" ]; then
+    log "inspect_failed: $IMAGE:candidate"
+    exit 2
+fi
+
+tree=$(git -C "$SOURCE" rev-parse "$want^{tree}") || {
+    log "build_inputs_failed: cannot resolve the tree of $want"
+    exit 2
+}
+dockerfile_sha256=$(sha256sum "$work/src/Dockerfile" | awk '{print $1}')
+if [ -z "$dockerfile_sha256" ]; then
+    log "build_inputs_failed: cannot hash the build's Dockerfile"
+    exit 2
+fi
+from_line=$(sed -n '/^FROM /{p;q;}' "$work/src/Dockerfile" 2>/dev/null) || from_line=
+if [ -z "$from_line" ]; then
+    log "build_inputs_failed: no FROM line in the build's Dockerfile"
+    exit 2
+fi
+from_ref=$(printf '%s\n' "$from_line" | awk '{print $NF}')
+case "$from_ref" in
+    *@sha256:*)
+        # A digest-pinned FROM carries the base digest itself.
+        base_digest=${from_ref##*@}
+        ;;
+    *)
+        # For an unpinned line the engine may still report what it resolved.
+        # Record nothing rather than inventing a digest when it cannot.
+        base_digest=$(podman image inspect --format '{{.Digest}}' "$from_ref" 2>/dev/null || true)
+        ;;
+esac
+engine=$(podman --version 2>/dev/null || true)
+
+# Read the dependency set from inside the candidate, with no network path.
+distributions="$work/python-distributions.txt"
+if ! podman run --rm --network=none --entrypoint python "$IMAGE:candidate" \
+        -m pip list --format=freeze >"$distributions" 2>/dev/null; then
+    log "build_inputs_failed: cannot read the candidate's Python distributions"
+    exit 2
+fi
+
+mkdir -p "$STATE/builds" || {
+    log "build_inputs_failed: cannot create $STATE/builds"
+    exit 2
+}
+record="$STATE/builds/sha-$short.json"
+record_tmp=$(mktemp "$STATE/builds/.sha-$short.XXXXXX") || {
+    log "build_inputs_failed: cannot create a temporary record"
+    exit 2
+}
+if ! SOURCE_SHA="$want" TREE_SHA="$tree" DOCKERFILE_SHA256="$dockerfile_sha256" \
+        FROM_LINE="$from_line" BASE_DIGEST="$base_digest" IMAGE_ID="$candidate" \
+        ENGINE="$engine" CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        python3 - "$distributions" >"$record_tmp" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    distributions = [line.strip() for line in handle if line.strip()]
+
+document = {
+    "schema": "ci-burst.build-inputs.v1",
+    "source_sha": os.environ["SOURCE_SHA"],
+    "tree_sha": os.environ["TREE_SHA"],
+    "dockerfile_sha256": os.environ["DOCKERFILE_SHA256"],
+    "from": os.environ["FROM_LINE"],
+    "base_digest": os.environ["BASE_DIGEST"] or None,
+    "image_id": os.environ["IMAGE_ID"],
+    "engine": os.environ["ENGINE"] or "unknown",
+    "python_distributions": distributions,
+    "created_at": os.environ["CREATED_AT"],
+}
+json.dump(document, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PY
+then
+    rm -f "$record_tmp"
+    record_tmp=
+    log "build_inputs_failed: cannot render $record"
+    exit 2
+fi
+chmod 0644 "$record_tmp"
+if ! mv -f "$record_tmp" "$record"; then
+    log "build_inputs_failed: cannot publish $record"
+    exit 2
+fi
+record_tmp=
+log "build_inputs: $record"
+
 if ! podman tag "$IMAGE:candidate" "$IMAGE:sha-$short"; then
     log "tag_failed: $want"
     exit 2
@@ -176,14 +277,6 @@ fi
 # `latest` rather than assumed: the first refresh after a manual install
 # replaces an image that has no sha tag of its own. An inspection failure is
 # not "no image": only a confirmed absent tag may skip the handle.
-candidate=$(podman image inspect --format '{{.Id}}' "$IMAGE:candidate") || {
-    log "inspect_failed: $IMAGE:candidate"
-    exit 2
-}
-if [ -z "$candidate" ]; then
-    log "inspect_failed: $IMAGE:candidate"
-    exit 2
-fi
 current=
 exists_rc=0
 podman image exists "$IMAGE:latest" || exists_rc=$?

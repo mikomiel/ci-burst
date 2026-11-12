@@ -27,6 +27,7 @@ and the validation step that binds it to that tag.
 - Run the job with the fleet's umask ([#65](https://github.com/mikomiel/ci-burst/pull/65)).
 - Make the repository bootstrap the deployed template user data ([#66](https://github.com/mikomiel/ci-burst/pull/66)).
 - Treat an exhausted Spot quota as a definite refusal ([#72](https://github.com/mikomiel/ci-burst/pull/72)).
+- Settle an identity first seen at termination ([#73](https://github.com/mikomiel/ci-burst/pull/73)).
 
 ### Documentation
 

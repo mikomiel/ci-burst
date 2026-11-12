@@ -39,6 +39,7 @@ from .aws import (
 )
 from .config import ZoneCandidate
 from .cost import CostModel
+from .credit import evidence as credit_evidence
 from .errors import ProviderRefusal, Refusal, StateRefusal
 from .forgejo import ForgejoObserver
 from .ledger import Ledger, current_window
@@ -59,11 +60,13 @@ CLIENT_TOKEN_MAX_AGE_SECONDS = 24 * 60 * 60
 INSTANCE_RETENTION_SECONDS = 60 * 60
 
 COST_SCOPE_NOTE = (
-    "Tracked cost estimates compute at the Spot price taken when the launch was accepted, plus "
-    "one configured hourly incidental rate; the forward commitment prices unlived time at the "
-    "configured maximum Spot price. The estimate does not bound EBS, data transfer, log delivery, "
-    "minimum billing increments, failed cleanup or price movement, and it is not a guaranteed cap "
-    "on the AWS bill."
+    "Tracked cost estimates compute at the Spot price taken when the launch was accepted, plus the "
+    "hourly incidental rate recorded when the operation was admitted; the forward commitment prices "
+    "unlived time at the highest of the configured maximum Spot price, the admitted request's frozen "
+    "MaxPrice and the accepted price, and bills the provider's 60-second minimum once. The estimate "
+    "does not bound EBS, data transfer, log delivery, surplus CPU credits, billing increments beyond "
+    "the 60-second minimum, failed cleanup or price movement, and it is not a guaranteed cap on the "
+    "AWS bill."
 )
 
 
@@ -125,6 +128,9 @@ class CandidatePlan:
             "launch_template_version": self.candidate.launch_template_version,
             "status": "eligible" if self.eligible else "skipped",
             "price": self.quote.as_dict() if self.quote is not None else None,
+            # CPU-credit evidence only: the launch request never sets a credit
+            # mode, because the operator's launch template owns that choice.
+            "credit": credit_evidence(self.instance_type, self.template.credit_specification),
         }
         if self.reason is not None:
             data["reason"] = self.reason
@@ -183,13 +189,18 @@ class Controller:
         """Take one bounded admission and launch decision."""
         result = self._base("apply")
         self.config.require_live_contract()
-        # The writer lock precedes the connect: a version-1 file is copied and
-        # upgraded by that connect, and that mutation may not race a second writer.
+        # The writer lock precedes the connect: an earlier-schema file is copied
+        # and upgraded by that connect, and that mutation may not race a second
+        # writer.
         self.ledger.acquire_writer()
         try:
             self.ledger.connect(
                 create=True,
-                backfill=(self.config.aws.max_spot_price, self.config.budget.incidental_per_hour),
+                backfill=(
+                    self.config.aws.max_spot_price,
+                    self.config.budget.incidental_per_hour,
+                    self.config.budget.non_compute_allowance,
+                ),
             )
             account = self.aws.account_id()
             instances = self.aws.owned_instances(self.config.deployment)
@@ -649,6 +660,8 @@ class Controller:
                     account=account,
                     detail=request_sha256,
                     price_micros=selected.quote.price_micros,
+                    admitted_incidental_per_hour_micros=self.cost.incidental_per_hour_micros,
+                    admitted_buffer_micros=self.cost.buffer_micros,
                 )
             # Intent is committed before the request, so a lost response is
             # recoverable and never a reason to allocate a second operation for
@@ -1112,10 +1125,14 @@ class Controller:
             return
         # The accepted price is inside the commitment the operation carried while
         # it was unresolved; the cap would settle above what admission reserved.
+        # The admitted basis, not the current configuration, prices the incidental
+        # rate: a later settings change must not reprice a worker that ran.
         self.ledger.settle(
             operation.id,
             self.cost.full_lifetime_micros(
-                operation.price_micros, self.cost.lifetime_seconds(operation)
+                self.cost.settlement_price_micros(operation),
+                self.cost.lifetime_seconds(operation),
+                self.cost.incidental_for(operation),
             ),
             self.clock(),
         )

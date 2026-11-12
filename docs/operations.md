@@ -624,10 +624,36 @@ intent is resolved.
 Tracked cost does not bound EBS, data transfer, public IPv4 beyond the configured
 rate, AMI and snapshot storage, log delivery, billing increments longer than the
 60-second minimum, Spot price changes after launch, or resources left by failed
-cleanup. Surplus CPU credits are a separate residual: a burstable instance can be
-charged for CPU time above its baseline, and no configured rate estimates it.
-Tracked cost is an estimate and not a guaranteed cap on the AWS bill, and no
-status, lifetime or alert in this project should be described as one.
+cleanup. Tracked cost is an estimate and not a guaranteed cap on the AWS bill, and
+no status, lifetime or alert in this project should be described as one.
+
+Burstable CPU credits are a separate residual. A burstable instance in
+`unlimited` CPU-credit mode can keep bursting after its earned credits are spent
+and accrue surplus CPU credits, which the provider bills on top of the instance
+price; a short, immediately busy worker is exactly the shape that incurs them.
+T3, T3a, T4g and T8i launch in `unlimited` mode by default and T2 in `standard`
+mode, unless the launch template's `CreditSpecification` or the account-level
+default says otherwise. Every plan candidate therefore carries a `credit`
+object: whether the family is burstable, the observed or default mode, whether
+that mode came from the template or the AWS family default, and that surplus
+credits are unquantified. The plan does not query the account-level default
+credit specification: where the template sets none it reports the family
+default, not the account's effective default. A family outside the product's
+explicit table reports `unknown` rather than a guessed mode, and a non-burstable
+family reports the question as not applicable. A template value that is present
+but not `standard` or `unlimited` is reported as unknown evidence, never as the
+default mode: the plan reports no mode with a `template-unrecognized` source,
+and a launch carrying it would fail provider validation. A value the adapter
+cannot represent -- empty, over-long or non-printable -- is still present and
+takes that same unknown path; it is never reported as an absent specification.
+`scripts/check_prerequisites.py` reports the template's
+`CreditSpecification` value when it is representable, and whether the template
+and each configured pool type is burstable; an unrecognized or unrepresentable
+value is `credit_specification_invalid` drift, while an absent specification
+stays absent and is not drift. The
+estimate does not bound surplus credits in either mode: choosing the instance
+family, setting the credit mode and any billable comparison are operator
+decisions, and the product only reports the exposure.
 
 ### Reconciling with the provider bill
 

@@ -1,10 +1,14 @@
+import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from ci_burst.aws import Aws, _definite_launch_error, _instances, _spot_quote, is_capacity_failure
 from ci_burst.config import load
+from ci_burst.credit import CreditSpecification
 from ci_burst.errors import ProviderRefusal
 
 from support import write_config
@@ -21,6 +25,25 @@ def history(price, timestamp, zone="eu-central-1a", instance_type="t4g.small", p
 
 
 OBSERVED_AT = 1_800_000_000.0
+
+
+def sdk_client_error(code):
+    """A botocore-shaped ``ClientError`` and the module ``_translate`` probes.
+
+    The suite runs without the SDK installed, so supplying the synthetic
+    ``botocore.exceptions`` module is what makes the classification branch under
+    test reachable at all.
+    """
+
+    class ClientError(Exception):
+        response = {"Error": {"Code": code}}
+
+    exceptions = types.ModuleType("botocore.exceptions")
+    exceptions.ClientError = ClientError
+    exceptions.BotoCoreError = type("BotoCoreError", (Exception,), {})
+    botocore_module = types.ModuleType("botocore")
+    botocore_module.exceptions = exceptions
+    return ClientError, {"botocore": botocore_module, "botocore.exceptions": exceptions}
 
 
 class SpotQuoteTests(unittest.TestCase):
@@ -103,6 +126,12 @@ class ErrorClassificationTests(unittest.TestCase):
 
 
 class InstanceParsingTests(unittest.TestCase):
+    def assert_inventory_refused(self, response):
+        with self.assertRaises(ProviderRefusal) as raised:
+            _instances(response)
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertTrue(raised.exception.uncertain)
+
     def test_tags_state_and_launch_time_are_parsed(self):
         response = {
             "Reservations": [
@@ -123,6 +152,51 @@ class InstanceParsingTests(unittest.TestCase):
         self.assertEqual(parsed[0].state, "running")
         self.assertEqual(parsed[0].tags["ci-burst:managed"], "true")
         self.assertIsNotNone(parsed[0].launch_time)
+
+    def test_a_valid_multi_reservation_response_is_parsed_unchanged(self):
+        response = {
+            "Reservations": [
+                {"Instances": [{"InstanceId": "i-1", "State": {"Name": "running"}}]},
+                {
+                    "Instances": [
+                        {"InstanceId": "i-2", "State": {"Name": "pending"}},
+                        {"InstanceId": "i-3", "State": {"Name": "terminated"}},
+                    ]
+                },
+            ]
+        }
+        parsed = _instances(response)
+        self.assertEqual([item.instance_id for item in parsed], ["i-1", "i-2", "i-3"])
+        self.assertEqual([item.state for item in parsed], ["running", "pending", "terminated"])
+
+    def test_an_empty_reservations_list_is_a_complete_empty_inventory(self):
+        self.assertEqual(_instances({"Reservations": []}), [])
+        self.assertEqual(_instances({"Reservations": [{"Instances": []}]}), [])
+
+    def test_absent_or_non_list_reservations_are_refused(self):
+        for response in ({}, {"Reservations": None}, {"Reservations": ""}, {"Reservations": {}}, [], None):
+            with self.subTest(response=response):
+                self.assert_inventory_refused(response)
+
+    def test_a_reservation_that_is_not_a_mapping_is_refused(self):
+        for reservation in ("reservation", ["reservation"], 1, None):
+            with self.subTest(reservation=reservation):
+                self.assert_inventory_refused({"Reservations": [reservation]})
+
+    def test_absent_or_non_list_instances_are_refused(self):
+        for reservation in ({}, {"Instances": None}, {"Instances": {}}, {"Instances": ""}):
+            with self.subTest(reservation=reservation):
+                self.assert_inventory_refused({"Reservations": [reservation]})
+
+    def test_an_instance_entry_that_is_not_a_mapping_is_refused(self):
+        for entry in ("instance", ["instance"], 1, None):
+            with self.subTest(entry=entry):
+                self.assert_inventory_refused({"Reservations": [{"Instances": [entry]}]})
+
+    def test_an_entry_without_a_usable_instance_id_is_refused(self):
+        for entry in ({}, {"InstanceId": ""}, {"InstanceId": None}, {"InstanceId": 42}, {"InstanceId": ["i-1"]}):
+            with self.subTest(entry=entry):
+                self.assert_inventory_refused({"Reservations": [{"Instances": [entry]}]})
 
 
 class FakeClient:
@@ -175,6 +249,26 @@ class AdapterTests(unittest.TestCase):
             self.aws().owned_instances("test-deployment")
         self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
 
+    def test_owned_inventory_refuses_a_response_without_reservations(self):
+        self.client.responses = [{}]
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.aws().owned_instances("test-deployment")
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertTrue(raised.exception.uncertain)
+        self.assertEqual([name for name, _ in self.client.calls], ["describe_instances"])
+
+    def test_by_id_inventory_refuses_a_response_without_reservations(self):
+        self.client.responses = [{}]
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.aws().instances(["i-1"])
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertTrue(raised.exception.uncertain)
+
+    def test_an_empty_reservations_list_is_a_complete_empty_inventory(self):
+        self.client.responses = [{"Reservations": []}, {"Reservations": []}]
+        self.assertEqual(self.aws().owned_instances("test-deployment"), [])
+        self.assertEqual(self.aws().instances(["i-1"]), [])
+
     def test_template_carries_placement_and_rejects_an_indirect_image(self):
         self.client.responses = [
             {
@@ -216,6 +310,57 @@ class AdapterTests(unittest.TestCase):
         template = self.aws().template("runner", 3)
         self.assertEqual(template.placement_zone, "eu-central-1a")
         self.assertTrue(template.has_user_data)
+
+    def test_template_credit_specification_keeps_presence_and_bounded_value(self):
+        def response(credit):
+            data = {
+                "ImageId": "ami-1",
+                "InstanceType": "t4g.small",
+                "InstanceInitiatedShutdownBehavior": "terminate",
+                "UserData": "AAAA",
+            }
+            if credit is not None:
+                data["CreditSpecification"] = credit
+            return {
+                "LaunchTemplateVersions": [
+                    {
+                        "LaunchTemplateId": "lt-1",
+                        "VersionNumber": 3,
+                        "LaunchTemplateData": data,
+                    }
+                ]
+            }
+
+        self.client.responses = [response({"CpuCredits": "standard"})]
+        self.assertEqual(
+            self.aws().template("runner", 3).credit_specification,
+            CreditSpecification(present=True, value="standard"),
+        )
+        # An unrecognized value is still the template's value. Dropping it here
+        # would report the family default as if the template had chosen it.
+        self.client.responses = [response({"CpuCredits": "burst"})]
+        self.assertEqual(
+            self.aws().template("runner", 3).credit_specification,
+            CreditSpecification(present=True, value="burst"),
+        )
+        # Absence is the only state that carries neither presence nor a value.
+        self.client.responses = [response(None)]
+        self.assertEqual(self.aws().template("runner", 3).credit_specification, CreditSpecification())
+        # A present value the adapter cannot represent keeps its presence: it is
+        # unknown evidence, never absence and never the family default.
+        for invalid in (
+            {"CpuCredits": "x" * 40},  # over the display bound
+            {"CpuCredits": ""},  # empty
+            {"CpuCredits": "\u00e9"},  # non-ASCII
+            {"CpuCredits": "stan\ndard"},  # non-printable
+            {"CpuCredits": 7},  # not a token
+            {},  # a specification with no value at all
+        ):
+            self.client.responses = [response(invalid)]
+            self.assertEqual(
+                self.aws().template("runner", 3).credit_specification,
+                CreditSpecification(present=True, value=None),
+            )
 
     def test_template_must_terminate_on_shutdown(self):
         self.client.responses = [
@@ -304,6 +449,101 @@ class AdapterTests(unittest.TestCase):
 
         self.assertEqual(Aws(self.config, client=MissingClient()).instances(["i-old"]), [])
 
+    def test_a_mixed_not_found_batch_is_resolved_per_identifier(self):
+        class NotFound(Exception):
+            response = {"Error": {"Code": "InvalidInstanceID.NotFound"}}
+
+        class MixedClient:
+            """Real EC2 rejects the whole by-ID call when one id is unknown."""
+
+            def __init__(self):
+                self.calls = []
+
+            def describe_instances(self, **kwargs):
+                identifiers = kwargs.get("InstanceIds") or []
+                self.calls.append(list(identifiers))
+                if len(identifiers) > 1:
+                    raise NotFound()
+                if identifiers == ["i-old"]:
+                    raise NotFound()
+                return {
+                    "Reservations": [
+                        {"Instances": [{"InstanceId": "i-live", "State": {"Name": "running"}}]}
+                    ]
+                }
+
+        client = MixedClient()
+        instances = Aws(self.config, client=client).instances(["i-old", "i-live"])
+        # The live identifier survives beside the aged-out one, and absence was
+        # never inferred from the rejected batch.
+        self.assertEqual([item.instance_id for item in instances], ["i-live"])
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(client.calls[0], ["i-old", "i-live"])
+        self.assertEqual(client.calls[1:], [["i-old"], ["i-live"]])
+
+    def test_a_per_identifier_read_failure_is_uncertain_not_absence(self):
+        class NotFound(Exception):
+            response = {"Error": {"Code": "InvalidInstanceID.NotFound"}}
+
+        class FailingMemberClient:
+            def describe_instances(self, **kwargs):
+                identifiers = kwargs.get("InstanceIds") or []
+                if len(identifiers) > 1:
+                    raise NotFound()
+                if identifiers == ["i-old"]:
+                    raise NotFound()
+                raise RuntimeError("ResponseParserError")
+
+        with self.assertRaises(ProviderRefusal) as raised:
+            Aws(self.config, client=FailingMemberClient()).instances(["i-old", "i-live"])
+        # A real failure must never be swallowed into an empty list.
+        self.assertEqual(raised.exception.reason, "AWS_UNCERTAIN")
+        self.assertTrue(raised.exception.uncertain)
+
+    def test_a_definite_launch_rejection_on_a_per_identifier_read_is_uncertain(self):
+        class NotFound(Exception):
+            response = {"Error": {"Code": "InvalidInstanceID.NotFound"}}
+
+        ClientError, modules = sdk_client_error("UnauthorizedOperation")
+
+        class FailingMemberClient:
+            def describe_instances(self, **kwargs):
+                identifiers = kwargs.get("InstanceIds") or []
+                if len(identifiers) > 1:
+                    raise NotFound()
+                if identifiers == ["i-old"]:
+                    raise NotFound()
+                raise ClientError()
+
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertRaises(ProviderRefusal) as raised:
+                Aws(self.config, client=FailingMemberClient()).instances(["i-old", "i-live"])
+        # The code is definite for a launch, but a read failure does not
+        # establish that the instance is absent.
+        self.assertEqual(raised.exception.reason, "AWS_REFUSED")
+        self.assertEqual(raised.exception.detail, "UnauthorizedOperation")
+        self.assertTrue(raised.exception.uncertain)
+
+    def test_a_definite_launch_rejection_on_the_batch_read_is_uncertain(self):
+        ClientError, modules = sdk_client_error("UnauthorizedOperation")
+
+        class FailingBatchClient:
+            def __init__(self):
+                self.calls = []
+
+            def describe_instances(self, **kwargs):
+                self.calls.append(list(kwargs.get("InstanceIds") or []))
+                raise ClientError()
+
+        client = FailingBatchClient()
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertRaises(ProviderRefusal) as raised:
+                Aws(self.config, client=client).instances(["i-1"])
+        self.assertEqual(client.calls, [["i-1"]])
+        self.assertEqual(raised.exception.reason, "AWS_REFUSED")
+        self.assertEqual(raised.exception.detail, "UnauthorizedOperation")
+        self.assertTrue(raised.exception.uncertain)
+
     def test_identity_and_ec2_share_one_session(self):
         import sys
         import types
@@ -347,6 +587,66 @@ class AdapterTests(unittest.TestCase):
     def test_no_read_is_made_for_an_empty_instance_list(self):
         self.assertEqual(self.aws().instances([]), [])
         self.assertEqual(self.client.calls, [])
+
+
+class MissingSdkTests(unittest.TestCase):
+    """A checkout without the runtime SDK must refuse, not raise an import error."""
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+        self.config = load(write_config(self.root, config={"aws": {"profile": "ci-burst-check"}}))
+        self.missing = {"boto3": None, "botocore": None, "botocore.config": None}
+
+    def config_only_missing(self):
+        """The SDK package imports, but its ``config`` module does not."""
+        return {"botocore": types.ModuleType("botocore"), "botocore.config": None}
+
+    def test_each_live_entry_path_returns_the_documented_refusal(self):
+        for call in (Aws(self.config)._client, Aws(self.config).account_id):
+            with self.subTest(entry=call.__name__):
+                with mock.patch.dict(sys.modules, self.missing):
+                    with self.assertRaises(ProviderRefusal) as raised:
+                        call()
+                self.assertEqual(raised.exception.reason, "AWS_SDK_UNAVAILABLE")
+                self.assertFalse(raised.exception.uncertain)
+                self.assertIn("boto3", raised.exception.detail)
+                # The diagnostic names the installation requirement only.
+                self.assertNotIn("ci-burst-check", raised.exception.detail)
+
+    def test_client_resolves_the_sdk_config_before_the_session(self):
+        sessions = []
+
+        class Session:
+            def client(self, service, region_name=None, config=None):
+                return object()
+
+        def session(aws):
+            sessions.append(aws)
+            return Session()
+
+        with mock.patch.object(Aws, "_session", session):
+            with mock.patch.dict(sys.modules, self.config_only_missing()):
+                with self.assertRaises(ProviderRefusal) as raised:
+                    Aws(self.config)._client()
+        self.assertEqual(raised.exception.reason, "AWS_SDK_UNAVAILABLE")
+        self.assertFalse(raised.exception.uncertain)
+        # The SDK config is resolved first, so the session guard cannot mask
+        # the config guard.
+        self.assertEqual(sessions, [])
+
+    def test_account_identity_refuses_when_only_the_sdk_config_is_missing(self):
+        class Session:
+            def client(self, service, region_name=None, config=None):
+                return object()
+
+        with mock.patch.object(Aws, "_session", lambda self: Session()):
+            with mock.patch.dict(sys.modules, self.config_only_missing()):
+                with self.assertRaises(ProviderRefusal) as raised:
+                    Aws(self.config).account_id()
+        self.assertEqual(raised.exception.reason, "AWS_SDK_UNAVAILABLE")
+        self.assertFalse(raised.exception.uncertain)
 
 
 if __name__ == "__main__":

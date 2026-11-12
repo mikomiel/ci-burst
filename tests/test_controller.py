@@ -3,14 +3,16 @@ import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from ci_burst.config import load
 from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment
+from ci_burst.credit import CreditSpecification
 from ci_burst.errors import ConfigRefusal, ProviderRefusal, StateRefusal
-from ci_burst.aws import DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
+from ci_burst.aws import Aws, DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
 from ci_burst.ledger import Ledger, current_window
 from ci_burst.money import format_money
 
@@ -254,6 +256,170 @@ class PlanTests(ControllerCase):
         result = self.build(observation=observation_demand()).plan()
         self.assertIn("does not bound EBS", result["cost_scope"])
         self.assertIn("not a guaranteed cap", result["cost_scope"])
+        self.assertIn("surplus CPU credits", result["cost_scope"])
+
+
+class CreditEvidenceTests(ControllerCase):
+    """Burstable CPU credits are reported evidence, never a pricing control."""
+
+    def test_burstable_candidate_reports_the_unlimited_default(self):
+        result = self.build(observation=observation_demand()).plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": True,
+                "mode": "unlimited",
+                "mode_source": "aws-default",
+                "surplus_credits": "unquantified",
+            },
+        )
+        self.assertEqual(result["selected"]["credit"], result["candidates"][0]["credit"])
+
+    def test_template_credit_specification_outranks_the_default(self):
+        aws = FakeAws(
+            template_facts=template(credit_specification=CreditSpecification(present=True, value="standard")),
+            spot_quote=quote(clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(result["candidates"][0]["credit"]["mode"], "standard")
+        self.assertEqual(result["candidates"][0]["credit"]["mode_source"], "template")
+
+    def test_unrecognized_template_credit_specification_is_not_the_default(self):
+        # The template set a value, so reporting the family default here would
+        # invent evidence about a launch the provider would refuse.
+        aws = FakeAws(
+            template_facts=template(credit_specification=CreditSpecification(present=True, value="burst")),
+            spot_quote=quote(clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": True,
+                "mode": None,
+                "mode_source": "template-unrecognized",
+                "surplus_credits": "unknown",
+            },
+        )
+        self.assertEqual(result["selected"]["credit"], result["candidates"][0]["credit"])
+
+    def test_adapter_output_with_an_invalid_template_mode_is_not_the_default(self):
+        # The plan reads the template through the adapter, so this exercises
+        # the adapter's own parse of a provider response: an over-long value is
+        # present but not representable, and it must not become the default.
+        now = self.clock.now
+
+        class Client:
+            def describe_instances(self, **kwargs):
+                return {"Reservations": []}
+
+            def describe_launch_template_versions(self, **kwargs):
+                return {
+                    "LaunchTemplateVersions": [
+                        {
+                            "LaunchTemplateId": "lt-adapter",
+                            "VersionNumber": 3,
+                            "LaunchTemplateData": {
+                                "ImageId": "ami-0123456789abcdef0",
+                                "InstanceType": "t4g.small",
+                                "InstanceInitiatedShutdownBehavior": "terminate",
+                                "UserData": "AAAA",
+                                "CreditSpecification": {"CpuCredits": "x" * 40},
+                            },
+                        }
+                    ]
+                }
+
+            def describe_spot_price_history(self, **kwargs):
+                return {
+                    "SpotPriceHistory": [
+                        {
+                            "InstanceType": "t4g.small",
+                            "AvailabilityZone": "eu-central-1a",
+                            "ProductDescription": "Linux/UNIX",
+                            "SpotPrice": "0.020000",
+                            "Timestamp": datetime.fromtimestamp(now, timezone.utc),
+                        }
+                    ]
+                }
+
+        aws = Aws(self.config, client=Client(), clock=self.clock)
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": True,
+                "mode": None,
+                "mode_source": "template-unrecognized",
+                "surplus_credits": "unknown",
+            },
+        )
+
+    def test_non_burstable_candidate_reports_not_applicable(self):
+        aws = FakeAws(
+            template_facts=template(instance_type="m7g.xlarge"),
+            spot_quote=quote(instance_type="m7g.xlarge", clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": False,
+                "mode": None,
+                "mode_source": "not-applicable",
+                "surplus_credits": "not-applicable",
+            },
+        )
+
+    def test_non_burstable_candidate_reports_a_pinned_template_mode(self):
+        aws = FakeAws(
+            template_facts=template(
+                instance_type="m7g.xlarge",
+                credit_specification=CreditSpecification(present=True, value="standard"),
+            ),
+            spot_quote=quote(instance_type="m7g.xlarge", clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": False,
+                "mode": "standard",
+                "mode_source": "template",
+                "surplus_credits": "not-applicable",
+            },
+        )
+
+    def test_unknown_family_reports_unknown_instead_of_guessing(self):
+        aws = FakeAws(
+            template_facts=template(instance_type="z9.medium"),
+            spot_quote=quote(instance_type="z9.medium", clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": None,
+                "mode": None,
+                "mode_source": "unknown",
+                "surplus_credits": "unknown",
+            },
+        )
+
+    def test_credit_evidence_does_not_change_pricing_or_the_launch_request(self):
+        controller = self.build(observation=observation_demand())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        run = [call for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(run), 1)
+        request = run[0][1]
+        self.assertNotIn("CreditSpecification", json.dumps(request))
+        self.assertNotIn("CpuCredits", json.dumps(request))
+        self.assertEqual(request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"], "0.040000")
+        self.assertEqual(result["price"]["price_display"], "0.020000")
+        self.assertEqual(result["reservation_micros"], controller.cost.per_launch_micros())
 
 
 class ApplyTests(ControllerCase):
@@ -728,12 +894,242 @@ class ApplyTests(ControllerCase):
         controller.apply()
         self.assertEqual(self.reopened().operation(operation_id).state, "terminal")
 
+    def test_a_mixed_not_found_batch_keeps_the_live_operation_and_slot(self):
+        from ci_burst.aws import Aws
+
+        class NotFound(Exception):
+            response = {"Error": {"Code": "InvalidInstanceID.NotFound"}}
+
+        class MixedClient:
+            """The filtered inventory misses both; the live one is still running."""
+
+            def describe_instances(self, **kwargs):
+                identifiers = kwargs.get("InstanceIds")
+                if identifiers is None:  # the deployment-filtered inventory
+                    return {"Reservations": []}
+                if len(identifiers) > 1:
+                    raise NotFound()
+                if identifiers == ["i-old"]:
+                    raise NotFound()
+                return {
+                    "Reservations": [
+                        {"Instances": [{"InstanceId": "i-live", "State": {"Name": "running"}}]}
+                    ]
+                }
+
+        aged = self.seed(
+            operation_id="op-aged",
+            instance_id="i-old",
+            expires_at=self.clock.now + 2 * INSTANCE_RETENTION_SECONDS,
+        )
+        live = self.seed(
+            operation_id="op-live",
+            instance_id="i-live",
+            expires_at=self.clock.now + 2 * INSTANCE_RETENTION_SECONDS,
+        )
+        self.clock.advance(INSTANCE_RETENTION_SECONDS + 1)
+        controller = self.build(
+            observation=observation_empty(),
+            aws=Aws(self.config, client=MixedClient(), clock=self.clock, account="111122223333"),
+        )
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertEqual(
+            [entry["reason"] for entry in result["slot"]["discrepancies"]],
+            ["OWNERSHIP_TAGS_MISSING"],
+        )
+        self.assertEqual(result["slot"]["discrepancies"][0]["instance_id"], "i-live")
+        # The live operation keeps its slot; the refused decision is not proof
+        # of termination.
+        self.assertEqual([entry["operation"] for entry in result["slot"]["operations"]], [live])
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation(live).state, "running")
+        self.assertIsNone(ledger.operation(live).settled_micros)
+        # The genuinely aged-out identifier keeps the conservative settlement.
+        self.assertEqual(ledger.operation(aged).state, "terminal")
+        self.assertEqual(ledger.operation(aged).detail, "instance_not_retained")
+        self.assertIsNotNone(ledger.operation(aged).settled_micros)
+
     def test_no_secret_or_user_data_in_launch_output(self):
         controller = self.build(observation=observation_demand())
         result = controller.apply()
         dumped = json.dumps(result)
         self.assertNotIn("UserData", dumped)
         self.assertNotIn("Authorization", dumped)
+
+
+class InventoryClient:
+    """One queued response per EC2 call, so a defect path can run to completion."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def _respond(self, name, kwargs):
+        self.calls.append((name, dict(kwargs)))
+        entry = self.responses.pop(0)
+        if isinstance(entry, Exception):
+            raise entry
+        return entry
+
+    def describe_instances(self, **kwargs):
+        return self._respond("describe_instances", kwargs)
+
+    def describe_launch_template_versions(self, **kwargs):
+        return self._respond("describe_launch_template_versions", kwargs)
+
+    def describe_spot_price_history(self, **kwargs):
+        return self._respond("describe_spot_price_history", kwargs)
+
+    def run_instances(self, **kwargs):
+        return self._respond("run_instances", kwargs)
+
+
+class InventoryIntegrityTests(ControllerCase):
+    """A response that cannot be parsed is a refusal, not an empty fleet."""
+
+    def controller_with(self, *responses):
+        from ci_burst.aws import Aws
+
+        client = InventoryClient(responses)
+        aws = Aws(self.config, client=client, clock=self.clock, account="111122223333")
+        controller = Controller(
+            self.config,
+            observer=FakeObserver(observation_demand()),
+            aws=aws,
+            ledger=Ledger(self.config.state.database, clock=self.clock),
+            clock=self.clock,
+        )
+        return controller, client
+
+    def launch_template_response(self):
+        return {
+            "LaunchTemplateVersions": [
+                {
+                    "LaunchTemplateId": "lt-0123456789abcdef0",
+                    "VersionNumber": 3,
+                    "LaunchTemplateData": {
+                        "ImageId": "ami-0123456789abcdef0",
+                        "InstanceType": "t4g.small",
+                        "InstanceInitiatedShutdownBehavior": "terminate",
+                        "UserData": "AAAA",
+                    },
+                }
+            ]
+        }
+
+    def spot_history_response(self):
+        return {
+            "SpotPriceHistory": [
+                {
+                    "InstanceType": "t4g.small",
+                    "AvailabilityZone": "eu-central-1a",
+                    "ProductDescription": "Linux/UNIX",
+                    "SpotPrice": "0.020000",
+                    "Timestamp": datetime.fromtimestamp(self.clock.now, timezone.utc),
+                }
+            ]
+        }
+
+    def test_a_malformed_inventory_cannot_release_a_running_operation(self):
+        operation_id = self.seed(state="running")
+        self.clock.advance(3601)
+        controller, client = self.controller_with(
+            {},  # owned inventory: no Reservations
+            {},  # by-id read for the confirmed instance
+            self.launch_template_response(),
+            self.spot_history_response(),
+            {"Instances": [{"InstanceId": "i-replacement"}]},
+        )
+        with self.assertRaises(ProviderRefusal) as raised:
+            controller.apply()
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertTrue(raised.exception.uncertain)
+        self.assertEqual([name for name, _ in client.calls], ["describe_instances"])
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "running")
+        self.assertIsNone(operation.settled_micros)
+        self.assertEqual(len(self.reopened().operations()), 1)
+
+    def test_a_malformed_reservation_cannot_release_a_running_operation(self):
+        operation_id = self.seed(state="running")
+        self.clock.advance(3601)
+        controller, client = self.controller_with(
+            {"Reservations": [{}]},
+            {},
+            self.launch_template_response(),
+            self.spot_history_response(),
+            {"Instances": [{"InstanceId": "i-replacement"}]},
+        )
+        with self.assertRaises(ProviderRefusal) as raised:
+            controller.apply()
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertEqual([name for name, _ in client.calls], ["describe_instances"])
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "running")
+        self.assertIsNone(operation.settled_micros)
+
+    def test_an_entry_without_an_instance_id_cannot_be_adopted(self):
+        operation_id = self.seed(state="uncertain", instance_id=None, operation_id="uncertain")
+        inventory = {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {
+                            "State": {"Name": "running"},
+                            "Tags": [
+                                {"Key": MANAGED_TAG, "Value": "true"},
+                                {"Key": DEPLOYMENT_TAG, "Value": "test-deployment"},
+                                {"Key": OPERATION_TAG, "Value": operation_id},
+                                {"Key": "ci-burst:expires-at", "Value": str(int(self.clock.now) + 3600)},
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+        controller, client = self.controller_with(
+            inventory,
+            {"Instances": [{"InstanceId": "i-resumed"}]},
+        )
+        with self.assertRaises(ProviderRefusal) as raised:
+            controller.apply()
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertTrue(raised.exception.uncertain)
+        self.assertEqual([name for name, _ in client.calls], ["describe_instances"])
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "uncertain")
+        self.assertIsNone(operation.instance_id)
+
+    def test_an_empty_reservations_list_is_a_verified_empty_inventory(self):
+        operation_id = self.seed(state="running")
+        self.clock.advance(3601)
+        controller, client = self.controller_with(
+            {"Reservations": []},
+            {"Reservations": []},
+            self.launch_template_response(),
+            self.spot_history_response(),
+            {"Instances": [{"InstanceId": "i-replacement"}]},
+        )
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(
+            [name for name, _ in client.calls],
+            [
+                "describe_instances",
+                "describe_instances",
+                "describe_launch_template_versions",
+                "describe_spot_price_history",
+                "run_instances",
+            ],
+        )
+        operations = self.reopened().operations()
+        self.assertEqual(len(operations), 2)
+        settled = self.reopened().operation(operation_id)
+        self.assertEqual(settled.state, "terminal")
+        self.assertEqual(settled.detail, "instance_not_retained")
+        self.assertIsNotNone(settled.settled_micros)
 
 
 class IntentScopeTests(ControllerCase):

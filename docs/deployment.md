@@ -67,6 +67,22 @@ Two additions this walkthrough needs:
 - record the template id, the numeric version, the subnet and the security
   group. Step 5 uses them.
 
+The repository bootstrap is published as a launch-template version, so a
+bootstrap change is never active until the operator publishes it. While
+`tests/test_runner_bootstrap.py` declares a pending publication
+(`PENDING_TEMPLATE_VERSION` and `PENDING_TEMPLATE_SHA256`), the committed bytes
+belong to the next version, not the pinned one: publish that version from the
+current one with the new user data
+([runner-setup.md § Worker bootstrap](runner-setup.md#worker-bootstrap) has the
+command), set `aws.launch_template_version` in the deployment TOML to the
+published number, then flip `PUBLISHED_TEMPLATE_VERSION`/`PUBLISHED_TEMPLATE_SHA256`
+to the pending pair and clear both pending values in a follow-up change.
+`check-prerequisites` reports template drift until the published version and the
+TOML agree. The contract test does not fail while the publication is pending: it
+compares the committed file with the recorded pending digest, so the pin stays
+exact and the drift is reported by the prerequisite check rather than by a red
+unit test.
+
 A template that pins its network (`NetworkInterfaces` or a subnet) keeps that
 placement and cannot be used with the ordered zone-candidate list in Step 5:
 the controller then passes a top-level `SubnetId` and EC2 refuses both. Pin the
@@ -581,6 +597,7 @@ conditions). Reverting the source is a reviewed change, not a history rewrite.
 | `FORGEJO_TOKEN_MISSING` | the env-file is not mounted or lacks the variable |
 | `FORGEJO_CONTRACT_UNQUALIFIED` | `qualification` is still `fixtures-only`; `apply` is refused |
 | `FORGEJO_UNEXPECTED_SHAPE` | the endpoint returned something other than an array or `null` |
+| `AWS_SDK_UNAVAILABLE` | the `boto3` runtime dependency is not installed in the command's environment |
 | `AWS_REFUSED` | the identity lacks a permission, or a condition (tag, template, subnet) does not match |
 | `AWS_UNCERTAIN` | the provider outcome is unknown; the recorded client token resumes the same operation |
 | `AWS_INVENTORY_INCOMPLETE` | the inventory response is not a complete, parseable result; no operation is settled and no replacement is admitted |

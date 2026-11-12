@@ -1,7 +1,10 @@
+import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from ci_burst.aws import Aws, _definite_launch_error, _instances, _spot_quote, is_capacity_failure
 from ci_burst.config import load
@@ -22,6 +25,25 @@ def history(price, timestamp, zone="eu-central-1a", instance_type="t4g.small", p
 
 
 OBSERVED_AT = 1_800_000_000.0
+
+
+def sdk_client_error(code):
+    """A botocore-shaped ``ClientError`` and the module ``_translate`` probes.
+
+    The suite runs without the SDK installed, so supplying the synthetic
+    ``botocore.exceptions`` module is what makes the classification branch under
+    test reachable at all.
+    """
+
+    class ClientError(Exception):
+        response = {"Error": {"Code": code}}
+
+    exceptions = types.ModuleType("botocore.exceptions")
+    exceptions.ClientError = ClientError
+    exceptions.BotoCoreError = type("BotoCoreError", (Exception,), {})
+    botocore_module = types.ModuleType("botocore")
+    botocore_module.exceptions = exceptions
+    return ClientError, {"botocore": botocore_module, "botocore.exceptions": exceptions}
 
 
 class SpotQuoteTests(unittest.TestCase):
@@ -427,6 +449,101 @@ class AdapterTests(unittest.TestCase):
 
         self.assertEqual(Aws(self.config, client=MissingClient()).instances(["i-old"]), [])
 
+    def test_a_mixed_not_found_batch_is_resolved_per_identifier(self):
+        class NotFound(Exception):
+            response = {"Error": {"Code": "InvalidInstanceID.NotFound"}}
+
+        class MixedClient:
+            """Real EC2 rejects the whole by-ID call when one id is unknown."""
+
+            def __init__(self):
+                self.calls = []
+
+            def describe_instances(self, **kwargs):
+                identifiers = kwargs.get("InstanceIds") or []
+                self.calls.append(list(identifiers))
+                if len(identifiers) > 1:
+                    raise NotFound()
+                if identifiers == ["i-old"]:
+                    raise NotFound()
+                return {
+                    "Reservations": [
+                        {"Instances": [{"InstanceId": "i-live", "State": {"Name": "running"}}]}
+                    ]
+                }
+
+        client = MixedClient()
+        instances = Aws(self.config, client=client).instances(["i-old", "i-live"])
+        # The live identifier survives beside the aged-out one, and absence was
+        # never inferred from the rejected batch.
+        self.assertEqual([item.instance_id for item in instances], ["i-live"])
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(client.calls[0], ["i-old", "i-live"])
+        self.assertEqual(client.calls[1:], [["i-old"], ["i-live"]])
+
+    def test_a_per_identifier_read_failure_is_uncertain_not_absence(self):
+        class NotFound(Exception):
+            response = {"Error": {"Code": "InvalidInstanceID.NotFound"}}
+
+        class FailingMemberClient:
+            def describe_instances(self, **kwargs):
+                identifiers = kwargs.get("InstanceIds") or []
+                if len(identifiers) > 1:
+                    raise NotFound()
+                if identifiers == ["i-old"]:
+                    raise NotFound()
+                raise RuntimeError("ResponseParserError")
+
+        with self.assertRaises(ProviderRefusal) as raised:
+            Aws(self.config, client=FailingMemberClient()).instances(["i-old", "i-live"])
+        # A real failure must never be swallowed into an empty list.
+        self.assertEqual(raised.exception.reason, "AWS_UNCERTAIN")
+        self.assertTrue(raised.exception.uncertain)
+
+    def test_a_definite_launch_rejection_on_a_per_identifier_read_is_uncertain(self):
+        class NotFound(Exception):
+            response = {"Error": {"Code": "InvalidInstanceID.NotFound"}}
+
+        ClientError, modules = sdk_client_error("UnauthorizedOperation")
+
+        class FailingMemberClient:
+            def describe_instances(self, **kwargs):
+                identifiers = kwargs.get("InstanceIds") or []
+                if len(identifiers) > 1:
+                    raise NotFound()
+                if identifiers == ["i-old"]:
+                    raise NotFound()
+                raise ClientError()
+
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertRaises(ProviderRefusal) as raised:
+                Aws(self.config, client=FailingMemberClient()).instances(["i-old", "i-live"])
+        # The code is definite for a launch, but a read failure does not
+        # establish that the instance is absent.
+        self.assertEqual(raised.exception.reason, "AWS_REFUSED")
+        self.assertEqual(raised.exception.detail, "UnauthorizedOperation")
+        self.assertTrue(raised.exception.uncertain)
+
+    def test_a_definite_launch_rejection_on_the_batch_read_is_uncertain(self):
+        ClientError, modules = sdk_client_error("UnauthorizedOperation")
+
+        class FailingBatchClient:
+            def __init__(self):
+                self.calls = []
+
+            def describe_instances(self, **kwargs):
+                self.calls.append(list(kwargs.get("InstanceIds") or []))
+                raise ClientError()
+
+        client = FailingBatchClient()
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertRaises(ProviderRefusal) as raised:
+                Aws(self.config, client=client).instances(["i-1"])
+        self.assertEqual(client.calls, [["i-1"]])
+        self.assertEqual(raised.exception.reason, "AWS_REFUSED")
+        self.assertEqual(raised.exception.detail, "UnauthorizedOperation")
+        self.assertTrue(raised.exception.uncertain)
+
     def test_identity_and_ec2_share_one_session(self):
         import sys
         import types
@@ -470,6 +587,66 @@ class AdapterTests(unittest.TestCase):
     def test_no_read_is_made_for_an_empty_instance_list(self):
         self.assertEqual(self.aws().instances([]), [])
         self.assertEqual(self.client.calls, [])
+
+
+class MissingSdkTests(unittest.TestCase):
+    """A checkout without the runtime SDK must refuse, not raise an import error."""
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+        self.config = load(write_config(self.root, config={"aws": {"profile": "ci-burst-check"}}))
+        self.missing = {"boto3": None, "botocore": None, "botocore.config": None}
+
+    def config_only_missing(self):
+        """The SDK package imports, but its ``config`` module does not."""
+        return {"botocore": types.ModuleType("botocore"), "botocore.config": None}
+
+    def test_each_live_entry_path_returns_the_documented_refusal(self):
+        for call in (Aws(self.config)._client, Aws(self.config).account_id):
+            with self.subTest(entry=call.__name__):
+                with mock.patch.dict(sys.modules, self.missing):
+                    with self.assertRaises(ProviderRefusal) as raised:
+                        call()
+                self.assertEqual(raised.exception.reason, "AWS_SDK_UNAVAILABLE")
+                self.assertFalse(raised.exception.uncertain)
+                self.assertIn("boto3", raised.exception.detail)
+                # The diagnostic names the installation requirement only.
+                self.assertNotIn("ci-burst-check", raised.exception.detail)
+
+    def test_client_resolves_the_sdk_config_before_the_session(self):
+        sessions = []
+
+        class Session:
+            def client(self, service, region_name=None, config=None):
+                return object()
+
+        def session(aws):
+            sessions.append(aws)
+            return Session()
+
+        with mock.patch.object(Aws, "_session", session):
+            with mock.patch.dict(sys.modules, self.config_only_missing()):
+                with self.assertRaises(ProviderRefusal) as raised:
+                    Aws(self.config)._client()
+        self.assertEqual(raised.exception.reason, "AWS_SDK_UNAVAILABLE")
+        self.assertFalse(raised.exception.uncertain)
+        # The SDK config is resolved first, so the session guard cannot mask
+        # the config guard.
+        self.assertEqual(sessions, [])
+
+    def test_account_identity_refuses_when_only_the_sdk_config_is_missing(self):
+        class Session:
+            def client(self, service, region_name=None, config=None):
+                return object()
+
+        with mock.patch.object(Aws, "_session", lambda self: Session()):
+            with mock.patch.dict(sys.modules, self.config_only_missing()):
+                with self.assertRaises(ProviderRefusal) as raised:
+                    Aws(self.config).account_id()
+        self.assertEqual(raised.exception.reason, "AWS_SDK_UNAVAILABLE")
+        self.assertFalse(raised.exception.uncertain)
 
 
 if __name__ == "__main__":

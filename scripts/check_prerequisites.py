@@ -833,9 +833,10 @@ class Prerequisites:
 
         A managed gateway is outside this contract and is reported as a fact. A
         network-interface or instance target is resolved to its instance: the
-        instance must be running, and its boot configuration must mention the
-        candidate's subnet CIDR. That is the only pre-launch evidence available
-        for a hand-built router; the canary in docs/router.md is the real proof.
+        instance must be running, its source/destination check must be disabled,
+        and its boot configuration must mention the candidate's subnet CIDR.
+        That is the only pre-launch evidence available for a hand-built router;
+        the canary in docs/router.md is the real proof.
         """
         target = egress["target"]
         kind = egress.get("target_kind")
@@ -943,7 +944,7 @@ class Prerequisites:
                 target,
                 status="unavailable",
                 facts=record_facts,
-                reasons=["router_user_data_unavailable"],
+                reasons=[*reasons, "router_user_data_unavailable"],
                 detail=error.code,
             )
         encoded = ((attribute.get("UserData") or {}).get("Value") or "").strip()
@@ -953,7 +954,7 @@ class Prerequisites:
                 target,
                 status="unavailable",
                 facts=record_facts,
-                reasons=["router_user_data_unavailable"],
+                reasons=[*reasons, "router_user_data_unavailable"],
                 detail="no user data",
             )
         try:
@@ -964,7 +965,7 @@ class Prerequisites:
                 target,
                 status="unavailable",
                 facts=record_facts,
-                reasons=["router_user_data_unavailable"],
+                reasons=[*reasons, "router_user_data_unavailable"],
                 detail="invalid base64",
             )
         # Only an uncommented declaration is evidence. A router that reads its
@@ -980,7 +981,7 @@ class Prerequisites:
                 target,
                 status="unavailable",
                 facts=record_facts,
-                reasons=["router_forwarding_unverified"],
+                reasons=[*reasons, "router_forwarding_unverified"],
                 detail="no forwarding CIDR is declared in user data",
             )
         if subnet_cidr and subnet_cidr not in forwarded:

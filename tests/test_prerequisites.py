@@ -134,6 +134,7 @@ class FakeEc2:
         self.images = {"ami-0123456789abcdef0": "arm64"}
         self.error = None
         self.errors = {}
+        self.attribute_errors = {}
         self.source_dest_checks = {}
         self.calls = []
 
@@ -218,11 +219,14 @@ class FakeEc2:
 
     def describe_instance_attribute(self, **kwargs):
         self.calls.append(("describe_instance_attribute", kwargs))
+        attribute = kwargs.get("Attribute")
+        if attribute in self.attribute_errors:
+            raise self.attribute_errors[attribute]
         self._maybe_raise("describe_instance_attribute")
         instance_id = kwargs["InstanceId"]
         if instance_id not in self.instances:
             raise ClientError("InvalidInstanceID.NotFound")
-        if kwargs.get("Attribute") == "sourceDestCheck":
+        if attribute == "sourceDestCheck":
             if instance_id not in self.source_dest_checks:
                 return {"SourceDestCheck": {}}
             return {"SourceDestCheck": {"Value": self.source_dest_checks[instance_id]}}
@@ -1042,6 +1046,18 @@ class PrerequisiteTests(unittest.TestCase):
         result = self.check()
         self.assert_unavailable(result, "router_source_dest_check_unavailable")
         self.assertEqual(self.records(result, "router")[0]["detail"], "UnauthorizedOperation")
+
+    def test_instance_target_losing_user_data_keeps_the_known_drift(self):
+        self.use_router(target_kind="InstanceId", source_dest_check=True)
+        self.ec2.attribute_errors["userData"] = ClientError("UnauthorizedOperation")
+        result = self.check()
+        self.assertEqual(result["decision"], "unavailable")
+        self.assertEqual(prerequisites._exit_code(result["decision"]), 3)
+        router = self.records(result, "router")[0]
+        self.assertEqual(router["status"], "unavailable")
+        self.assertEqual(router["detail"], "UnauthorizedOperation")
+        self.assertIn("router_source_dest_check_enabled", router["reasons"])
+        self.assertIn("router_user_data_unavailable", router["reasons"])
 
     def test_managed_gateway_target_skips_the_router_contract(self):
         result = self.check()

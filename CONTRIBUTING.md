@@ -52,6 +52,21 @@ current head. Outstanding change requests from eligible reviewers block both
 paths. Dismissal or unreadable evidence is a refusal. Comments do not erase
 decisive reviews. There is no dependency-bot review exemption.
 
+The one review exemption is the generated release-please pull request: the
+publisher records the `review` status as success only for the fixed
+`release-please--branches--main--components--ci-burst` branch, opened by the
+token owner, changing only `CHANGELOG.md`, `pyproject.toml`,
+`ci_burst/__init__.py` and `.release-please-manifest.json`, each as an in-place
+modification (an addition, deletion or rename keeps the normal review). Any
+other branch, author or path keeps the normal review requirement, and an
+explicit `CHANGES_REQUESTED` from an eligible reviewer still fails the release
+PR: the exemption removes the approval requirement, not a veto. Release-please
+derives that branch from the package name and the base branch, so changing
+either requires updating `scripts/pr_policy.py`; until then the exemption fails
+closed. The release artifact is generated from already-merged commits, still
+needs the same exact-head CI, and its sensitive paths keep it out of unattended
+merging: a maintainer merges it.
+
 The publisher and merger run only trusted default-branch scripts. Neither
 executes PR-head code or consumes PR-produced artifacts with a write token.
 The merger checks complete API results, both CI checks from GitHub Actions,
@@ -147,8 +162,10 @@ commits are hidden and do not open a release pull request by themselves, unless
 the commit is breaking. release-please opens a release pull request only when
 its changelog entry is non-empty, so those hidden sections are what keep a
 documentation-only or CI-only merge from releasing. The release pull request
-always changes a sensitive path, so the merge policy never auto-merges it: a
-maintainer merges it.
+needs CI but not the independent review status: the publisher recognises its
+generated shape (above) and records the status itself. It always changes a
+sensitive path, so the merge policy never auto-merges it: a maintainer merges
+it.
 
 `release-please-config.json` and `.release-please-manifest.json` are part of
 the release boundary. The workflow authenticates as the fine-grained personal

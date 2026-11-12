@@ -17,17 +17,21 @@ and the validation step that binds it to that tag.
 ### Added
 
 - Ship the optional in-VPC router as a deployment artefact ([#68](https://github.com/mikomiel/ci-burst/pull/68)).
-- Surface worker console evidence as events and metrics.
+- Surface worker console evidence as events and metrics ([#69](https://github.com/mikomiel/ci-burst/pull/69)).
+- Raise the concurrency ceiling to twelve ([#70](https://github.com/mikomiel/ci-burst/pull/70)).
+- Settle tracked worker cost against the allowance ([#73](https://github.com/mikomiel/ci-burst/pull/73)).
 
 ### Fixed
 
 - Refresh the image on a cleanup-only host ([#64](https://github.com/mikomiel/ci-burst/pull/64)).
 - Run the job with the fleet's umask ([#65](https://github.com/mikomiel/ci-burst/pull/65)).
 - Make the repository bootstrap the deployed template user data ([#66](https://github.com/mikomiel/ci-burst/pull/66)).
+- Treat an exhausted Spot quota as a definite refusal ([#72](https://github.com/mikomiel/ci-burst/pull/72)).
 
 ### Documentation
 
 - Relicense ci-burst under GPL-3.0-only ([#67](https://github.com/mikomiel/ci-burst/pull/67)).
+- Require the queue toolchain in every worker image ([#71](https://github.com/mikomiel/ci-burst/pull/71)).
 
 ## [0.2.0] - 2026-11-11
 

@@ -80,6 +80,11 @@ class GitHub:
             raise ApiError("pull_unavailable")
         return result
 
+    def pull_files(self, number):
+        if type(number) is not int or number < 1:
+            raise ApiError("invalid_pull_number")
+        return self.pages(f"pulls/{number}/files")
+
     def reviews(self, number):
         return self.pages(f"pulls/{number}/reviews")
 
@@ -158,6 +163,23 @@ class GitHub:
             raise ApiError("merge_postcondition_unproven")
 
 
+def file_paths(files):
+    """Every filename the pull request file list names, both sides of a rename."""
+    if not isinstance(files, list):
+        raise ApiError("pull_files_unusable")
+    paths = []
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
+            raise ApiError("pull_files_unusable")
+        paths.append(item["filename"])
+        previous = item.get("previous_filename")
+        if previous is not None:
+            if not isinstance(previous, str):
+                raise ApiError("pull_files_unusable")
+            paths.append(previous)
+    return paths
+
+
 def collect_reviews(api, known_heads):
     listing = api.open_pulls()
     if not isinstance(listing, list):
@@ -177,6 +199,17 @@ def collect_reviews(api, known_heads):
         known_heads.add(pr["head"]["sha"])
         pr["reviews"] = api.reviews(pr["number"])
         pr["maintainers"] = api.maintainer_ids(pr["reviews"], pr["user"]["login"])
+        if policy.release_candidate(pr):
+            # The file list is read only for the generated release shape; an
+            # unreadable list fails the whole publication closed. Only an
+            # in-place modification of release-managed files is a release:
+            # an addition, deletion or rename keeps the normal review.
+            files = api.pull_files(pr["number"])
+            paths = file_paths(files)
+            if all(item.get("status") == "modified" for item in files):
+                pr["release_paths"] = paths
+            else:
+                pr.pop("release_paths", None)
         snapshot.append(pr)
     return snapshot
 

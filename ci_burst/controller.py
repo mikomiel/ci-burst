@@ -239,6 +239,13 @@ class Controller:
             if discrepancies:
                 slot["discrepancies"] = discrepancies
             result["slot"] = slot
+            if discrepancies and self._deadline_reached(deadline):
+                # The reconciliation produced evidence, but the pass has no
+                # budget left to act on it. Report both: the pass was cut short
+                # and the evidence it did establish stays in the slot.
+                self._deferred(result, PHASE_RECONCILE)
+                result["reasons"].append("owned_state_discrepancy")
+                return result
             if discrepancies:
                 result["decision"] = "refused"
                 result.setdefault("reasons", []).append("owned_state_discrepancy")
@@ -258,6 +265,10 @@ class Controller:
                 return self._deferred(result, PHASE_OBSERVE)
             observation = self._observe_or_refuse(result)
             if observation is None:
+                if self._deadline_reached(deadline):
+                    # The refusal arrived after the budget was spent: keep the
+                    # observation refusal as evidence and report the deadline.
+                    return self._deferred(result, PHASE_OBSERVE)
                 return result
             result["observation"] = observation.as_dict()
             try:

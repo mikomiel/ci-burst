@@ -11,7 +11,13 @@ from unittest import mock
 from ci_burst.config import load
 from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment
 from ci_burst.credit import CreditSpecification
-from ci_burst.errors import ConfigRefusal, DeadlineRefusal, ProviderRefusal, StateRefusal
+from ci_burst.errors import (
+    ConfigRefusal,
+    DeadlineRefusal,
+    ObservationRefusal,
+    ProviderRefusal,
+    StateRefusal,
+)
 from ci_burst.aws import Aws, DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
 from ci_burst.ledger import Ledger, current_window
 from ci_burst.money import format_money
@@ -64,10 +70,10 @@ class ControllerCase(unittest.TestCase):
         self.clock = Clock()
         self.config = load(write_config(self.root))
 
-    def build(self, *, observation=None, aws=None, config=None, ledger=None):
+    def build(self, *, observation=None, aws=None, config=None, ledger=None, observer=None):
         self.config = config or self.config
         self.aws = aws or FakeAws(spot_quote=quote(clock=self.clock))
-        self.observer = FakeObserver(observation or observation_empty())
+        self.observer = observer or FakeObserver(observation or observation_empty())
         self.ledger = ledger or Ledger(self.config.state.database, clock=self.clock)
         return Controller(
             self.config,
@@ -959,6 +965,20 @@ class ApplyTests(ControllerCase):
         self.assertNotIn("Authorization", dumped)
 
 
+class SlowRefusingObserver:
+    """An observer whose refusal arrives only after the pass budget is spent."""
+
+    def __init__(self, clock, seconds=300):
+        self.clock = clock
+        self.seconds = seconds
+        self.calls = 0
+
+    def observe(self):
+        self.calls += 1
+        self.clock.advance(self.seconds)
+        raise ObservationRefusal("FORGEJO_UNREACHABLE", "slow read")
+
+
 class PassDeadlineTests(ControllerCase):
     def slow_quote(self, seconds=300):
         aws = FakeAws(spot_quote=quote(clock=self.clock), clock=self.clock)
@@ -1100,6 +1120,35 @@ class PassDeadlineTests(ControllerCase):
         result = self.build(observation=observation_demand()).apply()
         self.assertEqual(result["decision"], "launched")
         self.assertNotIn("phases_deferred", result)
+
+    def test_a_slow_observation_refusal_reports_the_deadline(self):
+        controller = self.build(observer=SlowRefusingObserver(self.clock))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["observe", "admission", "launch"])
+        self.assertEqual(result["refusal"]["reason"], "FORGEJO_UNREACHABLE")
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_a_by_id_read_that_ends_after_the_deadline_reports_both_truths(self):
+        operation_id = self.seed(state="running")
+        controller = self.build(observation=observation_demand())
+        self.aws.instances_result = []
+        self.aws.instances_by_id = {"i-seed": instance(instance_id="i-seed", state="running")}
+        self.aws.on_instances = lambda: self.clock.advance(300)
+
+        result = controller.apply()
+
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded", "owned_state_discrepancy"])
+        self.assertEqual(
+            result["phases_deferred"],
+            ["reconcile", "resume", "expire", "observe", "admission", "launch"],
+        )
+        self.assertEqual(result["slot"]["discrepancies"][0]["reason"], "OWNERSHIP_TAGS_MISSING")
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(self.reopened().operation(operation_id).state, "running")
+
 
 class InventoryClient:
     """One queued response per EC2 call, so a defect path can run to completion."""

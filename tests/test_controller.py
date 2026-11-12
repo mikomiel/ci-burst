@@ -256,6 +256,25 @@ class CreditEvidenceTests(ControllerCase):
         self.assertEqual(result["candidates"][0]["credit"]["mode"], "standard")
         self.assertEqual(result["candidates"][0]["credit"]["mode_source"], "template")
 
+    def test_unrecognized_template_credit_specification_is_not_the_default(self):
+        # The template set a value, so reporting the family default here would
+        # invent evidence about a launch the provider would refuse.
+        aws = FakeAws(
+            template_facts=template(credit_specification="burst"),
+            spot_quote=quote(clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": True,
+                "mode": None,
+                "mode_source": "template-unrecognized",
+                "surplus_credits": "unknown",
+            },
+        )
+        self.assertEqual(result["selected"]["credit"], result["candidates"][0]["credit"])
+
     def test_non_burstable_candidate_reports_not_applicable(self):
         aws = FakeAws(
             template_facts=template(instance_type="m7g.xlarge"),
@@ -268,6 +287,22 @@ class CreditEvidenceTests(ControllerCase):
                 "burstable": False,
                 "mode": None,
                 "mode_source": "not-applicable",
+                "surplus_credits": "not-applicable",
+            },
+        )
+
+    def test_non_burstable_candidate_reports_a_pinned_template_mode(self):
+        aws = FakeAws(
+            template_facts=template(instance_type="m7g.xlarge", credit_specification="standard"),
+            spot_quote=quote(instance_type="m7g.xlarge", clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": False,
+                "mode": "standard",
+                "mode_source": "template",
                 "surplus_credits": "not-applicable",
             },
         )

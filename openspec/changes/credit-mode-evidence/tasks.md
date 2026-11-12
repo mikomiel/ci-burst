@@ -14,7 +14,9 @@ cloud change and no billable call.
 ## 2. Plan evidence
 
 - [x] 2.1 Parse `LaunchTemplateData.CreditSpecification.CpuCredits` into the
-  template facts and let an explicit template mode outrank the family default.
+  template facts as its raw bounded value, so absent, recognized and
+  present-but-unrecognized stay distinct; an explicit recognized mode outranks
+  the family default.
 - [x] 2.2 Add the `credit` object to every candidate record reported by
   `Controller._decide`, including the selected candidate.
 - [x] 2.3 Prove pricing, the reservation and the frozen launch request are
@@ -25,7 +27,8 @@ cloud change and no billable call.
 - [x] 3.1 Report `credit_specification` and `burstable` in the template facts.
 - [x] 3.2 Report `burstable` for each configured pool type.
 - [x] 3.3 Keep an unreadable template `unavailable`; an absent specification is
-  reported as absent and follows the family default.
+  reported as absent and follows the family default, while an unrecognized value
+  is reported raw as `credit_specification_invalid` drift.
 
 ## 4. Documentation and acceptance
 
@@ -35,10 +38,11 @@ cloud change and no billable call.
   bill surplus credits; choosing the family and the mode stays operator work.
 - [x] 4.3 `COST_SCOPE_NOTE` names surplus CPU credits among the unbounded
   charges.
-- [x] 4.4 Cover the burstable default, the template override, non-burstable and
-  unknown families, and the unchanged launch request in
-  `tests/test_controller.py`; cover the reported, absent and denied prerequisite
-  evidence in `tests/test_prerequisites.py`.
+- [x] 4.4 Cover the burstable default, the recognized template override, the
+  unrecognized template value, non-burstable and unknown families, and the
+  unchanged launch request in `tests/test_controller.py`; cover the reported,
+  unrecognized-drift, absent and denied prerequisite evidence in
+  `tests/test_prerequisites.py`.
 
 ## 5. Operator follow-up (not authorized here)
 

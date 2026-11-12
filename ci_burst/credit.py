@@ -59,29 +59,42 @@ def burstable(instance_type):
 def evidence(instance_type, template_mode=None):
     """One candidate's bounded CPU-credit evidence.
 
-    ``template_mode`` is the launch template's ``CreditSpecification`` when it
-    names a supported mode; a template value outranks the family default because
-    it is the operator's explicit choice for this launch. A non-burstable family
-    reports the credit question as not applicable, and an unclassified family
-    reports unknown. Surplus credits are never reported as bounded.
+    ``template_mode`` is the launch template's raw ``CreditSpecification``
+    value. Its three states stay distinct: absent (``None``) means the template
+    sets no specification, so a burstable family reports its documented default;
+    a recognized value outranks that default with the template as its source; a
+    present but unrecognized value reports no mode, because the provider would
+    refuse the launch and no default applies. A non-burstable family reports the
+    credit question as not applicable unless the template pins a recognized
+    mode, and an unclassified family reports unknown. Surplus credits are never
+    reported as bounded.
     """
     state = burstable(instance_type)
+    recognized = template_mode in CREDIT_MODES
     if state is True:
-        if template_mode in CREDIT_MODES:
+        if recognized:
             mode, mode_source = template_mode, "template"
+        elif template_mode is not None:
+            mode, mode_source = None, "template-unrecognized"
         else:
             mode, mode_source = BURSTABLE_FAMILIES[family(instance_type)], "aws-default"
         return {
             "burstable": True,
             "mode": mode,
             "mode_source": mode_source,
-            "surplus_credits": "unquantified",
+            # An unrecognized specification leaves the effective mode unknown,
+            # so the surplus-credit exposure cannot be stated either.
+            "surplus_credits": "unknown" if mode_source == "template-unrecognized" else "unquantified",
         }
     if state is False:
+        if recognized:
+            mode, mode_source = template_mode, "template"
+        else:
+            mode, mode_source = None, "not-applicable"
         return {
             "burstable": False,
-            "mode": None,
-            "mode_source": "not-applicable",
+            "mode": mode,
+            "mode_source": mode_source,
             "surplus_credits": "not-applicable",
         }
     return {

@@ -675,11 +675,23 @@ class PrerequisiteTests(unittest.TestCase):
 
     def test_absent_credit_specification_is_reported_as_absent(self):
         # A burstable type with no template specification follows the family
-        # default; absence is evidence, not an unreadable field.
+        # default; absence is evidence, not an unreadable field and not drift.
         result = self.check()
+        self.assertEqual(result["decision"], "satisfied")
         facts = self.records(result, "template")[0]["facts"]
         self.assertIsNone(facts["credit_specification"])
         self.assertTrue(facts["burstable"])
+
+    def test_unrecognized_credit_specification_is_reported_as_drift(self):
+        # The raw value is reported, and an unsupported value is drift because
+        # the provider would refuse the launch; it is never read as the default.
+        self.ec2.templates[3] = template_data(CreditSpecification={"CpuCredits": "burst"})
+        result = self.check()
+        self.assert_drift(result, "credit_specification_invalid")
+        record = self.records(result, "template")[0]
+        self.assertEqual(record["status"], "drift")
+        self.assertEqual(record["facts"]["credit_specification"], "burst")
+        self.assertTrue(record["facts"]["burstable"])
 
     def test_configured_instance_type_pools_report_burstability(self):
         self.use_instance_types("t4g.small", "c7g.large")

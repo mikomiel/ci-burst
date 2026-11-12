@@ -16,9 +16,12 @@ leaves a charge unbounded.
   their documented AWS default credit mode, known non-burstable families, and
   `unknown` for everything else, never a guess.
 - Add an additive `credit` object to every plan candidate: burstable state,
-  mode, mode source and an explicitly unquantified surplus-credit exposure.
-- Report the launch template's `CreditSpecification` and burstability in
-  `scripts/check_prerequisites.py`; an unreadable template stays unavailable.
+  mode, mode source and an explicitly unquantified surplus-credit exposure. The
+  template's value keeps three states: absent (family default), recognized
+  (template mode) and present but unrecognized (unknown, never the default).
+- Report the launch template's raw `CreditSpecification` and burstability in
+  `scripts/check_prerequisites.py`; an unreadable template stays unavailable and
+  an unrecognized value is drift.
 - Document surplus CPU credits as a residual charge in the operations and
   runner-setup guides, and in the controller's cost-scope note.
 

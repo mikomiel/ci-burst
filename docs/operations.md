@@ -572,14 +572,22 @@ T3, T3a, T4g and T8i launch in `unlimited` mode by default and T2 in `standard`
 mode, unless the launch template's `CreditSpecification` or the account-level
 default says otherwise. Every plan candidate therefore carries a `credit`
 object: whether the family is burstable, the observed or default mode, whether
-that mode came from the template or the AWS default, and that surplus credits
-are unquantified. A family outside the product's explicit table reports
-`unknown` rather than a guessed mode, and a non-burstable family reports the
-question as not applicable. `scripts/check_prerequisites.py` reports the
-template's `CreditSpecification` and whether the template and each configured
-pool type is burstable. The estimate does not bound surplus credits in either
-mode: choosing the instance family, setting the credit mode and any billable
-comparison are operator decisions, and the product only reports the exposure.
+that mode came from the template or the AWS family default, and that surplus
+credits are unquantified. The plan does not query the account-level default
+credit specification: where the template sets none it reports the family
+default, not the account's effective default. A family outside the product's
+explicit table reports `unknown` rather than a guessed mode, and a non-burstable
+family reports the question as not applicable. A template value that is present
+but not `standard` or `unlimited` is reported as unknown evidence, never as the
+default mode: the plan reports no mode with a `template-unrecognized` source,
+and a launch carrying it would fail provider validation.
+`scripts/check_prerequisites.py` reports the template's raw
+`CreditSpecification` value and whether the template and each configured pool
+type is burstable; an unrecognized value is `credit_specification_invalid`
+drift, while an absent specification stays absent and is not drift. The
+estimate does not bound surplus credits in either mode: choosing the instance
+family, setting the credit mode and any billable comparison are operator
+decisions, and the product only reports the exposure.
 
 ### Reconciling with the provider bill
 

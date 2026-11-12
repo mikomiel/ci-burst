@@ -15,7 +15,6 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .credit import CREDIT_MODES
 from .errors import ProviderRefusal
 from .money import parse_money
 
@@ -29,6 +28,11 @@ MAX_INVENTORY_PAGES = 20
 #: One console read is bounded so a single image cannot turn an observation run
 #: into an unbounded download. The provider caps the same call at this size.
 MAX_CONSOLE_BYTES = 64 * 1024
+
+#: A CPU-credit value is a short enum token. The adapter keeps the template's
+#: raw value so an unrecognized mode stays visible as unrecognized, but it does
+#: not echo an arbitrary provider string as credit evidence.
+MAX_CREDIT_SPECIFICATION_CHARS = 32
 
 #: The controller owns retries: an unresolved launch is resumed with its frozen
 #: client token. Botocore's transparent retries would hide that a launch may
@@ -90,7 +94,9 @@ class Template:
     shutdown_behavior: str
     has_user_data: bool
     placement_zone: str | None
-    #: The template's explicit CPU-credit mode, or ``None`` when it sets none.
+    #: The template's raw CPU-credit value, or ``None`` when it sets none.
+    #: ``credit.evidence`` decides which values are recognized; collapsing an
+    #: unrecognized value here would report the family default as if chosen.
     #: The launch request never sets one; the template owns this choice.
     credit_specification: str | None = None
 
@@ -241,8 +247,6 @@ class Aws:
         has_user_data = bool(data.get("UserData"))
         placement = data.get("Placement") or {}
         placement_zone = placement.get("AvailabilityZone")
-        credit = data.get("CreditSpecification")
-        cpu_credits = credit.get("CpuCredits") if isinstance(credit, dict) else None
         return Template(
             name=name,
             template_id=entry.get("LaunchTemplateId", ""),
@@ -252,7 +256,7 @@ class Aws:
             shutdown_behavior=shutdown,
             has_user_data=has_user_data,
             placement_zone=placement_zone if isinstance(placement_zone, str) and placement_zone else None,
-            credit_specification=cpu_credits if cpu_credits in CREDIT_MODES else None,
+            credit_specification=_credit_specification(data),
         )
 
     def spot_quote(self, instance_type, availability_zone):
@@ -387,6 +391,23 @@ def _timestamp(value):
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _credit_specification(data):
+    """Return the template's raw CPU-credit value, bounded, or ``None``.
+
+    The value is kept verbatim, including one this product does not recognize:
+    ``credit.evidence`` owns mode recognition, and dropping a present value here
+    would report the family default as if the template had chosen it. A value
+    that is not a short printable token is not credit evidence at all.
+    """
+    specification = data.get("CreditSpecification")
+    value = specification.get("CpuCredits") if isinstance(specification, dict) else None
+    if not isinstance(value, str) or not value or not value.isascii() or not value.isprintable():
+        return None
+    if len(value) > MAX_CREDIT_SPECIFICATION_CHARS:
+        return None
+    return value
 
 
 def _spot_quote(entries, instance_type, availability_zone, observed_at):

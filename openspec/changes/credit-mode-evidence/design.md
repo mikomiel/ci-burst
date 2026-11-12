@@ -37,7 +37,7 @@ The `credit` object is one additive field on an existing candidate record:
 ```
 {"burstable": true|false|null,
  "mode": "standard"|"unlimited"|null,
- "mode_source": "template"|"aws-default"|"not-applicable"|"unknown",
+ "mode_source": "template"|"template-unrecognized"|"aws-default"|"not-applicable"|"unknown",
  "surplus_credits": "unquantified"|"not-applicable"|"unknown"}
 ```
 
@@ -48,28 +48,40 @@ owners of the mode.
 
 ### The template's specification outranks the default
 
-When the launch template names a valid mode, the candidate reports it with
-`mode_source: "template"`. Otherwise a burstable family reports its documented
-default with `mode_source: "aws-default"`. The account-level default can
-override the family default, which this product cannot observe without another
-API and permission; the mode source says which fact is being reported.
+The launch template's value has three states, and they stay distinct. Absent
+(`None`) means the template sets no specification, so a burstable family reports
+its documented default with `mode_source: "aws-default"`. A recognized
+`standard` or `unlimited` value reports itself with `mode_source: "template"`.
+Any other present value reports `mode: null` with `mode_source:
+"template-unrecognized"` and `surplus_credits: "unknown"`: the provider would
+refuse that launch, and the family default is not what the template says. The
+account-level default can override the family default, which this product cannot
+observe without another API and permission; the plan does not query it, and the
+mode source says which fact is being reported.
 
 ### The prerequisite check reports the same facts
 
-`_template_facts` reports `credit_specification` (or `None` when the template
-sets none) and `burstable` for the template type; configured pool types get
-`burstable` in the existing `instance_type` record. An unreadable template is
-already `unavailable`, so credit evidence cannot turn into a pass. An absent
-specification is evidence of the family default, not a missing read.
+`_template_facts` reports the raw `credit_specification` (or `None` when the
+template sets none) and `burstable` for the template type; configured pool types
+get `burstable` in the existing `instance_type` record. An unreadable template
+is already `unavailable`, so credit evidence cannot turn into a pass. An absent
+specification is evidence of the family default, not a missing read. A present
+value the product does not recognize is reported raw and as
+`credit_specification_invalid` drift, because a launch carrying it would fail
+provider validation; it is never read as the default.
 
 ## Failure behavior
 
 - Unknown family: `credit` reports `unknown`; the plan still launches on that
   candidate, because this change adds no refusal.
-- Non-burstable family: `credit` reports not applicable. A launch template that
-  still pins a credit specification supplies it to every launch, so an operator
-  mixing families should confirm the provider accepts that combination; this
-  change does not test it.
+- Non-burstable family: `credit` reports not applicable, unless the template
+  pins a recognized mode, which it reports with the template as its source. A
+  launch template that still pins a credit specification supplies it to every
+  launch, so an operator mixing families should confirm the provider accepts
+  that combination; this change does not test it.
+- Unrecognized template value: the plan reports no mode and does not fall back
+  to the family default; the prerequisite check reports the raw value and
+  `credit_specification_invalid` drift.
 - Unreadable template: the prerequisite check stays `unavailable` (exit 3), not
   drift and not a pass.
 - The estimate still cannot bound surplus credits; docs and the cost-scope note
@@ -89,8 +101,8 @@ specification is evidence of the family default, not a missing read.
 
 ## Evidence gaps
 
-- The account-level default credit specification is not observed; the plan
-  reports the family default, not the account state.
+- The account-level default credit specification is not observed or queried;
+  the plan reports the family default, not the account's effective default.
 - Surplus-credit cost needs provider billing or runtime burst evidence, so the
   plan reports it as unquantified.
 - The family table is curated; a new family stays `unknown` until reviewed.

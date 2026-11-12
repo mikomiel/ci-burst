@@ -217,29 +217,38 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(template.placement_zone, "eu-central-1a")
         self.assertTrue(template.has_user_data)
 
-    def test_template_credit_specification_is_parsed_and_validated(self):
+    def test_template_credit_specification_is_preserved_raw(self):
         def response(credit):
+            data = {
+                "ImageId": "ami-1",
+                "InstanceType": "t4g.small",
+                "InstanceInitiatedShutdownBehavior": "terminate",
+                "UserData": "AAAA",
+            }
+            if credit is not None:
+                data["CreditSpecification"] = credit
             return {
                 "LaunchTemplateVersions": [
                     {
                         "LaunchTemplateId": "lt-1",
                         "VersionNumber": 3,
-                        "LaunchTemplateData": {
-                            "ImageId": "ami-1",
-                            "InstanceType": "t4g.small",
-                            "InstanceInitiatedShutdownBehavior": "terminate",
-                            "UserData": "AAAA",
-                            "CreditSpecification": credit,
-                        },
+                        "LaunchTemplateData": data,
                     }
                 ]
             }
 
         self.client.responses = [response({"CpuCredits": "standard"})]
         self.assertEqual(self.aws().template("runner", 3).credit_specification, "standard")
-        # An unrecognized value is not evidence of a mode; report absence
-        # rather than passing a guessed value through.
+        # An unrecognized value is still the template's value. Dropping it here
+        # would report the family default as if the template had chosen it.
         self.client.responses = [response({"CpuCredits": "burst"})]
+        self.assertEqual(self.aws().template("runner", 3).credit_specification, "burst")
+        # Absent and non-token values are not mode evidence.
+        self.client.responses = [response(None)]
+        self.assertIsNone(self.aws().template("runner", 3).credit_specification)
+        self.client.responses = [response({"CpuCredits": "x" * 40})]
+        self.assertIsNone(self.aws().template("runner", 3).credit_specification)
+        self.client.responses = [response({"CpuCredits": 7})]
         self.assertIsNone(self.aws().template("runner", 3).credit_specification)
 
     def test_template_must_terminate_on_shutdown(self):

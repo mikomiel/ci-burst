@@ -56,13 +56,37 @@ must not be lost or presented as complete observation: the deferred records are
 read on a later run while the provider still knows them, and the documentation
 says the result is partial evidence.
 
+### The deferral rule is scoped to the read budget
+
+This change modifies two requirements, not one. `Observation refuses only when
+owned instances exceed the limit` carries the drain report and the read-budget
+refusal; `Turnover defers surplus candidates rather than refusing` keeps the
+deferral of surplus candidates and gains the budget qualifier. The second
+requirement is introduced by the prerequisite promotion PR #107, which splits
+`Provider-only bounded observation`; until #107 merges it is absent from
+`openspec/specs/worker-observation/spec.md`, so this delta's MODIFIED block for
+it applies only after that merge. Strict validation reports the absent archive
+target as an INFO, not as a failure, and the requirement must not be renamed or
+dropped to avoid that notice.
+
+Read alone, the promoted sentence — when the candidates exceed the per-run
+budget the command MUST defer the rest and MUST NOT refuse — contradicts the new
+refusal for 17 unfinished live candidates. The rule is correct for surplus
+terminal history and wrong for live evidence the budget cannot cover, so it is
+scoped rather than deleted: deletion would remove a behaviour that still holds
+and drop its only scenario, while scoping keeps the deferral and names the read
+budget as the boundary between deferring and refusing. `Provider-only bounded
+observation` is not touched: after the split it no longer carries the deferral
+rule.
+
 ## Failure behavior
 
 - An above-limit drain: `decision: reported`, `above_configured_limit` note,
   events and metrics written for the records read.
 - More than 16 unfinished non-terminal candidates: `ProviderRefusal` with
   `console_read_cap_exceeded`, exit code 2, no event and no metrics file.
-- Surplus termination history: `console_read_deferred` note, reported.
+- Surplus terminal history within the read budget: `console_read_deferred` note,
+  reported.
 - A provider error, an unreadable ledger or a corrupt record keeps its existing
   behavior; this change touches none of those paths.
 

@@ -247,10 +247,12 @@ observed it `terminated` or `stopped`. An exit line on the console is not that
 signal — the bootstrap can finish while the instance and its console carry on.
 Live workers are read first, so the growing consoles are never the ones deferred.
 
-A run that finds more candidates than the budget defers the rest with the note
-`console_read_deferred`, and the next run picks them up while they are still
-visible. A deferred run is partial observation: the note is the signal, and the
-run must not be read as complete evidence.
+A run whose unfinished non-terminal candidates fit within the budget but whose
+candidate list exceeds it defers the surplus terminal history with the note
+`console_read_deferred`, and the next run picks it up while it is still visible.
+Above that budget the run refuses instead, because live evidence cannot be
+covered in one run. A deferred run is partial observation: the note is the
+signal, and the run must not be read as complete evidence.
 
 The read budget is independent of the admission ceiling. A deployment running
 more non-terminal owned workers than its configured `controller.max_instances`

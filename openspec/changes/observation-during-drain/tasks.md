@@ -31,6 +31,11 @@ no cloud change.
   that the only refusal is the read budget.
 - [x] 3.2 The `worker-observation` delta modifies `Observation refuses only when
   owned instances exceed the limit` with the drain and read-budget scenarios.
+- [x] 3.3 The delta also modifies `Turnover defers surplus candidates rather
+  than refusing`, scoping the deferral to candidates the run will not read while
+  the unfinished non-terminal candidates fit the read budget, and the design
+  records the PR #107 merge prerequisite and that scoping is chosen over
+  deletion.
 
 ## 4. Validation
 

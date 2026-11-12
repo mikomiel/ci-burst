@@ -2,9 +2,10 @@
 
 ## Project status
 
-ci-burst is pre-implementation. There are no supported release versions and
-no verified production deployment at this stage. Do not interpret planning
-validation as evidence of safe live provisioning.
+The controller source is implemented and has tagged releases. The project does
+not support a production deployment: the shipped default is `fixtures-only`, and
+live qualification is the operator's recorded evidence. A green CI run, a merge
+or a tag is not proof of a live deployment.
 
 ## Reporting a vulnerability
 

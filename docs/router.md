@@ -13,7 +13,8 @@ into the subnet and see whether it registers as a runner.
 
 `scripts/check_prerequisites.py` reports the configured route target, whether
 its instance is running, and — for a hand-built router whose user data lists its
-rules — which CIDRs that text names without commenting them out. The router in
+rules — which CIDRs that text names without commenting them out. It also reports
+whether the route target's source/destination check is disabled. The router in
 this repository reads its CIDRs from SSM, so no CIDR is declared in its user
 data and the check reports its forwarding as **unverified**
 (`router_forwarding_unverified`, exit 3) rather than as a pass or as drift: no

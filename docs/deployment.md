@@ -298,25 +298,38 @@ It checks, from read-only describe calls:
   `deploy/runner/bootstrap.sh` byte for byte, trailing newlines aside;
 - every configured candidate's subnet exists in that zone and Region, and its
   route table (or the VPC's main route table) has an active default route;
-- when that default route targets a network interface, the owning instance is
-  running and its boot configuration names the candidate's subnet CIDR
-  (`router_forwarding_missing_cidr` when a configured CIDR is absent,
-  `router_user_data_unavailable` when it cannot be read, and
+- when that default route targets a network interface or an instance, the
+  owning instance is running and its boot configuration names the candidate's
+  subnet CIDR (`router_forwarding_missing_cidr` when a configured CIDR is
+  absent, `router_user_data_unavailable` when it cannot be read, and
   `router_forwarding_unverified` when no CIDR is declared in its user data —
   read from SSM or a baked image, for example. An unreadable, undeclared or
   externally-configured router is never a pass and never drift);
+- that router's source/destination check is read for either target kind: an
+  enabled setting is drift (`router_source_dest_check_enabled`), and a disabled
+  setting does not prove reachability. An interface target's setting comes from
+  `DescribeNetworkInterfaces`, so a refused read there is
+  `router_read_unavailable`; an instance target's setting comes from
+  `DescribeInstanceAttribute`, so a refused read there, an absent field or a
+  non-boolean value is `router_source_dest_check_unavailable`. Both codes mean
+  the check is incomplete and exit 3;
 - the template's security groups exist;
 - the template's instance profile and its role exist;
 - the registration parameter exists — metadata only.
 
-The output is one JSON document with stable reason codes. Exit `0` means every
-check passed, `2` means drift, and `3` means the check could not run
-completely. An incomplete check takes precedence over drift: if any check is
-unavailable the command exits `3`, while the drift reasons are still listed in
-`reasons`. A missing `ec2:DescribeSubnets`, `ssm:DescribeParameters` or
-`iam:GetInstanceProfile` permission, and an expected credential, session or
-session-configuration failure such as `ProfileNotFound` or `ConfigParseError`,
-are reported as `unavailable` and exit `3`; they are neither a pass nor drift.
+The output is one JSON document with stable reason codes and two top-level
+lists: `reasons` collects drift and `unavailable` collects every reason a check
+could not run. A check record that proved drift before a later read failed
+keeps the drift in its own `drift_reasons` list; the aggregation copies those
+codes into the top-level `reasons`, so a drift code never appears in
+`unavailable`. Exit `0` means every check passed, `2` means drift, and `3`
+means the check could not run completely. An incomplete check takes precedence
+over drift: if any check is unavailable the command exits `3`, while the drift
+reasons are still listed in `reasons`. A missing `ec2:DescribeSubnets`,
+`ssm:DescribeParameters` or `iam:GetInstanceProfile` permission, and an
+expected credential, session or session-configuration failure such as
+`ProfileNotFound` or `ConfigParseError`, are reported as `unavailable` and exit
+`3`; they are neither a pass nor drift.
 
 What it does not prove: nothing about a worker's runtime behaviour — boot,
 registration, job execution or termination; network reachability (security

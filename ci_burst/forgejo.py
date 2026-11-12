@@ -143,11 +143,12 @@ class ForgejoObserver:
     def _label_filter(self):
         """The bare label names the worker advertises, as the server expects.
 
-        The endpoint answers ``null`` when ``labels`` is absent, so the filter is
-        mandatory rather than an optimisation. It is only a prefilter: the
-        complete ``runs_on`` comparison in ``_reduce`` still decides eligibility,
-        so a job selected by one shared label remains incompatible when it also
-        requires a label the worker does not advertise.
+        An absent ``labels`` parameter is not a narrowing filter: the endpoint
+        then admits every waiting or running job in the repository, so the
+        parameter is mandatory rather than an optimisation. It is only a
+        prefilter: the complete ``runs_on`` comparison in ``_reduce`` still
+        decides eligibility, so a job selected by one shared label remains
+        incompatible when it also requires a label the worker does not advertise.
         """
         return ",".join(sorted({label.split(":", 1)[0] for label in self._config.worker.labels}))
 

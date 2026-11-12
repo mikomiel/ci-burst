@@ -102,7 +102,7 @@ class ParseConsoleTests(unittest.TestCase):
         self.assertFalse(facts.registered)
 
 
-class ExporterTests(unittest.TestCase):
+class ExportCase(unittest.TestCase):
     def setUp(self):
         self._directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._directory.cleanup)
@@ -137,6 +137,8 @@ class ExporterTests(unittest.TestCase):
     def events_read(self):
         return [json.loads(line) for line in self.events.read_text().splitlines() if line]
 
+
+class ExporterTests(ExportCase):
     def test_first_run_emits_one_event_per_marker_with_a_stable_identity(self):
         exporter = self.build(
             [instance("i-0123456789abcdef0", zone="eu-central-1a"), instance("i-0123456789abcdef1", state="terminated", zone="eu-central-1b")],
@@ -253,19 +255,6 @@ class ExporterTests(unittest.TestCase):
         self.assertNotIn("ci_burst_spend_micros", text)
         self.assertIn("ci_burst_worker_launches_total", text)
 
-    def test_console_cap_refuses_more_live_workers_than_the_configured_limit(self):
-        owned = [
-            instance("i-0123456789abcdef0"),
-            instance("i-0123456789abcdef1"),
-            instance("i-0123456789abcdef2"),
-        ]
-        exporter = self.build(owned, {}, max_instances=2)
-        with self.assertRaises(ProviderRefusal) as raised:
-            self.run_export(exporter)
-        self.assertEqual(raised.exception.reason, "console_read_cap_exceeded")
-        self.assertFalse(self.events.exists())
-        self.assertFalse(self.metrics.exists())
-
     def test_turnover_beyond_the_read_budget_is_deferred_not_refused(self):
         owned = [
             instance(f"i-0123456789abcde{index:02x}", state="terminated")
@@ -347,9 +336,10 @@ class ExporterTests(unittest.TestCase):
             instance("i-0123456789abcdef1", state="shutting-down"),
         ]
         exporter = self.build(owned, {}, max_instances=1)
-        with self.assertRaises(ProviderRefusal) as raised:
-            self.run_export(exporter)
-        self.assertEqual(raised.exception.reason, "console_read_cap_exceeded")
+        result = self.run_export(exporter)
+        self.assertEqual(result["decision"], "reported")
+        self.assertIn("above_configured_limit", result["notes"])
+        self.assertEqual(result["console_reads"], 2)
 
     def test_a_mixed_inventory_reads_every_live_worker_before_history(self):
         live = [instance(f"i-0123456789abc0{index:02x}") for index in range(12)]
@@ -882,6 +872,62 @@ class ExporterTests(unittest.TestCase):
         self.assertIsNone(note)
         self.assertEqual(state["instances"], {})
         self.assertEqual(state["totals"], {"launches": 0, "registered": 0, "unregistered": 0})
+
+
+class ObservationRefusesOnlyWhenOwnedInstancesExceedTheLimitTests(ExportCase):
+    def test_two_live_workers_above_a_lowered_limit_are_reported_with_evidence(self):
+        owned = [instance("i-0123456789abcdef0"), instance("i-0123456789abcdef1")]
+        exporter = self.build(
+            owned, {item.instance_id: CLEAN_BOOT for item in owned}, max_instances=1
+        )
+        result = self.run_export(exporter)
+        self.assertEqual(result["decision"], "reported")
+        self.assertEqual(result["console_reads"], 2)
+        self.assertIn("above_configured_limit", result["notes"])
+        self.assertNotIn("console_read_deferred", result["notes"])
+        self.assertEqual(len(self.console_read_calls(exporter)[0]), 2)
+        self.assertEqual(result["totals"]["registered"], 2)
+        self.assertTrue(self.events.exists())
+        self.assertTrue(self.metrics.exists())
+        self.assertIn("ci_burst_export_last_run_timestamp_seconds", self.metrics.read_text())
+
+    def test_seventeen_live_workers_exceed_the_read_budget_and_refuse(self):
+        owned = [
+            instance(f"i-0123456789abcde{index:02x}")
+            for index in range(MAX_CONSOLE_READS + 1)
+        ]
+        exporter = self.build(owned, {}, max_instances=1)
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.run_export(exporter)
+        self.assertEqual(raised.exception.reason, "console_read_cap_exceeded")
+        self.assertIn("read budget", raised.exception.detail)
+        self.assertEqual(self.console_read_calls(exporter), [])
+        self.assertFalse(self.events.exists())
+        self.assertFalse(self.metrics.exists())
+
+    def test_twelve_live_workers_at_their_limit_are_unchanged(self):
+        owned = [instance(f"i-0123456789abc0{index:02x}") for index in range(12)]
+        exporter = self.build(owned, {}, max_instances=12)
+        result = self.run_export(exporter)
+        self.assertEqual(result["decision"], "reported")
+        self.assertEqual(result["console_reads"], 12)
+        self.assertNotIn("above_configured_limit", result["notes"])
+        self.assertNotIn("console_read_deferred", result["notes"])
+
+    def test_deferred_terminal_history_still_reports_the_deferral(self):
+        live = [instance(f"i-0123456789abc0{index:02x}") for index in range(2)]
+        history = [
+            instance(f"i-0123456789abc1{index:02x}", state="terminated")
+            for index in range(MAX_CONSOLE_READS + 4)
+        ]
+        exporter = self.build(live + history, {}, max_instances=2)
+        result = self.run_export(exporter)
+        self.assertEqual(result["decision"], "reported")
+        self.assertEqual(result["console_reads"], MAX_CONSOLE_READS)
+        self.assertIn("console_read_deferred", result["notes"])
+        self.assertNotIn("above_configured_limit", result["notes"])
+        read = set(self.console_read_calls(exporter)[0])
+        self.assertEqual(read & {item.instance_id for item in live}, {item.instance_id for item in live})
 
 
 class ConsoleReadTests(unittest.TestCase):

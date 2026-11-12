@@ -581,10 +581,16 @@ conditions). Reverting the source is a reviewed change, not a history rewrite.
 | `FORGEJO_TOKEN_MISSING` | the env-file is not mounted or lacks the variable |
 | `FORGEJO_CONTRACT_UNQUALIFIED` | `qualification` is still `fixtures-only`; `apply` is refused |
 | `FORGEJO_UNEXPECTED_SHAPE` | the endpoint returned something other than an array or `null` |
+| `AWS_SDK_UNAVAILABLE` | the `boto3` runtime dependency is not installed in the command's environment |
 | `AWS_REFUSED` | the identity lacks a permission, or a condition (tag, template, subnet) does not match |
 | `AWS_UNCERTAIN` | the provider outcome is unknown; the recorded client token resumes the same operation |
+| `AWS_INVENTORY_INCOMPLETE` | the inventory response is not a complete, parseable result; no operation is settled and no replacement is admitted |
 | `UNRECORDED_OWNED_INSTANCE`, `OWNERSHIP_TAGS_MISSING`, `OPERATION_TAG_INVALID` | an owned instance needs reconciliation before another launch |
 | `spot_price_above_cap`, `spot_price_stale` | the price evidence is above `max_spot_price` or older than `price_max_age_seconds` |
+
+A malformed inventory is a refusal, not an empty fleet: the controller neither
+settles an operation nor launches a replacement from a response it could not
+parse.
 
 `status` prints the last decision and the operation's state without mutating
 anything. A refused cleanup stays visible and does not free its slot; a

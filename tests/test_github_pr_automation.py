@@ -123,6 +123,14 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result[HEAD], ("pending", "current_head_approval_required"))
         self.assertEqual(api.published, [(HEAD, "pending", "current_head_approval_required")])
 
+    def test_a_change_request_on_a_release_pr_is_published_as_failure(self):
+        api = FakeGitHub()
+        api.prs = [release_pull()]
+        with mock.patch.object(api, "reviews", return_value=[review("CHANGES_REQUESTED")]):
+            result = driver.run_review(api, apply=True)
+        self.assertEqual(result[HEAD], ("failure", "changes_requested"))
+        self.assertEqual(api.published, [(HEAD, "failure", "changes_requested")])
+
     def test_release_shaped_pr_with_a_deletion_or_rename_keeps_the_review(self):
         api = FakeGitHub()
         api.prs = [release_pull()]

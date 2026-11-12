@@ -128,6 +128,29 @@ class ReleaseTests(unittest.TestCase):
             ("success", "automated_release"),
         )
 
+    def test_a_change_request_still_blocks_the_release_pr(self):
+        pr = release_pull()
+        pr["reviews"] = [review("CHANGES_REQUESTED")]
+        self.assertEqual(self.plan(pr), ("failure", "changes_requested"))
+
+    def test_the_recognised_shape_matches_the_generated_release_pull_request(self):
+        # Captured from pull request #102, the first generated 0.3.0 release PR.
+        # The literals are deliberate: a drift in a policy constant fails here.
+        pr = pull()
+        pr["user"] = {"login": "mikomiel"}
+        pr["head"].update(
+            ref="release-please--branches--main--components--ci-burst",
+            repo={"full_name": "mikomiel/ci-burst"},
+        )
+        pr["release_paths"] = [
+            ".release-please-manifest.json",
+            "CHANGELOG.md",
+            "ci_burst/__init__.py",
+            "pyproject.toml",
+        ]
+        pr["reviews"] = []
+        self.assertEqual(self.plan(pr), ("success", "automated_release"))
+
     def test_every_other_shape_keeps_the_review_requirement(self):
         cases = {
             "wrong branch": lambda pr: pr["head"].update(

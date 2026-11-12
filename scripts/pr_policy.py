@@ -141,10 +141,11 @@ def review_plan(prs):
     """One verdict per SHA, worst open-PR verdict winning for a shared head.
 
     A generated release pull request is the only PR whose review status is
-    published without an independent review. It is a deterministic artifact of
-    merged commits and still needs exact-head CI and a human merge; the merge
+    published without an independent approval. It is a deterministic artifact
+    of merged commits and still needs exact-head CI and a human merge; the merge
     decision below never auto-merges it because it always changes a sensitive
-    path.
+    path. An explicit change request from an eligible reviewer is still a
+    failure: the exemption removes the approval requirement, not a veto.
     """
     if not isinstance(prs, list):
         raise Unusable("invalid_pull_snapshot")
@@ -154,12 +155,11 @@ def review_plan(prs):
         if not pull_scope(pr):
             raise Unusable("invalid_pull_scope")
         head = pr["head"]["sha"]
-        if release_scope(pr):
+        state, reason = review_verdict(
+            pr.get("reviews"), head, pr["user"]["login"], pr.get("maintainers", ())
+        )
+        if release_scope(pr) and state != "failure":
             state, reason = "success", "automated_release"
-        else:
-            state, reason = review_verdict(
-                pr.get("reviews"), head, pr["user"]["login"], pr.get("maintainers", ())
-            )
         if pr["draft"]:
             state, reason = "pending", "pull_request_is_draft"
         if head not in result or severity[state] > severity[result[head][0]]:

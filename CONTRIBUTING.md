@@ -58,12 +58,14 @@ publisher records the `review` status as success only for the fixed
 token owner, changing only `CHANGELOG.md`, `pyproject.toml`,
 `ci_burst/__init__.py` and `.release-please-manifest.json`, each as an in-place
 modification (an addition, deletion or rename keeps the normal review). Any
-other branch, author or path keeps the normal review requirement.
-Release-please derives that branch from the package name and the base branch,
-so changing either requires updating `scripts/pr_policy.py`; until then the
-exemption fails closed. The release artifact is generated from already-merged
-commits, still needs the same exact-head CI, and its sensitive paths keep it
-out of unattended merging: a maintainer merges it.
+other branch, author or path keeps the normal review requirement, and an
+explicit `CHANGES_REQUESTED` from an eligible reviewer still fails the release
+PR: the exemption removes the approval requirement, not a veto. Release-please
+derives that branch from the package name and the base branch, so changing
+either requires updating `scripts/pr_policy.py`; until then the exemption fails
+closed. The release artifact is generated from already-merged commits, still
+needs the same exact-head CI, and its sensitive paths keep it out of unattended
+merging: a maintainer merges it.
 
 The publisher and merger run only trusted default-branch scripts. Neither
 executes PR-head code or consumes PR-produced artifacts with a write token.

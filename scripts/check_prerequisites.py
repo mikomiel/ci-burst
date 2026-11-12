@@ -9,13 +9,14 @@ launch fails. It also compares the pinned template version's user data with
 version, so a repository edit that was never published is drift rather than a
 silent no-op.
 
-When a candidate's default route targets a network interface, that router is
-part of the deployment too: the command checks that it is running and that its
-boot configuration forwards the candidate's CIDR. It cannot prove reachability
-— a real registration does that. An unreadable router configuration, and a
-router whose forwarding CIDRs are not declared in its user data (read from SSM
-or a baked image, for example), are reported as unavailable rather than as a
-pass or as drift.
+When a candidate's default route targets a network interface or an instance,
+that router is part of the deployment too: the command checks that it is
+running, that its source/destination check is disabled, and that its boot
+configuration forwards the candidate's CIDR. It cannot prove reachability — a
+real registration does that. An unreadable router configuration, and a router
+whose forwarding CIDRs are not declared in its user data (read from SSM or a
+baked image, for example), are reported as unavailable rather than as a pass or
+as drift.
 
 The command only reads: it never mutates a resource, never reads a parameter
 value (not even a ciphertext), and never stores one. The template is read
@@ -893,6 +894,42 @@ class Prerequisites:
             return _record(
                 "router", target, status="drift", facts=record_facts, reasons=["router_target_not_running"]
             )
+        # AWS drops forwarded packets while source/destination checking is
+        # enabled. The interface read carries the setting; an instance target
+        # exposes the same setting through DescribeInstanceAttribute. An
+        # enabled setting is drift; a disabled one does not prove reachability.
+        if kind == "InstanceId":
+            try:
+                attribute = _call(
+                    self._clients.ec2,
+                    "describe_instance_attribute",
+                    InstanceId=instance_id,
+                    Attribute="sourceDestCheck",
+                )
+            except ProviderCallError as error:
+                return _record(
+                    "router",
+                    target,
+                    status="unavailable",
+                    facts=record_facts,
+                    reasons=["router_source_dest_check_unavailable"],
+                    detail=error.code,
+                )
+            source_dest_check = (attribute.get("SourceDestCheck") or {}).get("Value")
+            record_facts["source_dest_check"] = source_dest_check
+        if not isinstance(source_dest_check, bool):
+            # An absent or malformed setting is missing evidence, not a
+            # disabled check.
+            return _record(
+                "router",
+                target,
+                status="unavailable",
+                facts=record_facts,
+                reasons=["router_source_dest_check_unavailable"],
+            )
+        reasons = []
+        if source_dest_check:
+            reasons.append("router_source_dest_check_enabled")
         try:
             attribute = _call(
                 self._clients.ec2,
@@ -946,7 +983,6 @@ class Prerequisites:
                 reasons=["router_forwarding_unverified"],
                 detail="no forwarding CIDR is declared in user data",
             )
-        reasons = []
         if subnet_cidr and subnet_cidr not in forwarded:
             reasons.append("router_forwarding_missing_cidr")
         return _record(

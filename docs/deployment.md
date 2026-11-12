@@ -298,13 +298,17 @@ It checks, from read-only describe calls:
   `deploy/runner/bootstrap.sh` byte for byte, trailing newlines aside;
 - every configured candidate's subnet exists in that zone and Region, and its
   route table (or the VPC's main route table) has an active default route;
-- when that default route targets a network interface, the owning instance is
-  running and its boot configuration names the candidate's subnet CIDR
-  (`router_forwarding_missing_cidr` when a configured CIDR is absent,
-  `router_user_data_unavailable` when it cannot be read, and
+- when that default route targets a network interface or an instance, the
+  owning instance is running and its boot configuration names the candidate's
+  subnet CIDR (`router_forwarding_missing_cidr` when a configured CIDR is
+  absent, `router_user_data_unavailable` when it cannot be read, and
   `router_forwarding_unverified` when no CIDR is declared in its user data —
   read from SSM or a baked image, for example. An unreadable, undeclared or
   externally-configured router is never a pass and never drift);
+- that router's source/destination check is read for either target kind: an
+  enabled setting is drift (`router_source_dest_check_enabled`), an absent or
+  refused read is `router_source_dest_check_unavailable` and exits 3, and a
+  disabled setting does not prove reachability;
 - the template's security groups exist;
 - the template's instance profile and its role exist;
 - the registration parameter exists — metadata only.

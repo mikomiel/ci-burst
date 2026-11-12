@@ -134,6 +134,7 @@ class FakeEc2:
         self.images = {"ami-0123456789abcdef0": "arm64"}
         self.error = None
         self.errors = {}
+        self.source_dest_checks = {}
         self.calls = []
 
     def _maybe_raise(self, method):
@@ -221,6 +222,10 @@ class FakeEc2:
         instance_id = kwargs["InstanceId"]
         if instance_id not in self.instances:
             raise ClientError("InvalidInstanceID.NotFound")
+        if kwargs.get("Attribute") == "sourceDestCheck":
+            if instance_id not in self.source_dest_checks:
+                return {"SourceDestCheck": {}}
+            return {"SourceDestCheck": {"Value": self.source_dest_checks[instance_id]}}
         value = self.user_data.get(instance_id)
         return {"UserData": {"Value": value}} if value else {"UserData": {}}
 
@@ -589,21 +594,44 @@ class PrerequisiteTests(unittest.TestCase):
         self.assert_unavailable(result, "instance_types_unavailable")
         self.assertEqual(self.records(result, "pools")[0]["detail"], "AccessDenied")
 
-    def use_router(self, *, cidrs=(SUBNET_CIDR,), state="running", user_data=None):
-        """Point the candidate's default route at a router instance."""
+    def use_router(
+        self,
+        *,
+        cidrs=(SUBNET_CIDR,),
+        state="running",
+        user_data=None,
+        target_kind="NetworkInterfaceId",
+        source_dest_check=False,
+    ):
+        """Point the candidate's default route at a router instance.
+
+        ``source_dest_check`` is the provider's setting for the route target:
+        ``None`` means the field is absent from the read.
+        """
+        if target_kind == "InstanceId":
+            target = {"InstanceId": ROUTER_INSTANCE_ID}
+        else:
+            target = {"NetworkInterfaceId": ROUTER_ENI_ID}
         self.ec2.route_tables = [
             route_table_data(
                 Routes=[
                     {
                         "DestinationCidrBlock": "0.0.0.0/0",
-                        "NetworkInterfaceId": ROUTER_ENI_ID,
                         "State": "active",
+                        **target,
                     }
                 ]
             )
         ]
-        self.ec2.interfaces[ROUTER_ENI_ID] = interface_data()
+        interface = interface_data()
+        if source_dest_check is None:
+            interface.pop("SourceDestCheck")
+        else:
+            interface["SourceDestCheck"] = source_dest_check
+        self.ec2.interfaces[ROUTER_ENI_ID] = interface
         self.ec2.instances[ROUTER_INSTANCE_ID] = instance_data(State={"Name": state})
+        if source_dest_check is not None:
+            self.ec2.source_dest_checks[ROUTER_INSTANCE_ID] = source_dest_check
         self.ec2.user_data[ROUTER_INSTANCE_ID] = (
             router_user_data(cidrs) if user_data is None else user_data
         )
@@ -960,6 +988,60 @@ class PrerequisiteTests(unittest.TestCase):
             )
         )
         self.assert_unavailable(self.check(), "router_forwarding_unverified")
+
+    def test_router_with_source_dest_check_enabled_is_drift(self):
+        self.use_router(source_dest_check=True)
+        result = self.check()
+        self.assert_drift(result, "router_source_dest_check_enabled")
+        router = self.records(result, "router")[0]
+        self.assertEqual(router["status"], "drift")
+        self.assertIs(router["facts"]["source_dest_check"], True)
+
+    def test_router_with_source_dest_check_disabled_passes(self):
+        self.use_router(source_dest_check=False)
+        result = self.check()
+        self.assertEqual(result["decision"], "satisfied")
+        self.assertIs(self.records(result, "router")[0]["facts"]["source_dest_check"], False)
+
+    def test_router_without_a_source_dest_check_fact_is_unavailable(self):
+        self.use_router(source_dest_check=None)
+        result = self.check()
+        self.assert_unavailable(result, "router_source_dest_check_unavailable")
+        self.assertEqual(self.records(result, "router")[0]["status"], "unavailable")
+
+    def test_router_interface_read_denied_is_unavailable(self):
+        self.use_router()
+        self.ec2.errors["describe_network_interfaces"] = ClientError("UnauthorizedOperation")
+        result = self.check()
+        self.assert_unavailable(result, "router_read_unavailable")
+        self.assertEqual(self.records(result, "router")[0]["detail"], "UnauthorizedOperation")
+
+    def test_instance_target_with_source_dest_check_enabled_is_drift(self):
+        self.use_router(target_kind="InstanceId", source_dest_check=True)
+        result = self.check()
+        self.assert_drift(result, "router_source_dest_check_enabled")
+        self.assertIn(
+            ("describe_instance_attribute", {"InstanceId": ROUTER_INSTANCE_ID, "Attribute": "sourceDestCheck"}),
+            self.ec2.calls,
+        )
+        self.assertIs(self.records(result, "router")[0]["facts"]["source_dest_check"], True)
+
+    def test_instance_target_with_source_dest_check_disabled_passes(self):
+        self.use_router(target_kind="InstanceId", source_dest_check=False)
+        result = self.check()
+        self.assertEqual(result["decision"], "satisfied")
+        self.assertIs(self.records(result, "router")[0]["facts"]["source_dest_check"], False)
+
+    def test_instance_target_without_a_source_dest_check_fact_is_unavailable(self):
+        self.use_router(target_kind="InstanceId", source_dest_check=None)
+        self.assert_unavailable(self.check(), "router_source_dest_check_unavailable")
+
+    def test_instance_target_source_dest_check_read_denied_is_unavailable(self):
+        self.use_router(target_kind="InstanceId")
+        self.ec2.errors["describe_instance_attribute"] = ClientError("UnauthorizedOperation")
+        result = self.check()
+        self.assert_unavailable(result, "router_source_dest_check_unavailable")
+        self.assertEqual(self.records(result, "router")[0]["detail"], "UnauthorizedOperation")
 
     def test_managed_gateway_target_skips_the_router_contract(self):
         result = self.check()

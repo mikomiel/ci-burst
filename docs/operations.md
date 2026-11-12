@@ -125,9 +125,12 @@ subnet_id = "subnet-0123456789abcdef0"
 
 The order is type-major and it is the priority: every zone of `m7g.xlarge`
 first, then every zone of `m8g.xlarge`. A definite capacity rejection walks to
-the next pool in that order within the same admission and operation. A batch
-spreads across the first eligible type's zones only, so a later type is a
-fallback rather than a second fleet.
+the next pool in that order within the same admission and operation, and a
+rotation that starts inside the first type stays there until that type's pools
+are exhausted. A batch spreads across the first eligible type's zones only, so a
+later type is a fallback rather than a second fleet. Without a configured list
+each candidate keeps its template version's type and the batch rotates across
+every eligible candidate as before.
 
 The list is optional. When it is absent, the launch template's own
 `InstanceType` is the only pool per candidate, which is the original behaviour.

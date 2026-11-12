@@ -30,8 +30,10 @@ widens them.
 - Send the selected pool's `InstanceType` explicitly in the frozen
   `RunInstances` request. The template's `InstanceType` stays required and
   becomes the default and the shape reference.
-- Rotate a batch across the first eligible type's zones only, so a later type is
-  reached by a definite capacity rejection and not by batch spread.
+- Rotate a batch across the first eligible type's zones only when a list is
+  configured, so a later type is reached by a definite capacity rejection and
+  not by batch spread. Without a list the original whole-list rotation stays,
+  because then each candidate's type comes from its own template version.
 - Report the pool (zone and type) in plan output, launch records and attempt
   records, and name the pool in the fallback detail.
 - Extend the operator prerequisite check: every configured type must be offered

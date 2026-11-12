@@ -619,16 +619,34 @@ class Prerequisites:
                 )
             )
             return
-        reference_vcpus = {metadata[name]["vcpus"] for name in reference_types}
-        reference_memory = {metadata[name]["memory_mib"] for name in reference_types}
-        image_architectures = {architectures[image] for image in image_ids if image in architectures}
+        # A requested image that the provider does not describe is missing
+        # evidence, not a pass: the architecture of every configured template is
+        # part of the check.
+        unread_images = sorted(image for image in image_ids if image not in architectures)
+        if unread_images:
+            checks.append(
+                _record(
+                    "pools",
+                    "aws",
+                    status="unavailable",
+                    reasons=["instance_types_unavailable"],
+                    detail="describe_images did not return: " + ", ".join(unread_images),
+                )
+            )
+            return
+        reference_shapes = [
+            (metadata[name]["vcpus"], metadata[name]["memory_mib"]) for name in reference_types
+        ]
+        image_architectures = {architectures[image] for image in image_ids}
         for instance_type in types:
             facts = dict(metadata[instance_type])
             facts["zones"] = list(zones)
             reasons = []
-            if reference_vcpus and facts["vcpus"] not in reference_vcpus:
-                reasons.append("instance_type_shape_mismatch")
-            if reference_memory and facts["memory_mib"] not in reference_memory:
+            # Every configured type must match every template version a
+            # candidate pins, not merely one of them: two versions with
+            # different shapes cannot both stay in service with one list.
+            shape = (facts["vcpus"], facts["memory_mib"])
+            if any(reference != shape for reference in reference_shapes):
                 reasons.append("instance_type_shape_mismatch")
             if image_architectures and not image_architectures <= set(facts["architectures"]):
                 reasons.append("image_architecture_unsupported")

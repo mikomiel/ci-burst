@@ -37,11 +37,16 @@ no cloud change.
 - [ ] 4.2 Admission: pools expand type-major with one price each; a pool above
   the cap is skipped while a later type stays eligible; a capacity rejection
   advances across types within one operation and reservation; a batch stays on
-  the first type and still alternates zones; the frozen request names the
-  selected type.
+  the first type and still alternates zones; a rotated worker's capacity
+  rejection and expiring evidence both stay inside the preferred type; without
+  a configured list, candidates whose template versions pin different types
+  keep the original whole-list rotation; the frozen request names the selected
+  type.
 - [ ] 4.3 Prerequisites: a clean type list passes; a type missing from a zone,
-  a different shape and an unsupported image architecture are drift; an
-  unreadable metadata read is unavailable with exit 3, not drift.
+  a different shape against any configured template, and an unsupported image
+  architecture are drift; a type whose shape matches one template but not
+  another is drift; an unreadable metadata read and an absent or partial image
+  description are unavailable with exit 3, not drift.
 
 ## 5. Documentation
 

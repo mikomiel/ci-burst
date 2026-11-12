@@ -32,6 +32,8 @@ PROFILE = "example-runner-profile"
 ROLE = "example-runner-role"
 PROFILE_ARN = "arn:aws:iam::000000000000:instance-profile/workers/example-runner"
 SUBNET_ID = "subnet-0123456789abcdef0"
+SECOND_SUBNET_ID = "subnet-0123456789abcdef1"
+SECOND_IMAGE_ID = "ami-0123456789abcdef1"
 SUBNET_CIDR = "192.0.2.0/24"
 ROUTER_ENI_ID = "eni-0123456789abcdef0"
 ROUTER_INSTANCE_ID = "i-0123456789abcdef0"
@@ -432,7 +434,14 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertNotIn(reason, result["reasons"])
         self.assertEqual(prerequisites._exit_code(result["decision"]), 3)
 
-    def use_instance_types(self, *types, offered=None, metadata=None, architecture="arm64"):
+    def use_instance_types(
+        self,
+        *types,
+        offered=None,
+        metadata=None,
+        architecture="arm64",
+        zones=("eu-central-1a",),
+    ):
         """Configure the deployment's type list and the provider facts behind it."""
         self.config = prerequisites.load(deployment_toml(self.root, instance_types=list(types)))
         for instance_type in types:
@@ -443,9 +452,32 @@ class PrerequisiteTests(unittest.TestCase):
         self.ec2.offerings = set(
             offered
             if offered is not None
-            else {(instance_type, "eu-central-1a") for instance_type in types}
+            else {(instance_type, zone) for instance_type in types for zone in zones}
         )
         self.ec2.images["ami-0123456789abcdef0"] = architecture
+        return self.config
+
+    def add_candidate(self, *, zone="eu-central-1b", subnet_id=SECOND_SUBNET_ID, version=4, template_overrides=None):
+        """Append one more zone candidate that pins its own template version."""
+        path = self.config.path
+        block = [
+            "",
+            "[[aws.availability_zones]]",
+            f'zone = "{zone}"',
+            f'subnet_id = "{subnet_id}"',
+            f"launch_template_version = {version}",
+            "",
+        ]
+        path.write_text(path.read_text(encoding="utf-8") + "\n".join(block) + "\n", encoding="utf-8")
+        self.ec2.subnets[subnet_id] = subnet_data(SubnetId=subnet_id, AvailabilityZone=zone)
+        self.ec2.route_tables.append(
+            route_table_data(
+                RouteTableId="rtb-0123456789abcdeff",
+                Associations=[{"SubnetId": subnet_id, "Main": False}],
+            )
+        )
+        self.ec2.templates[version] = template_data(**(template_overrides or {}))
+        self.config = prerequisites.load(path)
         return self.config
 
     def test_configured_instance_types_are_reported_as_pools(self):
@@ -496,6 +528,36 @@ class PrerequisiteTests(unittest.TestCase):
         result = self.check()
         self.assert_drift(result, "image_architecture_unsupported")
         self.assertEqual(self.records(result, "instance_type")[0]["status"], "drift")
+
+    def test_a_type_must_match_every_configured_template_shape(self):
+        self.ec2.instance_types["m7g.2xlarge"] = {
+            "vcpus": 8,
+            "memory": 32768,
+            "architectures": ["arm64"],
+        }
+        self.use_instance_types("t4g.small")
+        self.add_candidate(template_overrides={"InstanceType": "m7g.2xlarge"})
+        self.ec2.offerings |= {("t4g.small", "eu-central-1b")}
+        result = self.check()
+        self.assert_drift(result, "instance_type_shape_mismatch")
+
+    def test_a_missing_image_description_is_unavailable(self):
+        self.use_instance_types("t4g.small")
+        self.ec2.images = {}
+        result = self.check()
+        self.assert_unavailable(result, "instance_types_unavailable")
+        self.assertIn(
+            "describe_images did not return", self.records(result, "pools")[0]["detail"]
+        )
+
+    def test_a_partial_image_response_is_unavailable(self):
+        self.use_instance_types("t4g.small")
+        self.add_candidate(template_overrides={"ImageId": SECOND_IMAGE_ID})
+        self.ec2.offerings |= {("t4g.small", "eu-central-1b")}
+        self.ec2.images = {"ami-0123456789abcdef0": "arm64"}
+        result = self.check()
+        self.assert_unavailable(result, "instance_types_unavailable")
+        self.assertIn(SECOND_IMAGE_ID, self.records(result, "pools")[0]["detail"])
 
     def test_unreadable_instance_type_metadata_is_unavailable(self):
         self.use_instance_types("t4g.small")

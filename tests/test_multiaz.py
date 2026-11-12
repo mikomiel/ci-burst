@@ -25,7 +25,7 @@ CANDIDATES = (
 )
 
 
-def deployment_toml(candidates=CANDIDATES, *, aws=None):
+def deployment_toml(candidates=CANDIDATES, *, aws=None, max_instances=None):
     """Render a deployment configuration with an ordered candidate list."""
     aws_values = {
         "region": "eu-central-1",
@@ -48,6 +48,10 @@ def deployment_toml(candidates=CANDIDATES, *, aws=None):
         "[worker]",
         'labels = ["ci-burst:host", "homelab:host"]',
         "",
+    ]
+    if max_instances is not None:
+        lines += ["[controller]", f"max_instances = {max_instances}", ""]
+    lines += [
         "[budget]",
         "window_seconds = 86400",
         'allowance = "10.00"',
@@ -139,9 +143,11 @@ class MultiZoneCase(unittest.TestCase):
         path.write_text(deployment_toml(candidates, **kwargs), encoding="utf-8")
         return load(path)
 
-    def build(self, *, config=None, quotes=None, run_errors=None, observation=None):
+    def build(
+        self, *, config=None, quotes=None, run_errors=None, observation=None, aws_class=MultiZoneAws
+    ):
         self.config_value = config or self.config()
-        self.aws = MultiZoneAws(
+        self.aws = aws_class(
             quotes=quotes
             if quotes is not None
             else {
@@ -684,6 +690,52 @@ class SingleZoneCompatibilityTests(MultiZoneCase):
         self.assertNotIn("SubnetId", request)
 
 
+class MixedTemplateVersionAws(MultiZoneAws):
+    """Two candidates whose template versions pin different instance types."""
+
+    TYPES_BY_VERSION = {3: "t4g.small", 4: "c7g.large"}
+
+    def template(self, name, version):
+        self.calls.append(("template", name, version))
+        return template(version=version, instance_type=self.TYPES_BY_VERSION[version])
+
+
+class NoTypeListTests(MultiZoneCase):
+    """Without a configured list the candidate types come from the templates."""
+
+    CANDIDATES = (
+        {"zone": "eu-central-1a", "subnet_id": "subnet-0123456789abcdef0"},
+        {
+            "zone": "eu-central-1b",
+            "subnet_id": "subnet-0123456789abcdef1",
+            "launch_template_version": 4,
+        },
+    )
+
+    def test_batch_rotation_still_alternates_across_differing_template_types(self):
+        config = self.config(candidates=self.CANDIDATES, max_instances=2)
+        quotes = {
+            ("t4g.small", "eu-central-1a"): zone_quote(
+                "eu-central-1a", 20_000, self.clock, instance_type="t4g.small"
+            ),
+            ("c7g.large", "eu-central-1b"): zone_quote(
+                "eu-central-1b", 20_000, self.clock, instance_type="c7g.large"
+            ),
+        }
+        controller = self.build(
+            config=config,
+            quotes=quotes,
+            observation=observation_demand(2),
+            aws_class=MixedTemplateVersionAws,
+        )
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(
+            [(launch["zone"], launch["instance_type"]) for launch in result["launches"]],
+            [("eu-central-1a", "t4g.small"), ("eu-central-1b", "c7g.large")],
+        )
+
+
 class PoolTests(MultiZoneCase):
     """One ordered type list multiplying the configured zones into pools."""
 
@@ -789,6 +841,59 @@ class PoolTests(MultiZoneCase):
         )
         ledger = self.reopened()
         self.assertEqual([operation.state for operation in ledger.operations()], ["failed"])
+
+    def test_a_capacity_rejection_falls_back_within_the_preferred_type(self):
+        capacity = ProviderRefusal("AWS_REFUSED", "InsufficientInstanceCapacity")
+        config = self.config(aws={"instance_types": list(self.TYPES)}, max_instances=2)
+        controller = self.build(
+            config=config,
+            quotes=self.pool_quotes(),
+            run_errors={("t4g.small", "eu-central-1b"): capacity},
+            observation=observation_demand(2),
+        )
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        second = result["launches"][1]
+        self.assertEqual((second["zone"], second["instance_type"]), ("eu-central-1a", "t4g.small"))
+        self.assertEqual(
+            [
+                (attempt["zone"], attempt["instance_type"], attempt["outcome"])
+                for attempt in second["attempts"]
+            ],
+            [
+                ("eu-central-1b", "t4g.small", "capacity_rejected"),
+                ("eu-central-1a", "t4g.small", "accepted"),
+            ],
+        )
+
+    def test_evidence_expiring_mid_batch_stays_within_the_preferred_type(self):
+        config = self.config(aws={"instance_types": list(self.TYPES)}, max_instances=2)
+        quotes = self.pool_quotes()
+        # Fresh at admission, stale by the time the rotated worker is sent: the
+        # first launch advances the clock while the request is in flight.
+        quotes[("t4g.small", "eu-central-1b")] = zone_quote(
+            "eu-central-1b",
+            20_000,
+            self.clock,
+            observed_at=self.clock.now - 850,
+            instance_type="t4g.small",
+        )
+        controller = self.build(config=config, quotes=quotes, observation=observation_demand(2))
+        self.aws.on_run = lambda request: self.clock.advance(100)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        second = result["launches"][1]
+        self.assertEqual((second["zone"], second["instance_type"]), ("eu-central-1a", "t4g.small"))
+        self.assertEqual(
+            [
+                (attempt["zone"], attempt["instance_type"], attempt["outcome"])
+                for attempt in second["attempts"]
+            ],
+            [
+                ("eu-central-1b", "t4g.small", "skipped"),
+                ("eu-central-1a", "t4g.small", "accepted"),
+            ],
+        )
 
     def test_a_single_type_list_still_sends_the_type_explicitly(self):
         config = self.config(aws={"instance_types": ["t4g.small"]})

@@ -46,10 +46,12 @@ That keeps the first type's zones as the normal landing places and makes later
 types genuine fallbacks. Batch admission currently rotates its start across all
 eligible candidates; with more than one type that would spread a twelve-worker
 burst onto the fallback types, which contradicts "the order is the priority".
-The rotation width becomes the first type's contiguous eligible block, so a
-batch still spreads across zones and only a capacity rejection reaches the next
-type. With one type the block equals the eligible list, so behaviour is
-identical to today.
+The rotation width becomes the first type's contiguous eligible block, and the
+rotation keeps the later blocks in order after the preferred one, so a capacity
+rejection inside the preferred type still tries that type's remaining zones
+before any later type. Without a configured list each candidate's type comes
+from its own template version — two candidate types there are not a preference
+order — so the whole eligible list keeps rotating exactly as before.
 
 ### The template's type remains the shape anchor
 

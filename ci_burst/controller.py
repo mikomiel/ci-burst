@@ -564,6 +564,11 @@ class Controller:
         block = 0
         while block < len(eligible) and eligible[block].instance_type == preferred:
             block += 1
+        # A configured type list makes the first block the preferred type, so
+        # rotation stays inside it and the later blocks remain fallbacks. Without
+        # a list each candidate's type comes from its own template version, which
+        # is not a preference order: keep the original whole-list rotation.
+        width = block if self.config.aws.instance_types else len(eligible)
         launches = []
         result["launches"] = launches
         for index in range(decision["launch_count"]):
@@ -574,8 +579,8 @@ class Controller:
                 result["decision"] = "launched" if launches else "refused"
                 result.setdefault("reasons", []).append("admission_expired")
                 return result
-            start = index % block
-            rotated = eligible[start:] + eligible[:start]
+            start = index % width
+            rotated = eligible[start:width] + eligible[:start] + eligible[width:]
             position, skipped = self._first_fresh(rotated)
             if position is None:
                 # No remaining worker can start on fresh evidence, and nothing

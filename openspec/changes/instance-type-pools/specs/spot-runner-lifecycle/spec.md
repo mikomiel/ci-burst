@@ -30,7 +30,7 @@ Live provisioning MUST use an operator-prepared launch template with an explicit
 - **AND** the controller does not silently launch a different resource shape
 
 ### Requirement: Ordered capacity fallback within one admission
-Placement MUST be an ordered list of configured pools, each combining one configured availability-zone candidate with one configured instance type. The order MUST be type-major: every candidate of the first configured type, then every candidate of the next, and the order MUST be treated as the priority. When the provider definitely rejects a launch for insufficient capacity, and only then, the controller MAY attempt the next configured pool in order within the same admission. It MUST NOT retry a pool, create a second instance, or fall through for any other failure. A batch MUST spread its workers across the first eligible type's zones and MUST NOT spread them across types; a later type MUST be reached only by a definite capacity rejection. If every pool is rejected the slot MUST stay free with a stable reason.
+Placement MUST be an ordered list of configured pools, each combining one configured availability-zone candidate with one configured instance type. The order MUST be type-major: every candidate of the first configured type, then every candidate of the next, and the order MUST be treated as the priority. When the provider definitely rejects a launch for insufficient capacity, and only then, the controller MAY attempt the next configured pool in order within the same admission. It MUST NOT retry a pool, create a second instance, or fall through for any other failure. When an instance-type list is configured, a batch MUST spread its workers across the first eligible type's zones and MUST NOT spread them across types: a later type MUST be reached only by a definite capacity rejection, never by batch spread. When no list is configured, each candidate's type is its own template version's type and the batch MAY rotate across the whole eligible candidate list, preserving the original behaviour. If every pool is rejected the slot MUST stay free with a stable reason.
 
 #### Scenario: First candidate lacks capacity
 - **WHEN** the first selected pool is definitely rejected for insufficient instance capacity
@@ -41,6 +41,16 @@ Placement MUST be an ordered list of configured pools, each combining one config
 - **WHEN** every zone of the first configured type is definitely rejected for insufficient instance capacity
 - **THEN** the same admission attempts the first configured candidate of the next type once, in order
 - **AND** the worker's operation, reservation and slot are preserved
+
+#### Scenario: A rotated worker is rejected for capacity
+- **WHEN** a worker's rotation starts inside the preferred type and that pool is definitely rejected for insufficient capacity
+- **THEN** the same worker tries the remaining zones of the preferred type before any later type
+- **AND** the frozen request advances within the same operation and reservation
+
+#### Scenario: No instance-type list is configured
+- **WHEN** no instance-type list is configured and two candidates' template versions pin different types
+- **THEN** a batch rotates across every eligible candidate as it did before the list existed
+- **AND** a capacity rejection still walks the configured candidate order
 
 #### Scenario: A batch larger than one zone count
 - **WHEN** the admitted batch is larger than the number of eligible pools of the first configured type

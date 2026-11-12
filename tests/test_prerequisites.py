@@ -541,6 +541,15 @@ class PrerequisiteTests(unittest.TestCase):
         result = self.check()
         self.assert_drift(result, "instance_type_shape_mismatch")
 
+    def test_incomplete_instance_type_facts_are_unavailable(self):
+        self.use_instance_types(
+            "t4g.small",
+            metadata={"t4g.small": {"vcpus": None, "memory": None, "architectures": ["arm64"]}},
+        )
+        result = self.check()
+        self.assert_unavailable(result, "instance_types_unavailable")
+        self.assertIn("incomplete instance type facts", self.records(result, "pools")[0]["detail"])
+
     def test_a_missing_image_description_is_unavailable(self):
         self.use_instance_types("t4g.small")
         self.ec2.images = {}

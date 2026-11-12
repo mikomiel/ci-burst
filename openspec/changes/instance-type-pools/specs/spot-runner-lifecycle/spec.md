@@ -47,6 +47,11 @@ Placement MUST be an ordered list of configured pools, each combining one config
 - **THEN** the same worker tries the remaining zones of the preferred type before any later type
 - **AND** the frozen request advances within the same operation and reservation
 
+#### Scenario: Preferred-type evidence expires before a worker starts
+- **WHEN** an instance-type list is configured and no pool of the preferred type has fresh price evidence for the next worker
+- **THEN** that worker is not started on a later type
+- **AND** the batch stops with the stable stale-price reason and the already launched workers stay in place
+
 #### Scenario: No instance-type list is configured
 - **WHEN** no instance-type list is configured and two candidates' template versions pin different types
 - **THEN** a batch rotates across every eligible candidate as it did before the list existed

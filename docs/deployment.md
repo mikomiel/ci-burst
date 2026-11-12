@@ -284,8 +284,9 @@ It checks, from read-only describe calls:
   every configured template type's `VCpuInfo.DefaultVCpus` and
   `MemoryInfo.SizeInMiB`, and supports the template image's architecture
   (`instance_type_not_offered`, `instance_type_shape_mismatch`,
-  `image_architecture_unsupported`; an unreadable type or image read is
-  `instance_types_unavailable` and exits 3). The check's operator identity
+  `image_architecture_unsupported`; an unreadable type or image read, or a
+  type described without vCPU or memory facts, is `instance_types_unavailable`
+  and exits 3). The check's operator identity
   therefore also needs `ec2:DescribeInstanceTypes`,
   `ec2:DescribeInstanceTypeOfferings` and `ec2:DescribeImages`;
 - every configured template version exists and still satisfies the controller's

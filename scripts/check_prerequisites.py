@@ -619,6 +619,27 @@ class Prerequisites:
                 )
             )
             return
+        # A named type without complete vCPU and memory facts is missing
+        # evidence, not a shape: comparing ``None`` against ``None`` would pass
+        # the check without establishing the invariant.
+        incomplete = sorted(
+            name
+            for name in set(types) | reference_types
+            if type(metadata[name]["vcpus"]) is not int
+            or type(metadata[name]["memory_mib"]) is not int
+            or not metadata[name]["architectures"]
+        )
+        if incomplete:
+            checks.append(
+                _record(
+                    "pools",
+                    "aws",
+                    status="unavailable",
+                    reasons=["instance_types_unavailable"],
+                    detail="incomplete instance type facts: " + ", ".join(incomplete),
+                )
+            )
+            return
         # A requested image that the provider does not describe is missing
         # evidence, not a pass: the architecture of every configured template is
         # part of the check.

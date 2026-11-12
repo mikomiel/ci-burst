@@ -49,7 +49,9 @@ burst onto the fallback types, which contradicts "the order is the priority".
 The rotation width becomes the first type's contiguous eligible block, and the
 rotation keeps the later blocks in order after the preferred one, so a capacity
 rejection inside the preferred type still tries that type's remaining zones
-before any later type. Without a configured list each candidate's type comes
+before any later type. The starting pool is always inside that block: when every
+preferred pool's price evidence has expired, the batch stops with
+`spot_price_stale` instead of starting on a fallback type. Without a configured list each candidate's type comes
 from its own template version — two candidate types there are not a preference
 order — so the whole eligible list keeps rotating exactly as before.
 

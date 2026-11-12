@@ -895,6 +895,27 @@ class PoolTests(MultiZoneCase):
             ],
         )
 
+    def test_expiring_evidence_does_not_start_a_worker_on_a_fallback_type(self):
+        config = self.config(aws={"instance_types": list(self.TYPES)}, max_instances=2)
+        quotes = self.pool_quotes()
+        for zone in self.ZONES:
+            quotes[("t4g.small", zone)] = zone_quote(
+                zone,
+                20_000,
+                self.clock,
+                observed_at=self.clock.now - 850,
+                instance_type="t4g.small",
+            )
+        controller = self.build(config=config, quotes=quotes, observation=observation_demand(2))
+        self.aws.on_run = lambda request: self.clock.advance(100)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertIn("spot_price_stale", result["reasons"])
+        self.assertEqual(
+            [request["InstanceType"] for request in self.run_requests()], ["t4g.small"]
+        )
+
     def test_the_fallback_detail_names_the_pool_it_left_not_a_stale_one(self):
         capacity = ProviderRefusal("AWS_REFUSED", "InsufficientInstanceCapacity")
         quotes = self.pool_quotes()

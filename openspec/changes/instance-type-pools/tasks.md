@@ -17,8 +17,10 @@ no cloud change.
   type-major order, pricing each pool before any time-sensitive check.
 - [x] 2.2 Send the selected pool's `InstanceType` in the frozen `RunInstances`
   request and compare the quote's type against the pool's type.
-- [x] 2.3 Keep batch rotation inside the first eligible type's zone block, so a
-  later type is reached only by a definite capacity rejection.
+- [x] 2.3 Keep batch rotation inside the first eligible type's zone block and
+  require every starting pool to be in that block, so a later type is reached
+  only by a definite capacity rejection, never by rotation or expiring
+  evidence.
 - [x] 2.4 Report the pool (zone and type) in the plan, launch and attempt
   records, and name the pool in the fallback detail.
 
@@ -38,15 +40,17 @@ no cloud change.
   the cap is skipped while a later type stays eligible; a capacity rejection
   advances across types within one operation and reservation; a batch stays on
   the first type and still alternates zones; a rotated worker's capacity
-  rejection and expiring evidence both stay inside the preferred type; without
-  a configured list, candidates whose template versions pin different types
-  keep the original whole-list rotation; the frozen request names the selected
-  type.
+  rejection and expiring evidence both stay inside the preferred type; a fully
+  stale preferred type stops the batch instead of starting a later type;
+  without a configured list, candidates whose template versions pin different
+  types keep the original whole-list rotation; the frozen request names the
+  selected type.
 - [x] 4.3 Prerequisites: a clean type list passes; a type missing from a zone,
   a different shape against any configured template, and an unsupported image
   architecture are drift; a type whose shape matches one template but not
-  another is drift; an unreadable metadata read and an absent or partial image
-  description are unavailable with exit 3, not drift.
+  another is drift; an unreadable metadata read, incomplete vCPU or memory
+  facts, and an absent or partial image description are unavailable with exit
+  3, not drift.
 
 ## 5. Documentation
 

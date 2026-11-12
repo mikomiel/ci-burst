@@ -581,7 +581,12 @@ class Controller:
                 return result
             start = index % width
             rotated = eligible[start:width] + eligible[:start] + eligible[width:]
-            position, skipped = self._first_fresh(rotated)
+            # With a configured list only the preferred block may supply the
+            # starting pool: a worker must never begin on a fallback type
+            # without a capacity rejection. The later blocks stay in ``order``
+            # so such a rejection can still reach them.
+            search = rotated[:width] if self.config.aws.instance_types else rotated
+            position, skipped = self._first_fresh(search)
             if position is None:
                 # No remaining worker can start on fresh evidence, and nothing
                 # was committed for this one.

@@ -28,8 +28,10 @@ is not deployment or runtime evidence.
 - Changes to workflow policy, permissions, agent instructions, scripts, tests,
   dependency definitions or packaging require a maintainer decision. Do not
   narrow that boundary to unblock a pull request.
-- A public-source change does not authorize release tags, packages, images,
-  deployment, cloud resources, credentials or IAM changes.
+- A public-source change does not authorize a release tag by itself. A
+  maintainer merges the release-please release pull request to authorize the
+  annotated tag and GitHub Release; neither authorizes a package, image,
+  deployment, cloud resource, credential or IAM change.
 
 ## Public-content boundary
 

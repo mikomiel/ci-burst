@@ -176,10 +176,11 @@ class Aws:
     def _client(self):
         if self._client_cache is not None:
             return self._client_cache
+        config = _sdk_config()
         self._client_cache = self._session().client(
             "ec2",
             region_name=self._config.aws.region,
-            config=_sdk_config(),
+            config=config,
         )
         return self._client_cache
 
@@ -286,8 +287,10 @@ class Aws:
         identifier is unknown, so a rejected batch proves nothing about its
         other members. Absence is therefore established only for an identifier
         read on its own: a record that exists is returned even beside an
-        aged-out one, and any other per-identifier read failure refuses rather
-        than reporting the set as empty.
+        aged-out one, and any other read failure -- of the batch or of one
+        identifier -- refuses with an uncertain refusal, because the state of
+        that identifier cannot be established, rather than reporting the set
+        as empty.
 
         `InvalidInstanceID.NotFound` is not proof that the instance never
         existed or that it terminated at a particular time; the controller
@@ -302,7 +305,7 @@ class Aws:
             response = client.describe_instances(InstanceIds=identifiers)
         except Exception as error:  # noqa: BLE001 - classified below
             if _error_code(error) != "InvalidInstanceID.NotFound":
-                raise _translate(error) from None
+                raise _translate_read(error) from None
             found = []
             for instance_id in identifiers:
                 try:
@@ -310,7 +313,7 @@ class Aws:
                 except Exception as member:  # noqa: BLE001 - classified below
                     if _error_code(member) == "InvalidInstanceID.NotFound":
                         continue
-                    raise _translate(member) from None
+                    raise _translate_read(member) from None
                 found.extend(_instances(response))
             return found
         return _instances(response)
@@ -388,6 +391,18 @@ def _translate(error):
     # A response-parser failure or another unclassified exception can occur
     # after the service accepted the request. It is never proof of non-creation.
     return ProviderRefusal("AWS_UNCERTAIN", type(error).__name__, uncertain=True)
+
+
+def _translate_read(error):
+    """Map a read failure to an uncertain refusal.
+
+    A read that failed cannot establish the state of the identifier it asked
+    about, whatever the provider's error code would mean for a launch. The
+    translated reason code and detail are preserved so the failure stays
+    diagnosable.
+    """
+    refusal = _translate(error)
+    return ProviderRefusal(refusal.reason, refusal.detail, uncertain=True)
 
 
 def _error_code(error):

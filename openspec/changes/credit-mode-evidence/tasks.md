@@ -28,7 +28,9 @@ cloud change and no billable call.
 - [x] 3.2 Report `burstable` for each configured pool type.
 - [x] 3.3 Keep an unreadable template `unavailable`; an absent specification is
   reported as absent and follows the family default, while an unrecognized value
-  is reported raw as `credit_specification_invalid` drift.
+  is reported raw as `credit_specification_invalid` drift. A present value the
+  adapter cannot represent keeps its presence as unknown evidence and the same
+  drift, never absence and never the default.
 
 ## 4. Documentation and acceptance
 

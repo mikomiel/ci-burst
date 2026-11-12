@@ -399,11 +399,13 @@ the matching semantics; this guide does not repeat them.
   default: where the template sets none it reports the family default, not the
   account's effective default. A template value that is present but not
   `standard` or `unlimited` is reported as unknown evidence, never as the
-  default, and `scripts/check_prerequisites.py` reports the raw value and
-  `credit_specification_invalid` drift for it. Choosing the family and the
-  credit mode, and any billable benchmark, remain your decisions; a cheap
-  burstable type is fine only for short or trivial jobs, and unlimited mode is
-  not a bound on cost.
+  default; a value the adapter cannot represent (empty, over-long or
+  non-printable) is still present and stays unknown, never absent.
+  `scripts/check_prerequisites.py` reports the value when it is representable
+  and `credit_specification_invalid` drift for either case. Choosing the family
+  and the credit mode, and any billable benchmark, remain your decisions; a
+  cheap burstable type is fine only for short or trivial jobs, and unlimited
+  mode is not a bound on cost.
 - Keep the worker on a subnet and security group with no inbound access, no
   credentials beyond the one parameter, and no route to unrelated private
   networks.

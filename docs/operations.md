@@ -580,11 +580,14 @@ explicit table reports `unknown` rather than a guessed mode, and a non-burstable
 family reports the question as not applicable. A template value that is present
 but not `standard` or `unlimited` is reported as unknown evidence, never as the
 default mode: the plan reports no mode with a `template-unrecognized` source,
-and a launch carrying it would fail provider validation.
-`scripts/check_prerequisites.py` reports the template's raw
-`CreditSpecification` value and whether the template and each configured pool
-type is burstable; an unrecognized value is `credit_specification_invalid`
-drift, while an absent specification stays absent and is not drift. The
+and a launch carrying it would fail provider validation. A value the adapter
+cannot represent -- empty, over-long or non-printable -- is still present and
+takes that same unknown path; it is never reported as an absent specification.
+`scripts/check_prerequisites.py` reports the template's
+`CreditSpecification` value when it is representable, and whether the template
+and each configured pool type is burstable; an unrecognized or unrepresentable
+value is `credit_specification_invalid` drift, while an absent specification
+stays absent and is not drift. The
 estimate does not bound surplus credits in either mode: choosing the instance
 family, setting the credit mode and any billable comparison are operator
 decisions, and the product only reports the exposure.

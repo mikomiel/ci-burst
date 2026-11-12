@@ -48,27 +48,31 @@ owners of the mode.
 
 ### The template's specification outranks the default
 
-The launch template's value has three states, and they stay distinct. Absent
-(`None`) means the template sets no specification, so a burstable family reports
-its documented default with `mode_source: "aws-default"`. A recognized
-`standard` or `unlimited` value reports itself with `mode_source: "template"`.
-Any other present value reports `mode: null` with `mode_source:
-"template-unrecognized"` and `surplus_credits: "unknown"`: the provider would
-refuse that launch, and the family default is not what the template says. The
-account-level default can override the family default, which this product cannot
-observe without another API and permission; the plan does not query it, and the
-mode source says which fact is being reported.
+The launch template's value has three states, and they stay distinct. The
+adapter reports presence separately from a bounded display value: absence is the
+only state with neither. Absent means the template sets no specification, so a
+burstable family reports its documented default with `mode_source:
+"aws-default"`. A recognized `standard` or `unlimited` value reports itself with
+`mode_source: "template"`. Any other present value -- unrecognized, or empty,
+non-printable, non-ASCII or over-long, which the adapter records without its
+payload -- reports `mode: null` with `mode_source: "template-unrecognized"` and
+`surplus_credits: "unknown"`: the provider would refuse that launch, and the
+family default is not what the template says. The account-level default can
+override the family default, which this product cannot observe without another
+API and permission; the plan does not query it, and the mode source says which
+fact is being reported.
 
 ### The prerequisite check reports the same facts
 
-`_template_facts` reports the raw `credit_specification` (or `None` when the
-template sets none) and `burstable` for the template type; configured pool types
-get `burstable` in the existing `instance_type` record. An unreadable template
-is already `unavailable`, so credit evidence cannot turn into a pass. An absent
-specification is evidence of the family default, not a missing read. A present
-value the product does not recognize is reported raw and as
+`_template_facts` reports the bounded `credit_specification` value (or `None`
+when the template sets none, or when a present value cannot be represented) and
+`burstable` for the template type; configured pool types get `burstable` in the
+existing `instance_type` record. An unreadable template is already `unavailable`,
+so credit evidence cannot turn into a pass. An absent specification is evidence
+of the family default, not a missing read. A present value the product does not
+recognize -- including one the adapter could not represent -- is
 `credit_specification_invalid` drift, because a launch carrying it would fail
-provider validation; it is never read as the default.
+provider validation; it is never read as the default and never as a pass.
 
 ## Failure behavior
 
@@ -79,9 +83,10 @@ provider validation; it is never read as the default.
   launch template that still pins a credit specification supplies it to every
   launch, so an operator mixing families should confirm the provider accepts
   that combination; this change does not test it.
-- Unrecognized template value: the plan reports no mode and does not fall back
-  to the family default; the prerequisite check reports the raw value and
-  `credit_specification_invalid` drift.
+- Unrecognized or unrepresentable template value: the plan reports no mode and
+  does not fall back to the family default; the prerequisite check reports
+  `credit_specification_invalid` drift (and the bounded raw value when one can be
+  reported).
 - Unreadable template: the prerequisite check stays `unavailable` (exit 3), not
   drift and not a pass.
 - The estimate still cannot bound surplus credits; docs and the cost-scope note

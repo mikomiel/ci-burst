@@ -47,3 +47,18 @@ stay distinct.
 - **WHEN** a plan or the operations documentation describes tracked cost
 - **THEN** surplus CPU credits are named as a separate residual charge
 - **AND** the estimate is not described as a cap on the AWS bill
+
+### Requirement: Present but unrepresentable credit evidence stays unknown
+
+A launch template credit specification that is present but cannot be represented
+as bounded evidence MUST stay present. A burstable candidate MUST report it as
+unknown credit evidence rather than the family default, and the prerequisite
+check MUST report drift rather than a pass.
+
+#### Scenario: The launch template sets an unrepresentable credit mode
+- **WHEN** the template's `CreditSpecification` is present but empty, non-printable, non-ASCII or longer than the bounded evidence allows
+- **THEN** it stays present: it is unknown credit evidence, never an absent specification
+- **AND** a burstable candidate's plan reports the mode as `null` with `template-unrecognized` as its source
+- **AND** it does not report the family default as the mode
+- **AND** it reports surplus CPU credits as unknown
+- **AND** the prerequisite check reports `credit_specification_invalid` drift and does not report a pass

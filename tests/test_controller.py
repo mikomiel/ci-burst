@@ -3,14 +3,16 @@ import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from ci_burst.config import load
 from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment
+from ci_burst.credit import CreditSpecification
 from ci_burst.errors import ConfigRefusal, ProviderRefusal, StateRefusal
-from ci_burst.aws import DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
+from ci_burst.aws import Aws, DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
 from ci_burst.ledger import Ledger, current_window
 from ci_burst.money import format_money
 
@@ -249,7 +251,7 @@ class CreditEvidenceTests(ControllerCase):
 
     def test_template_credit_specification_outranks_the_default(self):
         aws = FakeAws(
-            template_facts=template(credit_specification="standard"),
+            template_facts=template(credit_specification=CreditSpecification(present=True, value="standard")),
             spot_quote=quote(clock=self.clock),
         )
         result = self.build(observation=observation_demand(), aws=aws).plan()
@@ -260,7 +262,7 @@ class CreditEvidenceTests(ControllerCase):
         # The template set a value, so reporting the family default here would
         # invent evidence about a launch the provider would refuse.
         aws = FakeAws(
-            template_facts=template(credit_specification="burst"),
+            template_facts=template(credit_specification=CreditSpecification(present=True, value="burst")),
             spot_quote=quote(clock=self.clock),
         )
         result = self.build(observation=observation_demand(), aws=aws).plan()
@@ -274,6 +276,59 @@ class CreditEvidenceTests(ControllerCase):
             },
         )
         self.assertEqual(result["selected"]["credit"], result["candidates"][0]["credit"])
+
+    def test_adapter_output_with_an_invalid_template_mode_is_not_the_default(self):
+        # The plan reads the template through the adapter, so this exercises
+        # the adapter's own parse of a provider response: an over-long value is
+        # present but not representable, and it must not become the default.
+        now = self.clock.now
+
+        class Client:
+            def describe_instances(self, **kwargs):
+                return {"Reservations": []}
+
+            def describe_launch_template_versions(self, **kwargs):
+                return {
+                    "LaunchTemplateVersions": [
+                        {
+                            "LaunchTemplateId": "lt-adapter",
+                            "VersionNumber": 3,
+                            "LaunchTemplateData": {
+                                "ImageId": "ami-0123456789abcdef0",
+                                "InstanceType": "t4g.small",
+                                "InstanceInitiatedShutdownBehavior": "terminate",
+                                "UserData": "AAAA",
+                                "CreditSpecification": {"CpuCredits": "x" * 40},
+                            },
+                        }
+                    ]
+                }
+
+            def describe_spot_price_history(self, **kwargs):
+                return {
+                    "SpotPriceHistory": [
+                        {
+                            "InstanceType": "t4g.small",
+                            "AvailabilityZone": "eu-central-1a",
+                            "ProductDescription": "Linux/UNIX",
+                            "SpotPrice": "0.020000",
+                            "Timestamp": datetime.fromtimestamp(now, timezone.utc),
+                        }
+                    ]
+                }
+
+        aws = Aws(self.config, client=Client(), clock=self.clock)
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": True,
+                "mode": None,
+                "mode_source": "template-unrecognized",
+                "surplus_credits": "unknown",
+            },
+        )
 
     def test_non_burstable_candidate_reports_not_applicable(self):
         aws = FakeAws(
@@ -293,7 +348,10 @@ class CreditEvidenceTests(ControllerCase):
 
     def test_non_burstable_candidate_reports_a_pinned_template_mode(self):
         aws = FakeAws(
-            template_facts=template(instance_type="m7g.xlarge", credit_specification="standard"),
+            template_facts=template(
+                instance_type="m7g.xlarge",
+                credit_specification=CreditSpecification(present=True, value="standard"),
+            ),
             spot_quote=quote(instance_type="m7g.xlarge", clock=self.clock),
         )
         result = self.build(observation=observation_demand(), aws=aws).plan()

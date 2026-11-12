@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from .credit import CreditSpecification
 from .errors import ProviderRefusal
 from .money import parse_money
 
@@ -31,7 +32,8 @@ MAX_CONSOLE_BYTES = 64 * 1024
 
 #: A CPU-credit value is a short enum token. The adapter keeps the template's
 #: raw value so an unrecognized mode stays visible as unrecognized, but it does
-#: not echo an arbitrary provider string as credit evidence.
+#: not echo an arbitrary provider string as credit evidence. A present value
+#: outside this bound keeps its presence without the payload, never absence.
 MAX_CREDIT_SPECIFICATION_CHARS = 32
 
 #: The controller owns retries: an unresolved launch is resumed with its frozen
@@ -94,11 +96,11 @@ class Template:
     shutdown_behavior: str
     has_user_data: bool
     placement_zone: str | None
-    #: The template's raw CPU-credit value, or ``None`` when it sets none.
-    #: ``credit.evidence`` decides which values are recognized; collapsing an
-    #: unrecognized value here would report the family default as if chosen.
-    #: The launch request never sets one; the template owns this choice.
-    credit_specification: str | None = None
+    #: The template's CPU-credit choice. ``present`` keeps a value the adapter
+    #: cannot represent from reading as absence; ``credit.evidence`` decides
+    #: which bounded values are recognized. The launch request never sets one;
+    #: the template owns this choice.
+    credit_specification: CreditSpecification = CreditSpecification()
 
     def as_dict(self):
         return {
@@ -394,20 +396,28 @@ def _timestamp(value):
 
 
 def _credit_specification(data):
-    """Return the template's raw CPU-credit value, bounded, or ``None``.
+    """Return the template's CPU-credit choice, preserving presence.
 
-    The value is kept verbatim, including one this product does not recognize:
-    ``credit.evidence`` owns mode recognition, and dropping a present value here
-    would report the family default as if the template had chosen it. A value
-    that is not a short printable token is not credit evidence at all.
+    A ``CreditSpecification`` the response sets is the template's choice even
+    when its ``CpuCredits`` cannot be represented -- empty, non-printable,
+    non-ASCII or over-long. Such a value is kept as present with a ``None``
+    value: it is unknown credit evidence, and returning absence would report the
+    family default as if the template had chosen it. ``credit.evidence`` owns
+    recognition; the adapter only bounds the echoed payload.
     """
     specification = data.get("CreditSpecification")
+    if specification is None:
+        return CreditSpecification()
     value = specification.get("CpuCredits") if isinstance(specification, dict) else None
-    if not isinstance(value, str) or not value or not value.isascii() or not value.isprintable():
-        return None
-    if len(value) > MAX_CREDIT_SPECIFICATION_CHARS:
-        return None
-    return value
+    if (
+        not isinstance(value, str)
+        or not value
+        or not value.isascii()
+        or not value.isprintable()
+        or len(value) > MAX_CREDIT_SPECIFICATION_CHARS
+    ):
+        return CreditSpecification(present=True)
+    return CreditSpecification(present=True, value=value)
 
 
 def _spot_quote(entries, instance_type, availability_zone, observed_at):

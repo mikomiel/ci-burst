@@ -693,6 +693,19 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertEqual(record["facts"]["credit_specification"], "burst")
         self.assertTrue(record["facts"]["burstable"])
 
+    def test_unrepresentable_credit_specification_is_reported_as_drift(self):
+        # The value is read from a provider response through the adapter, not
+        # injected as a parsed Template: it is present but too long to echo as
+        # bounded evidence, so no value is reported and the presence is still
+        # invalid drift, never a satisfied check.
+        self.ec2.templates[3] = template_data(CreditSpecification={"CpuCredits": "x" * 40})
+        result = self.check()
+        self.assert_drift(result, "credit_specification_invalid")
+        record = self.records(result, "template")[0]
+        self.assertEqual(record["status"], "drift")
+        self.assertIsNone(record["facts"]["credit_specification"])
+        self.assertTrue(record["facts"]["burstable"])
+
     def test_configured_instance_type_pools_report_burstability(self):
         self.use_instance_types("t4g.small", "c7g.large")
         result = self.check()

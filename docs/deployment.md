@@ -259,9 +259,15 @@ relation to the systemd unit and the transport timeouts.
 `budget.incidental_per_hour` is the estimated non-compute cost of one
 instance-hour, added to tracked cost, and defaults to zero (compute only).
 `budget.non_compute_allowance` is not spend: it is the buffer added to every live
-worker's forward commitment. § Cost tracking and the allowance in
-[operations.md](operations.md#cost-tracking-and-the-allowance) owns the formulas
-and the reconciliation with the provider bill.
+worker's forward commitment. Cost settings apply to new admissions: an operation
+already admitted keeps the incidental rate, buffer, frozen `MaxPrice` and
+lifetime it was admitted under, so editing `budget.incidental_per_hour`,
+`budget.non_compute_allowance` or `aws.max_lifetime_seconds` never reprices it.
+A raised `aws.max_spot_price` is the one conservative exception: the forward
+commitment of a live operation is priced at no less than the configured
+maximum, so raising it may increase that commitment. It can never lower one. § Cost tracking and the allowance
+in [operations.md](operations.md#cost-tracking-and-the-allowance) owns the
+formulas and the reconciliation with the provider bill.
 
 Start with the one candidate the scaling policy authorizes. An optional
 `aws.instance_types` list multiplies that candidate over same-shape types; keep

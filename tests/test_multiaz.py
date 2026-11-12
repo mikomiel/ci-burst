@@ -365,7 +365,7 @@ class LaunchFallbackTests(MultiZoneCase):
         # One admission: one forward commitment, counted once.
         self.assertEqual(operation.reservation_micros, 540_000)
         window = current_window(self.clock.now, config.budget.window_seconds)
-        self.assertEqual(ledger.window_totals(window, controller.cost, self.clock.now)["committed"], 540_500)
+        self.assertEqual(ledger.window_totals(window, controller.cost, self.clock.now)["committed"], 539_834)
 
     def test_each_candidate_is_attempted_at_most_once_in_order(self):
         config = self.config(

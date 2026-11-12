@@ -9,6 +9,27 @@ The version, this file and the release tag are maintained by
 conventional commits on `main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases)
 owns the release boundary. Do not edit a released section by hand.
 
+## [0.3.0](https://github.com/mikomiel/ci-burst/compare/v0.2.0...v0.3.0) (2026-11-12)
+
+
+### Added
+
+* **config:** allow ordered instance-type pools beside zones ([#78](https://github.com/mikomiel/ci-burst/issues/78)) ([037fa5f](https://github.com/mikomiel/ci-burst/commit/037fa5f5de2e2f5c2a4eeed62dc7aa1d7f0f7f75))
+* **config:** raise the concurrency ceiling to twelve ([#70](https://github.com/mikomiel/ci-burst/issues/70)) ([3eba851](https://github.com/mikomiel/ci-burst/commit/3eba85139c3c18150fa213727c4ada04765df076))
+* **cost:** settle tracked worker cost against the allowance ([#73](https://github.com/mikomiel/ci-burst/issues/73)) ([0a9f1f6](https://github.com/mikomiel/ci-burst/commit/0a9f1f6bf7f8b869f3d0e0ea25bfcdccc0e5f65f))
+* **deploy:** record the worker image build recipe ([#75](https://github.com/mikomiel/ci-burst/issues/75)) ([645364b](https://github.com/mikomiel/ci-burst/commit/645364b109a02c488217d459d3cbefbcf2dcdaaf))
+* **export:** surface worker console evidence as events and metrics ([#69](https://github.com/mikomiel/ci-burst/issues/69)) ([098359c](https://github.com/mikomiel/ci-burst/commit/098359cabaf2014246ee347ab1655f537cd28ee3))
+* **router:** ship the optional in-VPC router as a deployment artefact ([#68](https://github.com/mikomiel/ci-burst/issues/68)) ([657dae8](https://github.com/mikomiel/ci-burst/commit/657dae855fb268d0505e4a14929e6853a134579d))
+
+
+### Fixed
+
+* **aws:** treat an exhausted Spot quota as a definite refusal ([#72](https://github.com/mikomiel/ci-burst/issues/72)) ([e4bf73f](https://github.com/mikomiel/ci-burst/commit/e4bf73f28b8228a5bc914a5fc3150786ebc9b202))
+* **ci:** recognise the generated release PR without a review ([#113](https://github.com/mikomiel/ci-burst/issues/113)) ([d8a9c17](https://github.com/mikomiel/ci-burst/commit/d8a9c17373686b20302cdd76896e43a3d6086200))
+* **deploy:** refresh the image on a cleanup-only host ([#64](https://github.com/mikomiel/ci-burst/issues/64)) ([22a0db5](https://github.com/mikomiel/ci-burst/commit/22a0db5cc1797eb8e56b359a524d8dd1057b801d))
+* **runner:** make the repository bootstrap the deployed template user data ([#66](https://github.com/mikomiel/ci-burst/issues/66)) ([ca17763](https://github.com/mikomiel/ci-burst/commit/ca17763d3d90d5f36e50b2134c550d9f19feff4b))
+* **runner:** run the job with the fleet's umask ([#65](https://github.com/mikomiel/ci-burst/issues/65)) ([abe5092](https://github.com/mikomiel/ci-burst/commit/abe5092ebd83b4a6daa21f508cb467ae3f1f7df6))
+
 ## [0.2.0] - 2026-11-11
 
 ### Added

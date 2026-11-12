@@ -49,6 +49,7 @@ if str(ROOT) not in sys.path:
 
 from ci_burst.aws import Aws  # noqa: E402
 from ci_burst.config import load  # noqa: E402
+from ci_burst.credit import CREDIT_MODES, burstable  # noqa: E402
 from ci_burst.errors import ConfigRefusal, ProviderRefusal, Refusal  # noqa: E402
 
 DEFAULT_CONFIG = "deployment.toml"
@@ -248,6 +249,15 @@ def _network_pinned(data):
     return bool(data.get("NetworkInterfaces"))
 
 
+def _credit_specification(data):
+    """Return the template's explicit CPU-credit mode, or ``None``."""
+    specification = data.get("CreditSpecification")
+    if not isinstance(specification, dict):
+        return None
+    mode = specification.get("CpuCredits")
+    return mode if mode in CREDIT_MODES else None
+
+
 def _template_facts(template, data=None):
     facts = {
         "template_id": template.template_id,
@@ -256,12 +266,17 @@ def _template_facts(template, data=None):
         "shutdown_behavior": template.shutdown_behavior,
         "bootstrap_present": template.has_user_data,
         "placement_zone": template.placement_zone,
+        # An absent specification is evidence: the launch then follows the
+        # family/account default. Only an unreadable template is unavailable.
+        "credit_specification": template.credit_specification,
+        "burstable": burstable(template.instance_type),
         "security_group_ids": [],
         "security_group_names": [],
         "instance_profile": None,
         "instance_profile_arn": None,
     }
     if data is not None:
+        facts["credit_specification"] = _credit_specification(data) or template.credit_specification
         facts["security_group_ids"] = _security_group_ids(data)
         facts["security_group_names"] = _security_group_names(data)
         facts["instance_profile"], facts["instance_profile_arn"] = _instance_profile_reference(data)
@@ -672,6 +687,9 @@ class Prerequisites:
         for instance_type in types:
             facts = dict(metadata[instance_type])
             facts["zones"] = list(zones)
+            # The configured pool's family decides whether a credit mode can
+            # apply; the template's own type is reported by the template check.
+            facts["burstable"] = burstable(instance_type)
             reasons = []
             # Every configured type must match every template version a
             # candidate pins, not merely one of them: two versions with

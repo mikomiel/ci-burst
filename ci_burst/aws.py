@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from .credit import CREDIT_MODES
 from .errors import ProviderRefusal
 from .money import parse_money
 
@@ -89,6 +90,9 @@ class Template:
     shutdown_behavior: str
     has_user_data: bool
     placement_zone: str | None
+    #: The template's explicit CPU-credit mode, or ``None`` when it sets none.
+    #: The launch request never sets one; the template owns this choice.
+    credit_specification: str | None = None
 
     def as_dict(self):
         return {
@@ -237,6 +241,8 @@ class Aws:
         has_user_data = bool(data.get("UserData"))
         placement = data.get("Placement") or {}
         placement_zone = placement.get("AvailabilityZone")
+        credit = data.get("CreditSpecification")
+        cpu_credits = credit.get("CpuCredits") if isinstance(credit, dict) else None
         return Template(
             name=name,
             template_id=entry.get("LaunchTemplateId", ""),
@@ -246,6 +252,7 @@ class Aws:
             shutdown_behavior=shutdown,
             has_user_data=has_user_data,
             placement_zone=placement_zone if isinstance(placement_zone, str) and placement_zone else None,
+            credit_specification=cpu_credits if cpu_credits in CREDIT_MODES else None,
         )
 
     def spot_quote(self, instance_type, availability_zone):

@@ -389,6 +389,17 @@ the matching semantics; this guide does not repeat them.
 - A worker costs compute plus a public IPv4 (if assigned) for the minutes it
   runs, plus any NAT device you keep running. Spot is cheaper; the controller
   reserves against your configured maximum price.
+- A burstable worker (T2, T3, T3a, T4g, T8i) runs in `standard` or `unlimited`
+  CPU-credit mode. Standard mode throttles the worker to its baseline once its
+  earned credits are spent; unlimited mode keeps bursting and can bill surplus
+  CPU credits on top of the Spot price. T3, T3a, T4g and T8i launch in unlimited
+  mode by default and T2 in standard mode, unless the template's
+  `CreditSpecification` or the account default says otherwise. `plan` reports the
+  mode per candidate (or an explicit unknown), and
+  `scripts/check_prerequisites.py` reports the template's `CreditSpecification`
+  and burstability. Choosing the family and the credit mode, and any billable
+  benchmark, remain your decisions; a cheap burstable type is fine only for
+  short or trivial jobs, and unlimited mode is not a bound on cost.
 - Keep the worker on a subnet and security group with no inbound access, no
   credentials beyond the one parameter, and no route to unrelated private
   networks.

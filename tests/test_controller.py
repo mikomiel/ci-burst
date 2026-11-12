@@ -227,6 +227,79 @@ class PlanTests(ControllerCase):
         result = self.build(observation=observation_demand()).plan()
         self.assertIn("does not bound EBS", result["cost_scope"])
         self.assertIn("not a guaranteed cap", result["cost_scope"])
+        self.assertIn("surplus CPU credits", result["cost_scope"])
+
+
+class CreditEvidenceTests(ControllerCase):
+    """Burstable CPU credits are reported evidence, never a pricing control."""
+
+    def test_burstable_candidate_reports_the_unlimited_default(self):
+        result = self.build(observation=observation_demand()).plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": True,
+                "mode": "unlimited",
+                "mode_source": "aws-default",
+                "surplus_credits": "unquantified",
+            },
+        )
+        self.assertEqual(result["selected"]["credit"], result["candidates"][0]["credit"])
+
+    def test_template_credit_specification_outranks_the_default(self):
+        aws = FakeAws(
+            template_facts=template(credit_specification="standard"),
+            spot_quote=quote(clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(result["candidates"][0]["credit"]["mode"], "standard")
+        self.assertEqual(result["candidates"][0]["credit"]["mode_source"], "template")
+
+    def test_non_burstable_candidate_reports_not_applicable(self):
+        aws = FakeAws(
+            template_facts=template(instance_type="m7g.xlarge"),
+            spot_quote=quote(instance_type="m7g.xlarge", clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": False,
+                "mode": None,
+                "mode_source": "not-applicable",
+                "surplus_credits": "not-applicable",
+            },
+        )
+
+    def test_unknown_family_reports_unknown_instead_of_guessing(self):
+        aws = FakeAws(
+            template_facts=template(instance_type="z9.medium"),
+            spot_quote=quote(instance_type="z9.medium", clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": None,
+                "mode": None,
+                "mode_source": "unknown",
+                "surplus_credits": "unknown",
+            },
+        )
+
+    def test_credit_evidence_does_not_change_pricing_or_the_launch_request(self):
+        controller = self.build(observation=observation_demand())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        run = [call for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(run), 1)
+        request = run[0][1]
+        self.assertNotIn("CreditSpecification", json.dumps(request))
+        self.assertNotIn("CpuCredits", json.dumps(request))
+        self.assertEqual(request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"], "0.040000")
+        self.assertEqual(result["price"]["price_display"], "0.020000")
+        self.assertEqual(result["reservation_micros"], controller.cost.per_launch_micros())
 
 
 class ApplyTests(ControllerCase):

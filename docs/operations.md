@@ -559,10 +559,27 @@ never reaches `running`, and an uncertain outcome keeps its commitment until the
 intent is resolved.
 
 Tracked cost does not bound EBS, data transfer, public IPv4 beyond the configured
-rate, AMI and snapshot storage, log delivery, minimum billing increments, Spot
-price changes after launch, or resources left by failed cleanup. It is an
-estimate and not a guaranteed cap on the AWS bill, and no status, lifetime or
-alert in this project should be described as one.
+rate, AMI and snapshot storage, log delivery, surplus CPU credits, minimum
+billing increments, Spot price changes after launch, or resources left by failed
+cleanup. It is an estimate and not a guaranteed cap on the AWS bill, and no
+status, lifetime or alert in this project should be described as one.
+
+Burstable CPU credits are a separate residual. A burstable instance in
+`unlimited` CPU-credit mode can keep bursting after its earned credits are spent
+and accrue surplus CPU credits, which the provider bills on top of the instance
+price; a short, immediately busy worker is exactly the shape that incurs them.
+T3, T3a, T4g and T8i launch in `unlimited` mode by default and T2 in `standard`
+mode, unless the launch template's `CreditSpecification` or the account-level
+default says otherwise. Every plan candidate therefore carries a `credit`
+object: whether the family is burstable, the observed or default mode, whether
+that mode came from the template or the AWS default, and that surplus credits
+are unquantified. A family outside the product's explicit table reports
+`unknown` rather than a guessed mode, and a non-burstable family reports the
+question as not applicable. `scripts/check_prerequisites.py` reports the
+template's `CreditSpecification` and whether the template and each configured
+pool type is burstable. The estimate does not bound surplus credits in either
+mode: choosing the instance family, setting the credit mode and any billable
+comparison are operator decisions, and the product only reports the exposure.
 
 ### Reconciling with the provider bill
 

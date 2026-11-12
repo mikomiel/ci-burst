@@ -664,6 +664,40 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertEqual(placement["facts"]["egress_route"]["destination"], "0.0.0.0/0")
         self.assertEqual(self.records(result, "registration_parameter")[0]["status"], "pass")
 
+    # -- CPU credit evidence ---------------------------------------------
+    def test_template_credit_specification_and_burstable_type_are_reported(self):
+        self.ec2.templates[3] = template_data(CreditSpecification={"CpuCredits": "standard"})
+        result = self.check()
+        self.assertEqual(result["decision"], "satisfied")
+        facts = self.records(result, "template")[0]["facts"]
+        self.assertEqual(facts["credit_specification"], "standard")
+        self.assertTrue(facts["burstable"])
+
+    def test_absent_credit_specification_is_reported_as_absent(self):
+        # A burstable type with no template specification follows the family
+        # default; absence is evidence, not an unreadable field.
+        result = self.check()
+        facts = self.records(result, "template")[0]["facts"]
+        self.assertIsNone(facts["credit_specification"])
+        self.assertTrue(facts["burstable"])
+
+    def test_configured_instance_type_pools_report_burstability(self):
+        self.use_instance_types("t4g.small", "c7g.large")
+        result = self.check()
+        facts = {record["target"]: record["facts"] for record in self.records(result, "instance_type")}
+        self.assertTrue(facts["t4g.small"]["burstable"])
+        self.assertFalse(facts["c7g.large"]["burstable"])
+
+    def test_denied_template_read_leaves_credit_evidence_unavailable(self):
+        modules, ClientError = botocore_error_modules()
+        with mock.patch.dict(sys.modules, modules):
+            self.ec2.errors["describe_launch_template_versions"] = ClientError("UnauthorizedOperation")
+            result = self.check()
+        self.assert_unavailable(result, "template_read_unavailable")
+        record = self.records(result, "template")[0]
+        self.assertEqual(record["status"], "unavailable")
+        self.assertNotIn("credit_specification", record.get("facts", {}))
+
     def test_registration_parameter_is_checked_without_reading_its_value(self):
         result = self.check()
         self.assertEqual(self.records(result, "registration_parameter")[0]["status"], "pass")

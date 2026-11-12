@@ -83,6 +83,8 @@ def _frozen_deployment(operation):
         tags = operation.request()["TagSpecifications"][0]["Tags"]
     except (KeyError, IndexError, TypeError, ValueError):
         return None
+    if not isinstance(tags, list):
+        return None
     for tag in tags:
         if isinstance(tag, dict) and tag.get("Key") == DEPLOYMENT_TAG:
             value = tag.get("Value")

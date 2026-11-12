@@ -4,12 +4,13 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from ci_burst.config import load
-from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller
+from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment
 from ci_burst.errors import ConfigRefusal, ProviderRefusal, StateRefusal
-from ci_burst.aws import SpotQuote
+from ci_burst.aws import DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
 from ci_burst.ledger import Ledger, current_window
 from ci_burst.money import format_money
 
@@ -56,13 +57,22 @@ class ControllerCase(unittest.TestCase):
         window = current_window(self.clock.now, controller.config.budget.window_seconds)
         return self.reopened().window_totals(window, controller.cost, self.clock.now)
 
-    def seed(self, *, state="running", operation_id="existing-op", expires_at=None, reservation=1_000_000, instance_id="i-seed"):
+    def seed(
+        self,
+        *,
+        state="running",
+        operation_id="existing-op",
+        expires_at=None,
+        reservation=1_000_000,
+        instance_id="i-seed",
+        request=None,
+    ):
         ledger = Ledger(self.config.state.database, clock=self.clock).connect()
         with ledger.transaction():
             ledger.new_operation(
                 operation_id=operation_id,
                 client_token="ci-burst-" + operation_id,
-                request={"seed": True},
+                request={"seed": True} if request is None else request,
                 request_sha256="0" * 64,
                 expires_at=expires_at if expires_at is not None else self.clock.now + 3600,
                 reservation_micros=reservation,
@@ -784,9 +794,29 @@ class IntentScopeTests(ControllerCase):
         self.assertEqual(len(ledger.operations()), 1)
         self.assertEqual(ledger.operation(first["operation"]).state, "starting")
 
-    def test_a_drained_ledger_serves_a_new_deployment_and_keeps_its_history(self):
-        old = self.seed(state="terminal", operation_id="old-op", instance_id="i-old")
+    def test_a_drained_ledger_serves_a_new_deployment_and_keeps_a_bound_history(self):
+        frozen_request = {
+            "TagSpecifications": [
+                {
+                    "ResourceType": "instance",
+                    "Tags": [
+                        {"Key": MANAGED_TAG, "Value": "true"},
+                        {"Key": DEPLOYMENT_TAG, "Value": "test-deployment"},
+                        {"Key": OPERATION_TAG, "Value": "old-op"},
+                    ],
+                }
+            ]
+        }
+        old = self.seed(
+            state="terminal",
+            operation_id="old-op",
+            instance_id="i-old",
+            request=frozen_request,
+        )
+        self.reopened().settle(old, 2_500_000, self.clock.now)
         retained = self.reopened().operation(old)
+        # The retained row carries a real deployment tag, not an unbound seed.
+        self.assertEqual(_frozen_deployment(retained), "test-deployment")
         changed = load(write_config(self.root, config={"deployment": "different-deployment"}))
 
         result = self.build(observation=observation_demand(), config=changed).apply()
@@ -795,13 +825,79 @@ class IntentScopeTests(ControllerCase):
         self.assertEqual(len(result["launches"]), 1)
         request = [call[1] for call in self.aws.calls if call[0] == "run_spot"][0]
         tags = {tag["Key"]: tag["Value"] for tag in request["TagSpecifications"][0]["Tags"]}
-        self.assertEqual(tags["ci-burst:deployment"], "different-deployment")
+        self.assertEqual(tags[DEPLOYMENT_TAG], "different-deployment")
         ledger = self.reopened()
         self.assertEqual(len(ledger.operations()), 2)
-        self.assertEqual(ledger.operation(old).state, "terminal")
+        old_row = ledger.operation(old)
+        self.assertEqual(old_row.state, "terminal")
+        self.assertEqual(old_row.request_json, retained.request_json)
+        self.assertEqual(old_row.request_sha256, retained.request_sha256)
+        self.assertEqual(old_row.reservation_micros, retained.reservation_micros)
+        self.assertEqual(old_row.settled_micros, retained.settled_micros)
+        self.assertEqual(old_row.settled_at, retained.settled_at)
+        self.assertEqual(json.loads(old_row.request_json), frozen_request)
+
+    def test_a_drained_ledger_tolerates_an_unbound_history_row(self):
+        old = self.seed(state="failed", operation_id="unbound-op", instance_id=None)
+        retained = self.reopened().operation(old)
+        self.assertIsNone(_frozen_deployment(retained))
+        changed = load(write_config(self.root, config={"deployment": "different-deployment"}))
+
+        result = self.build(observation=observation_demand(), config=changed).apply()
+
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(result["launches"]), 1)
+        ledger = self.reopened()
+        self.assertEqual(len(ledger.operations()), 2)
+        self.assertEqual(ledger.operation(old).state, "failed")
         self.assertEqual(ledger.operation(old).request_json, retained.request_json)
         self.assertEqual(ledger.operation(old).request_sha256, retained.request_sha256)
-        self.assertEqual(ledger.operation(old).reservation_micros, retained.reservation_micros)
+
+
+class FrozenDeploymentTests(unittest.TestCase):
+    """``_frozen_deployment`` reads only a well-formed deployment tag."""
+
+    @staticmethod
+    def operation(request_json):
+        return SimpleNamespace(request=lambda: json.loads(request_json))
+
+    @staticmethod
+    def tagged(tags):
+        return json.dumps(
+            {"TagSpecifications": [{"ResourceType": "instance", "Tags": tags}]}
+        )
+
+    def test_a_tagged_request_returns_its_deployment(self):
+        request = self.tagged(
+            [
+                {"Key": MANAGED_TAG, "Value": "true"},
+                {"Key": DEPLOYMENT_TAG, "Value": "test-deployment"},
+            ]
+        )
+        self.assertEqual(_frozen_deployment(self.operation(request)), "test-deployment")
+
+    def test_a_request_without_tag_specifications_is_unbound(self):
+        request = json.dumps({"InstanceType": "t3.micro"})
+        self.assertIsNone(_frozen_deployment(self.operation(request)))
+
+    def test_null_tags_are_unbound(self):
+        self.assertIsNone(_frozen_deployment(self.operation(self.tagged(None))))
+
+    def test_numeric_tags_are_unbound(self):
+        self.assertIsNone(_frozen_deployment(self.operation(self.tagged(42))))
+
+    def test_a_tag_entry_that_is_not_a_dict_is_ignored(self):
+        self.assertIsNone(_frozen_deployment(self.operation(self.tagged(["not-a-tag"]))))
+
+    def test_a_deployment_tag_with_an_empty_value_is_unbound(self):
+        self.assertIsNone(
+            _frozen_deployment(
+                self.operation(self.tagged([{"Key": DEPLOYMENT_TAG, "Value": ""}]))
+            )
+        )
+
+    def test_invalid_request_json_is_unbound(self):
+        self.assertIsNone(_frozen_deployment(self.operation("not json")))
 
 
 class FleetTests(ControllerCase):

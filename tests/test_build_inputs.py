@@ -6,13 +6,16 @@ Python dependencies are inputs of their own. These tests guard the properties
 that make a build record useful and keep them from being silently removed:
 
 * the base image is pinned by digest, not by a moving tag;
-* the refresh script writes one immutable record per image, keyed by image ID,
-  atomically, with the source SHA, tree SHA, Dockerfile hash, ``FROM`` line,
-  base digest, image ID, engine version, resolved Python distributions and a
-  timestamp, before it promotes; a source-keyed reference names that record and
-  is never the only copy of any inputs;
-* a failed same-source retry cannot replace the serving image's record, and a
-  record that cannot be produced never promotes;
+* the refresh script writes one authoritative record per image, keyed by image
+  ID and published by rename, with the Dockerfile hash, ``FROM`` line, base
+  digest, image ID and resolved Python distributions, plus a bounded list of
+  attestations naming the source and tree SHA and the engine and timestamp of
+  each build that resolved those bytes; a source-keyed reference names that
+  record and is never the only copy of any inputs;
+* one image ID may legitimately carry several attestations, but an image ID
+  whose build inputs differ is a conflict that refuses promotion; a failed
+  retry cannot replace the serving image's record, and a record that cannot be
+  produced never promotes;
 * a source SHA that cannot be resolved aborts before anything is built or
   recorded;
 * the worker recipe records its own inputs inside the image before it prints
@@ -51,18 +54,22 @@ DOCKERFILE = f"FROM python:3.12-slim@{BASE_DIGEST}\n"
 IMAGE_A = "sha256:" + "a" * 64
 IMAGE_B = "sha256:" + "b" * 64
 
+# A second commit whose only changes are excluded from the build context: the
+# tree differs, the image bytes do not.
+OTHER_SOURCE_SHA = "fedcba9876543210fedcba9876543210fedcba98"
+OTHER_TREE_SHA = "abcdef0123456789abcdef0123456789abcdef01"
+
 RECORD_KEYS = {
     "schema",
-    "source_sha",
-    "tree_sha",
+    "image_id",
     "dockerfile_sha256",
     "from",
     "base_digest",
-    "image_id",
-    "engine",
     "python_distributions",
-    "created_at",
+    "attestations",
 }
+
+ATTESTATION_KEYS = {"source_sha", "tree_sha", "engine", "created_at"}
 
 REFERENCE_KEYS = {"schema", "source_sha", "image_id", "record"}
 
@@ -119,16 +126,33 @@ class RefreshBuildRecordShapeTests(unittest.TestCase):
         self.assertIn('image_key=${candidate#sha256:}', self.script)
         self.assertIn("build_inputs_failed: unusable image identity", self.script)
 
-    def test_never_replaces_an_existing_image_record(self):
+    def test_refuses_a_conflicting_record_for_an_existing_image(self):
         self.assertIn('[ -e "$record" ]', self.script)
         self.assertIn('$record.conflict', self.script)
         self.assertIn("build_inputs_failed: image record conflict", self.script)
+
+    def test_appends_an_attestation_for_a_second_source_of_one_image(self):
+        # The image-keyed record is authoritative, so a second source that
+        # resolves the same bytes appends to it rather than replacing it.
+        self.assertIn('"schema": "ci-burst.build-inputs.v2"', self.script)
+        self.assertIn('"attestations"', self.script)
+        self.assertIn('log "build_inputs_attested: $record source=$want"', self.script)
+        self.assertIn("merged[\"attestations\"] = attestations + [new]", self.script)
+
+    def test_caps_the_attestation_list_and_refuses_at_the_cap(self):
+        self.assertIn("CAP = 8", self.script)
+        self.assertIn("len(attestations) >= CAP", self.script)
+        self.assertIn("build_inputs_full:", self.script)
 
     def test_writes_atomically_through_hidden_temp_files(self):
         # A visible partial record would misreport a build that is still
         # running; each rename must stay inside its own directory.
         self.assertIn(
             'record_tmp=$(mktemp "$records/.$image_key.XXXXXX")', self.script
+        )
+        self.assertIn(
+            "candidate_record=$(mktemp \"$records/.$image_key.candidate.XXXXXX\")",
+            self.script,
         )
         self.assertIn(
             'reference_tmp=$(mktemp "$STATE/builds/.sha-$short.XXXXXX")', self.script
@@ -141,7 +165,7 @@ class RefreshBuildRecordShapeTests(unittest.TestCase):
         )
 
     def test_records_the_required_inputs(self):
-        for key in sorted(RECORD_KEYS):
+        for key in sorted(RECORD_KEYS | ATTESTATION_KEYS):
             with self.subTest(key=key):
                 self.assertIn(f'"{key}"', self.script)
         for marker in (
@@ -199,9 +223,8 @@ class RefreshBuildRecordBehaviourTests(unittest.TestCase):
             "from pathlib import Path\n"
             "\n"
             "required = {\n"
-            '    "schema", "source_sha", "tree_sha", "dockerfile_sha256",\n'
-            '    "from", "base_digest", "image_id", "engine",\n'
-            '    "python_distributions", "created_at",\n'
+            '    "schema", "image_id", "dockerfile_sha256", "from",\n'
+            '    "base_digest", "python_distributions", "attestations",\n'
             "}\n"
             "builds, image_id = Path(sys.argv[1]), sys.argv[2]\n"
             "\n"
@@ -211,7 +234,9 @@ class RefreshBuildRecordBehaviourTests(unittest.TestCase):
             "    except (OSError, ValueError):\n"
             "        continue\n"
             "    if isinstance(document, dict) and set(document) == required \\\n"
-            "            and document.get('image_id') == image_id:\n"
+            "            and document.get('image_id') == image_id \\\n"
+            "            and isinstance(document.get('attestations'), list) \\\n"
+            "            and document['attestations']:\n"
             "        raise SystemExit(0)\n"
             "raise SystemExit(1)\n",
             encoding="utf-8",
@@ -306,8 +331,8 @@ class RefreshBuildRecordBehaviourTests(unittest.TestCase):
     def image_record_path(self, image_id):
         return self.state / "builds" / "images" / f"{image_id.split(':', 1)[1]}.json"
 
-    def reference_path(self):
-        return self.state / "builds" / f"sha-{SOURCE_SHA[:12]}.json"
+    def reference_path(self, source_sha=SOURCE_SHA):
+        return self.state / "builds" / f"sha-{source_sha[:12]}.json"
 
     def test_records_exactly_one_complete_record_per_image(self):
         completed = self.run_script()
@@ -318,9 +343,7 @@ class RefreshBuildRecordBehaviourTests(unittest.TestCase):
             self.image_record_path(IMAGE_A).read_text(encoding="utf-8")
         )
         self.assertEqual(set(document), RECORD_KEYS)
-        self.assertEqual(document["schema"], "ci-burst.build-inputs.v1")
-        self.assertEqual(document["source_sha"], SOURCE_SHA)
-        self.assertEqual(document["tree_sha"], TREE_SHA)
+        self.assertEqual(document["schema"], "ci-burst.build-inputs.v2")
         self.assertEqual(
             document["dockerfile_sha256"],
             hashlib.sha256(self.dockerfile_bytes).hexdigest(),
@@ -328,11 +351,79 @@ class RefreshBuildRecordBehaviourTests(unittest.TestCase):
         self.assertEqual(document["from"], f"FROM python:3.12-slim@{BASE_DIGEST}")
         self.assertEqual(document["base_digest"], BASE_DIGEST)
         self.assertEqual(document["image_id"], IMAGE_A)
-        self.assertEqual(document["engine"], "podman version 5.4.2")
         self.assertEqual(document["python_distributions"], DISTRIBUTIONS)
+        self.assertEqual(len(document["attestations"]), 1)
+        attestation = document["attestations"][0]
+        self.assertEqual(set(attestation), ATTESTATION_KEYS)
+        self.assertEqual(attestation["source_sha"], SOURCE_SHA)
+        self.assertEqual(attestation["tree_sha"], TREE_SHA)
+        self.assertEqual(attestation["engine"], "podman version 5.4.2")
         self.assertRegex(
-            document["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$"
+            attestation["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$"
         )
+
+    def test_a_same_image_from_a_different_commit_appends_an_attestation(self):
+        # A commit that changes only docs/, tests/ or deploy/ files is excluded
+        # by .dockerignore, so a build of it returns the image already on the
+        # host under another source. That is not a contradiction: record both
+        # sources against the image and promote normally.
+        first = self.run_script()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        (self.state / "deployed-sha").unlink()
+
+        second = self.run_script(
+            CI_BURST_TEST_WANT=OTHER_SOURCE_SHA, CI_BURST_TEST_TREE=OTHER_TREE_SHA
+        )
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn(
+            f"build_inputs_attested: {self.image_record_path(IMAGE_A)}",
+            second.stdout,
+        )
+
+        document = json.loads(
+            self.image_record_path(IMAGE_A).read_text(encoding="utf-8")
+        )
+        self.assertEqual(set(document), RECORD_KEYS)
+        self.assertEqual(
+            [(item["source_sha"], item["tree_sha"]) for item in document["attestations"]],
+            [(SOURCE_SHA, TREE_SHA), (OTHER_SOURCE_SHA, OTHER_TREE_SHA)],
+        )
+        for attestation in document["attestations"]:
+            with self.subTest(source=attestation["source_sha"]):
+                self.assertEqual(set(attestation), ATTESTATION_KEYS)
+                self.assertEqual(attestation["engine"], "podman version 5.4.2")
+                self.assertRegex(
+                    attestation["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$"
+                )
+
+        # The source-keyed reference names the same image, whose attestation
+        # list now carries several sources.
+        reference = json.loads(
+            self.reference_path(OTHER_SOURCE_SHA).read_text(encoding="utf-8")
+        )
+        self.assertEqual(reference["source_sha"], OTHER_SOURCE_SHA)
+        self.assertEqual(reference["image_id"], IMAGE_A)
+        self.assertEqual(
+            reference["record"], f"images/{self.image_record_path(IMAGE_A).name}"
+        )
+        self.assertEqual(
+            self.promoted.read_text(encoding="utf-8").splitlines(), [IMAGE_A, IMAGE_A]
+        )
+        self.assertEqual(
+            (self.state / "deployed-sha").read_text(encoding="utf-8").strip(),
+            OTHER_SOURCE_SHA,
+        )
+
+        # Recording the same source again is idempotent: no second attestation
+        # and no rewrite of the record.
+        recorded = self.image_record_path(IMAGE_A).read_bytes()
+        (self.state / "deployed-sha").unlink()
+        again = self.run_script(
+            CI_BURST_TEST_WANT=OTHER_SOURCE_SHA, CI_BURST_TEST_TREE=OTHER_TREE_SHA
+        )
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("build_inputs_kept", again.stdout)
+        self.assertEqual(self.image_record_path(IMAGE_A).read_bytes(), recorded)
 
     def test_the_source_keyed_file_is_a_reference_not_the_record(self):
         completed = self.run_script()
@@ -463,7 +554,7 @@ class RefreshBuildRecordBehaviourTests(unittest.TestCase):
         self.assertEqual(serving.read_bytes(), recorded)
         document = json.loads(serving.read_text(encoding="utf-8"))
         self.assertEqual(document["image_id"], IMAGE_A)
-        self.assertEqual(document["source_sha"], SOURCE_SHA)
+        self.assertEqual(document["attestations"][0]["source_sha"], SOURCE_SHA)
         # B's build has its own record; A's is not a casualty of it.
         other = json.loads(
             self.image_record_path(IMAGE_B).read_text(encoding="utf-8")
@@ -497,21 +588,70 @@ class RefreshBuildRecordBehaviourTests(unittest.TestCase):
         recorded = serving.read_bytes()
         (self.state / "deployed-sha").unlink()
 
-        # Same image ID, different recorded inputs: a contradiction, not a
-        # retry. Keep the first record, keep the candidate as evidence, and
-        # refuse to promote an image whose record no longer matches it.
-        second = self.run_script(CI_BURST_TEST_DISTRIBUTIONS="different==1.0")
+        # Same image ID, different build inputs: the Dockerfile changed without
+        # changing the bytes it produces. That is a contradiction, not a second
+        # source for the image, so keep the first record, keep the candidate as
+        # evidence, and refuse to promote.
+        changed_bytes = self.dockerfile_bytes + b"# a changed build input\n"
+        (self.context / "Dockerfile").write_bytes(changed_bytes)
+        second = self.run_script(
+            CI_BURST_TEST_WANT=OTHER_SOURCE_SHA, CI_BURST_TEST_TREE=OTHER_TREE_SHA
+        )
         self.assertNotEqual(second.returncode, 0, second.stdout)
         self.assertIn("build_inputs_failed: image record conflict", second.stdout)
         self.assertEqual(serving.read_bytes(), recorded)
         conflict = serving.with_name(serving.name + ".conflict")
         self.assertTrue(conflict.exists())
+        candidate = json.loads(conflict.read_text(encoding="utf-8"))
         self.assertEqual(
-            json.loads(conflict.read_text(encoding="utf-8"))["python_distributions"],
-            ["different==1.0"],
+            candidate["dockerfile_sha256"], hashlib.sha256(changed_bytes).hexdigest()
         )
+        self.assertNotEqual(
+            candidate["dockerfile_sha256"],
+            json.loads(recorded)["dockerfile_sha256"],
+        )
+        self.assertEqual(len(candidate["attestations"]), 1)
+        self.assertEqual(candidate["attestations"][0]["source_sha"], OTHER_SOURCE_SHA)
         self.assertEqual(
             self.promoted.read_text(encoding="utf-8").splitlines(), [IMAGE_A]
+        )
+        self.assertFalse((self.state / "deployed-sha").exists())
+
+    def test_the_attestation_list_is_capped_and_refuses_at_the_cap(self):
+        # Eight sources may be attested for one image. A ninth is refused rather
+        # than silently dropping a source that a reference may still name.
+        first = self.run_script()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        for index in range(1, 8):
+            (self.state / "deployed-sha").unlink()
+            completed = self.run_script(
+                CI_BURST_TEST_WANT=f"{index:040x}",
+                CI_BURST_TEST_TREE=f"{index + 100:040x}",
+            )
+            self.assertEqual(
+                completed.returncode, 0, completed.stdout + completed.stderr
+            )
+        document = json.loads(
+            self.image_record_path(IMAGE_A).read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(document["attestations"]), 8)
+
+        (self.state / "deployed-sha").unlink()
+        refused = self.run_script(
+            CI_BURST_TEST_WANT="f" * 40, CI_BURST_TEST_TREE="e" * 40
+        )
+        self.assertEqual(refused.returncode, 2, refused.stdout)
+        self.assertIn("build_inputs_full", refused.stdout)
+        self.assertEqual(
+            len(
+                json.loads(
+                    self.image_record_path(IMAGE_A).read_text(encoding="utf-8")
+                )["attestations"]
+            ),
+            8,
+        )
+        self.assertEqual(
+            self.promoted.read_text(encoding="utf-8").splitlines(), [IMAGE_A] * 8
         )
         self.assertFalse((self.state / "deployed-sha").exists())
 
@@ -580,6 +720,20 @@ class DocumentationTests(unittest.TestCase):
             "retained",
             "pruned manually",
             "conflict",
+            "attestation",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, text)
+
+    def test_container_guide_states_the_attestation_append_rule_and_cap(self):
+        text = " ".join(CONTAINER_DOC.read_text(encoding="utf-8").split())
+        for marker in (
+            "attestation list",
+            "appends",
+            "build_inputs_attested",
+            "build_inputs_full",
+            "capped at 8 sources",
+            "build inputs",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, text)

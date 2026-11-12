@@ -93,8 +93,9 @@ fi
 
 work=$(mktemp -d)
 record_tmp=
+candidate_record=
 reference_tmp=
-trap 'rm -rf "$work"; [ -z "$record_tmp" ] || rm -f "$record_tmp"; [ -z "$reference_tmp" ] || rm -f "$reference_tmp"' EXIT INT TERM
+trap 'rm -rf "$work"; [ -z "$record_tmp" ] || rm -f "$record_tmp"; [ -z "$candidate_record" ] || rm -f "$candidate_record"; [ -z "$reference_tmp" ] || rm -f "$reference_tmp"' EXIT INT TERM
 mkdir "$work/src"
 if ! git -C "$SOURCE" archive --format=tar --output "$work/tree.tar" "$want"; then
     log "archive_failed: $want"
@@ -241,10 +242,15 @@ if ! podman run --rm --network=none --entrypoint python "$IMAGE:candidate" \
     exit 2
 fi
 
-# The image-keyed record is the authoritative, immutable copy; the source-keyed
-# file is a reference to whichever image this source most recently recorded, so
-# a retry moves the reference and never the inputs. Both names are published by
-# a rename inside their own directory and both are written before promotion.
+# The image-keyed record is the authoritative copy; the source-keyed file is a
+# reference to whichever image this source most recently recorded, so a retry
+# moves the reference and never the inputs. Both names are published by a
+# rename inside their own directory and both are written before promotion.
+#
+# One image ID can be produced by more than one source commit: a commit that
+# changes only files the build ignores leaves the image bytes identical. The
+# record therefore carries a bounded list of attestations instead of one source
+# identity, and appending one republishes the whole record atomically.
 records="$STATE/builds/images"
 if ! mkdir -p "$records"; then
     log "build_inputs_failed: cannot create $records"
@@ -252,18 +258,20 @@ if ! mkdir -p "$records"; then
 fi
 record="$records/$image_key.json"
 reference="$STATE/builds/sha-$short.json"
-record_tmp=$(mktemp "$records/.$image_key.XXXXXX") || {
-    log "build_inputs_failed: cannot create a temporary record"
+candidate_record=$(mktemp "$records/.$image_key.candidate.XXXXXX") || {
+    log "build_inputs_failed: cannot create a temporary candidate record"
     exit 2
 }
 reference_tmp=$(mktemp "$STATE/builds/.sha-$short.XXXXXX") || {
+    rm -f "$candidate_record"
+    candidate_record=
     log "build_inputs_failed: cannot create a temporary reference"
     exit 2
 }
 if ! SOURCE_SHA="$want" TREE_SHA="$tree" DOCKERFILE_SHA256="$dockerfile_sha256" \
         FROM_LINE="$from_line" BASE_DIGEST="$base_digest" IMAGE_ID="$candidate" \
         ENGINE="$engine" CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        python3 - "$distributions" >"$record_tmp" <<'PY'
+        python3 - "$distributions" >"$candidate_record" <<'PY'
 import json
 import os
 import sys
@@ -272,86 +280,164 @@ with open(sys.argv[1], encoding="utf-8") as handle:
     distributions = [line.strip() for line in handle if line.strip()]
 
 document = {
-    "schema": "ci-burst.build-inputs.v1",
-    "source_sha": os.environ["SOURCE_SHA"],
-    "tree_sha": os.environ["TREE_SHA"],
+    "schema": "ci-burst.build-inputs.v2",
+    "image_id": os.environ["IMAGE_ID"],
     "dockerfile_sha256": os.environ["DOCKERFILE_SHA256"],
     "from": os.environ["FROM_LINE"],
     "base_digest": os.environ["BASE_DIGEST"] or None,
-    "image_id": os.environ["IMAGE_ID"],
-    "engine": os.environ["ENGINE"] or "unknown",
     "python_distributions": distributions,
-    "created_at": os.environ["CREATED_AT"],
+    "attestations": [
+        {
+            "source_sha": os.environ["SOURCE_SHA"],
+            "tree_sha": os.environ["TREE_SHA"],
+            "engine": os.environ["ENGINE"] or "unknown",
+            "created_at": os.environ["CREATED_AT"],
+        }
+    ],
 }
 json.dump(document, sys.stdout, indent=2, sort_keys=True)
 sys.stdout.write("\n")
 PY
 then
-    rm -f "$record_tmp"
-    record_tmp=
+    rm -f "$candidate_record"
+    candidate_record=
     log "build_inputs_failed: cannot render $record"
     exit 2
 fi
-chmod 0644 "$record_tmp"
+chmod 0644 "$candidate_record"
 if [ -e "$record" ]; then
-    # Never replace an existing image record. A retry that resolved the same
-    # image is the same record apart from the recording timestamp, so the
-    # first publication and its timestamp are kept. Anything else contradicts
-    # the image identity: keep the first record, keep the candidate beside it
-    # as evidence, and refuse to promote rather than silently overwrite.
-    compare_rc=0
-    python3 - "$record" "$record_tmp" <<'PY' || compare_rc=$?
+    # An existing record contradicts this build only when the build inputs
+    # differ. A different source commit that resolves the same inputs is not a
+    # contradiction: the image ID is the same bytes, so append its attestation.
+    # A source and tree already listed is the same build recorded again, and
+    # an existing record at the cap refuses rather than dropping an older
+    # attestation that a tag may still name.
+    record_tmp=$(mktemp "$records/.$image_key.XXXXXX") || {
+        rm -f "$candidate_record"
+        candidate_record=
+        log "build_inputs_failed: cannot create a temporary record"
+        exit 2
+    }
+    merge_rc=0
+    python3 - "$record" "$candidate_record" >"$record_tmp" <<'PY' || merge_rc=$?
 import json
 import sys
 
+# The list is bounded so one record stays small and readable. A new source that
+# would exceed it is refused (exit 12), not silently paid for by deleting an
+# attestation an earlier reference may still name.
+CAP = 8
+INPUTS = (
+    "image_id",
+    "from",
+    "base_digest",
+    "dockerfile_sha256",
+    "python_distributions",
+)
 
-def inputs(path):
+
+def load(path):
     with open(path, encoding="utf-8") as handle:
         document = json.load(handle)
-    if not isinstance(document, dict):
-        raise SystemExit(2)
-    document.pop("created_at", None)
+    if not isinstance(document, dict) or document.get("schema") != "ci-burst.build-inputs.v2":
+        raise ValueError("not a build-inputs record")
+    attestations = document.get("attestations")
+    if not isinstance(attestations, list) or not all(
+        isinstance(item, dict) for item in attestations
+    ):
+        raise ValueError("no attestation list")
     return document
 
 
+# Statuses are deliberately not 1: an uncaught Python error exits 1, and an
+# internal failure must land in the shell's named-failure branch, never be read
+# as a conflict and written beside the record.
 try:
-    first = inputs(sys.argv[1])
-    second = inputs(sys.argv[2])
+    existing = load(sys.argv[1])
+    candidate = load(sys.argv[2])
 except (OSError, ValueError):
     raise SystemExit(2)
-raise SystemExit(0 if first == second else 1)
+
+if any(key not in existing or key not in candidate for key in INPUTS):
+    raise SystemExit(2)
+if {key: existing[key] for key in INPUTS} != {key: candidate[key] for key in INPUTS}:
+    raise SystemExit(10)
+
+attestations = existing["attestations"]
+new = candidate["attestations"][0]
+if any(
+    item.get("source_sha") == new.get("source_sha")
+    and item.get("tree_sha") == new.get("tree_sha")
+    for item in attestations
+):
+    raise SystemExit(11)
+if len(attestations) >= CAP:
+    raise SystemExit(12)
+
+merged = {key: existing[key] for key in INPUTS}
+merged["schema"] = existing["schema"]
+merged["attestations"] = attestations + [new]
+json.dump(merged, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
 PY
-    case "$compare_rc" in
+    case "$merge_rc" in
         0)
-            rm -f "$record_tmp"
-            record_tmp=
-            log "build_inputs_kept: $record"
-            ;;
-        1)
-            conflict="$record.conflict"
-            if ! mv -f "$record_tmp" "$conflict"; then
-                rm -f "$record_tmp"
+            if ! mv -f "$record_tmp" "$record"; then
+                rm -f "$record_tmp" "$candidate_record"
                 record_tmp=
+                candidate_record=
+                log "build_inputs_failed: cannot publish $record"
+                exit 2
+            fi
+            record_tmp=
+            rm -f "$candidate_record"
+            candidate_record=
+            log "build_inputs_attested: $record source=$want"
+            ;;
+        10)
+            conflict="$record.conflict"
+            if ! mv -f "$candidate_record" "$conflict"; then
+                rm -f "$record_tmp" "$candidate_record"
+                record_tmp=
+                candidate_record=
                 log "build_inputs_failed: image record conflict at $record, and $conflict cannot be written"
                 exit 2
             fi
+            candidate_record=
+            rm -f "$record_tmp"
             record_tmp=
             log "build_inputs_failed: image record conflict at $record; kept the first record, wrote $conflict"
             exit 2
             ;;
-        *)
-            rm -f "$record_tmp"
+        11)
+            rm -f "$record_tmp" "$candidate_record"
             record_tmp=
+            candidate_record=
+            log "build_inputs_kept: $record"
+            ;;
+        12)
+            rm -f "$record_tmp" "$candidate_record"
+            record_tmp=
+            candidate_record=
+            log "build_inputs_full: $record already attests 8 sources; prune it before recording another"
+            exit 2
+            ;;
+        *)
+            rm -f "$record_tmp" "$candidate_record"
+            record_tmp=
+            candidate_record=
             log "build_inputs_failed: cannot compare with the existing record at $record"
             exit 2
             ;;
     esac
 else
-    if ! mv -f "$record_tmp" "$record"; then
+    if ! mv -f "$candidate_record" "$record"; then
+        rm -f "$candidate_record"
+        candidate_record=
         log "build_inputs_failed: cannot publish $record"
         exit 2
     fi
-    record_tmp=
+    candidate_record=
     log "build_inputs: $record"
 fi
 

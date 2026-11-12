@@ -219,8 +219,12 @@ Without it, launches fail with
 ### The worker image
 
 The template boots a prebuilt image, not a stock distribution. The image is an
-operator-owned prerequisite and this repository does not build it; it must
-provide what the bootstrap below assumes:
+operator-owned prerequisite; this repository carries the build recipe at
+[`deploy/runner/image/provision.sh`](../deploy/runner/image/provision.sh) and
+the operator steps at
+[`deploy/runner/image/README.md`](../deploy/runner/image/README.md), but it
+neither builds nor publishes the image. The image must provide what the
+bootstrap below assumes:
 
 - `forgejo-runner` **13.2.1** at `/usr/local/bin/forgejo-runner` — the pin lives
   in the image, not in a download;
@@ -242,10 +246,10 @@ provide what the bootstrap below assumes:
   the bootstrap changes to that directory before starting `one-job`, which
   resolves the file relative to its working directory.
 
-A deployment that starts from a stock image must put the install into the
-bootstrap it publishes. Either way the file here is the bytes actually
-published, so it cannot carry values an operator is expected to edit before
-use.
+A deployment that starts from a stock image can bake the toolchain with the
+recipe, or put the install into the bootstrap it publishes. Either way the
+bootstrap file here is the bytes actually published, so it cannot carry values
+an operator is expected to edit before use.
 
 ### Worker bootstrap
 

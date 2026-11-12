@@ -25,7 +25,8 @@ no cloud change.
   tracked spend and the forward commitment for a window.
 - [x] 2.5 Add `set_launch_time` and one-shot `settle` to the ledger.
 - [x] 2.6 Cover commitment, carryover, restart, read-only tolerance, migration,
-  backup failure and the missing-parameter refusal in `tests/test_ledger.py`.
+  copy failure, size mismatch and the missing-parameter refusal in
+  `tests/test_ledger.py`.
 
 ## 3. Controller
 
@@ -33,16 +34,18 @@ no cloud change.
   race a second writer.
 - [x] 3.2 Record the accepted quote's price at admission and on every capacity
   fallback; record the provider launch time on reconcile.
-- [x] 3.3 Settle on the terminal transition, settle a full lifetime for an
-  unobserved instance, and settle zero for a definite pre-launch failure.
+- [x] 3.3 Settle on the terminal transition, attach an identity observed only at
+  termination before settling, settle a full lifetime at the accepted price for
+  an unobserved instance, and settle zero for a definite pre-launch failure.
 - [x] 3.4 Admit against spend plus commitment plus one worst-case worker.
 - [x] 3.5 Report `spend`, `committed` and `remaining` from `apply`, `plan` and
   `status`; include the incidental rate in `hourly_ceiling`.
 - [x] 3.6 Rewrite the cost-scope note and keep the "estimate, not a bill cap"
   language.
-- [x] 3.7 Cover price recording, settlement, the unobserved case and one-shot
-  settlement in `tests/test_controller.py`; move the batch and status
-  expectations to the new accounting.
+- [x] 3.7 Cover price recording, settlement, the unobserved case, one-shot
+  settlement, an uncertain launch first observed terminated, and admission
+  through the age-out settlement in `tests/test_controller.py`; move the batch
+  and status expectations to the new accounting.
 
 ## 4. Export
 

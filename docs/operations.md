@@ -474,8 +474,10 @@ operations still running; `committed` is `spend` plus the forward commitment.
 
 An operation settles once, when a reconcile observes its instance `terminated`.
 An instance that disappears before the provider retention window settles at a
-full configured lifetime, because the provider then proves neither a shorter
-life nor a lower price. A definite pre-launch rejection settles zero, and a
+full configured lifetime at the price the launch was accepted at (the configured
+maximum when no price was recorded). That price keeps the settlement inside the
+commitment the operation carried while unresolved; settling at the maximum would
+charge more than admission reserved. A definite pre-launch rejection settles zero, and a
 settled or failed operation is never charged again. A restart does not reset the
 window.
 

@@ -961,6 +961,12 @@ class Controller:
         return slot, discrepancies
 
     def _reconcile_present(self, operation, instance):
+        # Attach the identity first: an uncertain launch whose first provider
+        # observation is already terminal must be settled as the instance that
+        # existed, not as an operation that never created one.
+        if operation.instance_id is None:
+            self.ledger.set_instance(operation.id, instance.instance_id)
+            operation = self.ledger.operation(operation.id)
         # A provider launch time is a real timestamp; zero or absent means the
         # adapter could not read one, and creation time stays the substitute.
         if instance.launch_time and operation.launch_time is None:
@@ -995,7 +1001,11 @@ class Controller:
         """
         if operation.settled_micros is not None:
             return
-        self.ledger.settle(operation.id, self.cost.full_lifetime_micros(), self.clock())
+        # The accepted price is inside the commitment the operation carried while
+        # it was unresolved; the cap would settle above what admission reserved.
+        self.ledger.settle(
+            operation.id, self.cost.full_lifetime_micros(operation.price_micros), self.clock()
+        )
 
     def _discrepancies(self, operations, instances):
         known = {

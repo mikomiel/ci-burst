@@ -32,8 +32,9 @@ MUST be costed at the configured maximum.
 
 An operation that reaches a terminal state MUST be settled exactly once and MUST
 NOT be charged again afterwards. An instance that aged out unobserved MUST be
-settled at a full configured lifetime; a definite pre-launch failure MUST settle
-at zero.
+settled at a full configured lifetime at the operation's recorded price, or at
+the configured maximum when none was recorded; a definite pre-launch failure
+MUST settle at zero.
 
 #### Scenario: A worker terminates
 - **WHEN** a reconcile observes the instance `terminated`

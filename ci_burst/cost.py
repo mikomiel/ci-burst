@@ -37,9 +37,16 @@ class CostModel:
             buffer_micros=config.budget.non_compute_allowance,
         )
 
-    def full_lifetime_micros(self):
-        """Worst case one worker can cost over its whole configured lifetime."""
-        return hourly_cost_micros(self.price_cap_micros, self.max_lifetime_seconds) + hourly_cost_micros(
+    def full_lifetime_micros(self, price_micros=0):
+        """Cost of one whole configured lifetime at a price, cap by default.
+
+        The age-out settlement uses the operation's accepted price, because that
+        price is the only evidence it has; a row without one uses the cap. The
+        caller passing the accepted price keeps the settlement inside the
+        forward commitment, which prices unlived time at the cap.
+        """
+        price = price_micros or self.price_cap_micros
+        return hourly_cost_micros(price, self.max_lifetime_seconds) + hourly_cost_micros(
             self.incidental_per_hour_micros, self.max_lifetime_seconds
         )
 

@@ -1239,6 +1239,88 @@ class CostTrackingTests(ControllerCase):
         self.assertEqual(operation.state, "terminal")
         self.assertEqual(operation.settled_micros, 40_000)
 
+    def test_an_uncertain_launch_observed_terminated_settles_its_cost(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        self.assertEqual(first["decision"], "uncertain")
+        operation_id = first["operation"]
+        launched_at = self.clock.now - 600
+        self.aws.run_error = None
+        self.aws.instances_result = [
+            replace(
+                instance(instance_id="i-adopted", operation=operation_id, state="terminated"),
+                launch_time=launched_at,
+            )
+        ]
+        controller.apply()
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "terminal")
+        # The identity learned at termination is part of the settled operation,
+        # so the accepted launch is not recorded as a free one.
+        self.assertEqual(operation.instance_id, "i-adopted")
+        self.assertEqual(operation.launch_time, launched_at)
+        # 600 seconds at the accepted 0.02 price; the reservation recorded the
+        # price with the intent, so the settlement uses it.
+        self.assertEqual(operation.settled_micros, 3_334)
+        controller.apply()
+        self.assertEqual(self.reopened().operation(operation_id).settled_micros, 3_334)
+
+    def test_age_out_settlement_stays_inside_the_commitment(self):
+        path = write_config(
+            self.root,
+            config={
+                "budget": {"allowance": "0.3003"},
+                "aws": {"max_spot_price": "0.2000"},
+                "controller": {"max_instances": 2},
+            },
+        )
+        path.write_text(
+            path.read_text().replace(
+                'non_compute_allowance = "0.50"', 'non_compute_allowance = "0.000001"'
+            )
+        )
+        config = load(path)
+        ledger = Ledger(config.state.database, clock=self.clock).connect()
+        with ledger.transaction():
+            ledger.new_operation(
+                operation_id="a",
+                client_token="ci-burst-a",
+                request={"seed": True},
+                request_sha256="0" * 64,
+                expires_at=self.clock.now,
+                reservation_micros=200_001,
+                window_start=current_window(self.clock.now, config.budget.window_seconds),
+                region=config.aws.region,
+                account="111122223333",
+                price_micros=100_000,
+            )
+        ledger.set_instance("a", "i-a")
+        ledger.set_launch_time("a", self.clock.now - 3600)
+        ledger.set_state("a", "running", instance_id="i-a")
+        ledger.close()
+        controller = self.build(
+            observation=observation_demand(2),
+            aws=FakeAws(spot_quote=quote(price_micros=200_000, clock=self.clock)),
+            config=config,
+        )
+        self.aws.instances_result = []
+        first = controller.apply()
+        self.assertEqual(first["decision"], "launched")
+        # A's expired lifetime has not been reconciled, so its commitment is its
+        # accrued cost and one full-lifetime worker is affordable.
+        self.assertEqual(first["launch_count"], 1)
+        second = first["launches"][0]["operation"]
+        self.clock.advance(INSTANCE_RETENTION_SECONDS + 1)
+        controller.apply()
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation("a").settled_micros, 100_000)
+        self.assertEqual(ledger.operation(second).settled_micros, 200_000)
+        window = current_window(self.clock.now, config.budget.window_seconds)
+        totals = ledger.window_totals(window, controller.cost, self.clock.now)
+        self.assertEqual(totals["spend"], 300_000)
+        self.assertLessEqual(totals["spend"], config.budget.allowance)
+
     def test_settlement_is_written_once(self):
         operation_id = self.seed(state="running", operation_id="live", reservation=540_000)
         launched_at = self.clock.now - 600

@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from ci_burst.errors import StateRefusal
@@ -198,6 +199,28 @@ class CommitmentTests(LedgerTestCase):
             reopened.window_totals(window, self.StubCost(), self.clock_now)["committed"], 4_000_000
         )
 
+    def test_a_real_model_keeps_accrued_cost_in_its_own_window(self):
+        from ci_burst.cost import CostModel
+
+        now = self.clock_now
+        earlier = current_window(now, 86400) - 86400
+        model = CostModel(
+            price_cap_micros=200_000,
+            incidental_per_hour_micros=0,
+            max_lifetime_seconds=3600,
+            buffer_micros=50_000,
+        )
+        operation = self.add(operation_id="live", reservation_micros=250_000, window_start=earlier)
+        self.ledger.set_instance(operation.id, "i-live")
+        self.ledger.set_launch_time(operation.id, now - 600)
+        self.ledger.set_state(operation.id, "running", instance_id="i-live")
+        earlier_totals = self.ledger.window_totals(earlier, model, now)
+        self.assertEqual(earlier_totals["spend"], 33_334)
+        self.assertEqual(earlier_totals["committed"], 250_001)
+        current_totals = self.ledger.window_totals(current_window(now, 86400), model, now)
+        self.assertEqual(current_totals["spend"], 0)
+        self.assertEqual(current_totals["committed"], 216_667)
+
     def test_window_rollover_changes_the_anchor(self):
         self.assertNotEqual(
             current_window(1_800_000_000.0, 86400),
@@ -269,6 +292,46 @@ class MigrationTests(unittest.TestCase):
         # 300 seconds at 0.04 per hour, rounded up to one micro, plus no incidentals.
         self.assertEqual(operation.settled_micros, 3334)
         self.assertEqual(len(list(self.path.parent.glob("state.sqlite3.pre-v2.*"))), 1)
+
+    def test_copy_failure_refuses_before_any_schema_write(self):
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=OSError("denied")):
+            with self.assertRaises(StateRefusal) as raised:
+                ledger.connect(create=True, backfill=(40_000, 0))
+        self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
+        connection = sqlite3.connect(self.path)
+        self.addCleanup(connection.close)
+        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
+        self.assertNotIn("price_micros", columns)
+
+    def test_size_mismatch_refuses_before_any_schema_write(self):
+        def truncated(source, target):
+            Path(target).write_bytes(b"")
+
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=truncated):
+            with self.assertRaises(StateRefusal) as raised:
+                ledger.connect(create=True, backfill=(40_000, 0))
+        self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
+        connection = sqlite3.connect(self.path)
+        self.addCleanup(connection.close)
+        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+
+    def test_a_refused_upgrade_can_be_retried(self):
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=OSError("denied")):
+            with self.assertRaises(StateRefusal):
+                ledger.connect(create=True, backfill=(40_000, 0))
+        ledger.connect(create=True, backfill=(40_000, 0))
+        self.assertEqual(ledger.version, SCHEMA_VERSION)
+        self.assertEqual(ledger.operation("old-op").settled_micros, 3334)
 
     def test_writable_connect_without_backfill_refuses(self):
         ledger = Ledger(self.path, clock=lambda: self.now)

@@ -549,7 +549,12 @@ topology.
   refuses before the first schema write. `plan`, `status` and `export` accept
   either version and never create or migrate the file. Rolling the image back
   after an upgrade requires restoring that copy first, because the previous
-  release refuses the new version.
+  release refuses the new version. The same run changes the operator-visible
+  budget shape: the JSON `budget` block reports `spend`, `committed` and
+  `remaining` instead of `consumed`, and `ci_burst_ledger_consumed_micros` is
+  replaced by `ci_burst_spend_micros` plus commitment, allowance and remaining
+  gauges. A consumer that reads the old key or series must be updated with the
+  upgrade.
 - `reap` never needs this directory, which is why cleanup keeps working when
   the ledger is unavailable.
 - To migrate hosts, stop admission as in rollback step 1, including the

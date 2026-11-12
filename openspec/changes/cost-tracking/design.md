@@ -47,9 +47,11 @@ admitting many more workers per window.
 
 An operation settles when a reconcile first observes its instance `terminated`,
 using the provider launch time and the observation time (within one scheduler
-tick). A worker that never appears again is settled at a full lifetime after the
-provider retention window, because the instance's own lifetime is shorter than
-that window and a full lifetime never under-counts. A definite pre-launch
+tick). A worker that never appears again is settled at a full lifetime at its accepted
+price — or at the configured maximum when no price was recorded — after the
+provider retention window. The lifetime is never shorter than the evidence
+allows, and the accepted price keeps the charge inside the commitment the
+operation carried while unresolved. A definite pre-launch
 rejection already records `failed` with a zero reservation and settles zero.
 
 ### Schema 2 with a verified copy, and a readable predecessor

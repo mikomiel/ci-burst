@@ -379,6 +379,14 @@ class Ledger:
         values.append(operation_id)
         connection.execute("UPDATE operations SET %s WHERE id = ?" % ", ".join(assignments), values)
 
+    def set_instance(self, operation_id, instance_id):
+        """Attach the provider identity when the first observation confirms it."""
+        connection = self._require()
+        connection.execute(
+            "UPDATE operations SET instance_id = ? WHERE id = ?",
+            (instance_id, operation_id),
+        )
+
     def set_launch_time(self, operation_id, launch_time):
         """Record the provider's launch time once, for every later cost read."""
         connection = self._require()

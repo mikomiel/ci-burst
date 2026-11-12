@@ -50,9 +50,11 @@ _SUBNET = re.compile(r"^subnet-(?:[0-9a-f]{8}|[0-9a-f]{17})$")
 _ZONE_CANDIDATE_KEYS = ("zone", "subnet_id", "launch_template_version")
 
 #: One EC2 instance type name: a family and a size, such as ``m7g.xlarge``.
+#: Both parts may carry a hyphen, as ``u-6tb1.112xlarge`` and
+#: ``m7i.metal-24xl`` do; a leading, trailing or doubled hyphen is refused.
 #: The list is validated here because every configured type multiplies the
 #: placement pools an admission prices.
-_INSTANCE_TYPE = re.compile(r"^[a-z][a-z0-9-]*\.[a-z0-9]+$")
+_INSTANCE_TYPE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*\.[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 #: How many instance types one deployment may list. Every admission prices
 #: every configured type in every configured zone, so the bound keeps those

@@ -28,6 +28,7 @@ and the validation step that binds it to that tag.
 - Make the repository bootstrap the deployed template user data ([#66](https://github.com/mikomiel/ci-burst/pull/66)).
 - Treat an exhausted Spot quota as a definite refusal ([#72](https://github.com/mikomiel/ci-burst/pull/72)).
 - Settle an identity first seen at termination ([#73](https://github.com/mikomiel/ci-burst/pull/73)).
+- Floor remaining cost at the accepted price ([#73](https://github.com/mikomiel/ci-burst/pull/73)).
 
 ### Documentation
 

@@ -66,16 +66,12 @@ zero.
 
 ### Requirement: Forward cost commitment
 
-Admission MUST use tracked spend plus each non-terminal operation's worst-case
-remaining cost plus the buffer it was admitted under, and MUST price a new worker
-at the configured maximum for its lifetime. Remaining cost MUST be priced at no
-less than the accepted price and the frozen `MaxPrice`, using the
-admitted incidental rate, with its lifetime from the durable expiry window. The
-schema upgrade MUST persist a backfill marker on every non-terminal operation
-whose admitted inputs it had to fill in, and such an operation MUST keep its
-stored reservation as a floor for its whole life. A normally admitted operation
-MUST carry the marker as false and MUST NOT be floored, because its recorded
-basis already reproduces its own reservation.
+The admission commitment MUST be tracked spend plus, for every non-terminal
+operation, its worst-case remaining cost and its admitted buffer. Remaining
+cost MUST be priced at no less than the accepted price and the frozen
+`MaxPrice`, at the admitted incidental rate, over its durable lifetime. An
+operation the upgrade marked as backfilled MUST keep its stored reservation
+as a floor; a normally admitted operation MUST NOT be floored.
 
 #### Scenario: The allowance admits fewer workers than the free slots
 - **WHEN** the window's commitment plus one worst-case worker exceeds the allowance
@@ -112,12 +108,11 @@ completed operation MUST be charged to the window it started in.
 ### Requirement: Upgrade from the reservation schema
 
 The ledger MUST upgrade a version-1 or version-2 file in place, exactly once,
-after copying it to a size-matched backup, and MUST refuse without mutating when
-that copy or the configured parameters are unavailable. The upgrade MUST add the
-admitted incidental rate and buffer, keep settled costs and terminal admitted
-inputs untouched, and backfill non-terminal rows best-effort. Read-only
-observation MUST accept every earlier schema without writing, and rolling back
-MUST be restoring the backup.
+after a size-matched backup, refusing without mutation when that copy or the
+parameters are unavailable. The upgrade MUST add the incidental rate, buffer
+and backfill marker, keep settled costs and terminal inputs, and backfill
+non-terminal rows while marking them. Read-only observation MUST accept every
+earlier schema without writing; rollback MUST restore the backup.
 
 #### Scenario: The first writable run after promotion
 - **WHEN** a writable command opens a version-1 or version-2 file with the configured parameters

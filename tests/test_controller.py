@@ -11,6 +11,7 @@ from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller
 from ci_burst.errors import ConfigRefusal, ProviderRefusal, StateRefusal
 from ci_burst.aws import SpotQuote
 from ci_burst.ledger import Ledger, current_window
+from ci_burst.money import format_money
 
 from support import (
     Clock,
@@ -698,6 +699,111 @@ class ApplyTests(ControllerCase):
         self.assertNotIn("Authorization", dumped)
 
 
+class IntentScopeTests(ControllerCase):
+    def test_a_deployment_rename_refuses_the_frozen_intent(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        self.assertEqual(first["decision"], "uncertain")
+        operation_id = first["operation"]
+        frozen = self.reopened().operation(operation_id)
+        sends_before = len([call for call in self.aws.calls if call[0] == "run_spot"])
+
+        changed = load(write_config(self.root, config={"deployment": "different-deployment"}))
+        self.aws.run_error = None
+        result = self.build(observation=observation_empty(), aws=self.aws, config=changed).apply()
+
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        scope = [
+            entry for entry in result["slot"]["discrepancies"] if entry["reason"] == "SCOPE_CHANGED"
+        ]
+        self.assertEqual(
+            scope,
+            [
+                {
+                    "operation": operation_id,
+                    "reason": "SCOPE_CHANGED",
+                    "region": "eu-central-1",
+                    "account": "111122223333",
+                    "deployment": "test-deployment",
+                }
+            ],
+        )
+        # The refusal names the scope without disclosing the frozen request.
+        self.assertNotIn(frozen.client_token, json.dumps(result))
+        self.assertNotIn("TagSpecifications", json.dumps(result))
+        self.assertEqual(
+            len([call for call in self.aws.calls if call[0] == "run_spot"]), sends_before
+        )
+        self.assertEqual(self.aws.terminated, [])
+        self.assertNotIn("resumes", result)
+        self.assertNotIn("operation", result)
+
+        unchanged = self.reopened().operation(operation_id)
+        self.assertEqual(unchanged.state, "uncertain")
+        self.assertEqual(unchanged.updated_at, frozen.updated_at)
+        self.assertEqual(unchanged.client_token, frozen.client_token)
+        self.assertEqual(unchanged.request_sha256, frozen.request_sha256)
+        self.assertEqual(unchanged.request_json, frozen.request_json)
+
+    def test_plan_refuses_a_deployment_rename_without_an_aws_call(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        operation_id = first["operation"]
+        frozen = self.reopened().operation(operation_id)
+        calls_before = list(self.aws.calls)
+
+        changed = load(write_config(self.root, config={"deployment": "different-deployment"}))
+        result = self.build(observation=observation_demand(), aws=self.aws, config=changed).plan()
+
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["refusal"]["reason"], "SCOPE_CHANGED")
+        self.assertEqual(self.aws.calls, calls_before)
+        unchanged = self.reopened().operation(operation_id)
+        self.assertEqual(unchanged.state, "uncertain")
+        self.assertEqual(unchanged.updated_at, frozen.updated_at)
+        self.assertEqual(unchanged.client_token, frozen.client_token)
+        self.assertEqual(unchanged.request_sha256, frozen.request_sha256)
+        self.assertEqual(unchanged.request_json, frozen.request_json)
+
+    def test_the_same_deployment_still_resumes_idempotently(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        self.assertEqual(first["decision"], "uncertain")
+        self.aws.run_error = None
+        second = self.build(observation=observation_demand(), aws=self.aws).apply()
+        self.assertEqual(second["decision"], "resumed")
+        self.assertEqual(second["operation"], first["operation"])
+        sends = [call[1] for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(sends), 2)
+        self.assertEqual(sends[0], sends[1])
+        ledger = self.reopened()
+        self.assertEqual(len(ledger.operations()), 1)
+        self.assertEqual(ledger.operation(first["operation"]).state, "starting")
+
+    def test_a_drained_ledger_serves_a_new_deployment_and_keeps_its_history(self):
+        old = self.seed(state="terminal", operation_id="old-op", instance_id="i-old")
+        retained = self.reopened().operation(old)
+        changed = load(write_config(self.root, config={"deployment": "different-deployment"}))
+
+        result = self.build(observation=observation_demand(), config=changed).apply()
+
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(result["launches"]), 1)
+        request = [call[1] for call in self.aws.calls if call[0] == "run_spot"][0]
+        tags = {tag["Key"]: tag["Value"] for tag in request["TagSpecifications"][0]["Tags"]}
+        self.assertEqual(tags["ci-burst:deployment"], "different-deployment")
+        ledger = self.reopened()
+        self.assertEqual(len(ledger.operations()), 2)
+        self.assertEqual(ledger.operation(old).state, "terminal")
+        self.assertEqual(ledger.operation(old).request_json, retained.request_json)
+        self.assertEqual(ledger.operation(old).request_sha256, retained.request_sha256)
+        self.assertEqual(ledger.operation(old).reservation_micros, retained.reservation_micros)
+
+
 class FleetTests(ControllerCase):
     def fleet_config(self, max_instances=4):
         return load(write_config(self.root, config={"controller": {"max_instances": max_instances}}))
@@ -1247,6 +1353,82 @@ class FleetTests(ControllerCase):
         self.assertEqual(result["budget"]["busy_instances"], 1)
         self.assertEqual(result["budget"]["hourly_ceiling"], "0.160000")
 
+
+
+class BudgetHeadroomTests(ControllerCase):
+    def headroom_config(self, *, max_instances, allowance):
+        return load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": max_instances},
+                    "budget": {"allowance": allowance},
+                },
+            )
+        )
+
+    def test_a_zero_worker_plan_reports_the_unspent_allowance(self):
+        controller = self.build(
+            observation=observation_demand(3),
+            config=self.headroom_config(max_instances=3, allowance="0.1000"),
+        )
+        result = controller.plan()
+        self.assertEqual(result["launch_count"], 0)
+        self.assertEqual(result["budget"]["remaining_after"], "0.100000")
+        self.assertEqual(
+            result["budget"]["remaining_after"], result["budget"]["remaining"]
+        )
+
+    def test_a_one_worker_plan_subtracts_one_reservation(self):
+        controller = self.build(
+            observation=observation_demand(1),
+            config=self.headroom_config(max_instances=3, allowance="10.00"),
+        )
+        result = controller.plan()
+        self.assertEqual(result["launch_count"], 1)
+        expected = format_money(
+            controller.config.budget.allowance - controller.cost.per_launch_micros()
+        )
+        self.assertEqual(result["budget"]["remaining_after"], expected)
+        self.assertEqual(result["budget"]["remaining_after"], "9.460000")
+
+    def test_a_multi_worker_plan_subtracts_the_whole_batch(self):
+        controller = self.build(
+            observation=observation_demand(3),
+            config=self.headroom_config(max_instances=3, allowance="10.00"),
+        )
+        result = controller.plan()
+        self.assertEqual(result["launch_count"], 3)
+        expected = format_money(
+            controller.config.budget.allowance - 3 * controller.cost.per_launch_micros()
+        )
+        self.assertEqual(result["budget"]["remaining_after"], expected)
+        self.assertEqual(result["budget"]["remaining_after"], "8.380000")
+
+    def test_a_budget_capped_plan_subtracts_only_the_admitted_batch(self):
+        controller = self.build(
+            observation=observation_demand(3),
+            config=self.headroom_config(max_instances=3, allowance="1.30"),
+        )
+        result = controller.plan()
+        self.assertEqual(result["launch_count"], 2)
+        self.assertIn("budget_capped_batch", result["notes"])
+        expected = format_money(
+            controller.config.budget.allowance - 2 * controller.cost.per_launch_micros()
+        )
+        self.assertEqual(result["budget"]["remaining_after"], expected)
+        self.assertEqual(result["budget"]["remaining_after"], "0.220000")
+
+    def test_admission_still_launches_only_the_planned_batch(self):
+        config = self.headroom_config(max_instances=4, allowance="1.30")
+        controller = self.build(observation=observation_demand(6), config=config)
+        planned = controller.plan()
+        self.assertEqual(planned["launch_count"], 2)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_count"], planned["launch_count"])
+        self.assertEqual(len(result["launches"]), planned["launch_count"])
+        self.assertLessEqual(self.totals(controller)["committed"], config.budget.allowance)
 
 
 class CostTrackingTests(ControllerCase):

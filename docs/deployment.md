@@ -253,6 +253,25 @@ same change: the policy — not the TOML — is what decides which placements ar
 allowed, so a candidate the policy omits is a denied launch rather than a
 fallback. A zone without a subnet cannot be used at all.
 
+### Change the deployment name
+
+The deployment name is the ownership scope of every frozen launch request, so
+`apply` refuses with `SCOPE_CHANGED` while any operation started under the old
+name is still nonterminal. Rename in this order:
+
+1. Stop admission (disable or stop the `apply` unit) and leave expiry cleanup
+   running.
+2. Drain the old scope: run `status` until every operation is `terminal` or
+   `failed`, and resolve every unresolved intent and every owned instance under
+   the old name. Do not edit, retag or delete the ledger rows.
+3. Confirm the old scope is clean: `status` reports no nonterminal operation and
+   `reap` has nothing left to terminate.
+4. Change `deployment` in the TOML and restart the apply unit.
+
+The ledger keeps the old rows as history and settled cost; new operations append
+their own rows under the new name. A rename with outstanding intent launches
+nothing and changes nothing, so clean up the old scope first.
+
 ## Verify the prerequisites
 
 The worker prerequisites in [runner-setup.md](runner-setup.md) stay

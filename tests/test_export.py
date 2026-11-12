@@ -44,6 +44,17 @@ NOISE = """\
 [    1.1] kernel: another line
 """
 
+ONE_JOB_COMPLETED = "cloud-init: bootstrap one-job completed rc=0\n"
+ONE_JOB_FAILED = "cloud-init: bootstrap one-job failed rc=42\n"
+ONE_JOB_TIMEOUT = "cloud-init: bootstrap one-job timeout rc=124\n"
+ONE_JOB_UNSHIPPED = """\
+cloud-init: bootstrap one-job cancelled rc=3
+cloud-init: bootstrap one-job completed rc=1
+cloud-init: bootstrap one-job timeout rc=9
+cloud-init: bootstrap one-job failed rc=0
+cloud-init: bootstrap one-job failed rc=124
+"""
+
 
 class ParseConsoleTests(unittest.TestCase):
     def test_clean_boot_yields_steps_and_clean_exit(self):
@@ -52,6 +63,32 @@ class ParseConsoleTests(unittest.TestCase):
         self.assertEqual(facts.exit_code, 0)
         self.assertEqual(facts.errors, ())
         self.assertTrue(facts.registered)
+        self.assertIsNone(facts.job_process)
+
+    def test_each_one_job_process_marker_keeps_its_outcome_and_status(self):
+        for text, expected in (
+            (ONE_JOB_COMPLETED, ("completed", 0)),
+            (ONE_JOB_FAILED, ("failed", 42)),
+            (ONE_JOB_TIMEOUT, ("timeout", 124)),
+        ):
+            with self.subTest(text=text.strip()):
+                facts = parse_console(text)
+                self.assertEqual(facts.job_process, expected)
+                self.assertIsNone(facts.exit_code)
+                self.assertEqual(facts.steps, ())
+
+    def test_an_unshipped_one_job_outcome_is_ignored(self):
+        # A closed vocabulary, not a pattern: a forged outcome or a status the
+        # bootstrap cannot pair with it is not a marker.
+        facts = parse_console(ONE_JOB_UNSHIPPED)
+        self.assertIsNone(facts.job_process)
+        self.assertIsNone(facts.exit_code)
+
+    def test_the_process_marker_is_distinct_from_the_exit_marker(self):
+        facts = parse_console(CLEAN_BOOT + ONE_JOB_FAILED)
+        self.assertEqual(facts.exit_code, 0)
+        self.assertEqual(facts.job_process, ("failed", 42))
+        self.assertEqual(facts.steps.count("job"), 1)
 
     def test_duplicated_serial_stream_is_deduplicated(self):
         facts = parse_console(CLEAN_BOOT + CLEAN_BOOT)
@@ -602,6 +639,67 @@ class ExporterTests(ExportCase):
         self.assertNotIn("exit:000", persisted["emitted"])
         for event in self.events_read():
             self.assertNotIn(":exit:000", event["id"])
+
+    def test_a_one_job_process_status_is_published_without_a_job_verdict(self):
+        console = "STEP job\nbootstrap one-job failed rc=42\nbootstrap exiting rc=42\n"
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": console})
+        result = self.run_export(exporter)
+        process = [event for event in self.events_read() if event["event"] == "job-process"]
+        self.assertEqual(len(process), 1)
+        event = process[0]
+        self.assertEqual(event["id"], "i-0123456789abcdef0:job-process:failed:42")
+        # The shape is exact: the marker names the worker process outcome and
+        # its status, and carries no console text, job verdict or success field.
+        self.assertEqual(
+            set(event),
+            {"id", "ts", "deployment", "instance", "zone", "operation", "event", "outcome", "rc"},
+        )
+        self.assertEqual(event["outcome"], "failed")
+        self.assertEqual(event["rc"], 42)
+        for forbidden in ("success", "verdict", "job_result", "conclusion"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, json.dumps(event))
+                self.assertNotIn(forbidden, self.metrics.read_text())
+                self.assertNotIn(forbidden, json.dumps(result))
+        self.assertNotIn("job_process", self.metrics.read_text())
+        # The marker is deduplicated by its stable identity like any other.
+        self.assertEqual(self.run_export(exporter)["events_emitted"], 0)
+
+    def test_a_pre_change_exit_event_line_still_validates(self):
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        historical = {
+            "id": "i-0123456789abcdef1:exit:1",
+            "ts": "2026-11-11T00:00:00Z",
+            "deployment": "test-deployment",
+            "instance": "i-0123456789abcdef1",
+            "zone": None,
+            "operation": None,
+            "event": "exit",
+            "rc": 1,
+        }
+        self.events.write_text(json.dumps(historical, sort_keys=True) + "\n")
+        result = self.run_export(self.build([], {}))
+        self.assertNotIn("events_pruned", result["notes"])
+        self.assertIn("i-0123456789abcdef1:exit:1", self.events.read_text())
+
+    def test_a_retained_job_process_line_validates_and_a_forged_one_is_dropped(self):
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        common = {
+            "ts": "2026-11-11T00:00:00Z",
+            "deployment": "test-deployment",
+            "instance": "i-0123456789abcdef1",
+            "zone": None,
+            "operation": None,
+            "event": "job-process",
+        }
+        valid = dict(common, id="i-0123456789abcdef1:job-process:timeout:124", outcome="timeout", rc=124)
+        forged = dict(common, id="i-0123456789abcdef1:job-process:passed:1", outcome="passed", rc=1)
+        self.events.write_text(json.dumps(valid, sort_keys=True) + "\n" + json.dumps(forged, sort_keys=True) + "\n")
+        result = self.run_export(self.build([], {}))
+        self.assertIn("events_pruned", result["notes"])
+        body = self.events.read_text()
+        self.assertIn("i-0123456789abcdef1:job-process:timeout:124", body)
+        self.assertNotIn(":job-process:passed:", body)
 
     def test_a_foreign_operation_tag_is_not_published(self):
         secret = "SYNTHETIC-CONSOLE-SECRET-123"

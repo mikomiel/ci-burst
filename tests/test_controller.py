@@ -894,6 +894,63 @@ class ApplyTests(ControllerCase):
         controller.apply()
         self.assertEqual(self.reopened().operation(operation_id).state, "terminal")
 
+    def test_a_mixed_not_found_batch_keeps_the_live_operation_and_slot(self):
+        from ci_burst.aws import Aws
+
+        class NotFound(Exception):
+            response = {"Error": {"Code": "InvalidInstanceID.NotFound"}}
+
+        class MixedClient:
+            """The filtered inventory misses both; the live one is still running."""
+
+            def describe_instances(self, **kwargs):
+                identifiers = kwargs.get("InstanceIds")
+                if identifiers is None:  # the deployment-filtered inventory
+                    return {"Reservations": []}
+                if len(identifiers) > 1:
+                    raise NotFound()
+                if identifiers == ["i-old"]:
+                    raise NotFound()
+                return {
+                    "Reservations": [
+                        {"Instances": [{"InstanceId": "i-live", "State": {"Name": "running"}}]}
+                    ]
+                }
+
+        aged = self.seed(
+            operation_id="op-aged",
+            instance_id="i-old",
+            expires_at=self.clock.now + 2 * INSTANCE_RETENTION_SECONDS,
+        )
+        live = self.seed(
+            operation_id="op-live",
+            instance_id="i-live",
+            expires_at=self.clock.now + 2 * INSTANCE_RETENTION_SECONDS,
+        )
+        self.clock.advance(INSTANCE_RETENTION_SECONDS + 1)
+        controller = self.build(
+            observation=observation_empty(),
+            aws=Aws(self.config, client=MixedClient(), clock=self.clock, account="111122223333"),
+        )
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertEqual(
+            [entry["reason"] for entry in result["slot"]["discrepancies"]],
+            ["OWNERSHIP_TAGS_MISSING"],
+        )
+        self.assertEqual(result["slot"]["discrepancies"][0]["instance_id"], "i-live")
+        # The live operation keeps its slot; the refused decision is not proof
+        # of termination.
+        self.assertEqual([entry["operation"] for entry in result["slot"]["operations"]], [live])
+        ledger = self.reopened()
+        self.assertEqual(ledger.operation(live).state, "running")
+        self.assertIsNone(ledger.operation(live).settled_micros)
+        # The genuinely aged-out identifier keeps the conservative settlement.
+        self.assertEqual(ledger.operation(aged).state, "terminal")
+        self.assertEqual(ledger.operation(aged).detail, "instance_not_retained")
+        self.assertIsNotNone(ledger.operation(aged).settled_micros)
+
     def test_no_secret_or_user_data_in_launch_output(self):
         controller = self.build(observation=observation_demand())
         result = controller.apply()

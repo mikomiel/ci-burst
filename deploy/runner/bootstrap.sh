@@ -50,6 +50,7 @@ install -d -o runner -g runner -m 0700 /var/lib/forgejo-runner/work
 cd /var/lib/forgejo-runner
 umask 0022
 # 0022 matches the persistent fleet's systemd UMask; the 077 above protects only the token
+JOB_RC=0
 timeout --signal=TERM --kill-after=60 3600 \
   runuser -u runner -- env \
     HOME=/var/lib/forgejo-runner \
@@ -59,6 +60,12 @@ timeout --signal=TERM --kill-after=60 3600 \
     npm_config_cache=/var/lib/forgejo-runner/cache/npm \
     PIP_CACHE_DIR=/var/lib/forgejo-runner/cache/pip \
     CI_PROFILE_CACHE_ROOT=/var/lib/forgejo-runner/cache/validation \
-    /usr/local/bin/forgejo-runner one-job --wait -c /etc/forgejo-runner/config.yml || true
+    /usr/local/bin/forgejo-runner one-job --wait -c /etc/forgejo-runner/config.yml || JOB_RC=$?
 echo "STEP job"
 rm -f /var/lib/forgejo-runner/.runner
+case "$JOB_RC" in
+  0) echo "bootstrap one-job completed rc=0" ;;
+  124|137) echo "bootstrap one-job timeout rc=$JOB_RC" ;;
+  *) echo "bootstrap one-job failed rc=$JOB_RC" ;;
+esac
+exit "$JOB_RC"

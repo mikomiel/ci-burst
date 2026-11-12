@@ -192,14 +192,20 @@ One JSON object per line:
 ```json
 {"id":"i-0123456789abcdef0:step:register","ts":"2026-11-11T16:55:17Z","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"step","step":"register"}
 {"id":"i-0123456789abcdef0:exit:0","ts":"...","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"exit","rc":0}
+{"id":"i-0123456789abcdef0:job-process:failed:42","ts":"...","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"job-process","outcome":"failed","rc":42}
 ```
 
 `event` is `step` (a step name from the shipped script's fixed set), `exit`
-(`bootstrap exiting rc=N`) or `error`, where `kind` is one of `forgejo_ping`,
-`ssm_timeout`, `apt_failed`, `register_failed` or `runner_error`. No console
-text is published: a failure line contributes its kind only. The console is not
-a trusted channel, and truncation is not redaction — read the raw line with the
-provider CLI when you need it.
+(`bootstrap exiting rc=N`), `job-process` (`bootstrap one-job <outcome> rc=N`,
+where `outcome` is one of `completed`, `failed` or `timeout`) or `error`, where
+`kind` is one of `forgejo_ping`, `ssm_timeout`, `apt_failed`, `register_failed`
+or `runner_error`. The `job-process` event and the `exit` marker describe the
+worker process lifecycle and never the Forgejo job result: a runner can exit 0
+after a job that failed, so no success metric or job verdict is derived from
+them and the job result stays with Forgejo. No console text is published: a
+failure line contributes its kind only. The console is not a trusted channel,
+and truncation is not redaction — read the raw line with the provider CLI when
+you need it.
 
 The file is replaced atomically on each run rather than appended to in place, so
 a collector must open it by path and must not hold a descriptor across runs; that

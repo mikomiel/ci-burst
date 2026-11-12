@@ -1,6 +1,6 @@
 # Changelog
 
-This changelog records merged source history. It is not deployment,
+This changelog records released source history. It is not deployment,
 runtime, or qualification evidence: a merge is neither a release nor a
 deployment, and a released section is not a deployment record.
 

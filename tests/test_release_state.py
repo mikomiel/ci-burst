@@ -39,7 +39,13 @@ class ReleaseConfigTests(unittest.TestCase):
         self.assertEqual(CONFIG["packages"]["."]["package-name"], PACKAGE)
         self.assertEqual(PYPROJECT["project"]["name"], PACKAGE)
 
-    def test_changelog_sections_keep_the_repository_categories(self):
+    def test_only_release_relevant_sections_are_visible(self):
+        """release-please releases only when its changelog entry is non-empty.
+
+        A visible ``docs`` or ``ci`` section would therefore let a
+        documentation-only merge open a patch release, contradicting
+        ``CONTRIBUTING.md``. Only ``feat``, ``fix`` and ``perf`` may be visible.
+        """
         sections = {
             section["type"]: section
             for section in CONFIG["packages"]["."]["changelog-sections"]
@@ -48,13 +54,17 @@ class ReleaseConfigTests(unittest.TestCase):
             ("feat", "Added"),
             ("fix", "Fixed"),
             ("perf", "Performance"),
-            ("docs", "Documentation"),
-            ("ci", "CI"),
         ):
             with self.subTest(commit_type=commit_type):
                 self.assertEqual(sections[commit_type]["section"], heading)
-                self.assertNotIn("hidden", sections[commit_type])
-        for commit_type in ("chore", "test", "refactor", "build"):
+                self.assertFalse(sections[commit_type].get("hidden", False))
+        visible = {
+            commit_type
+            for commit_type, section in sections.items()
+            if not section.get("hidden", False)
+        }
+        self.assertEqual(visible, {"feat", "fix", "perf"})
+        for commit_type in ("docs", "ci", "chore", "test", "refactor", "build"):
             with self.subTest(commit_type=commit_type):
                 self.assertIs(sections[commit_type]["hidden"], True)
 

@@ -81,7 +81,8 @@ test('release-please observes automated merges and requires its token', () => {
   assert.deepEqual(Object.keys(w.on).sort(), ['push', 'workflow_dispatch', 'workflow_run']);
   assert.deepEqual(w.on.push.branches, ['main']);
   assert.deepEqual(w.on.workflow_run, { workflows: ['automerge'], types: ['completed'] });
-  assert.deepEqual(w.permissions, { contents: 'write', 'pull-requests': 'write' });
+  assert.deepEqual(w.permissions, { contents: 'read' });
+  assert.deepEqual(w.concurrency, { group: 'release-please', 'cancel-in-progress': false });
   assert.equal(w.env, undefined);
   assert.equal(w.defaults, undefined);
 
@@ -90,8 +91,10 @@ test('release-please observes automated merges and requires its token', () => {
   assert.ok(job['timeout-minutes'] <= 10);
   assert.equal(
     job.if.replace(/\s+/g, ' ').trim(),
-    "github.event_name != 'workflow_run' "
-      + "|| github.event.workflow_run.head_branch == 'main'",
+    "(github.event_name != 'workflow_run' "
+      + "|| github.event.workflow_run.head_branch == 'main') "
+      + "&& (github.event_name != 'workflow_dispatch' "
+      + "|| github.ref == 'refs/heads/main')",
   );
   for (const key of ['permissions', 'env', 'defaults', 'container', 'services', 'environment']) {
     assert.equal(job[key], undefined, `the release job must not set ${key}`);

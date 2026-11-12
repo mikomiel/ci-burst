@@ -141,11 +141,14 @@ release pull request is the release decision; release-please then creates the
 annotated `v`-prefixed tag and the GitHub Release. Never tag by hand.
 
 Before 1.0, a `feat` commit is a minor release, a `fix` or `perf` commit is a
-patch, and a breaking change is a minor release. `docs`, `ci`, `chore`, `test`
-and `refactor` commits appear in the changelog as configured but do not by
-themselves open a release pull request. The release pull request always changes
-a sensitive path, so the merge policy never auto-merges it: a maintainer merges
-it.
+patch, and a breaking change is a minor release. A released section lists
+`feat`, `fix` and `perf` entries; `docs`, `ci`, `chore`, `test` and `refactor`
+commits are hidden and do not open a release pull request by themselves, unless
+the commit is breaking. release-please opens a release pull request only when
+its changelog entry is non-empty, so those hidden sections are what keep a
+documentation-only or CI-only merge from releasing. The release pull request
+always changes a sensitive path, so the merge policy never auto-merges it: a
+maintainer merges it.
 
 `release-please-config.json` and `.release-please-manifest.json` are part of
 the release boundary. The workflow authenticates as the fine-grained personal
@@ -153,7 +156,7 @@ access token stored in the `RELEASE_PLEASE_TOKEN` secret; the default
 `GITHUB_TOKEN` cannot be used because a pull request it creates does not
 trigger the pull-request workflows, so the required checks would never run.
 
-`CHANGELOG.md` records merged source history, never deployment or runtime
+`CHANGELOG.md` records released source history, never deployment or runtime
 evidence. A tag or a GitHub Release is not a deployment: package, image,
 deployment and cloud decisions remain separate operator decisions and are not
 authorized by a release.

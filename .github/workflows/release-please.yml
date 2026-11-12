@@ -10,12 +10,15 @@
 # push-triggered workflows for it. The `workflow_run` trigger observes the
 # completion of that trusted default-branch automation instead, and the
 # `if` guard keeps it to the default branch. `workflow_dispatch` is the manual
-# reconciliation path.
+# reconciliation path and is accepted only from the default branch, so a
+# branch's copy of this privileged workflow never runs against the secret.
 #
 # The token is a fine-grained personal access token with Contents: write and
 # Pull requests: write on this repository, stored as RELEASE_PLEASE_TOKEN. The
 # default GITHUB_TOKEN cannot be used: a pull request it creates does not
 # trigger the pull-request workflows, so the required checks would never run.
+# The ambient GITHUB_TOKEN is therefore read-only; the action writes only with
+# the personal token.
 name: release-please
 
 on:
@@ -27,14 +30,19 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
 
 jobs:
   release-please:
     if: >-
-      github.event_name != 'workflow_run'
-      || github.event.workflow_run.head_branch == 'main'
+      (github.event_name != 'workflow_run'
+      || github.event.workflow_run.head_branch == 'main')
+      && (github.event_name != 'workflow_dispatch'
+      || github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

@@ -26,6 +26,16 @@ def pull(number=1, head=HEAD):
             "changed_files": 1, "mergeable": True, "mergeable_state": "clean"}
 
 
+def release_pull(number=1, paths=None):
+    """The generated release-please pull request shape, with its file list."""
+    pr = pull(number)
+    pr["user"] = {"login": policy.RELEASE_AUTHOR}
+    pr["head"].update(ref=policy.RELEASE_BRANCH, repo={"full_name": policy.REPOSITORY})
+    pr["release_paths"] = sorted(policy.RELEASE_PATHS) if paths is None else paths
+    pr["reviews"] = []
+    return pr
+
+
 def checks():
     return [{"id": n, "name": name, "head_sha": HEAD, "app": {"id": 15368},
              "status": "completed", "conclusion": "success"}
@@ -103,6 +113,52 @@ class ReviewTests(unittest.TestCase):
         good["reviews"] = draft["reviews"] = [review()]
         draft["draft"] = True
         self.assertEqual(policy.review_plan([good, draft])[HEAD][0], "pending")
+
+
+class ReleaseTests(unittest.TestCase):
+    """The one review exemption is the generated release PR, and only its shape."""
+
+    def plan(self, pr):
+        return policy.review_plan([pr])[HEAD]
+
+    def test_generated_release_pr_needs_no_independent_review(self):
+        self.assertEqual(self.plan(release_pull()), ("success", "automated_release"))
+        self.assertEqual(
+            self.plan(release_pull(paths=["CHANGELOG.md"])),
+            ("success", "automated_release"),
+        )
+
+    def test_every_other_shape_keeps_the_review_requirement(self):
+        cases = {
+            "wrong branch": lambda pr: pr["head"].update(
+                ref="release-please--branches--main--components--other"),
+            "fork head": lambda pr: pr["head"].update(repo={"full_name": "someone/ci-burst"}),
+            "wrong author": lambda pr: pr.update(user={"login": "contributor"}),
+            "no file list": lambda pr: pr.pop("release_paths"),
+            "empty file list": lambda pr: pr.update(release_paths=[]),
+            "unexpected path": lambda pr: pr.update(
+                release_paths=["CHANGELOG.md", ".github/workflows/ci.yml"]),
+            "draft": lambda pr: pr.update(draft=True),
+        }
+        for label, change in cases.items():
+            with self.subTest(label):
+                pr = release_pull()
+                change(pr)
+                self.assertEqual(self.plan(pr)[0], "pending")
+
+    def test_missing_head_repository_is_not_a_release_candidate(self):
+        self.assertFalse(policy.release_candidate(pull()))
+
+    def test_automerge_still_refuses_a_release_pull_request(self):
+        pr = release_pull()
+        self.assertEqual(
+            policy.merge_decision(pr, [], checks(), statuses(), comparison("CHANGELOG.md")),
+            (False, "current_head_approval_required"),
+        )
+        self.assertEqual(
+            policy.merge_decision(pr, [review()], checks(), statuses(), comparison("pyproject.toml")),
+            (False, "sensitive_paths"),
+        )
 
 
 class CheckTests(unittest.TestCase):

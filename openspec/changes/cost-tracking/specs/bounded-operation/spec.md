@@ -70,9 +70,12 @@ Admission MUST use tracked spend plus each non-terminal operation's worst-case
 remaining cost plus the buffer it was admitted under, and MUST price a new worker
 at the configured maximum for its lifetime. Remaining cost MUST be priced at no
 less than the accepted price and the frozen `MaxPrice`, using the
-admitted incidental rate, with its lifetime from the durable expiry window. An
-operation whose reservation exceeds what its recorded basis reproduces MUST keep
-that reservation as a floor.
+admitted incidental rate, with its lifetime from the durable expiry window. The
+schema upgrade MUST persist a backfill marker on every non-terminal operation
+whose admitted inputs it had to fill in, and such an operation MUST keep its
+stored reservation as a floor for its whole life. A normally admitted operation
+MUST carry the marker as false and MUST NOT be floored, because its recorded
+basis already reproduces its own reservation.
 
 #### Scenario: The allowance admits fewer workers than the free slots
 - **WHEN** the window's commitment plus one worst-case worker exceeds the allowance

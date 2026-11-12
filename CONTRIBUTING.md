@@ -40,7 +40,8 @@ repository automation can merge eligible ordinary PRs under the same rules.
 Automation's merge scope is exactly the ordinary-path allowlist: `README.md`,
 `CHANGELOG.md` and the named OpenSpec documents. Changes under `ci_burst/`,
 `docs/`, `tests/`, `.github/` and dependency files such as `pyproject.toml`,
-`package.json` and `package-lock.json` are merged by a person. That is the
+`package.json`, `package-lock.json`, `release-please-config.json` and
+`.release-please-manifest.json` are merged by a person. That is the
 intended scope, not a gap.
 
 `scripts/pr_policy.py` is the shared rule owner. It accepts the pinned Gandalf
@@ -129,64 +130,32 @@ review cycle; an approval from before the latest commit does not count.
 
 ## Releases
 
-A release exists only after both maintainer actions, in order:
+Releases use [release-please](https://github.com/googleapis/release-please) so
+the version, the changelog and the tag cannot disagree. A merged
+release-relevant conventional commit on `main` makes release-please open or
+update one release pull request: it bumps `pyproject.toml` and
+`ci_burst/__init__.py`, writes `CHANGELOG.md` and records the version in
+`.release-please-manifest.json`. That update is observed after both a
+maintainer merge and a merge by the repository's own automation. Merging the
+release pull request is the release decision; release-please then creates the
+annotated `v`-prefixed tag and the GitHub Release. Never tag by hand.
 
-1. an annotated semantic version tag `vMAJOR.MINOR.PATCH` on `main`; and
-2. a GitHub Release for that tag whose notes are the matching `CHANGELOG.md`
-   section.
+Before 1.0, a `feat` commit is a minor release, a `fix` a patch, and a
+breaking change a minor release. `docs`, `ci`, `chore`, `test` and `refactor`
+commits appear in the changelog as configured but do not by themselves open a
+release pull request. The release pull request always changes a sensitive
+path, so the merge policy never auto-merges it: a maintainer merges it.
 
-Creating the tag is a maintainer decision. A merge, a green check, a changelog
-entry or a package build is not a release or a deployment, and none of them
-authorizes a tag, a package, an image, a deployment or a cloud change.
-
-Before 1.0, an observable behaviour change is a minor release and a fix is a
-patch; no other compatibility is promised.
-
-A release uses two changelog states:
-
-- **Preparation**, before the tag exists: move the Unreleased entries under
-  `## [X.Y.Z] - YYYY-MM-DD` and add `<!-- release-pending: vX.Y.Z -->` below
-  that heading. The marker is the explicit preparation state; `check:policy`
-  accepts the heading without its tag only while that marker is present. Merge
-  the preparation pull request.
-- **Published**, after the tag: create the annotated `vX.Y.Z` tag on the
-  preparation merge commit; `CHANGELOG.md` at that commit must already contain
-  the released section. Create the GitHub Release from that section, then
-  remove the marker in a follow-up change.
-  `python3 scripts/render_changelog.py --validate-release` verifies that every
-  released heading has its annotated `vX.Y.Z` tag, that the tag's own
-  `CHANGELOG.md` contains the section, and that no marker remains.
-
-The tag must be `v`-prefixed and annotated; a lightweight or unprefixed tag is
-not a release and the checks reject it. A released heading without either the
-preparation marker or its tag is a defect, and so are an annotated release tag
-without its released section and a tag created before its section. Lead zeroes
-and headings that are not exactly `## [X.Y.Z] - YYYY-MM-DD` are rejected.
+`release-please-config.json` and `.release-please-manifest.json` are part of
+the release boundary. The workflow authenticates as the fine-grained personal
+access token stored in the `RELEASE_PLEASE_TOKEN` secret; the default
+`GITHUB_TOKEN` cannot be used because a pull request it creates does not
+trigger the pull-request workflows, so the required checks would never run.
 
 `CHANGELOG.md` records merged source history, never deployment or runtime
-evidence. Its Unreleased section is generated from merged `feat:`, `fix:`,
-`docs:` and `ci:` subjects after the latest release tag:
-
-```sh
-python3 scripts/render_changelog.py --write
-```
-
-`--write` refuses while a preparation marker is pending and its tag does not
-exist; do not regenerate between cutting the section and tagging it.
-
-`Unreleased` is a snapshot regenerated at release preparation, not a
-continuously updated index. `python3 scripts/render_changelog.py --check`
-reports its drift on demand: it prints the rendering that `--write` would
-produce and exits non-zero. It is deliberately not wired into pull-request CI,
-because a pull request's own commits cannot be in the snapshot committed before
-them, so the check could never be green there.
-
-Regeneration fails closed rather than guessing the boundary: the renderer
-refuses a shallow checkout, a released section that cannot be reconciled with
-a local reachable annotated tag (for example a `--no-tags` clone, a tag on an
-unrelated branch, or a tag created before the section), a malformed,
-noncanonical or duplicate release heading, and a preparation marker whose tag
-does not exist. Fetch tags or the full history instead of bypassing the check.
+evidence. A tag or a GitHub Release is not a deployment: package, image,
+deployment and cloud decisions remain separate operator decisions and are not
+authorized by a release.
 
 ## Checks
 

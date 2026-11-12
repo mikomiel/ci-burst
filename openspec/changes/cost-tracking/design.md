@@ -65,11 +65,26 @@ maximum cannot shrink the ceiling of a request already sent. No cap column is
 added: the admitted ceiling already lives in the frozen request, and a malformed
 one is parsed tolerantly rather than raising while cost is reported.
 
-A configuration change therefore applies to new admissions only. Terminal rows
-keep their stored settled cost and are never repriced. A non-terminal row whose
-stored reservation is higher than what its recorded basis reproduces — the
-best-effort backfill of the schema-3 upgrade — keeps that reservation as a floor,
-so the upgrade cannot release a commitment whose real inputs are unknown.
+A configuration change therefore applies to new admissions only, with one
+asymmetry: a raised `max_spot_price` prices an outstanding operation's unlived
+time at the higher ceiling, so its forward commitment may rise. That is
+conservative — it can only hold allowance back, never release it — and it does
+not reprice cost already accrued, which stays at the accepted price. A lowered
+ceiling cannot reprice an operation already admitted, and no cost edit can
+release a commitment one still carries. Terminal rows keep their stored settled
+cost and are never repriced.
+
+The schema-3 upgrade persists `admitted_inputs_backfilled` on each non-terminal
+row whose inputs it backfilled, and only that stored mark makes the row's
+reservation a floor. The floor must not be inferred from a whole-life estimate
+of the recorded basis: that estimate includes the current configured ceiling, so
+raising `max_spot_price` could reach the reservation, switch the floor off and
+release allowance admission had committed (the reviewed case released 94_999
+micros of a 590_000 reservation). The floor is the reservation itself — the
+admitted worst case — so it needs no second bound and cannot exceed what the row
+promised. Ordinary admission never activates it, including the later workers of
+a batch whose separately timestamped creation time makes their recorded lifetime
+a few seconds shorter than the configured one.
 
 Rejected alternative: refuse a cost-policy change while operations are
 outstanding. It cannot be enforced where the edit is made, because the

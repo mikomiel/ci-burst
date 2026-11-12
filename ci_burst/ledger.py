@@ -60,6 +60,10 @@ class Operation:
     #: Non-compute buffer recorded at admission, in micros. ``None`` on a row
     #: that predates schema 3, where the configured buffer applies.
     admitted_buffer_micros: int | None = None
+    #: Persisted migration marker: 1 when the schema-3 upgrade backfilled this
+    #: row's admitted cost inputs, so its stored reservation remains the floor.
+    #: A normally admitted row records 0.
+    admitted_inputs_backfilled: int = 0
 
     def request(self):
         return json.loads(self.request_json)
@@ -102,10 +106,11 @@ class Ledger:
         buffer_micros)`` and is required only to upgrade a file written by an
         earlier schema. A version-1 file settles its terminal operations from
         their recorded timestamps at that price and rate; the version-3 upgrade
-        records the incidental rate and buffer on every nonterminal operation.
-        That backfill is best-effort: the values are the ones configured now,
-        because the inputs admission actually used are not recoverable from the
-        file. The caller must hold the deployment writer lock before a writable
+        records the incidental rate and buffer on every nonterminal operation and
+        marks it ``admitted_inputs_backfilled``. That backfill is best-effort: the
+        values are the ones configured now, because the inputs admission actually
+        used are not recoverable from the file, and the mark keeps the stored
+        reservation as that row's floor. The caller must hold the deployment writer lock before a writable
         connect, because the upgrade copies the file and rewrites its schema.
         """
         if self._connection is not None:
@@ -203,7 +208,8 @@ class Ledger:
                 settled_micros INTEGER,
                 settled_at REAL,
                 admitted_incidental_per_hour_micros INTEGER,
-                admitted_buffer_micros INTEGER
+                admitted_buffer_micros INTEGER,
+                admitted_inputs_backfilled INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX operations_state ON operations (state);
             CREATE INDEX operations_window ON operations (reservation_window);
@@ -218,12 +224,15 @@ class Ledger:
         transaction: its terminal operations are settled from their recorded
         timestamps, and every nonterminal operation of either earlier version
         records the incidental rate and buffer supplied by the caller. Terminal
-        operations keep ``NULL`` admitted inputs and their stored
-        ``settled_micros``, so settled history is never rewritten. The caller
-        holds the deployment writer lock; this method takes no lock of its own.
-        A failed copy refuses before the first schema write, and an interrupted
-        upgrade rolls the whole transaction back, so the file stays readable by
-        the version that wrote it.
+        operations keep ``NULL`` admitted inputs, a zero backfill flag and their
+        stored ``settled_micros``, so settled history is never rewritten; a
+        nonterminal row also records ``admitted_inputs_backfilled = 1``, which
+        makes its reservation floor a persisted decision rather than an
+        inference from an estimate that includes the current configuration. The
+        caller holds the deployment writer lock; this method takes no lock of
+        its own. A failed copy refuses before the first schema write, and an
+        interrupted upgrade rolls the whole transaction back, so the file stays
+        readable by the version that wrote it.
         """
         price_micros, incidental_per_hour, buffer_micros = backfill
         backup = Path(str(self.path) + ".pre-v3.%d" % int(self._clock()))
@@ -257,9 +266,16 @@ class Ledger:
                     )
             connection.execute("ALTER TABLE operations ADD COLUMN admitted_incidental_per_hour_micros INTEGER")
             connection.execute("ALTER TABLE operations ADD COLUMN admitted_buffer_micros INTEGER")
+            # ``NOT NULL DEFAULT 0`` fills every existing row, terminal ones
+            # included, without a separate pass; only the backfilled nonterminal
+            # rows are then marked.
+            connection.execute(
+                "ALTER TABLE operations ADD COLUMN admitted_inputs_backfilled INTEGER NOT NULL DEFAULT 0"
+            )
             connection.execute(
                 "UPDATE operations SET admitted_incidental_per_hour_micros = ?,"
-                " admitted_buffer_micros = ? WHERE state IN (%s)" % ",".join("?" * len(NONTERMINAL)),
+                " admitted_buffer_micros = ?, admitted_inputs_backfilled = 1"
+                " WHERE state IN (%s)" % ",".join("?" * len(NONTERMINAL)),
                 (incidental_per_hour, buffer_micros, *NONTERMINAL),
             )
             connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
@@ -350,7 +366,9 @@ class Ledger:
         A new admission passes the configured incidental rate and buffer, so the
         operation keeps the cost assumptions it was admitted under; ``None``
         leaves a row on the model-wide configuration, which is what an operation
-        that predates schema 3 keeps.
+        that predates schema 3 keeps. Its admitted inputs are the ones admission
+        used, so it records ``admitted_inputs_backfilled = 0`` explicitly: only
+        the upgrade marks a backfilled row.
         """
         connection = self._require()
         now = self._clock()
@@ -358,7 +376,8 @@ class Ledger:
             "INSERT INTO operations (id, client_token, state, created_at, updated_at, expires_at,"
             " reservation_micros, reservation_window, region, account, request_json, request_sha256,"
             " instance_id, detail, price_micros, admitted_incidental_per_hour_micros,"
-            " admitted_buffer_micros) VALUES (?, ?, 'intent', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+            " admitted_buffer_micros, admitted_inputs_backfilled)"
+            " VALUES (?, ?, 'intent', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0)",
             (
                 operation_id,
                 client_token,
@@ -556,6 +575,7 @@ def _operation(row):
         settled_at=optional("settled_at"),
         admitted_incidental_per_hour_micros=optional("admitted_incidental_per_hour_micros"),
         admitted_buffer_micros=optional("admitted_buffer_micros"),
+        admitted_inputs_backfilled=optional("admitted_inputs_backfilled", 0) or 0,
     )
 
 

@@ -47,6 +47,16 @@ class SchemaTests(LedgerTestCase):
         self.assertEqual(self.ledger.operation(operation.id).client_token, "ci-burst-op-0")
         self.assertEqual(self.ledger.operation_by_token("ci-burst-op-0").id, operation.id)
 
+    def test_a_new_admission_stores_an_explicit_zero_backfill_flag(self):
+        operation = self.add()
+        self.assertEqual(operation.admitted_inputs_backfilled, 0)
+        connection = sqlite3.connect(self.path)
+        self.addCleanup(connection.close)
+        row = connection.execute(
+            "SELECT admitted_inputs_backfilled FROM operations WHERE id = ?", (operation.id,)
+        ).fetchone()
+        self.assertEqual(row[0], 0)
+
     def test_restart_preserves_operations(self):
         operation = self.add()
         self.ledger.set_state(operation.id, "running", instance_id="i-1")
@@ -382,6 +392,9 @@ class MigrationTests(unittest.TestCase):
         self.assertIsNone(operation.launch_time)
         self.assertIsNone(operation.admitted_incidental_per_hour_micros)
         self.assertIsNone(operation.admitted_buffer_micros)
+        # An unmigrated file cannot carry the persisted marker, so it reads as a
+        # normally admitted row: observation only, never admission.
+        self.assertEqual(operation.admitted_inputs_backfilled, 0)
 
     def test_v1_upgrade_creates_one_v3_backup_and_backfills(self):
         ledger = self.writable()
@@ -392,13 +405,17 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(terminal.state, "terminal")
         # 300 seconds at 0.04 per hour, rounded up to one micro, plus no incidentals.
         self.assertEqual(terminal.settled_micros, 3334)
-        # Terminal history keeps NULL admitted inputs: it is never repriced.
+        # Terminal history keeps NULL admitted inputs and a zero marker: it is
+        # never repriced and never floored.
         self.assertIsNone(terminal.admitted_incidental_per_hour_micros)
         self.assertIsNone(terminal.admitted_buffer_micros)
+        self.assertEqual(terminal.admitted_inputs_backfilled, 0)
         live = ledger.operation("live-op")
-        # The nonterminal row records the basis supplied to connect(), best effort.
+        # The nonterminal row records the basis supplied to connect(), best
+        # effort, and is marked as backfilled so its reservation stays the floor.
         self.assertEqual(live.admitted_incidental_per_hour_micros, 0)
         self.assertEqual(live.admitted_buffer_micros, 0)
+        self.assertEqual(live.admitted_inputs_backfilled, 1)
         self.assertEqual(live.price_micros, 0)
         self.assertIsNone(live.launch_time)
 
@@ -413,11 +430,24 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(terminal.settled_at, self.now - 400)
         self.assertIsNone(terminal.admitted_incidental_per_hour_micros)
         self.assertIsNone(terminal.admitted_buffer_micros)
+        self.assertEqual(terminal.admitted_inputs_backfilled, 0)
         live = ledger.operation("live-op")
         self.assertEqual(live.state, "running")
         self.assertEqual(live.admitted_incidental_per_hour_micros, 5_000)
         self.assertEqual(live.admitted_buffer_micros, 7_000)
+        self.assertEqual(live.admitted_inputs_backfilled, 1)
         self.assertIsNone(live.settled_micros)
+
+    def test_a_reopened_v3_file_keeps_the_backfill_marker(self):
+        self._write(2)
+        ledger = self.writable(backfill=(40_000, 5_000, 7_000))
+        self.assertEqual(ledger.version, SCHEMA_VERSION)
+        ledger.close()
+        reopened = Ledger(self.path, clock=lambda: self.now).connect()
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.version, SCHEMA_VERSION)
+        self.assertEqual(reopened.operation("live-op").admitted_inputs_backfilled, 1)
+        self.assertEqual(reopened.operation("old-op").admitted_inputs_backfilled, 0)
 
     def test_read_only_keeps_a_v2_database_unwritten(self):
         self._write(2)
@@ -427,6 +457,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(ledger.version, 2)
         self.assertEqual(ledger.operation("old-op").settled_micros, 12_345)
         self.assertIsNone(ledger.operation("live-op").admitted_buffer_micros)
+        self.assertEqual(ledger.operation("live-op").admitted_inputs_backfilled, 0)
         self.assertEqual([operation.id for operation in ledger.operations()], ["old-op", "live-op"])
         self.assertEqual(before, sorted(item.name for item in self.path.parent.iterdir()))
 
@@ -441,6 +472,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(self.user_version(), 1)
         self.assertNotIn("price_micros", self.columns())
         self.assertNotIn("admitted_buffer_micros", self.columns())
+        self.assertNotIn("admitted_inputs_backfilled", self.columns())
 
     def test_size_mismatch_refuses_before_any_schema_write(self):
         def truncated(source, target):
@@ -488,6 +520,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(self.user_version(), 1)
         self.assertNotIn("price_micros", self.columns())
         self.assertNotIn("admitted_buffer_micros", self.columns())
+        self.assertNotIn("admitted_inputs_backfilled", self.columns())
         connection = sqlite3.connect(self.path)
         self.addCleanup(connection.close)
         self.assertEqual(

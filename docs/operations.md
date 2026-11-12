@@ -526,14 +526,24 @@ admitted under, not the current configuration. Admission records the configured
 incidental rate and buffer on the operation, and the ceiling is the highest of
 the configured maximum, the `MaxPrice` frozen in the operation's request and its
 accepted price. Editing `max_spot_price`, `incidental_per_hour`,
-`non_compute_allowance` or `max_lifetime_seconds` therefore reprices new
-admissions only: it cannot lower the ceiling of a request already sent, erase
-cost already accrued, or release a commitment an outstanding worker still
-carries. The lifetime comes from the operation's own durable expiry window for
-the same reason. A non-terminal operation whose stored reservation is higher
-than what its recorded basis reproduces — a row the schema-3 upgrade backfilled
-with the configuration of the moment — keeps that reservation as its floor. Terminal rows
-keep their stored settled cost and are never repriced.
+`non_compute_allowance` or `max_lifetime_seconds` cannot lower the ceiling of a
+request already sent, erase cost already accrued, or release a commitment an
+outstanding worker still carries. A raised `max_spot_price` is the one edit that
+can raise an outstanding operation's forward commitment, because unlived time is
+priced at the higher ceiling; that is conservative and can only hold allowance
+back. A lowered ceiling cannot reprice an operation already admitted, and no cost
+edit can release one. The lifetime comes from the operation's own durable expiry
+window for the same reason.
+
+The schema-3 upgrade marks every non-terminal row whose admitted inputs it
+backfilled with `admitted_inputs_backfilled = 1`; a terminal row keeps `0` and
+its stored settled cost. Only that stored mark makes the row's reservation the
+commitment floor. The floor is not inferred from a whole-life estimate, because
+such an estimate includes the current configured ceiling: raising
+`max_spot_price` could then reach the reservation, switch the floor off and
+release allowance admission had committed. A row admitted normally carries a
+zero mark, no floor, and keeps only the commitment its own recorded basis
+reproduces. Terminal rows are never repriced.
 
 A batch is affordable while the window's `spend` plus the forward commitment
 plus one new worker's worst case stays inside `allowance`:

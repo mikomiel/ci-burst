@@ -131,27 +131,26 @@ class CostModel:
         )
 
     def reservation_floor_micros(self, operation):
-        """The stored reservation, where the recorded basis cannot reproduce it.
+        """The reservation kept for a row whose admitted inputs were backfilled.
 
-        A row admitted under its recorded basis reproduces its own reservation,
-        so this is zero for it and its commitment may fall below the reservation
-        as the minutes it has lived were accepted at a price under the ceiling.
-        A non-terminal row whose admitted inputs had to be backfilled can
-        reproduce less than the reservation admission committed; keeping that
-        reservation stops the configuration at upgrade time from releasing it.
+        The schema-3 upgrade persists ``admitted_inputs_backfilled`` on every
+        non-terminal row it backfills, because their real inputs are unknown.
+        The stored reservation is then the only record of the worst case
+        admission committed, so it is the floor. The decision is read from the
+        row, never inferred from a whole-life estimate: an estimate includes the
+        current configured ceiling, so raising it could reach the reservation,
+        switch an inferred floor off and release allowance admission had
+        committed.
+
+        The floor is the reservation itself, which is the admitted worst case,
+        so no further bound applies: it cannot exceed what the row promised.
+        Every normally admitted row carries a zero flag and therefore no floor,
+        and its commitment may fall below the reservation as its minutes are
+        accepted under the ceiling.
         """
-        reservation = operation.reservation_micros or 0
-        if reservation <= 0:
+        if not operation.admitted_inputs_backfilled:
             return 0
-        reproducible = (
-            self.full_lifetime_micros(
-                self.price_ceiling_micros(operation),
-                self.lifetime_seconds(operation),
-                self.incidental_for(operation),
-            )
-            + self.buffer_for(operation)
-        )
-        return reservation if reservation > reproducible else 0
+        return operation.reservation_micros or 0
 
     # -- pricing --------------------------------------------------------
     def full_lifetime_micros(
@@ -249,7 +248,8 @@ class CostModel:
         if floor:
             # The unaccrued part of the admitted worst case, less the buffer the
             # caller adds back: a backfilled row keeps the commitment admission
-            # made even when the current configuration reproduces less.
+            # made even when the current configuration prices its remaining life
+            # lower. A raised ceiling can only add to this, never subtract.
             remaining = max(
                 remaining,
                 floor - self.accrued_micros(operation, now) - self.buffer_for(operation),

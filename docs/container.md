@@ -548,11 +548,16 @@ topology.
   `state.sqlite3.pre-v3.<epoch>`, checks the copy's size, then migrates
   version 1 through version 2 to version 3 in one transaction. If the copy
   fails it refuses before the first schema write, so a failed upgrade leaves the
-  file readable by the release that wrote it. Terminal operations keep their
-  stored settled cost and record no admitted cost inputs; nonterminal
-  operations record the configured incidental rate and non-compute buffer as a
-  best-effort backfill, because the inputs their admission actually used are not
-  recoverable from an earlier file. `plan`, `status` and `export` accept
+  file readable by the release that wrote it. Schema 3 adds three columns:
+  `admitted_incidental_per_hour_micros`, `admitted_buffer_micros` and
+  `admitted_inputs_backfilled`, an integer that defaults to `0`. Terminal
+  operations keep their stored settled cost, a zero marker and no admitted cost
+  inputs; nonterminal operations record the configured incidental rate and
+  non-compute buffer as a best-effort backfill, because the inputs their
+  admission actually used are not recoverable from an earlier file, and are
+  marked `admitted_inputs_backfilled = 1`. The mark keeps such a row's stored
+  reservation as its commitment floor and is never inferred from the current
+  configuration. `plan`, `status` and `export` accept
   versions 1, 2 and 3 and never create or migrate the file. Rolling the image
   back after an upgrade requires restoring the `.pre-v3.` copy first, because
   the previous release refuses schema 3. The version-1 upgrade also changes the

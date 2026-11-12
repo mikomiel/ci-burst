@@ -109,9 +109,8 @@ class CommitmentTests(unittest.TestCase):
             max_lifetime_seconds=60,
             buffer_micros=0,
         )
-        # A row admitted under the shorter model's own basis: its recorded
-        # reservation reproduces that basis, so the admitted-worst-case floor
-        # does not apply.
+        # A row admitted under the shorter model's own basis: its flag is 0, so
+        # the admitted-worst-case floor does not apply.
         live = operation(expires_at=1_003_600.0, admitted_buffer_micros=0, reservation_micros=200_000)
         self.assertEqual(shorter.lifetime_seconds(live), 3600)
         self.assertEqual(shorter.accrued_micros(live, 1_000_600.0), 16_667)
@@ -300,10 +299,11 @@ class AdmittedBasisTests(unittest.TestCase):
 
     def test_a_backfilled_operation_keeps_the_admitted_worst_case(self):
         # A non-terminal row migrated while the configured rates are lower: the
-        # recorded basis reproduces 40_000, but admission committed 590_000.
+        # upgrade marked it, so its reservation stays the floor.
         backfilled = self.admitted(
             admitted_incidental_per_hour_micros=0,
             admitted_buffer_micros=0,
+            admitted_inputs_backfilled=1,
         )
         model = self.lowered_model()
         now = 1_000_600.0
@@ -325,10 +325,54 @@ class AdmittedBasisTests(unittest.TestCase):
         no_ceiling = operation(request_json="{}", price_micros=0)
         self.assertEqual(raised.settlement_price_micros(no_ceiling), 100_000)
 
-    def test_a_recorded_basis_reproduces_its_reservation(self):
-        live = self.admitted()
-        model = self.original_model()
-        self.assertEqual(model.reservation_floor_micros(live), 0)
+    def test_only_a_backfilled_row_has_a_reservation_floor(self):
+        admitted = self.admitted()
+        self.assertEqual(admitted.admitted_inputs_backfilled, 0)
+        self.assertEqual(self.original_model().reservation_floor_micros(admitted), 0)
+        backfilled = self.admitted(admitted_inputs_backfilled=1, reservation_micros=590_000)
+        self.assertEqual(self.original_model().reservation_floor_micros(backfilled), 590_000)
+
+    def test_a_raised_ceiling_never_releases_a_backfilled_commitment(self):
+        # The reviewer's reproducer: a backfilled row with reservation 590_000, a
+        # frozen MaxPrice of 0.040000, an accepted price of 0.020000, zero
+        # backfilled incidental and buffer, a 3_600-second lifetime and 600
+        # seconds lived. An inferred floor compared the reservation with a
+        # whole-life estimate that included the current ceiling; at 0.590000 the
+        # estimate reached the reservation, the floor vanished and the
+        # commitment fell 590_000 -> 495_001, releasing 94_999 of allowance.
+        backfilled = self.admitted(
+            admitted_incidental_per_hour_micros=0,
+            admitted_buffer_micros=0,
+            admitted_inputs_backfilled=1,
+        )
+        now = 1_000_600.0
+        models = (
+            CostModel(
+                price_cap_micros=40_000,
+                incidental_per_hour_micros=0,
+                max_lifetime_seconds=3600,
+                buffer_micros=0,
+            ),
+            CostModel(
+                price_cap_micros=590_000,
+                incidental_per_hour_micros=0,
+                max_lifetime_seconds=3600,
+                buffer_micros=0,
+            ),
+            # Far above the reservation: unlived time is priced higher, which may
+            # raise the forward commitment but must never lower it.
+            CostModel(
+                price_cap_micros=1_000_000,
+                incidental_per_hour_micros=0,
+                max_lifetime_seconds=3600,
+                buffer_micros=0,
+            ),
+        )
+        low, raised, far = models
+        self.assertEqual(low.committed_micros(backfilled, now), 590_000)
+        self.assertEqual(raised.committed_micros(backfilled, now), 590_000)
+        self.assertGreaterEqual(far.committed_micros(backfilled, now), 590_000)
+        self.assertEqual(raised.reservation_floor_micros(backfilled), 590_000)
 
     def test_a_malformed_frozen_request_never_raises(self):
         model = CostModel(

@@ -126,6 +126,12 @@ class ErrorClassificationTests(unittest.TestCase):
 
 
 class InstanceParsingTests(unittest.TestCase):
+    def assert_inventory_refused(self, response):
+        with self.assertRaises(ProviderRefusal) as raised:
+            _instances(response)
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertTrue(raised.exception.uncertain)
+
     def test_tags_state_and_launch_time_are_parsed(self):
         response = {
             "Reservations": [
@@ -146,6 +152,51 @@ class InstanceParsingTests(unittest.TestCase):
         self.assertEqual(parsed[0].state, "running")
         self.assertEqual(parsed[0].tags["ci-burst:managed"], "true")
         self.assertIsNotNone(parsed[0].launch_time)
+
+    def test_a_valid_multi_reservation_response_is_parsed_unchanged(self):
+        response = {
+            "Reservations": [
+                {"Instances": [{"InstanceId": "i-1", "State": {"Name": "running"}}]},
+                {
+                    "Instances": [
+                        {"InstanceId": "i-2", "State": {"Name": "pending"}},
+                        {"InstanceId": "i-3", "State": {"Name": "terminated"}},
+                    ]
+                },
+            ]
+        }
+        parsed = _instances(response)
+        self.assertEqual([item.instance_id for item in parsed], ["i-1", "i-2", "i-3"])
+        self.assertEqual([item.state for item in parsed], ["running", "pending", "terminated"])
+
+    def test_an_empty_reservations_list_is_a_complete_empty_inventory(self):
+        self.assertEqual(_instances({"Reservations": []}), [])
+        self.assertEqual(_instances({"Reservations": [{"Instances": []}]}), [])
+
+    def test_absent_or_non_list_reservations_are_refused(self):
+        for response in ({}, {"Reservations": None}, {"Reservations": ""}, {"Reservations": {}}, [], None):
+            with self.subTest(response=response):
+                self.assert_inventory_refused(response)
+
+    def test_a_reservation_that_is_not_a_mapping_is_refused(self):
+        for reservation in ("reservation", ["reservation"], 1, None):
+            with self.subTest(reservation=reservation):
+                self.assert_inventory_refused({"Reservations": [reservation]})
+
+    def test_absent_or_non_list_instances_are_refused(self):
+        for reservation in ({}, {"Instances": None}, {"Instances": {}}, {"Instances": ""}):
+            with self.subTest(reservation=reservation):
+                self.assert_inventory_refused({"Reservations": [reservation]})
+
+    def test_an_instance_entry_that_is_not_a_mapping_is_refused(self):
+        for entry in ("instance", ["instance"], 1, None):
+            with self.subTest(entry=entry):
+                self.assert_inventory_refused({"Reservations": [{"Instances": [entry]}]})
+
+    def test_an_entry_without_a_usable_instance_id_is_refused(self):
+        for entry in ({}, {"InstanceId": ""}, {"InstanceId": None}, {"InstanceId": 42}, {"InstanceId": ["i-1"]}):
+            with self.subTest(entry=entry):
+                self.assert_inventory_refused({"Reservations": [{"Instances": [entry]}]})
 
 
 class FakeClient:
@@ -197,6 +248,26 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaises(ProviderRefusal) as raised:
             self.aws().owned_instances("test-deployment")
         self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+
+    def test_owned_inventory_refuses_a_response_without_reservations(self):
+        self.client.responses = [{}]
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.aws().owned_instances("test-deployment")
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertTrue(raised.exception.uncertain)
+        self.assertEqual([name for name, _ in self.client.calls], ["describe_instances"])
+
+    def test_by_id_inventory_refuses_a_response_without_reservations(self):
+        self.client.responses = [{}]
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.aws().instances(["i-1"])
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.assertTrue(raised.exception.uncertain)
+
+    def test_an_empty_reservations_list_is_a_complete_empty_inventory(self):
+        self.client.responses = [{"Reservations": []}, {"Reservations": []}]
+        self.assertEqual(self.aws().owned_instances("test-deployment"), [])
+        self.assertEqual(self.aws().instances(["i-1"]), [])
 
     def test_template_carries_placement_and_rejects_an_indirect_image(self):
         self.client.responses = [

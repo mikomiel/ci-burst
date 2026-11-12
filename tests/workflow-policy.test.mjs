@@ -74,8 +74,41 @@ test('validation CI stays read-only and checks policy alongside OpenSpec', () =>
   assert.ok(commands.includes('npm run check:policy'));
   assert.ok(commands.includes('npm run check:spec'));
   assert.ok(commands.some((c) => c.startsWith('npm ci --ignore-scripts')));
-  const checkout = w.jobs.planning.steps.find((step) => step.uses?.startsWith('actions/checkout@'));
-  assert.equal(checkout.with['fetch-depth'], 0); // changelog release checks need tags
+});
+
+test('release-please observes automated merges and requires its token', () => {
+  const w = workflow('release-please.yml');
+  assert.deepEqual(Object.keys(w.on).sort(), ['push', 'workflow_dispatch', 'workflow_run']);
+  assert.deepEqual(w.on.push.branches, ['main']);
+  assert.deepEqual(w.on.workflow_run, { workflows: ['automerge'], types: ['completed'] });
+  assert.deepEqual(w.permissions, { contents: 'read' });
+  assert.deepEqual(w.concurrency, { group: 'release-please', 'cancel-in-progress': false });
+  assert.equal(w.env, undefined);
+  assert.equal(w.defaults, undefined);
+
+  const job = w.jobs['release-please'];
+  assert.equal(job['runs-on'], 'ubuntu-24.04');
+  assert.ok(job['timeout-minutes'] <= 10);
+  assert.equal(
+    job.if.replace(/\s+/g, ' ').trim(),
+    "(github.event_name != 'workflow_run' "
+      + "|| github.event.workflow_run.head_branch == 'main') "
+      + "&& (github.event_name != 'workflow_dispatch' "
+      + "|| github.ref == 'refs/heads/main')",
+  );
+  for (const key of ['permissions', 'env', 'defaults', 'container', 'services', 'environment']) {
+    assert.equal(job[key], undefined, `the release job must not set ${key}`);
+  }
+
+  const [step, ...unexpected] = job.steps;
+  assert.deepEqual(unexpected, []);
+  assert.match(step.uses, /^googleapis\/release-please-action@[a-f0-9]{40}$/);
+  assert.deepEqual(step.with, {
+    token: '${{ secrets.RELEASE_PLEASE_TOKEN }}',
+    'config-file': 'release-please-config.json',
+    'manifest-file': '.release-please-manifest.json',
+  });
+  assert.equal(step.env, undefined);
 });
 
 // The container image job is a build proof, not a publication path. These

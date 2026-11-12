@@ -687,6 +687,10 @@ class Controller:
         never admitted twice.
         """
         attempts = []
+        # The pool the previous request actually went to. A plan skipped for
+        # stale evidence was never attempted, so it must not be reported as the
+        # pool the fallback left.
+        attempted = None
         for index, plan in enumerate(plans):
             if index:
                 now = self.clock()
@@ -721,12 +725,13 @@ class Controller:
                         request=request,
                         request_sha256=_sha256(request),
                         client_token=request["ClientToken"],
-                        detail="capacity_fallback:" + plans[index - 1].label,
+                        detail="capacity_fallback:" + attempted.label,
                         price_micros=plan.quote.price_micros,
                     )
                 operation = self.ledger.operation(operation.id)
             else:
                 request = operation.request()
+            attempted = plan
             outcome, refusal = self._send(operation, request, result, "launched", defer_capacity=True)
             if outcome == "accepted":
                 attempts.append(

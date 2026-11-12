@@ -895,6 +895,38 @@ class PoolTests(MultiZoneCase):
             ],
         )
 
+    def test_the_fallback_detail_names_the_pool_it_left_not_a_stale_one(self):
+        capacity = ProviderRefusal("AWS_REFUSED", "InsufficientInstanceCapacity")
+        quotes = self.pool_quotes()
+        quotes[("t4g.small", "eu-central-1b")] = zone_quote(
+            "eu-central-1b",
+            20_000,
+            self.clock,
+            observed_at=self.clock.now - 850,
+            instance_type="t4g.small",
+        )
+        controller = self.build(
+            config=self.config(aws={"instance_types": list(self.TYPES)}),
+            quotes=quotes,
+            run_errors={("t4g.small", "eu-central-1a"): capacity},
+        )
+        self.aws.on_run = lambda request: self.clock.advance(100)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(
+            [
+                (attempt["zone"], attempt["instance_type"], attempt["outcome"])
+                for attempt in result["launches"][0]["attempts"]
+            ],
+            [
+                ("eu-central-1a", "t4g.small", "capacity_rejected"),
+                ("eu-central-1b", "t4g.small", "skipped"),
+                ("eu-central-1a", "c7g.large", "accepted"),
+            ],
+        )
+        operation = self.reopened().operation(result["operation"])
+        self.assertEqual(operation.detail, "capacity_fallback:eu-central-1a/t4g.small")
+
     def test_a_single_type_list_still_sends_the_type_explicitly(self):
         config = self.config(aws={"instance_types": ["t4g.small"]})
         controller = self.build(

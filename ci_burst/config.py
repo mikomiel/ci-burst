@@ -8,7 +8,9 @@ an extension point.
 
 Placement is configured as an ordered list of availability-zone candidates. The
 original single-zone key remains supported and is normalized to a one-candidate
-list, so no consumer chooses between two placement shapes.
+list, so no consumer chooses between two placement shapes. An optional ordered
+instance-type list multiplies those candidates into one pool per type; the same
+type-major order is the priority the controller falls back through.
 """
 
 import re
@@ -46,6 +48,16 @@ _SUBNET = re.compile(r"^subnet-(?:[0-9a-f]{8}|[0-9a-f]{17})$")
 
 #: Keys accepted inside one ``[[aws.availability_zones]]`` table.
 _ZONE_CANDIDATE_KEYS = ("zone", "subnet_id", "launch_template_version")
+
+#: One EC2 instance type name: a family and a size, such as ``m7g.xlarge``.
+#: The list is validated here because every configured type multiplies the
+#: placement pools an admission prices.
+_INSTANCE_TYPE = re.compile(r"^[a-z][a-z0-9-]*\.[a-z0-9]+$")
+
+#: How many instance types one deployment may list. Every admission prices
+#: every configured type in every configured zone, so the bound keeps those
+#: synchronous provider reads predictable.
+_MAX_INSTANCE_TYPES = 4
 
 
 @dataclass(frozen=True)
@@ -93,8 +105,17 @@ class ZoneCandidate:
 
 @dataclass(frozen=True)
 class AwsConfig:
+    """One Region, an ordered zone list, and an ordered instance-type list.
+
+    ``instance_types`` is empty for the original single-type form: the launch
+    template's own ``InstanceType`` is then the only pool per candidate. A
+    non-empty tuple multiplies every candidate into one pool per type, in
+    type-major order, and the template's type is no longer launched on its own.
+    """
+
     region: str
     zones: tuple
+    instance_types: tuple
     launch_template_name: str
     launch_template_version: int
     max_spot_price: int
@@ -283,6 +304,43 @@ def _zone_candidates(aws_table, region, default_version):
     return tuple(candidates)
 
 
+def _instance_types_refusal(where, message):
+    """Refuse a malformed instance-type list with its own stable reason."""
+    raise ConfigRefusal("INSTANCE_TYPES_INVALID", f"{where}: {message}")
+
+
+def _instance_types(aws_table):
+    """Return the ordered instance types, or an empty tuple for the template.
+
+    ``aws.instance_types`` is optional and authoritative when present: every
+    configured type becomes one pool in every configured zone, and the launch
+    template's own ``InstanceType`` is only the shape reference the operator
+    check compares against. An absent key keeps the original single-type
+    behaviour instead of guessing a list from the provider.
+    """
+    where = "aws.instance_types"
+    listed = aws_table.get("instance_types")
+    if listed is None:
+        return ()
+    if not isinstance(listed, list) or not listed:
+        _instance_types_refusal(where, "must be a non-empty array of instance type names")
+    if len(listed) > _MAX_INSTANCE_TYPES:
+        _instance_types_refusal(
+            where, f"must list at most {_MAX_INSTANCE_TYPES} instance types"
+        )
+    seen = set()
+    for index, entry in enumerate(listed):
+        if not isinstance(entry, str) or not _INSTANCE_TYPE.fullmatch(entry) or len(entry) > 64:
+            _instance_types_refusal(
+                f"{where}[{index}]",
+                'must be an instance type name such as "m7g.xlarge"',
+            )
+        if entry in seen:
+            _instance_types_refusal(f"{where}[{index}]", "must be unique")
+        seen.add(entry)
+    return tuple(listed)
+
+
 def load(path):
     """Load and validate a configuration file, or raise ``ConfigRefusal``."""
     config_path = Path(path)
@@ -340,6 +398,7 @@ def load(path):
             "region",
             "availability_zone",
             "availability_zones",
+            "instance_types",
             "launch_template_name",
             "launch_template_version",
             "max_spot_price",
@@ -351,12 +410,14 @@ def load(path):
     region = _string(aws_table, "region", "aws", pattern=_REGION, pattern_name="an AWS Region name")
     launch_template_version = _integer(aws_table, "launch_template_version", "aws", minimum=1, maximum=10_000)
     zones = _zone_candidates(aws_table, region, launch_template_version)
+    instance_types = _instance_types(aws_table)
     profile = aws_table.get("profile")
     if profile is not None and (not isinstance(profile, str) or not profile):
         _fail("aws.profile", "must be a non-empty string when set")
     aws = AwsConfig(
         region=region,
         zones=zones,
+        instance_types=instance_types,
         launch_template_name=_string(
             aws_table, "launch_template_name", "aws", pattern=_TEMPLATE_NAME, pattern_name="a launch template name"
         ),

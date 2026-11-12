@@ -125,6 +125,11 @@ class FakeEc2:
         self.route_tables = []
         self.security_groups = {}
         self.security_group_names = {}
+        self.instance_types = {
+            "t4g.small": {"vcpus": 2, "memory": 2048, "architectures": ["arm64"]},
+        }
+        self.offerings = set()
+        self.images = {"ami-0123456789abcdef0": "arm64"}
         self.error = None
         self.errors = {}
         self.calls = []
@@ -240,6 +245,46 @@ class FakeEc2:
         }
 
 
+    def describe_instance_types(self, **kwargs):
+        self.calls.append(("describe_instance_types", kwargs))
+        self._maybe_raise("describe_instance_types")
+        entries = []
+        for name in kwargs["InstanceTypes"]:
+            facts = self.instance_types.get(name)
+            if facts is None:
+                continue
+            entries.append(
+                {
+                    "InstanceType": name,
+                    "VCpuInfo": {"DefaultVCpus": facts["vcpus"]},
+                    "MemoryInfo": {"SizeInMiB": facts["memory"]},
+                    "ProcessorInfo": {"SupportedArchitectures": list(facts["architectures"])},
+                }
+            )
+        return {"InstanceTypes": entries}
+
+    def describe_instance_type_offerings(self, **kwargs):
+        self.calls.append(("describe_instance_type_offerings", kwargs))
+        self._maybe_raise("describe_instance_type_offerings")
+        return {
+            "InstanceTypeOfferings": [
+                {"InstanceType": instance_type, "Location": location, "LocationType": "availability-zone"}
+                for instance_type, location in sorted(self.offerings)
+            ]
+        }
+
+    def describe_images(self, **kwargs):
+        self.calls.append(("describe_images", kwargs))
+        self._maybe_raise("describe_images")
+        return {
+            "Images": [
+                {"ImageId": image_id, "Architecture": self.images[image_id]}
+                for image_id in kwargs["ImageIds"]
+                if image_id in self.images
+            ]
+        }
+
+
 class FakeSsm:
     def __init__(self, names=(), pages=None):
         self.parameters = {name: {} for name in names}
@@ -304,7 +349,7 @@ def botocore_error_modules():
     return {"botocore": botocore, "botocore.exceptions": exceptions}, ClientError
 
 
-def deployment_toml(root, *, version=3, zone="eu-central-1a", subnet_id=SUBNET_ID):
+def deployment_toml(root, *, version=3, zone="eu-central-1a", subnet_id=SUBNET_ID, instance_types=None):
     """A deployment with one ordered candidate so the network is configured."""
     lines = [
         'deployment = "test-deployment"',
@@ -339,7 +384,15 @@ def deployment_toml(root, *, version=3, zone="eu-central-1a", subnet_id=SUBNET_I
         'database = "state.sqlite3"',
     ]
     path = Path(root) / "deployment.toml"
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    text = "\n".join(lines) + "\n"
+    if instance_types:
+        rendered = ", ".join(json.dumps(name) for name in instance_types)
+        text = text.replace(
+            "\n[[aws.availability_zones]]",
+            f"\ninstance_types = [{rendered}]\n\n[[aws.availability_zones]]",
+            1,
+        )
+    path.write_text(text, encoding="utf-8")
     return path
 
 
@@ -378,6 +431,78 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertIn(reason, result["unavailable"])
         self.assertNotIn(reason, result["reasons"])
         self.assertEqual(prerequisites._exit_code(result["decision"]), 3)
+
+    def use_instance_types(self, *types, offered=None, metadata=None, architecture="arm64"):
+        """Configure the deployment's type list and the provider facts behind it."""
+        self.config = prerequisites.load(deployment_toml(self.root, instance_types=list(types)))
+        for instance_type in types:
+            self.ec2.instance_types.setdefault(
+                instance_type, {"vcpus": 2, "memory": 2048, "architectures": ["arm64"]}
+            )
+        self.ec2.instance_types.update(metadata or {})
+        self.ec2.offerings = set(
+            offered
+            if offered is not None
+            else {(instance_type, "eu-central-1a") for instance_type in types}
+        )
+        self.ec2.images["ami-0123456789abcdef0"] = architecture
+        return self.config
+
+    def test_configured_instance_types_are_reported_as_pools(self):
+        self.use_instance_types("t4g.small", "c7g.large")
+        result = self.check()
+        self.assertEqual(result["decision"], "satisfied")
+        self.assertEqual(
+            [record["target"] for record in self.records(result, "instance_type")],
+            ["t4g.small", "c7g.large"],
+        )
+        self.assertEqual(
+            [record["target"] for record in self.records(result, "pool")],
+            ["eu-central-1a/t4g.small", "eu-central-1a/c7g.large"],
+        )
+        self.assertTrue(all(record["status"] == "pass" for record in self.records(result, "pool")))
+
+    def test_no_instance_type_list_performs_no_pool_reads(self):
+        result = self.check()
+        self.assertEqual(result["decision"], "satisfied")
+        self.assertEqual(self.records(result, "instance_type"), [])
+        self.assertEqual(self.records(result, "pool"), [])
+        self.assertNotIn(
+            "describe_instance_types", [call[0] for call in self.ec2.calls]
+        )
+
+    def test_an_instance_type_missing_from_a_zone_is_drift(self):
+        self.use_instance_types("t4g.small", "c7g.large", offered={("t4g.small", "eu-central-1a")})
+        result = self.check()
+        self.assert_drift(result, "instance_type_not_offered")
+        record = self.records(result, "pool")[1]
+        self.assertEqual(record["target"], "eu-central-1a/c7g.large")
+        self.assertEqual(record["status"], "drift")
+
+    def test_a_type_with_a_different_shape_is_drift(self):
+        self.use_instance_types(
+            "t4g.small",
+            "c7g.large",
+            metadata={"c7g.large": {"vcpus": 4, "memory": 8192, "architectures": ["arm64"]}},
+        )
+        result = self.check()
+        self.assert_drift(result, "instance_type_shape_mismatch")
+        record = [item for item in self.records(result, "instance_type") if item["target"] == "c7g.large"][0]
+        self.assertEqual(record["status"], "drift")
+        self.assertEqual(record["facts"]["vcpus"], 4)
+
+    def test_an_unsupported_image_architecture_is_drift(self):
+        self.use_instance_types("t4g.small", architecture="x86_64")
+        result = self.check()
+        self.assert_drift(result, "image_architecture_unsupported")
+        self.assertEqual(self.records(result, "instance_type")[0]["status"], "drift")
+
+    def test_unreadable_instance_type_metadata_is_unavailable(self):
+        self.use_instance_types("t4g.small")
+        self.ec2.errors["describe_instance_types"] = ClientError("AccessDenied")
+        result = self.check()
+        self.assert_unavailable(result, "instance_types_unavailable")
+        self.assertEqual(self.records(result, "pools")[0]["detail"], "AccessDenied")
 
     def use_router(self, *, cidrs=(SUBNET_CIDR,), state="running", user_data=None):
         """Point the candidate's default route at a router instance."""

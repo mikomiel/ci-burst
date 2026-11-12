@@ -31,7 +31,7 @@ identities' access keys, which you can deactivate at any time.
 | --- | --- | --- |
 | `OWNER/REPOSITORY` | the one Forgejo repository whose queue is observed | `example-owner/example-repo` |
 | `LABEL` | the runner label your worker advertises and the job asks for | `cloud-ci` |
-| Region, zone, subnet, security group, instance type | the worker placement | `eu-central-1`, `eu-central-1a`, `subnet-...`, `sg-...`, `c7g.xlarge` |
+| Region, zone, subnet, security group, instance type(s) | the worker placement | `eu-central-1`, `eu-central-1a`, `subnet-...`, `sg-...`, `c7g.xlarge` |
 | `MAX_SPOT_PRICE`, `ALLOWANCE` | the two money limits | `0.1200`, `10.00` |
 
 `LABEL` is the routing contract. A job runs on the worker only when its
@@ -50,7 +50,10 @@ Follow [runner-setup.md](runner-setup.md) sections 1–4. You create:
 - a network placement that reaches Forgejo, the SSM endpoint and your package
   mirrors;
 - a pinned launch template with a literal AMI, an instance type,
-  `InstanceInitiatedShutdownBehavior = terminate` and bootstrap user data.
+  `InstanceInitiatedShutdownBehavior = terminate` and bootstrap user data. An
+  optional `aws.instance_types` list may widen the pools; every listed type must
+  have the template type's exact vCPU count and memory size and the image's
+  architecture.
 
 Two additions this walkthrough needs:
 
@@ -93,7 +96,9 @@ name. The policies are deliberately small:
 - `RunInstances` names exactly one launch template, the subnets the deployment
   may use — one for the single-zone form, one per zone candidate — and one
   security group. Step 5 owns that rule: a candidate whose subnet is missing
-  from the policy is a denied launch, not a fallback;
+  from the policy is a denied launch, not a fallback. A configured instance type
+  is a top-level request field and needs no grant of its own, because the
+  policy's condition is on the launch template;
 - `TerminateInstances` carries an `ec2:ResourceTag/ci-burst:managed = true`
   condition, so an instance the controller did not tag cannot be terminated;
 - `ec2:GetConsoleOutput` is one read grant, on `instance/*`, for the `export`
@@ -200,6 +205,9 @@ max_instances = 4
 region = "eu-central-1"
 launch_template_name = "example-ci-burst-runner"
 launch_template_version = 3
+# Optional, ordered, at most four. Each type multiplies every candidate into one
+# pool; all types must share the template type's vCPU count and memory size.
+instance_types = ["m7g.xlarge", "m8g.xlarge"]
 max_spot_price = "0.1200"
 max_lifetime_seconds = 3600
 profile = "default"
@@ -236,7 +244,9 @@ worker's forward commitment. § Cost tracking and the allowance in
 [operations.md](operations.md#cost-tracking-and-the-allowance) owns the formulas
 and the reconciliation with the provider bill.
 
-Start with the one candidate the scaling policy authorizes. Add a
+Start with the one candidate the scaling policy authorizes. An optional
+`aws.instance_types` list multiplies that candidate over same-shape types; keep
+the template's type first so the default landing place does not change. Add a
 `[[aws.availability_zones]]` table per further candidate, in priority order,
 and add that candidate's subnet to the policy's `RunInstances` resources in the
 same change: the policy — not the TOML — is what decides which placements are
@@ -270,6 +280,14 @@ you used another name. The command needs Python 3.12 or newer and the runtime
 
 It checks, from read-only describe calls:
 
+- every configured instance type is offered in every configured zone, matches
+  every configured template type's `VCpuInfo.DefaultVCpus` and
+  `MemoryInfo.SizeInMiB`, and supports the template image's architecture
+  (`instance_type_not_offered`, `instance_type_shape_mismatch`,
+  `image_architecture_unsupported`; an unreadable type or image read is
+  `instance_types_unavailable` and exits 3). The check's operator identity
+  therefore also needs `ec2:DescribeInstanceTypes`,
+  `ec2:DescribeInstanceTypeOfferings` and `ec2:DescribeImages`;
 - every configured template version exists and still satisfies the controller's
   own template contract — a literal `ImageId`, an `InstanceType` and
   `InstanceInitiatedShutdownBehavior = terminate` — and reports the image,
@@ -376,7 +394,7 @@ podman run --rm --init --network ci-burst --name ci-burst-manual --read-only \
 document. A refusal names its reason code; the troubleshooting table in Step 9
 maps the common ones.
 
-The template, zone-candidate and price evidence appears only when there is
+The template, pool and price evidence appears only when there is
 eligible waiting demand and a slot is free: the command returns `wait` before
 reading a template or a price when there is nothing to launch. On an idle queue
 the decision is `wait` with reason `no_runnable_demand` and no price evidence —
@@ -520,6 +538,7 @@ conditions). Reverting the source is a reviewed change, not a history rewrite.
 | `TEMPLATE_NOT_FOUND` | the template name or numeric version does not exist in the Region |
 | `TEMPLATE_IMAGE_NOT_LITERAL`, `TEMPLATE_INSTANCE_TYPE_MISSING`, `TEMPLATE_SHUTDOWN_NOT_TERMINATE` | the template version does not satisfy the worker contract |
 | `ZONE_CANDIDATES_INVALID` | a zone candidate is malformed, repeated or empty |
+| `INSTANCE_TYPES_INVALID` | the instance-type list is malformed, repeated, empty or longer than four |
 | `FORGEJO_TOKEN_MISSING` | the env-file is not mounted or lacks the variable |
 | `FORGEJO_CONTRACT_UNQUALIFIED` | `qualification` is still `fixtures-only`; `apply` is refused |
 | `FORGEJO_UNEXPECTED_SHAPE` | the endpoint returned something other than an array or `null` |

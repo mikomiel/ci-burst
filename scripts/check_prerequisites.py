@@ -343,6 +343,7 @@ class Prerequisites:
         checks = []
         templates = self._templates(checks)
         self._candidates(checks, templates)
+        self._pools(checks, templates)
         checks.append(self._registration_parameter_check())
         drift = [reason for check in checks if check["status"] == "drift" for reason in check.get("reasons", [])]
         unavailable = [
@@ -569,6 +570,129 @@ class Prerequisites:
             checks.append(route_check)
             if egress is not None:
                 checks.append(self._router(candidate, placement_facts, egress))
+
+    def _pools(self, checks, templates):
+        """Verify every configured instance type is usable in every zone.
+
+        The controller reads no instance-type metadata at admission: the list is
+        static configuration, and an unusable entry would fail launches instead
+        of widening them. This check is the gate that keeps that failure off the
+        fleet. A type must be offered in the zone, must match every configured
+        template's own type in vCPU and memory, and every configured template
+        image must support its architecture.
+        """
+        types = self._config.aws.instance_types
+        if not types:
+            return
+        zones = tuple(candidate.availability_zone for candidate in self._config.aws.zones)
+        references = [
+            (template.instance_type, template.image_id)
+            for template, _data in templates.values()
+            if template is not None
+        ]
+        reference_types = {name for name, _image in references}
+        image_ids = {image for _name, image in references}
+        try:
+            metadata = self._instance_type_metadata(sorted(set(types) | reference_types))
+            offered = self._instance_type_offerings(types)
+            architectures = self._image_architectures(image_ids)
+        except ProviderCallError as error:
+            checks.append(
+                _record(
+                    "pools",
+                    "aws",
+                    status="unavailable",
+                    reasons=["instance_types_unavailable"],
+                    detail=error.code,
+                )
+            )
+            return
+        unread = sorted(name for name in set(types) | reference_types if name not in metadata)
+        if unread:
+            checks.append(
+                _record(
+                    "pools",
+                    "aws",
+                    status="unavailable",
+                    reasons=["instance_types_unavailable"],
+                    detail="describe_instance_types did not return: " + ", ".join(unread),
+                )
+            )
+            return
+        reference_vcpus = {metadata[name]["vcpus"] for name in reference_types}
+        reference_memory = {metadata[name]["memory_mib"] for name in reference_types}
+        image_architectures = {architectures[image] for image in image_ids if image in architectures}
+        for instance_type in types:
+            facts = dict(metadata[instance_type])
+            facts["zones"] = list(zones)
+            reasons = []
+            if reference_vcpus and facts["vcpus"] not in reference_vcpus:
+                reasons.append("instance_type_shape_mismatch")
+            if reference_memory and facts["memory_mib"] not in reference_memory:
+                reasons.append("instance_type_shape_mismatch")
+            if image_architectures and not image_architectures <= set(facts["architectures"]):
+                reasons.append("image_architecture_unsupported")
+            checks.append(
+                _record(
+                    "instance_type",
+                    instance_type,
+                    status="drift" if reasons else "pass",
+                    facts=facts,
+                    reasons=reasons,
+                )
+            )
+            for zone in zones:
+                missing = (instance_type, zone) not in offered
+                checks.append(
+                    _record(
+                        "pool",
+                        f"{zone}/{instance_type}",
+                        status="drift" if missing else "pass",
+                        facts={"zone": zone, "instance_type": instance_type},
+                        reasons=["instance_type_not_offered"] if missing else (),
+                    )
+                )
+
+    def _instance_type_metadata(self, names):
+        """Read vCPU, memory and architecture facts for the configured types."""
+        response = _call(self._clients.ec2, "describe_instance_types", InstanceTypes=sorted(names))
+        metadata = {}
+        for entry in response.get("InstanceTypes") or []:
+            name = entry.get("InstanceType")
+            if not isinstance(name, str):
+                continue
+            vcpu_info = entry.get("VCpuInfo") or {}
+            memory_info = entry.get("MemoryInfo") or {}
+            processor_info = entry.get("ProcessorInfo") or {}
+            metadata[name] = {
+                "vcpus": vcpu_info.get("DefaultVCpus"),
+                "memory_mib": memory_info.get("SizeInMiB"),
+                "architectures": sorted(processor_info.get("SupportedArchitectures") or []),
+            }
+        return metadata
+
+    def _instance_type_offerings(self, names):
+        """Return the ``(instance type, zone)`` pairs the Region offers."""
+        response = _call(
+            self._clients.ec2,
+            "describe_instance_type_offerings",
+            LocationType="availability-zone",
+            Filters=[{"Name": "instance-type", "Values": list(names)}],
+        )
+        return {
+            (entry.get("InstanceType"), entry.get("Location"))
+            for entry in response.get("InstanceTypeOfferings") or []
+        }
+
+    def _image_architectures(self, image_ids):
+        """Return the architecture each configured template image was built for."""
+        if not image_ids:
+            return {}
+        response = _call(self._clients.ec2, "describe_images", ImageIds=sorted(image_ids))
+        return {
+            image.get("ImageId"): image.get("Architecture")
+            for image in response.get("Images") or []
+        }
 
     def _subnet(self, candidate):
         """Return ``(record, None)`` on failure or ``(None, facts)`` on success."""

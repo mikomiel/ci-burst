@@ -44,6 +44,68 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
         self.assertEqual(raised.exception.detail, "controller.max_instances: must be between 1 and 12")
 
+    def test_instance_types_are_optional_and_ordered(self):
+        config = load(
+            write_config(
+                self.root,
+                config={"aws": {"instance_types": ["m7g.xlarge", "m8g.xlarge"]}},
+            )
+        )
+        self.assertEqual(config.aws.instance_types, ("m7g.xlarge", "m8g.xlarge"))
+
+    def test_absent_instance_types_keep_the_template_type(self):
+        config = load(write_config(self.root))
+        self.assertEqual(config.aws.instance_types, ())
+
+    def test_refuses_an_empty_instance_type_list(self):
+        path = write_config(self.root, config={"aws": {"instance_types": []}})
+        with self.assertRaises(ConfigRefusal) as raised:
+            load(path)
+        self.assertEqual(raised.exception.reason, "INSTANCE_TYPES_INVALID")
+        self.assertEqual(
+            raised.exception.detail,
+            "aws.instance_types: must be a non-empty array of instance type names",
+        )
+
+    def test_refuses_a_duplicate_instance_type(self):
+        path = write_config(
+            self.root, config={"aws": {"instance_types": ["m7g.xlarge", "m7g.xlarge"]}}
+        )
+        with self.assertRaises(ConfigRefusal) as raised:
+            load(path)
+        self.assertEqual(raised.exception.reason, "INSTANCE_TYPES_INVALID")
+        self.assertEqual(raised.exception.detail, "aws.instance_types[1]: must be unique")
+
+    def test_refuses_a_malformed_instance_type(self):
+        path = write_config(self.root, config={"aws": {"instance_types": ["M7G.XLARGE"]}})
+        with self.assertRaises(ConfigRefusal) as raised:
+            load(path)
+        self.assertEqual(raised.exception.reason, "INSTANCE_TYPES_INVALID")
+        self.assertIn("must be an instance type name", raised.exception.detail)
+
+    def test_refuses_more_than_four_instance_types(self):
+        path = write_config(
+            self.root,
+            config={
+                "aws": {
+                    "instance_types": [
+                        "m6g.xlarge",
+                        "m7g.xlarge",
+                        "m8g.xlarge",
+                        "c7g.xlarge",
+                        "r7g.xlarge",
+                    ]
+                }
+            },
+        )
+        with self.assertRaises(ConfigRefusal) as raised:
+            load(path)
+        self.assertEqual(raised.exception.reason, "INSTANCE_TYPES_INVALID")
+        self.assertEqual(
+            raised.exception.detail,
+            "aws.instance_types: must list at most 4 instance types",
+        )
+
     def test_relative_state_path_resolves_against_config(self):
         config = load(write_config(self.root, config={"state": {"database": "var/state.sqlite3"}}))
         self.assertTrue(str(config.state.database).endswith("var/state.sqlite3"))

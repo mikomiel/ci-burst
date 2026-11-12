@@ -79,13 +79,13 @@ def _toml(value):
     return json.dumps(value)
 
 
-def zone_quote(zone, price_micros, clock, timestamp=None, observed_at=None):
+def zone_quote(zone, price_micros, clock, timestamp=None, observed_at=None, instance_type="t4g.small"):
     observed = clock.now if observed_at is None else observed_at
     return SpotQuote(
         price_micros=price_micros,
         timestamp=observed if timestamp is None else timestamp,
         price_display=f"{price_micros / 1_000_000:.6f}",
-        instance_type="t4g.small",
+        instance_type=instance_type,
         availability_zone=zone,
         observed_at=observed,
     )
@@ -105,7 +105,9 @@ class MultiZoneAws(FakeAws):
 
     def spot_quote(self, instance_type, availability_zone):
         self.calls.append(("spot_quote", instance_type, availability_zone))
-        value = self.quotes.get(availability_zone)
+        value = self.quotes.get(
+            (instance_type, availability_zone), self.quotes.get(availability_zone)
+        )
         if isinstance(value, Exception):
             raise value
         return value
@@ -114,7 +116,10 @@ class MultiZoneAws(FakeAws):
         self.calls.append(("run_spot", json.loads(json.dumps(request))))
         if self.on_run is not None:
             self.on_run(request)
-        error = self.run_errors.get(request["Placement"]["AvailabilityZone"])
+        placement = request["Placement"]["AvailabilityZone"]
+        error = self.run_errors.get(
+            (request.get("InstanceType"), placement), self.run_errors.get(placement)
+        )
         if isinstance(error, list):
             error = error.pop(0) if error else None
         if error is not None:
@@ -474,6 +479,7 @@ class LaunchFallbackTests(MultiZoneCase):
             [
                 {
                     "zone": "eu-central-1a",
+                    "instance_type": "t4g.small",
                     "outcome": "uncertain",
                     "reason": "AWS_UNCERTAIN",
                     "detail": "ReadTimeout",
@@ -501,6 +507,7 @@ class LaunchFallbackTests(MultiZoneCase):
             [
                 {
                     "zone": "eu-central-1a",
+                    "instance_type": "t4g.small",
                     "outcome": "rejected",
                     "reason": "AWS_REFUSED",
                     "detail": "UnauthorizedOperation",
@@ -675,6 +682,123 @@ class SingleZoneCompatibilityTests(MultiZoneCase):
         request = self.run_requests()[0]
         self.assertEqual(request["Placement"], {"AvailabilityZone": "eu-central-1a"})
         self.assertNotIn("SubnetId", request)
+
+
+class PoolTests(MultiZoneCase):
+    """One ordered type list multiplying the configured zones into pools."""
+
+    TYPES = ("t4g.small", "c7g.large")
+    ZONES = ("eu-central-1a", "eu-central-1b")
+
+    def typed_config(self):
+        return self.config(aws={"instance_types": list(self.TYPES)})
+
+    def pool_quotes(self, prices=None):
+        prices = prices or {}
+        return {
+            (instance_type, zone): zone_quote(
+                zone,
+                prices.get((instance_type, zone), 20_000),
+                self.clock,
+                instance_type=instance_type,
+            )
+            for instance_type in self.TYPES
+            for zone in self.ZONES
+        }
+
+    def test_pools_expand_type_major_with_one_price_each(self):
+        controller = self.build(config=self.typed_config(), quotes=self.pool_quotes())
+        result = controller.plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(
+            [(candidate["instance_type"], candidate["zone"]) for candidate in result["candidates"]],
+            [
+                ("t4g.small", "eu-central-1a"),
+                ("t4g.small", "eu-central-1b"),
+                ("c7g.large", "eu-central-1a"),
+                ("c7g.large", "eu-central-1b"),
+            ],
+        )
+        self.assertEqual(
+            [(candidate["instance_type"], candidate["zone"]) for candidate in result["candidates"]],
+            [(call[1], call[2]) for call in self.aws.calls if call[0] == "spot_quote"],
+        )
+        self.assertEqual(result["selected"]["instance_type"], "t4g.small")
+        self.assertEqual(result["selected"]["zone"], "eu-central-1a")
+
+    def test_a_type_above_the_cap_is_skipped_while_the_next_pool_is_eligible(self):
+        quotes = self.pool_quotes(
+            {
+                ("t4g.small", "eu-central-1a"): 50_000,
+                ("t4g.small", "eu-central-1b"): 50_000,
+            }
+        )
+        controller = self.build(config=self.typed_config(), quotes=quotes)
+        result = controller.plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(
+            [candidate.get("reason") for candidate in result["candidates"][:2]],
+            ["spot_price_above_cap", "spot_price_above_cap"],
+        )
+        self.assertEqual(result["selected"]["instance_type"], "c7g.large")
+        self.assertEqual(result["selected"]["zone"], "eu-central-1a")
+
+    def test_a_capacity_rejection_advances_across_types(self):
+        capacity = ProviderRefusal("AWS_REFUSED", "InsufficientInstanceCapacity")
+        controller = self.build(
+            config=self.typed_config(),
+            quotes=self.pool_quotes(),
+            run_errors={
+                ("t4g.small", "eu-central-1a"): capacity,
+                ("t4g.small", "eu-central-1b"): capacity,
+            },
+        )
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        launch = result["launches"][0]
+        self.assertEqual((launch["zone"], launch["instance_type"]), ("eu-central-1a", "c7g.large"))
+        self.assertEqual(
+            [
+                (attempt["zone"], attempt["instance_type"], attempt["outcome"])
+                for attempt in launch["attempts"]
+            ],
+            [
+                ("eu-central-1a", "t4g.small", "capacity_rejected"),
+                ("eu-central-1b", "t4g.small", "capacity_rejected"),
+                ("eu-central-1a", "c7g.large", "accepted"),
+            ],
+        )
+        ledger = self.reopened()
+        self.assertEqual(len(ledger.operations()), 1)
+        request = ledger.operation(result["operation"]).request()
+        self.assertEqual(request["InstanceType"], "c7g.large")
+        self.assertEqual(request["Placement"]["AvailabilityZone"], "eu-central-1a")
+
+    def test_every_pool_refusing_leaves_the_slot_free(self):
+        capacity = ProviderRefusal("AWS_REFUSED", "InsufficientInstanceCapacity")
+        controller = self.build(
+            config=self.typed_config(),
+            quotes=self.pool_quotes(),
+            run_errors={(instance_type, zone): capacity for instance_type in self.TYPES for zone in self.ZONES},
+        )
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launch_failed")
+        self.assertIn("capacity_exhausted", result["reasons"])
+        self.assertEqual(
+            len([call for call in self.aws.calls if call[0] == "run_spot"]), 4
+        )
+        ledger = self.reopened()
+        self.assertEqual([operation.state for operation in ledger.operations()], ["failed"])
+
+    def test_a_single_type_list_still_sends_the_type_explicitly(self):
+        config = self.config(aws={"instance_types": ["t4g.small"]})
+        controller = self.build(
+            config=config,
+            quotes={("t4g.small", zone): zone_quote(zone, 20_000, self.clock) for zone in self.ZONES},
+        )
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(self.run_requests()[0]["InstanceType"], "t4g.small")
 
 
 if __name__ == "__main__":

@@ -57,11 +57,13 @@ database = "state.sqlite3"
 
 Optional keys: `forgejo.timeout_seconds` (10), `forgejo.max_response_bytes`
 (2,000,000), `aws.price_max_age_seconds` (900), `aws.profile`,
-`aws.availability_zones`, `controller.max_instances` (an integer in `1..12`,
-default `1`). Relative state paths resolve against the configuration file
-directory. Unknown keys, floating-point money, a template-version alias, a
-non-`https` Forgejo URL, a `controller.max_instances` outside `1..12` and a
-malformed zone-candidate list (`ZONE_CANDIDATES_INVALID`) are refused.
+`aws.availability_zones`, `aws.instance_types` (an ordered list of at most four
+type names), `controller.max_instances` (an integer in `1..12`, default `1`).
+Relative state paths resolve against the configuration file directory. Unknown
+keys, floating-point money, a template-version alias, a non-`https` Forgejo URL,
+a `controller.max_instances` outside `1..12`, a malformed zone-candidate list
+(`ZONE_CANDIDATES_INVALID`) and a malformed instance-type list
+(`INSTANCE_TYPES_INVALID`) are refused.
 
 ### Availability-zone candidates
 
@@ -101,6 +103,47 @@ The candidate subnet is sent as the `RunInstances` request's `SubnetId`
 parameter, so a template used with a candidate list must not pin network
 interfaces or a subnet itself. The single-zone form sends no subnet override and
 keeps the network choice in the launch template.
+
+### Instance-type pools
+
+Every configured candidate can be multiplied by an ordered instance-type list,
+so the Region can offer more Spot capacity than one type has across its zones:
+
+```toml
+[aws]
+region = "eu-central-1"
+launch_template_name = "example-ci-burst-runner"
+launch_template_version = 6
+instance_types = ["m7g.xlarge", "m8g.xlarge"]
+max_spot_price = "0.0400"
+max_lifetime_seconds = 3600
+
+[[aws.availability_zones]]
+zone = "eu-central-1a"
+subnet_id = "subnet-0123456789abcdef0"
+```
+
+The order is type-major and it is the priority: every zone of `m7g.xlarge`
+first, then every zone of `m8g.xlarge`. A definite capacity rejection walks to
+the next pool in that order within the same admission and operation. A batch
+spreads across the first eligible type's zones only, so a later type is a
+fallback rather than a second fleet.
+
+The list is optional. When it is absent, the launch template's own
+`InstanceType` is the only pool per candidate, which is the original behaviour.
+When it is present it is authoritative, and `RunInstances` carries the selected
+pool's `InstanceType` explicitly; the template's type stays required as the
+default and as the shape reference.
+
+Every configured type must have the template type's exact vCPU count and memory
+size, and the template image must support its architecture. The controller does
+not read instance-type metadata: `scripts/check_prerequisites.py` verifies that
+each type is offered in each configured zone and that shape and architecture
+match, so drift is visible before the list is enabled. A list that is empty,
+repeats a type, names a malformed type, or holds more than four types is
+refused at load time with `INSTANCE_TYPES_INVALID`. The bound exists because
+every admission prices every pool: four types in three zones is twelve Spot
+price reads per tick.
 
 The source runs on Python 3.12 or newer and needs `boto3` at runtime. The
 standard-library tests run without the SDK, a token or a cloud account.
@@ -307,7 +350,8 @@ usable:
 
 - numeric `launch_template_version`, never an alias;
 - literal `ImageId`, never `resolve:ssm:` or another indirection;
-- `InstanceType` set;
+- `InstanceType` set — the template's type, and the shape anchor for any
+  configured `aws.instance_types` list;
 - `InstanceInitiatedShutdownBehavior = terminate`;
 - bootstrap `UserData` present (the controller checks presence only and never
   reads, stores or reports its contents).
@@ -566,14 +610,14 @@ request, client token and reservation. A batch is not one admission with several
 instances: every worker can be resumed, reconciled, expired and charged on its
 own. Every request still sends `MinCount = MaxCount = 1`.
 
-The launch order rotates the eligible candidate list cyclically by the worker
-index (`start = index % len(eligible)`, then
-`eligible[start:] + eligible[:start]`), so a batch starts at successive candidates
-and wraps: four workers over two zones start A, B, A, B. Rotation spreads workers
-across the ordered zones; it is not a capacity guarantee. Each worker starts at
-the first candidate in its rotation whose quote is still fresh, records the
-earlier candidates as `skipped` (`spot_price_stale`), and walks its own candidate
-order only on a definite capacity rejection.
+The launch order rotates the eligible pool list cyclically by the worker index,
+inside the first eligible type's block, so a batch starts at successive pools of
+that type and wraps: four workers over two zones start A, B, A, B. Rotation
+spreads workers across the ordered zones; it is not a capacity guarantee, and a
+later instance type is reached only by a definite capacity rejection, never by
+batch spread. Each worker starts at the first pool in its rotation whose quote is
+still fresh, records the earlier pools as `skipped` (`spot_price_stale`), and
+walks its own pool order only on a definite capacity rejection.
 
 The worker contract stays one job per worker. An idle worker waits for one job
 until its own maximum lifetime, then shuts down and terminates. Its forward
@@ -618,21 +662,22 @@ waiting demand, free slots and affordable workers (§ Fleet size and
 fan-out). Each worker in the batch is its own admission, with its own frozen
 request, ledger operation, client token and reservation; the batch stops as soon
 as one worker is not accepted. Within one worker, if the provider definitely
-rejects the selected candidate for insufficient capacity
+rejects the selected pool for insufficient capacity
 (`InsufficientInstanceCapacity`), that rejection proves no instance was created,
-so that admission advances to the next eligible candidate in order — at most once
-per candidate — and a success ends the walk. Every attempt sends `MinCount =
-MaxCount = 1`, so no fallback and no batch can produce a second instance for one
-worker. Before each worker and each advance the controller re-reads the clock:
-the candidate's Spot quote must still be within `price_max_age_seconds` and the
-admission lifetime must not have elapsed. A candidate whose evidence expired is
-recorded as `skipped` (`spot_price_stale`), not frozen or sent, and the next
-remaining candidate is considered. The result reports a `launches` array with one
-entry per admitted worker (`operation`, `instance_id`, `zone`, `reservation`,
-`decision`, `attempts`). Each entry's `zone` is the placement that actually
-accepted that worker, so a capacity fallback is not reported under the original
-choice, and its `attempts` carries that worker's own ordered outcomes
-(`capacity_rejected`, `accepted`, `rejected`, `uncertain` or `skipped`). The
+so that admission advances to the next eligible pool in order — at most once per
+pool — and a success ends the walk. Every attempt sends `MinCount = MaxCount = 1`,
+so no fallback and no batch can produce a second instance for one worker. Before
+each worker and each advance the controller re-reads the clock: the pool's Spot
+quote must still be within `price_max_age_seconds` and the admission lifetime
+must not have elapsed. A pool whose evidence expired is recorded as `skipped`
+(`spot_price_stale`), not frozen or sent, and the next remaining pool is
+considered. The result reports a `launches` array with one entry per admitted
+worker (`operation`, `instance_id`, `zone`, `instance_type`, `reservation`,
+`decision`, `attempts`). Each entry's `zone` and `instance_type` are the pool
+that actually accepted that worker, so a capacity fallback is not reported under
+the original choice, and its `attempts` carries that worker's own ordered
+outcomes (`capacity_rejected`, `accepted`, `rejected`, `uncertain` or
+`skipped`). The
 top-level `operation`, `instance_id`, `expires_at` and `reservation` are the
 first launch's values, so a one-worker deployment reads the shape it did before;
 the top-level `attempts` is the ordered outcome list of the first launch, or of
@@ -641,10 +686,10 @@ the accepted attempt is the placement that actually launched.
 
 No other failure falls through: a non-capacity definite rejection keeps today's
 `launch_failed` behaviour, and an uncertain response keeps the operation
-outstanding. If every candidate is rejected for capacity the operation is
+outstanding. If every pool is rejected for capacity the operation is
 `failed` — its slot is free again — the queue stays unserved, and the result
 carries the stable `capacity_exhausted` reason plus the final provider refusal.
-If the remaining candidates' price evidence expires during the attempt, the
+If the remaining pools' price evidence expires during the attempt, the
 operation is also `failed` with its slot free and the stable `spot_price_stale`
 reason, and no new admission or reservation is created. Nothing is reported as
 launched.
@@ -809,11 +854,12 @@ limit (`(max_spot_price + incidental_per_hour) × max_instances`).
 
 ## Supported limits
 
-One repository, one Region and one ordered list of availability-zone candidates
-(the single-zone key is the one-candidate form), up to
-`controller.max_instances` (1..12) owned instances, one writer and one ledger.
-Ordered fallback is supported only for a definite insufficient capacity
-rejection, within one admission and at most once per configured candidate. Not
+One repository, one Region and one ordered list of placement pools: the
+availability-zone candidate list (the single-zone key is the one-candidate form),
+optionally multiplied by an ordered instance-type list of at most four same-shape
+types, up to `controller.max_instances` (1..12) owned instances, one writer and
+one ledger. Ordered fallback is supported only for a definite insufficient
+capacity rejection, within one admission and at most once per configured pool. Not
 supported: concurrent controllers, multiple ledgers, warm pools, On-Demand
 fallback, automatic zone or Region discovery and substitution, provider
 selection, job retries, workflow rewrites, image construction and secret

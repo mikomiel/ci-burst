@@ -50,15 +50,16 @@ cleanup bounds.
 
 ## 4. Capacity, quota and network
 
-- [ ] The Region and every configured availability-zone candidate have the
-      chosen instance type and Spot capacity; the account's Spot quota covers the
+- [ ] The Region and every configured pool (instance type × availability-zone
+      candidate) has Spot capacity; the account's Spot quota covers the
       configured `controller.max_instances` workers.
 - [ ] The worker reaches the Forgejo endpoint over the approved path; TLS
       verification is on and no redirect is followed.
 - [ ] Egress from the worker is limited to what the queue needs; the worker
       cannot reach unrelated private networks.
-- [ ] Every configured candidate produced one **registered** worker in a canary
-      run; a candidate that produced none was removed, not merely configured.
+- [ ] Every configured instance type produced one **registered** worker in a
+      canary run, and every configured candidate was exercised at least once; a
+      pool that produced none was removed, not merely configured.
 - [ ] When the worker subnets route through a router instance, its boot
       configuration forwards every candidate subnet CIDR, and it still does
       after a reboot ([router.md](router.md)).
@@ -77,8 +78,8 @@ cleanup bounds.
 
 ## 6. Ownership and cleanup evidence
 
-- [ ] A plan reports the exact template, Region, ordered candidates, selected
-      zone, tracked spend and forward commitment.
+- [ ] A plan reports the exact template, Region, ordered pools, selected pool,
+      tracked spend and forward commitment.
 - [ ] A launched worker's readback shows all four ownership tags and the expiry.
 - [ ] A refused or denied cleanup stays visible and does not free its slot.
 - [ ] The operator knows that an accepted termination request is not confirmed

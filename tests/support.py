@@ -39,13 +39,20 @@ def template(**overrides):
     return Template(**values)
 
 
-def quote(price_micros=20_000, timestamp=None, clock=None, observed_at=None, availability_zone="eu-central-1a"):
+def quote(
+    price_micros=20_000,
+    timestamp=None,
+    clock=None,
+    observed_at=None,
+    availability_zone="eu-central-1a",
+    instance_type="t4g.small",
+):
     observed = observed_at if observed_at is not None else (clock.now if clock else 1_800_000_000.0)
     return SpotQuote(
         price_micros=price_micros,
         timestamp=timestamp if timestamp is not None else observed,
         price_display=f"{price_micros / 1_000_000:.6f}",
-        instance_type="t4g.small",
+        instance_type=instance_type,
         availability_zone=availability_zone,
         observed_at=observed,
     )
@@ -100,7 +107,7 @@ class FakeAws:
         self._maybe_raise()
         value = self.spot_quote_value
         if isinstance(value, dict):
-            value = value.get(availability_zone)
+            value = value.get((instance_type, availability_zone), value.get(availability_zone))
         if isinstance(value, Exception):
             raise value
         return value

@@ -77,8 +77,11 @@ current one with the new user data
 command), set `aws.launch_template_version` in the deployment TOML to the
 published number, then flip `PUBLISHED_TEMPLATE_VERSION`/`PUBLISHED_TEMPLATE_SHA256`
 to the pending pair and clear both pending values in a follow-up change.
-`check-prerequisites` reports drift until the template and the TOML agree, and
-the contract test fails until the constants are flipped.
+`check-prerequisites` reports template drift until the published version and the
+TOML agree. The contract test does not fail while the publication is pending: it
+compares the committed file with the recorded pending digest, so the pin stays
+exact and the drift is reported by the prerequisite check rather than by a red
+unit test.
 
 A template that pins its network (`NetworkInterfaces` or a subnet) keeps that
 placement and cannot be used with the ordered zone-candidate list in Step 5:

@@ -69,7 +69,8 @@ version is published. The test keeps the last published version and digest and
 adds a pending pair for the prepared version: the file must equal the pending
 digest while one is owed, and the published digest otherwise. Publication —
 create the version, bump the deployment TOML, flip the constants — stays an
-operator step with a visible failing test until it is done.
+operator step. While it is owed the test is green against the pending bytes, and
+the prerequisite check reports the deployed-template drift.
 
 ## Risks / Trade-offs
 
@@ -78,6 +79,7 @@ operator step with a visible failing test until it is done.
   only ever added, never un-learned.
 - The marker is one more console line on a channel the exporter already bounds;
   it adds no read and no text.
-- The pending digest fails the contract test until the operator publishes the
-  next version. That is deliberate: an unpublished bootstrap change reaching no
+- While a pending digest is owed the contract test passes against the prepared
+  bytes and `check-prerequisites` reports template drift. The pin is never
+  widened to accept either digest: an unpublished bootstrap change reaching no
   worker was the original defect this contract exists to catch.

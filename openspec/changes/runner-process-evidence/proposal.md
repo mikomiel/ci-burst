@@ -32,8 +32,9 @@ not.
 ## Impact
 
 - The next launch-template version changes the bootstrap user data; until it is
-  published the pinned version keeps the old behaviour. The contract test fails
-  on the pending digest, so the gap is visible rather than silent.
+  published the pinned version keeps the old behaviour. The contract test records
+  the prepared bytes as pending and the prerequisite check reports the drift, so
+  the gap is visible rather than silent.
 - One additional event per worker that reaches the one-job phase, and one
   additional closed marker in the console vocabulary. The metric set and the
   job result are unchanged: the event says nothing about whether the Forgejo

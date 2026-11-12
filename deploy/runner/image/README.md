@@ -33,12 +33,22 @@ source pin (`ansible-homelab/inventory/group_vars/all.yml`, `ruff_version`) so
 the image and the fleet cannot drift silently. The current image carries
 0.17.3; the source pin after the 2026-11-11 bump is 0.17.4.
 
+The tool downloads are version- and checksum-pinned. The apt packages are not:
+they resolve from the builder's configured Debian repositories at build time,
+so a later rebuild can carry different OS package versions even with the same
+tool pins. Pin a Debian snapshot repository if the OS layer must be
+reproducible.
+
 ## Build
 
 1. Launch a disposable builder matching the worker architecture (the current
-   deployment uses Debian 13 arm64) in the deployment's subnet. The provision
-   script needs no Forgejo credential and no instance profile; the worker's
-   registration is the runtime bootstrap's job, after the image is published.
+   deployment uses Debian 13 arm64) in the deployment's subnet with
+   `InstanceInitiatedShutdownBehavior=terminate` and delete-on-termination
+   storage. The recipe's watchdog and EXIT trap run `shutdown -h now`; with the
+   default `stop`, a finished or failed build would stop the instance and keep
+   its volume instead of disappearing. The provision script needs no Forgejo
+   credential and no instance profile; the worker's registration is the runtime
+   bootstrap's job, after the image is published.
 2. Build the user data with the ruff pin prepended, publish it, and wait for
    `IMAGE_READY` on the serial console:
 
@@ -53,8 +63,10 @@ the image and the fleet cannot drift silently. The current image carries
 
    Use the persistent fleet's current `ruff_version`; 0.17.4 is the source pin,
    0.17.3 reproduces the current image. The script prints `STEP` markers and a
-   `PROBE end have=N miss=M` line; any `MISS` fails the build. The builder
-   self-terminates after 3600 s, so snapshot it while it is still running.
+   `PROBE end have=N miss=M` line; any `MISS` fails the build. The 3600 s
+   watchdog and the EXIT trap run `shutdown -h now`; with the launch behaviour
+   above that terminates the builder, so snapshot it while it is still
+   running.
 3. Create the image without rebooting the builder:
 
    ```sh

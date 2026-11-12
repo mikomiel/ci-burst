@@ -7,6 +7,11 @@
 # operator can create the image. It does not register a runner, read a secret
 # or publish an image.
 #
+# The builder must use InstanceInitiatedShutdownBehavior=terminate: the EXIT
+# trap and the 3600 s watchdog run `shutdown -h now`, and with the default
+# `stop` that retains the instance and its storage after a finished or failed
+# build.
+#
 # Provenance: recovered on 2026-11-12 from the deployment's launch-template
 # version that built the 2026-11-10 worker image. The
 # 2026-11-11 image is that image plus jq, podman, make, gcc and libc6-dev.
@@ -197,6 +202,27 @@ for tool in ruff uv node; do
     miss=$((miss + 1))
   fi
 done
+
+# The runtime bootstrap starts the runner with HOME and the cache variables
+# set and the job's umask at 0022. Reproduce that shape and check PATH-based
+# discovery, which is what a test's shutil.which("ruff") actually uses; the
+# absolute-path checks above cannot see a PATH that omits /usr/local/bin.
+if runuser -u runner -- env \
+     HOME=/var/lib/forgejo-runner \
+     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+     XDG_CACHE_HOME=/var/lib/forgejo-runner/cache \
+     UV_CACHE_DIR=/var/lib/forgejo-runner/cache/uv \
+     NPM_CONFIG_CACHE=/var/lib/forgejo-runner/cache/npm \
+     PIP_CACHE_DIR=/var/lib/forgejo-runner/cache/pip \
+     CI_PROFILE_CACHE_ROOT=/var/lib/forgejo-runner/cache/validation \
+     bash -c 'umask 0022; python3 -c "import shutil,sys; sys.exit(0 if shutil.which(\"ruff\") else 1)"' \
+     >/dev/null 2>&1; then
+  echo "HAVE ruff-on-job-path"
+  have=$((have + 1))
+else
+  echo "MISS ruff-on-job-path"
+  miss=$((miss + 1))
+fi
 echo "PROBE end have=${have} miss=${miss}"
 if [ "$miss" -ne 0 ]; then
   echo "provision: missing required tools; fix the image before snapshotting" >&2

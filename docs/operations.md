@@ -482,20 +482,26 @@ Accepted risk, stated plainly:
 
 Tracked cost is an estimate of what the fleet will be billed, in exact
 micro-units, not a provider invoice. Each operation records the Spot price of the
-request that was accepted and, on the first reconcile that observes the instance,
-the provider's launch time. Its cost is computed per second:
+request that was accepted, the incidental hourly rate and the non-compute buffer
+it was admitted under, the `MaxPrice` frozen in its request and, on the first
+reconcile that observes the instance, the provider's launch time. Its cost is
+computed per second:
 
 ```
 cost = ceil(price * billable_seconds / 3600)
-     + ceil(incidental_per_hour * billable_seconds / 3600)
-billable_seconds = clamp(max(60, end - launch_time), 0, max_lifetime_seconds)
+     + ceil(incidental * billable_seconds / 3600)
+billable_seconds = clamp(max(60, end - launch_time), 0, lifetime_seconds)
 ```
 
 `price` is the accepted quote. A row without one — created before this ledger
-schema, or whose write was lost — uses `max_spot_price`, which over-states but
-never under-states. The 60-second floor is the provider's per-instance minimum.
-`incidental_per_hour` covers public IPv4 and EBS and defaults to zero: set it to
-the deployment's rates, or leave it zero and track compute only.
+schema, or whose write was lost — uses the higher of `max_spot_price` and the
+`MaxPrice` frozen in its request, which over-states but never under-states.
+`incidental` is the rate recorded on the operation at admission, falling back to
+the configured `incidental_per_hour` for a row that predates schema 3; it covers
+public IPv4 and EBS and defaults to zero. The 60-second floor is the provider's
+per-instance minimum, and it is counted once: it starts `billable_seconds`, so
+the same interval is not priced again as remaining life. A 60-second worker
+therefore commits one billed minute, not two.
 
 Admission does not use accrued cost alone. For every non-terminal operation the
 controller commits:
@@ -503,23 +509,34 @@ controller commits:
 ```
 commitment = accrued cost
            + ceil(remaining_price * remaining_seconds / 3600)
-           + ceil(incidental_per_hour * remaining_seconds / 3600)
-           + non_compute_allowance
-remaining_seconds = max(0, lifetime_seconds - elapsed)
-remaining_price = max(max_spot_price, accepted_price or 0)
+           + ceil(incidental * remaining_seconds / 3600)
+           + buffer
+remaining_seconds = max(0, lifetime_seconds - billable_seconds)
+remaining_price = max(max_spot_price, admitted MaxPrice, accepted_price or 0)
 lifetime_seconds = max(60, ceil(expires_at - created_at))
 ```
 
 so a newly admitted worker commits `max_spot_price * max_lifetime +
 incidental_per_hour * max_lifetime + non_compute_allowance` — the earlier
 reservation plus the incidental term, which is zero unless configured — and that
-commitment shrinks every second it lives. The accepted price is a floor on `remaining_price`: lowering
-`max_spot_price` below a live operation's accepted price does not shrink that
-operation's commitment, because it still settles at the accepted price. The
-lifetime comes from the operation's own durable expiry window, so lowering
-`max_lifetime_seconds` applies to the next launch and never shortens a worker
-that is already admitted. A batch is affordable while the window's `spend` plus the forward
-commitment plus one new worker's worst case stays inside `allowance`:
+commitment shrinks every second it lives.
+
+`incidental`, `buffer` and `remaining_price` are the inputs the operation was
+admitted under, not the current configuration. Admission records the configured
+incidental rate and buffer on the operation, and the ceiling is the highest of
+the configured maximum, the `MaxPrice` frozen in the operation's request and its
+accepted price. Editing `max_spot_price`, `incidental_per_hour`,
+`non_compute_allowance` or `max_lifetime_seconds` therefore reprices new
+admissions only: it cannot lower the ceiling of a request already sent, erase
+cost already accrued, or release a commitment an outstanding worker still
+carries. The lifetime comes from the operation's own durable expiry window for
+the same reason. A non-terminal operation whose stored reservation is higher
+than what its recorded basis reproduces — a row the schema-3 upgrade backfilled
+with the configuration of the moment — keeps that reservation as its floor. Terminal rows
+keep their stored settled cost and are never repriced.
+
+A batch is affordable while the window's `spend` plus the forward commitment
+plus one new worker's worst case stays inside `allowance`:
 
 ```
 affordable = (allowance - committed) // per_launch
@@ -530,12 +547,14 @@ operations still running; `committed` is `spend` plus the forward commitment.
 
 An operation settles once, when a reconcile observes its instance `terminated`.
 An instance that disappears before the provider retention window settles at a
-full configured lifetime at the price the launch was accepted at (the configured
-maximum when no price was recorded). That price keeps the settlement inside the
-commitment the operation carried while unresolved; settling at the maximum would
-charge more than admission reserved. A definite pre-launch rejection settles zero, and a
-settled or failed operation is never charged again. A restart does not reset the
-window.
+full configured lifetime at the price the launch was accepted at, or at the
+`MaxPrice` frozen in its request when no price was recorded (the configured
+maximum only for a row whose request carries none). That bound keeps the
+settlement inside the commitment the operation carried while unresolved; a raised
+configuration never settles above it. A definite pre-launch rejection settles
+zero, and a settled or failed operation is never charged again: `settle` writes
+only a row that has no settled cost yet, so a later reconcile or configuration
+edit cannot rewrite it. A restart does not reset the window.
 
 The unspent part of a commitment is released as the operation ages and fully
 released when it settles, so a one-job worker that exits after ten minutes stops
@@ -546,10 +565,12 @@ never reaches `running`, and an uncertain outcome keeps its commitment until the
 intent is resolved.
 
 Tracked cost does not bound EBS, data transfer, public IPv4 beyond the configured
-rate, AMI and snapshot storage, log delivery, minimum billing increments, Spot
-price changes after launch, or resources left by failed cleanup. It is an
-estimate and not a guaranteed cap on the AWS bill, and no status, lifetime or
-alert in this project should be described as one.
+rate, AMI and snapshot storage, log delivery, billing increments longer than the
+60-second minimum, Spot price changes after launch, or resources left by failed
+cleanup. Surplus CPU credits are a separate residual: a burstable instance can be
+charged for CPU time above its baseline, and no configured rate estimates it.
+Tracked cost is an estimate and not a guaranteed cap on the AWS bill, and no
+status, lifetime or alert in this project should be described as one.
 
 ### Reconciling with the provider bill
 

@@ -1,3 +1,4 @@
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -151,7 +152,9 @@ class CommitmentTests(LedgerTestCase):
     """The window totals a fixed worst case until an operation is resolved."""
 
     class StubCost:
-        buffer_micros = 0
+        #: A model-wide buffer that must never reach a window total: every
+        #: operation carries the buffer recorded at its own admission.
+        buffer_micros = 999_999_999
 
         def accrued_micros(self, operation, now):
             return 0
@@ -159,10 +162,13 @@ class CommitmentTests(LedgerTestCase):
         def remaining_micros(self, operation, now):
             return operation.reservation_micros
 
+        def buffer_for(self, operation):
+            return operation.admitted_buffer_micros or 0
+
         def committed_micros(self, operation, now):
             if operation.state in TERMINAL:
                 return self.accrued_micros(operation, now)
-            return self.remaining_micros(operation, now) + self.buffer_micros
+            return self.remaining_micros(operation, now) + self.buffer_for(operation)
 
     def totals(self, window):
         return self.ledger.window_totals(window, self.StubCost(), self.clock_now)
@@ -221,6 +227,23 @@ class CommitmentTests(LedgerTestCase):
         self.assertEqual(current_totals["spend"], 0)
         self.assertEqual(current_totals["committed"], 216_667)
 
+    def test_each_operation_carries_its_own_recorded_buffer(self):
+        window = current_window(self.clock_now, 86400)
+        self.add(
+            operation_id="a", reservation_micros=1_000_000, window_start=window,
+            admitted_buffer_micros=1_000,
+        )
+        self.add(
+            operation_id="b", reservation_micros=2_000_000, window_start=window,
+            admitted_buffer_micros=3_000,
+        )
+        self.assertEqual(self.totals(window)["committed"], 3_004_000)
+
+    def test_an_operation_without_a_recorded_buffer_adds_none(self):
+        window = current_window(self.clock_now, 86400)
+        self.add(operation_id="a", reservation_micros=1_000_000, window_start=window)
+        self.assertEqual(self.totals(window)["committed"], 1_000_000)
+
     def test_window_rollover_changes_the_anchor(self):
         self.assertNotEqual(
             current_window(1_800_000_000.0, 86400),
@@ -228,50 +251,127 @@ class CommitmentTests(LedgerTestCase):
         )
 
 
+V1_SCHEMA = """
+    CREATE TABLE operations (
+        id TEXT PRIMARY KEY,
+        client_token TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        expires_at REAL NOT NULL,
+        reservation_micros INTEGER NOT NULL,
+        reservation_window REAL NOT NULL,
+        region TEXT NOT NULL,
+        account TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        instance_id TEXT,
+        detail TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX operations_state ON operations (state);
+    PRAGMA user_version = 1;
+"""
+
+V2_SCHEMA = """
+    CREATE TABLE operations (
+        id TEXT PRIMARY KEY,
+        client_token TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        expires_at REAL NOT NULL,
+        reservation_micros INTEGER NOT NULL,
+        reservation_window REAL NOT NULL,
+        region TEXT NOT NULL,
+        account TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        instance_id TEXT,
+        detail TEXT NOT NULL DEFAULT '',
+        price_micros INTEGER NOT NULL DEFAULT 0,
+        launch_time REAL,
+        settled_micros INTEGER,
+        settled_at REAL
+    );
+    CREATE INDEX operations_state ON operations (state);
+    CREATE INDEX operations_window ON operations (reservation_window);
+    PRAGMA user_version = 2;
+"""
+
+V1_COLUMNS = (
+    "id, client_token, state, created_at, updated_at, expires_at, reservation_micros,"
+    " reservation_window, region, account, request_json, request_sha256, instance_id, detail"
+)
+V2_COLUMNS = V1_COLUMNS + ", price_micros, launch_time, settled_micros, settled_at"
+
+
 class MigrationTests(unittest.TestCase):
-    """A version-1 file upgrades once, after a verified copy, without losing state."""
+    """An earlier file upgrades once, after a verified copy, without losing state."""
 
     def setUp(self):
         self._directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._directory.cleanup)
         self.path = Path(self._directory.name) / "state.sqlite3"
         self.now = 1_800_000_000.0
-        connection = sqlite3.connect(self.path)
-        connection.executescript(
-            """
-            CREATE TABLE operations (
-                id TEXT PRIMARY KEY,
-                client_token TEXT NOT NULL UNIQUE,
-                state TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                expires_at REAL NOT NULL,
-                reservation_micros INTEGER NOT NULL,
-                reservation_window REAL NOT NULL,
-                region TEXT NOT NULL,
-                account TEXT NOT NULL,
-                request_json TEXT NOT NULL,
-                request_sha256 TEXT NOT NULL,
-                instance_id TEXT,
-                detail TEXT NOT NULL DEFAULT ''
-            );
-            CREATE INDEX operations_state ON operations (state);
-            PRAGMA user_version = 1;
-            """
-        )
-        row = (
+        self._write(1)
+
+    def _rows(self, version):
+        terminal = (
             "old-op", "ci-burst-old", "terminal", self.now - 600, self.now - 300, self.now - 60,
             170000, current_window(self.now, 86400), "eu-central-1", "111122223333", "{}", "0" * 64,
             "i-old", "",
         )
-        connection.execute(
-            "INSERT INTO operations (id, client_token, state, created_at, updated_at, expires_at,"
-            " reservation_micros, reservation_window, region, account, request_json, request_sha256,"
-            " instance_id, detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            row,
+        nonterminal = (
+            "live-op", "ci-burst-live", "running", self.now - 300, self.now - 100, self.now + 3300,
+            170000, current_window(self.now, 86400), "eu-central-1", "111122223333", "{}", "0" * 64,
+            "i-live", "",
         )
+        if version == 1:
+            return [terminal, nonterminal], V1_COLUMNS
+        return [
+            terminal + (30_000, self.now - 600, 12_345, self.now - 400),
+            nonterminal + (20_000, self.now - 300, None, None),
+        ], V2_COLUMNS
+
+    def _write(self, version):
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        connection = sqlite3.connect(self.path)
+        connection.executescript(V1_SCHEMA if version == 1 else V2_SCHEMA)
+        rows, columns = self._rows(version)
+        for row in rows:
+            connection.execute(
+                "INSERT INTO operations (%s) VALUES (%s)" % (columns, ",".join("?" * len(row))),
+                row,
+            )
         connection.commit()
         connection.close()
+
+    def writable(self, backfill=(40_000, 0, 0)):
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        ledger.connect(create=True, backfill=backfill)
+        self.addCleanup(ledger.close)
+        return ledger
+
+    def backups(self):
+        return sorted(self.path.parent.glob("state.sqlite3.pre-v3.*"))
+
+    def user_version(self):
+        connection = sqlite3.connect(self.path)
+        try:
+            return connection.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            connection.close()
+
+    def columns(self):
+        connection = sqlite3.connect(self.path)
+        try:
+            return {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
+        finally:
+            connection.close()
 
     def test_read_only_accepts_the_previous_schema(self):
         ledger = Ledger(self.path, clock=lambda: self.now).connect(create=False, read_only=True)
@@ -280,18 +380,55 @@ class MigrationTests(unittest.TestCase):
         operation = ledger.operation("old-op")
         self.assertEqual(operation.price_micros, 0)
         self.assertIsNone(operation.launch_time)
+        self.assertIsNone(operation.admitted_incidental_per_hour_micros)
+        self.assertIsNone(operation.admitted_buffer_micros)
 
-    def test_writable_connect_migrates_with_a_backup_and_backfills(self):
-        ledger = Ledger(self.path, clock=lambda: self.now)
-        ledger.acquire_writer()
-        self.addCleanup(ledger.close)
-        ledger.connect(create=True, backfill=(40_000, 0))
+    def test_v1_upgrade_creates_one_v3_backup_and_backfills(self):
+        ledger = self.writable()
         self.assertEqual(ledger.version, SCHEMA_VERSION)
-        operation = ledger.operation("old-op")
-        self.assertEqual(operation.state, "terminal")
+        self.assertEqual(len(self.backups()), 1)
+        self.assertEqual(list(self.path.parent.glob("state.sqlite3.pre-v2.*")), [])
+        terminal = ledger.operation("old-op")
+        self.assertEqual(terminal.state, "terminal")
         # 300 seconds at 0.04 per hour, rounded up to one micro, plus no incidentals.
-        self.assertEqual(operation.settled_micros, 3334)
-        self.assertEqual(len(list(self.path.parent.glob("state.sqlite3.pre-v2.*"))), 1)
+        self.assertEqual(terminal.settled_micros, 3334)
+        # Terminal history keeps NULL admitted inputs: it is never repriced.
+        self.assertIsNone(terminal.admitted_incidental_per_hour_micros)
+        self.assertIsNone(terminal.admitted_buffer_micros)
+        live = ledger.operation("live-op")
+        # The nonterminal row records the basis supplied to connect(), best effort.
+        self.assertEqual(live.admitted_incidental_per_hour_micros, 0)
+        self.assertEqual(live.admitted_buffer_micros, 0)
+        self.assertEqual(live.price_micros, 0)
+        self.assertIsNone(live.launch_time)
+
+    def test_v2_upgrade_backfills_only_nonterminal_rows(self):
+        self._write(2)
+        ledger = self.writable(backfill=(40_000, 5_000, 7_000))
+        self.assertEqual(ledger.version, SCHEMA_VERSION)
+        self.assertEqual(len(self.backups()), 1)
+        terminal = ledger.operation("old-op")
+        # The stored settled cost and its timestamp are never rewritten.
+        self.assertEqual(terminal.settled_micros, 12_345)
+        self.assertEqual(terminal.settled_at, self.now - 400)
+        self.assertIsNone(terminal.admitted_incidental_per_hour_micros)
+        self.assertIsNone(terminal.admitted_buffer_micros)
+        live = ledger.operation("live-op")
+        self.assertEqual(live.state, "running")
+        self.assertEqual(live.admitted_incidental_per_hour_micros, 5_000)
+        self.assertEqual(live.admitted_buffer_micros, 7_000)
+        self.assertIsNone(live.settled_micros)
+
+    def test_read_only_keeps_a_v2_database_unwritten(self):
+        self._write(2)
+        before = sorted(item.name for item in self.path.parent.iterdir())
+        ledger = Ledger(self.path, clock=lambda: self.now).connect(create=False, read_only=True)
+        self.addCleanup(ledger.close)
+        self.assertEqual(ledger.version, 2)
+        self.assertEqual(ledger.operation("old-op").settled_micros, 12_345)
+        self.assertIsNone(ledger.operation("live-op").admitted_buffer_micros)
+        self.assertEqual([operation.id for operation in ledger.operations()], ["old-op", "live-op"])
+        self.assertEqual(before, sorted(item.name for item in self.path.parent.iterdir()))
 
     def test_copy_failure_refuses_before_any_schema_write(self):
         ledger = Ledger(self.path, clock=lambda: self.now)
@@ -299,13 +436,11 @@ class MigrationTests(unittest.TestCase):
         self.addCleanup(ledger.close)
         with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=OSError("denied")):
             with self.assertRaises(StateRefusal) as raised:
-                ledger.connect(create=True, backfill=(40_000, 0))
+                ledger.connect(create=True, backfill=(40_000, 0, 0))
         self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
-        connection = sqlite3.connect(self.path)
-        self.addCleanup(connection.close)
-        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
-        self.assertNotIn("price_micros", columns)
+        self.assertEqual(self.user_version(), 1)
+        self.assertNotIn("price_micros", self.columns())
+        self.assertNotIn("admitted_buffer_micros", self.columns())
 
     def test_size_mismatch_refuses_before_any_schema_write(self):
         def truncated(source, target):
@@ -316,15 +451,52 @@ class MigrationTests(unittest.TestCase):
         self.addCleanup(ledger.close)
         with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=truncated):
             with self.assertRaises(StateRefusal) as raised:
-                ledger.connect(create=True, backfill=(40_000, 0))
+                ledger.connect(create=True, backfill=(40_000, 0, 0))
         self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
+        self.assertEqual(self.user_version(), 1)
+        self.assertNotIn("price_micros", self.columns())
+        ledger.connect(create=True, backfill=(40_000, 0, 0))
+        self.assertEqual(ledger.version, SCHEMA_VERSION)
+
+    def test_a_v2_copy_failure_leaves_the_database_unchanged(self):
+        self._write(2)
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=OSError("denied")):
+            with self.assertRaises(StateRefusal) as raised:
+                ledger.connect(create=True, backfill=(40_000, 5_000, 7_000))
+        self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
+        self.assertEqual(self.user_version(), 2)
+        self.assertNotIn("admitted_incidental_per_hour_micros", self.columns())
+        self.assertNotIn("admitted_buffer_micros", self.columns())
+        self.assertEqual(self.backups(), [])
+        # The refusal is retryable and the retry upgrades in one transaction.
+        ledger.connect(create=True, backfill=(40_000, 5_000, 7_000))
+        self.assertEqual(ledger.version, SCHEMA_VERSION)
+        self.assertEqual(ledger.operation("live-op").admitted_buffer_micros, 7_000)
+        self.assertEqual(ledger.operation("old-op").settled_micros, 12_345)
+
+    def test_a_failed_upgrade_rolls_the_whole_transaction_back(self):
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        with mock.patch("ci_burst.ledger._backfilled_cost", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                ledger.connect(create=True, backfill=(40_000, 0, 0))
+        # The version-2 shape and the version-3 columns are rolled back together.
+        self.assertEqual(self.user_version(), 1)
+        self.assertNotIn("price_micros", self.columns())
+        self.assertNotIn("admitted_buffer_micros", self.columns())
         connection = sqlite3.connect(self.path)
         self.addCleanup(connection.close)
-        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
-        self.assertNotIn("price_micros", columns)
-        ledger.connect(create=True, backfill=(40_000, 0))
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 2
+        )
+        # A retry after the failure still migrates cleanly.
+        ledger.connect(create=True, backfill=(40_000, 0, 0))
         self.assertEqual(ledger.version, SCHEMA_VERSION)
+        self.assertEqual(ledger.operation("old-op").settled_micros, 3334)
 
     def test_a_refused_upgrade_can_be_retried(self):
         ledger = Ledger(self.path, clock=lambda: self.now)
@@ -332,8 +504,8 @@ class MigrationTests(unittest.TestCase):
         self.addCleanup(ledger.close)
         with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=OSError("denied")):
             with self.assertRaises(StateRefusal):
-                ledger.connect(create=True, backfill=(40_000, 0))
-        ledger.connect(create=True, backfill=(40_000, 0))
+                ledger.connect(create=True, backfill=(40_000, 0, 0))
+        ledger.connect(create=True, backfill=(40_000, 0, 0))
         self.assertEqual(ledger.version, SCHEMA_VERSION)
         self.assertEqual(ledger.operation("old-op").settled_micros, 3334)
 
@@ -345,9 +517,20 @@ class MigrationTests(unittest.TestCase):
             ledger.connect(create=True)
         self.assertEqual(raised.exception.reason, "STATE_MIGRATION_PARAMETERS_REQUIRED")
         # The refusal left the file at its original version.
-        connection = sqlite3.connect(self.path)
-        self.addCleanup(connection.close)
-        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+        self.assertEqual(self.user_version(), 1)
+
+    def test_restoring_the_backup_rolls_the_ledger_back(self):
+        self._write(2)
+        ledger = self.writable(backfill=(40_000, 5_000, 7_000))
+        self.assertEqual(ledger.version, SCHEMA_VERSION)
+        ledger.close()
+        backup = self.backups()[0]
+        shutil.copy2(backup, self.path)
+        rolled_back = Ledger(self.path, clock=lambda: self.now).connect(create=False, read_only=True)
+        self.addCleanup(rolled_back.close)
+        self.assertEqual(rolled_back.version, 2)
+        self.assertEqual(rolled_back.operation("old-op").settled_micros, 12_345)
+        self.assertIsNone(rolled_back.operation("live-op").admitted_buffer_micros)
 
 
 if __name__ == "__main__":

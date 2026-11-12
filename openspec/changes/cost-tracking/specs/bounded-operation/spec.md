@@ -11,17 +11,28 @@ making the window report the money the fleet is expected to be billed.
 
 ### Requirement: Tracked cost from launch evidence
 
-The controller MUST record the accepted request's Spot price and the provider's
-launch time for every operation and MUST compute tracked cost from them in exact
-integer micro-units. Cost MUST use a minimum billable duration of 60 seconds and
-MUST NOT exceed the operation's stored lifetime. A row without a recorded price
-MUST be costed at the configured maximum.
+The controller MUST record the accepted request's Spot price, the admitted
+incidental rate and buffer, and the provider's launch time, and MUST compute
+tracked cost from them in exact integer micro-units. Cost MUST use a 60-second
+minimum billed duration, counted once: the floored duration is the accrued
+duration and the start of the remaining commitment. Cost MUST NOT exceed the
+operation's stored lifetime.
 
 #### Scenario: A worker is launched
 - **WHEN** a request is accepted
-- **THEN** the operation stores the accepted quote's price
+- **THEN** the operation stores the accepted quote's price and the admitted incidental rate and buffer
 - **AND** the first reconcile that observes the instance stores its provider launch time
 - **AND** accrued cost grows with the seconds it has lived at that price
+
+#### Scenario: A short-lived worker is settled
+- **WHEN** an operation is billed for less than the one-minute minimum
+- **THEN** its whole cost uses the one billed minute
+- **AND** the same minute is not also charged as remaining life
+
+#### Scenario: The price or the incidental rate was not recorded
+- **WHEN** an operation has no recorded price
+- **THEN** its cost uses the higher of the configured maximum and the frozen request `MaxPrice`
+- **AND** a row without a recorded incidental rate uses the configured rate
 
 #### Scenario: The accepted price was not recorded
 - **WHEN** an operation has no recorded price
@@ -30,11 +41,12 @@ MUST be costed at the configured maximum.
 
 ### Requirement: Settlement
 
-An operation that reaches a terminal state MUST be settled exactly once and MUST
-NOT be charged again afterwards. An instance that aged out unobserved MUST be
-settled at a full configured lifetime at the operation's recorded price, or at
-the configured maximum when none was recorded; a definite pre-launch failure
-MUST settle at zero.
+An operation that reaches a terminal state MUST be settled exactly once, and a
+stored settled cost MUST NOT be rewritten by a later reconcile, retry or
+configuration change. An instance that aged out unobserved MUST be settled at a
+full configured lifetime at its recorded price, or at the frozen request
+`MaxPrice` when none was recorded. A definite pre-launch failure MUST settle at
+zero.
 
 #### Scenario: A worker terminates
 - **WHEN** a reconcile observes the instance `terminated`
@@ -44,6 +56,7 @@ MUST settle at zero.
 #### Scenario: An instance ages out unobserved
 - **WHEN** the provider no longer returns an instance after the retention window
 - **THEN** the operation is settled at its full configured lifetime
+- **AND** the settlement uses the frozen request `MaxPrice` when no price was recorded
 - **AND** it is not treated as a zero-cost launch
 
 #### Scenario: A launch is rejected before creation
@@ -53,12 +66,13 @@ MUST settle at zero.
 
 ### Requirement: Forward cost commitment
 
-Admission MUST use tracked spend plus every non-terminal operation's worst-case
-remaining cost plus the configured buffer, and MUST price a newly admitted worker
+Admission MUST use tracked spend plus each non-terminal operation's worst-case
+remaining cost plus the buffer it was admitted under, and MUST price a new worker
 at the configured maximum for its lifetime. Remaining cost MUST be priced at no
-less than the recorded accepted price, and the lifetime bound MUST come from the
-operation's durable expiry window, so a configuration change applies only to
-later operations.
+less than the accepted price and the frozen `MaxPrice`, using the
+admitted incidental rate, with its lifetime from the durable expiry window. An
+operation whose reservation exceeds what its recorded basis reproduces MUST keep
+that reservation as a floor.
 
 #### Scenario: The allowance admits fewer workers than the free slots
 - **WHEN** the window's commitment plus one worst-case worker exceeds the allowance
@@ -67,8 +81,14 @@ later operations.
 
 #### Scenario: The ceiling is lowered while a worker is alive
 - **WHEN** the configured maximum price drops below an outstanding operation's accepted price
-- **THEN** its remaining commitment stays at the accepted price
+- **THEN** its remaining commitment stays at the accepted price or the frozen request ceiling
+- **AND** a lowered configured incidental rate or buffer does not change it
 - **AND** the lowered ceiling cannot make another worker look affordable on the shortfall
+
+#### Scenario: A cost setting is edited while a worker is outstanding
+- **WHEN** the configured maximum price, incidental rate, buffer or lifetime changes
+- **THEN** an operation already admitted keeps the basis it was admitted under
+- **AND** only a later admission is priced with the new settings
 
 #### Scenario: Restart with an outstanding operation
 - **WHEN** the process restarts with a non-terminal operation
@@ -88,15 +108,19 @@ completed operation MUST be charged to the window it started in.
 
 ### Requirement: Upgrade from the reservation schema
 
-The ledger MUST upgrade a version-1 file in place, exactly once, only after
-copying it to a backup whose size matches the original. It MUST refuse without
-mutating when that copy fails or the configured cost parameters are unavailable.
-Read-only observation MUST accept the previous schema and MUST NOT create,
-migrate or replace the file. An unsupported schema version MUST be refused.
+The ledger MUST upgrade a version-1 or version-2 file in place, exactly once,
+after copying it to a size-matched backup, and MUST refuse without mutating when
+that copy or the configured parameters are unavailable. The upgrade MUST add the
+admitted incidental rate and buffer, keep settled costs and terminal admitted
+inputs untouched, and backfill non-terminal rows best-effort. Read-only
+observation MUST accept every earlier schema without writing, and rolling back
+MUST be restoring the backup.
 
 #### Scenario: The first writable run after promotion
-- **WHEN** a writable command opens a version-1 file with the configured parameters
+- **WHEN** a writable command opens a version-1 or version-2 file with the configured parameters
 - **THEN** it copies the file, upgrades the schema and backfills terminal operations
+- **AND** it records the configured incidental rate and buffer on non-terminal operations
+- **AND** a row whose request records no price settles at the configured maximum
 - **AND** the file reports the new version while the backup remains beside it
 
 #### Scenario: The backup cannot be written
@@ -105,9 +129,14 @@ migrate or replace the file. An unsupported schema version MUST be refused.
 - **AND** the file stays at its original version
 
 #### Scenario: Observation runs before the upgrade
-- **WHEN** a read-only command opens a version-1 file
+- **WHEN** a read-only command opens a version-1 or version-2 file
 - **THEN** it reports operations with cost defaults and conservative estimates
 - **AND** it does not write to the file
+
+#### Scenario: Rolling back after an upgrade
+- **WHEN** the previous release must read the ledger again
+- **THEN** the backup copy is restored in place of the upgraded file
+- **AND** the restored file reports its original version
 
 ## MODIFIED Requirements
 

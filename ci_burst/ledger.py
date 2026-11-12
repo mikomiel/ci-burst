@@ -20,10 +20,10 @@ from pathlib import Path
 from .errors import StateRefusal
 from .money import hourly_cost_micros
 
-SCHEMA_VERSION = 2
-#: Read-only commands accept the previous schema so a running deployment keeps
+SCHEMA_VERSION = 3
+#: Read-only commands accept every earlier schema so a running deployment keeps
 #: observing while the next writable run migrates the file.
-READABLE_SCHEMA_VERSIONS = (1, 2)
+READABLE_SCHEMA_VERSIONS = (1, 2, 3)
 NONTERMINAL = ("intent", "starting", "running", "terminating", "uncertain")
 TERMINAL = ("terminal", "failed")
 
@@ -54,6 +54,12 @@ class Operation:
     #: state.
     settled_micros: int | None = None
     settled_at: float | None = None
+    #: Incidental hourly rate recorded at admission, in micros. ``None`` on a
+    #: row that predates schema 3, where the configured rate applies.
+    admitted_incidental_per_hour_micros: int | None = None
+    #: Non-compute buffer recorded at admission, in micros. ``None`` on a row
+    #: that predates schema 3, where the configured buffer applies.
+    admitted_buffer_micros: int | None = None
 
     def request(self):
         return json.loads(self.request_json)
@@ -90,13 +96,17 @@ class Ledger:
 
     # -- lifecycle -----------------------------------------------------
     def connect(self, create=True, read_only=False, backfill=None):
-        """Open the ledger, upgrading a version-1 file when writing is allowed.
+        """Open the ledger, upgrading an earlier file when writing is allowed.
 
-        ``backfill`` is ``(price_micros, incidental_per_hour_micros)`` and is
-        required only to upgrade a version-1 file: historical terminal operations
-        are then settled from their recorded timestamps at that price. The caller
-        must hold the deployment writer lock before a writable connect, because
-        the upgrade copies the file and rewrites its schema.
+        ``backfill`` is ``(price_micros, incidental_per_hour_micros,
+        buffer_micros)`` and is required only to upgrade a file written by an
+        earlier schema. A version-1 file settles its terminal operations from
+        their recorded timestamps at that price and rate; the version-3 upgrade
+        records the incidental rate and buffer on every nonterminal operation.
+        That backfill is best-effort: the values are the ones configured now,
+        because the inputs admission actually used are not recoverable from the
+        file. The caller must hold the deployment writer lock before a writable
+        connect, because the upgrade copies the file and rewrites its schema.
         """
         if self._connection is not None:
             return self
@@ -119,13 +129,13 @@ class Ledger:
             if version == 0:
                 self._create_schema(connection)
                 version = SCHEMA_VERSION
-            elif version == 1:
+            elif version in (1, 2):
                 if backfill is None:
                     raise StateRefusal(
                         "STATE_MIGRATION_PARAMETERS_REQUIRED",
-                        "schema 1 needs the configured price and incidental rate",
+                        "schema %d needs the configured price, incidental rate and buffer" % version,
                     )
-                self._migrate_v1(connection, backfill)
+                self._migrate(connection, version, backfill)
                 version = SCHEMA_VERSION
             elif version != SCHEMA_VERSION:
                 raise StateRefusal("STATE_VERSION_UNSUPPORTED", f"schema {version}")
@@ -149,9 +159,9 @@ class Ledger:
     def _connect_read_only(self):
         """Open an existing ledger without creating, migrating or writing it.
 
-        The previous schema stays readable so a running deployment can keep
-        observing between promotion and the first writable run; the rows it
-        reports then carry cost defaults and are estimated conservatively.
+        The earlier schemas stay readable so a running deployment can keep
+        observing between promotion and the first writable run; the rows they
+        report then carry cost defaults and are estimated conservatively.
         """
         try:
             uri = Path(self.path).resolve().as_uri() + "?mode=ro"
@@ -191,24 +201,32 @@ class Ledger:
                 price_micros INTEGER NOT NULL DEFAULT 0,
                 launch_time REAL,
                 settled_micros INTEGER,
-                settled_at REAL
+                settled_at REAL,
+                admitted_incidental_per_hour_micros INTEGER,
+                admitted_buffer_micros INTEGER
             );
             CREATE INDEX operations_state ON operations (state);
             CREATE INDEX operations_window ON operations (reservation_window);
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             """
         )
 
-    def _migrate_v1(self, connection, backfill):
-        """Upgrade a version-1 file once, after a verified copy.
+    def _migrate(self, connection, version, backfill):
+        """Upgrade an earlier file to schema 3, once, after a verified copy.
 
-        The caller holds the deployment writer lock; this method takes no lock of
-        its own. A failed copy refuses before the first schema write, and an
-        interrupted upgrade rolls the whole transaction back, so the file stays
-        readable by the version that wrote it.
+        A version-1 file passes through the version-2 shape in the same
+        transaction: its terminal operations are settled from their recorded
+        timestamps, and every nonterminal operation of either earlier version
+        records the incidental rate and buffer supplied by the caller. Terminal
+        operations keep ``NULL`` admitted inputs and their stored
+        ``settled_micros``, so settled history is never rewritten. The caller
+        holds the deployment writer lock; this method takes no lock of its own.
+        A failed copy refuses before the first schema write, and an interrupted
+        upgrade rolls the whole transaction back, so the file stays readable by
+        the version that wrote it.
         """
-        price_micros, incidental_per_hour = backfill
-        backup = Path(str(self.path) + ".pre-v2.%d" % int(self._clock()))
+        price_micros, incidental_per_hour, buffer_micros = backfill
+        backup = Path(str(self.path) + ".pre-v3.%d" % int(self._clock()))
         try:
             shutil.copy2(self.path, backup)
             copied = backup.stat().st_size
@@ -219,23 +237,31 @@ class Ledger:
         now = self._clock()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute("ALTER TABLE operations ADD COLUMN price_micros INTEGER NOT NULL DEFAULT 0")
-            connection.execute("ALTER TABLE operations ADD COLUMN launch_time REAL")
-            connection.execute("ALTER TABLE operations ADD COLUMN settled_micros INTEGER")
-            connection.execute("ALTER TABLE operations ADD COLUMN settled_at REAL")
-            connection.execute("CREATE INDEX operations_window ON operations (reservation_window)")
-            placeholders = ",".join("?" * len(TERMINAL))
-            rows = connection.execute(
-                "SELECT id, state, created_at, updated_at, expires_at, instance_id"
-                " FROM operations WHERE state IN (%s)" % placeholders,
-                TERMINAL,
-            ).fetchall()
-            for row in rows:
-                settled = _backfilled_cost(row, price_micros, incidental_per_hour)
-                connection.execute(
-                    "UPDATE operations SET settled_micros = ?, settled_at = ? WHERE id = ?",
-                    (settled, now, row["id"]),
-                )
+            if version == 1:
+                connection.execute("ALTER TABLE operations ADD COLUMN price_micros INTEGER NOT NULL DEFAULT 0")
+                connection.execute("ALTER TABLE operations ADD COLUMN launch_time REAL")
+                connection.execute("ALTER TABLE operations ADD COLUMN settled_micros INTEGER")
+                connection.execute("ALTER TABLE operations ADD COLUMN settled_at REAL")
+                connection.execute("CREATE INDEX operations_window ON operations (reservation_window)")
+                placeholders = ",".join("?" * len(TERMINAL))
+                rows = connection.execute(
+                    "SELECT id, state, created_at, updated_at, expires_at, instance_id"
+                    " FROM operations WHERE state IN (%s)" % placeholders,
+                    TERMINAL,
+                ).fetchall()
+                for row in rows:
+                    settled = _backfilled_cost(row, price_micros, incidental_per_hour)
+                    connection.execute(
+                        "UPDATE operations SET settled_micros = ?, settled_at = ? WHERE id = ?",
+                        (settled, now, row["id"]),
+                    )
+            connection.execute("ALTER TABLE operations ADD COLUMN admitted_incidental_per_hour_micros INTEGER")
+            connection.execute("ALTER TABLE operations ADD COLUMN admitted_buffer_micros INTEGER")
+            connection.execute(
+                "UPDATE operations SET admitted_incidental_per_hour_micros = ?,"
+                " admitted_buffer_micros = ? WHERE state IN (%s)" % ",".join("?" * len(NONTERMINAL)),
+                (incidental_per_hour, buffer_micros, *NONTERMINAL),
+            )
             connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
             connection.execute("COMMIT")
         except sqlite3.DatabaseError as error:
@@ -316,14 +342,23 @@ class Ledger:
         account,
         detail="",
         price_micros=0,
+        admitted_incidental_per_hour_micros=None,
+        admitted_buffer_micros=None,
     ):
-        """Insert frozen intent; the caller owns the enclosing transaction."""
+        """Insert frozen intent; the caller owns the enclosing transaction.
+
+        A new admission passes the configured incidental rate and buffer, so the
+        operation keeps the cost assumptions it was admitted under; ``None``
+        leaves a row on the model-wide configuration, which is what an operation
+        that predates schema 3 keeps.
+        """
         connection = self._require()
         now = self._clock()
         connection.execute(
             "INSERT INTO operations (id, client_token, state, created_at, updated_at, expires_at,"
             " reservation_micros, reservation_window, region, account, request_json, request_sha256,"
-            " instance_id, detail, price_micros) VALUES (?, ?, 'intent', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            " instance_id, detail, price_micros, admitted_incidental_per_hour_micros,"
+            " admitted_buffer_micros) VALUES (?, ?, 'intent', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
             (
                 operation_id,
                 client_token,
@@ -338,6 +373,8 @@ class Ledger:
                 request_sha256,
                 detail,
                 price_micros,
+                admitted_incidental_per_hour_micros,
+                admitted_buffer_micros,
             ),
         )
         return self.operation(operation_id)
@@ -453,7 +490,7 @@ class Ledger:
         ``spend`` is the tracked cost of operations admitted in this window,
         settled where known and accrued otherwise. ``committed`` adds the
         worst-case remaining life of every non-terminal operation, in this window
-        or carried over from an earlier one, plus its configured buffer. A
+        or carried over from an earlier one, plus that operation's own buffer. A
         launch is affordable only while ``committed`` plus one worst-case worker
         stays inside the allowance, so the promise that spend cannot exceed the
         allowance survives the move from reservations to tracked cost.
@@ -474,7 +511,7 @@ class Ledger:
                 continue
             if operation.reservation_window == window_start:
                 spend += cost.accrued_micros(operation, now)
-            forward += cost.remaining_micros(operation, now) + cost.buffer_micros
+            forward += cost.remaining_micros(operation, now) + cost.buffer_for(operation)
         return {"spend": spend, "committed": spend + forward}
 
     def window_launches(self, window_start):
@@ -517,6 +554,8 @@ def _operation(row):
         launch_time=optional("launch_time"),
         settled_micros=optional("settled_micros"),
         settled_at=optional("settled_at"),
+        admitted_incidental_per_hour_micros=optional("admitted_incidental_per_hour_micros"),
+        admitted_buffer_micros=optional("admitted_buffer_micros"),
     )
 
 

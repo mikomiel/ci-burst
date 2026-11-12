@@ -543,18 +543,24 @@ topology.
 - Do not mount the directory into two containers that may run `apply`. The
   writer lock is a file lock on one host, not a distributed lock, and the
   commitment budget is local.
-- A writable run upgrades a version-1 ledger once, while holding the writer
-  lock: it copies the file to `state.sqlite3.pre-v2.<epoch>`, checks the copy's
-  size, then changes the schema in one transaction. If the copy fails it
-  refuses before the first schema write. `plan`, `status` and `export` accept
-  either version and never create or migrate the file. Rolling the image back
-  after an upgrade requires restoring that copy first, because the previous
-  release refuses the new version. The same run changes the operator-visible
-  budget shape: the JSON `budget` block reports `spend`, `committed` and
-  `remaining` instead of `consumed`, and `ci_burst_ledger_consumed_micros` is
-  replaced by `ci_burst_spend_micros` plus commitment, allowance and remaining
-  gauges. A consumer that reads the old key or series must be updated with the
-  upgrade.
+- A writable run upgrades a version-1 or version-2 ledger to schema 3 once,
+  while holding the writer lock: it copies the file to
+  `state.sqlite3.pre-v3.<epoch>`, checks the copy's size, then migrates
+  version 1 through version 2 to version 3 in one transaction. If the copy
+  fails it refuses before the first schema write, so a failed upgrade leaves the
+  file readable by the release that wrote it. Terminal operations keep their
+  stored settled cost and record no admitted cost inputs; nonterminal
+  operations record the configured incidental rate and non-compute buffer as a
+  best-effort backfill, because the inputs their admission actually used are not
+  recoverable from an earlier file. `plan`, `status` and `export` accept
+  versions 1, 2 and 3 and never create or migrate the file. Rolling the image
+  back after an upgrade requires restoring the `.pre-v3.` copy first, because
+  the previous release refuses schema 3. The version-1 upgrade also changes the
+  operator-visible budget shape: the JSON `budget` block reports `spend`,
+  `committed` and `remaining` instead of `consumed`, and
+  `ci_burst_ledger_consumed_micros` is replaced by `ci_burst_spend_micros` plus
+  commitment, allowance and remaining gauges. A consumer that reads the old key
+  or series must be updated with the upgrade.
 - `reap` never needs this directory, which is why cleanup keeps working when
   the ledger is unavailable.
 - To migrate hosts, stop admission as in rollback step 1, including the

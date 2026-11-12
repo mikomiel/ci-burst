@@ -25,9 +25,12 @@ instance type and shutdown behaviour are exactly what the controller uses.
 
 Exit codes: 0 satisfied, 2 drift, 3 the check could not run completely. An
 incomplete check takes precedence over drift: when both occur, the decision is
-``unavailable`` and exits 3, while the drift reasons are still listed. A
-missing permission, a credential failure or a session configuration failure is
-reported as ``unavailable``; it is not drift and not a pass.
+``unavailable`` and exits 3, while the drift reasons are still listed in the
+top-level ``reasons``. A record that proved drift before its own read turned
+incomplete carries those codes in ``drift_reasons`` instead, so the top-level
+``unavailable`` list never holds a drift reason. A missing permission, a
+credential failure or a session configuration failure is reported as
+``unavailable``; it is not drift and not a pass.
 """
 
 import argparse
@@ -159,12 +162,14 @@ def _call(client, method, **kwargs):
         raise ProviderCallError(_provider_code(error)) from None
 
 
-def _record(name, target, *, status="pass", facts=None, reasons=(), detail=None):
+def _record(name, target, *, status="pass", facts=None, reasons=(), drift_reasons=(), detail=None):
     record = {"check": name, "target": target, "status": status}
     if facts is not None:
         record["facts"] = facts
     if reasons:
         record["reasons"] = list(reasons)
+    if drift_reasons:
+        record["drift_reasons"] = list(drift_reasons)
     if detail:
         record["detail"] = detail
     return record
@@ -347,12 +352,16 @@ class Prerequisites:
         self._pools(checks, templates)
         checks.append(self._registration_parameter_check())
         drift = [reason for check in checks if check["status"] == "drift" for reason in check.get("reasons", [])]
+        # Drift proven before a later read failed travels in ``drift_reasons``.
+        # It is still drift for the top-level result and never an unavailable
+        # reason.
+        drift += [reason for check in checks for reason in check.get("drift_reasons", [])]
         unavailable = [
             reason for check in checks if check["status"] == "unavailable" for reason in check.get("reasons", [])
         ]
         # An incomplete check wins: a denied or unreadable read means the
         # answer is not known, even when an independent drift reason was found.
-        # The drift reasons stay in ``reasons`` so they are not lost.
+        # The drift reasons stay listed so they are not lost.
         if unavailable:
             decision = "unavailable"
         elif drift:
@@ -849,6 +858,10 @@ class Prerequisites:
             )
         instance_id = target if kind == "InstanceId" else None
         source_dest_check = None
+        # Drift proven by a read that already succeeded. It survives a later
+        # refused read by travelling as ``drift_reasons`` on the unavailable
+        # record, so the top-level result still lists it.
+        reasons = []
         try:
             if instance_id is None:
                 response = _call(
@@ -861,6 +874,8 @@ class Prerequisites:
                     )
                 interface = interfaces[0]
                 source_dest_check = interface.get("SourceDestCheck")
+                if source_dest_check is True:
+                    reasons.append("router_source_dest_check_enabled")
                 instance_id = (interface.get("Attachment") or {}).get("InstanceId")
                 if not instance_id:
                     return _record(
@@ -869,11 +884,17 @@ class Prerequisites:
                         status="unavailable",
                         facts={"source_dest_check": source_dest_check, "subnet_cidr": subnet_cidr},
                         reasons=["router_target_unresolved"],
+                        drift_reasons=reasons,
                     )
             instance_response = _call(self._clients.ec2, "describe_instances", InstanceIds=[instance_id])
         except ProviderCallError as error:
             return _record(
-                "router", target, status="unavailable", reasons=["router_read_unavailable"], detail=error.code
+                "router",
+                target,
+                status="unavailable",
+                reasons=["router_read_unavailable"],
+                drift_reasons=reasons,
+                detail=error.code,
             )
         instance = next(
             (
@@ -896,9 +917,10 @@ class Prerequisites:
                 "router", target, status="drift", facts=record_facts, reasons=["router_target_not_running"]
             )
         # AWS drops forwarded packets while source/destination checking is
-        # enabled. The interface read carries the setting; an instance target
-        # exposes the same setting through DescribeInstanceAttribute. An
-        # enabled setting is drift; a disabled one does not prove reachability.
+        # enabled. The interface read already carried the setting and recorded
+        # its drift; an instance target exposes the same setting through
+        # DescribeInstanceAttribute. An enabled setting is drift; a disabled
+        # one does not prove reachability.
         if kind == "InstanceId":
             try:
                 attribute = _call(
@@ -928,8 +950,8 @@ class Prerequisites:
                 facts=record_facts,
                 reasons=["router_source_dest_check_unavailable"],
             )
-        reasons = []
-        if source_dest_check:
+        if source_dest_check and kind == "InstanceId":
+            # The interface read recorded an enabled setting already.
             reasons.append("router_source_dest_check_enabled")
         try:
             attribute = _call(
@@ -944,7 +966,8 @@ class Prerequisites:
                 target,
                 status="unavailable",
                 facts=record_facts,
-                reasons=[*reasons, "router_user_data_unavailable"],
+                reasons=["router_user_data_unavailable"],
+                drift_reasons=reasons,
                 detail=error.code,
             )
         encoded = ((attribute.get("UserData") or {}).get("Value") or "").strip()
@@ -954,7 +977,8 @@ class Prerequisites:
                 target,
                 status="unavailable",
                 facts=record_facts,
-                reasons=[*reasons, "router_user_data_unavailable"],
+                reasons=["router_user_data_unavailable"],
+                drift_reasons=reasons,
                 detail="no user data",
             )
         try:
@@ -965,7 +989,8 @@ class Prerequisites:
                 target,
                 status="unavailable",
                 facts=record_facts,
-                reasons=[*reasons, "router_user_data_unavailable"],
+                reasons=["router_user_data_unavailable"],
+                drift_reasons=reasons,
                 detail="invalid base64",
             )
         # Only an uncommented declaration is evidence. A router that reads its
@@ -981,7 +1006,8 @@ class Prerequisites:
                 target,
                 status="unavailable",
                 facts=record_facts,
-                reasons=[*reasons, "router_forwarding_unverified"],
+                reasons=["router_forwarding_unverified"],
+                drift_reasons=reasons,
                 detail="no forwarding CIDR is declared in user data",
             )
         if subnet_cidr and subnet_cidr not in forwarded:

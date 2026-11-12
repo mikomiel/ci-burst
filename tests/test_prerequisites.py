@@ -1053,11 +1053,62 @@ class PrerequisiteTests(unittest.TestCase):
         result = self.check()
         self.assertEqual(result["decision"], "unavailable")
         self.assertEqual(prerequisites._exit_code(result["decision"]), 3)
+        self.assertIn("router_source_dest_check_enabled", result["reasons"])
+        self.assertNotIn("router_source_dest_check_enabled", result["unavailable"])
         router = self.records(result, "router")[0]
         self.assertEqual(router["status"], "unavailable")
         self.assertEqual(router["detail"], "UnauthorizedOperation")
-        self.assertIn("router_source_dest_check_enabled", router["reasons"])
-        self.assertIn("router_user_data_unavailable", router["reasons"])
+        self.assertEqual(router["drift_reasons"], ["router_source_dest_check_enabled"])
+        self.assertEqual(router["reasons"], ["router_user_data_unavailable"])
+
+    def test_interface_target_losing_the_instance_read_keeps_the_known_drift(self):
+        self.use_router(source_dest_check=True)
+        self.ec2.errors["describe_instances"] = ClientError("UnauthorizedOperation")
+        result = self.check()
+        self.assertEqual(result["decision"], "unavailable")
+        self.assertEqual(prerequisites._exit_code(result["decision"]), 3)
+        self.assertIn("router_source_dest_check_enabled", result["reasons"])
+        self.assertNotIn("router_source_dest_check_enabled", result["unavailable"])
+        router = self.records(result, "router")[0]
+        self.assertEqual(router["status"], "unavailable")
+        self.assertEqual(router["detail"], "UnauthorizedOperation")
+        self.assertEqual(router["drift_reasons"], ["router_source_dest_check_enabled"])
+        self.assertEqual(router["reasons"], ["router_read_unavailable"])
+
+    def test_router_with_an_enabled_check_and_a_missing_cidr_is_drift(self):
+        self.use_router(cidrs=("198.51.100.0/24",), source_dest_check=True)
+        result = self.check()
+        self.assertEqual(result["decision"], "drift")
+        self.assertEqual(prerequisites._exit_code(result["decision"]), 2)
+        self.assertEqual(result["unavailable"], [])
+        reasons = ["router_source_dest_check_enabled", "router_forwarding_missing_cidr"]
+        self.assertEqual(result["reasons"], reasons)
+        router = self.records(result, "router")[0]
+        self.assertEqual(router["status"], "drift")
+        self.assertEqual(router["reasons"], reasons)
+        self.assertNotIn("drift_reasons", router)
+
+    def test_router_with_an_enabled_check_and_no_user_data_keeps_the_drift(self):
+        self.use_router(source_dest_check=True, user_data="")
+        result = self.check()
+        self.assertEqual(result["decision"], "unavailable")
+        self.assertEqual(prerequisites._exit_code(result["decision"]), 3)
+        self.assertIn("router_source_dest_check_enabled", result["reasons"])
+        self.assertIn("router_user_data_unavailable", result["unavailable"])
+        self.assertNotIn("router_source_dest_check_enabled", result["unavailable"])
+        router = self.records(result, "router")[0]
+        self.assertEqual(router["status"], "unavailable")
+        self.assertEqual(router["drift_reasons"], ["router_source_dest_check_enabled"])
+        self.assertEqual(router["reasons"], ["router_user_data_unavailable"])
+
+    def test_router_with_a_non_boolean_source_dest_check_is_unavailable(self):
+        self.use_router(source_dest_check="true")
+        result = self.check()
+        self.assert_unavailable(result, "router_source_dest_check_unavailable")
+        router = self.records(result, "router")[0]
+        self.assertEqual(router["status"], "unavailable")
+        self.assertNotIn("drift_reasons", router)
+        self.assertEqual(result["reasons"], [])
 
     def test_managed_gateway_target_skips_the_router_contract(self):
         result = self.check()

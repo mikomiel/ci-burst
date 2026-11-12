@@ -337,11 +337,19 @@ to raise the run frequency or remove the lock.
 
 The cleanup host is monitored from the journal, because `reap` has no exporter,
 textfile or healthcheck. The exit status says whether systemd saw the run
-complete; the document says what that run established:
+complete; the document says what that run established. The CLI pretty-prints
+one JSON document over several lines, so asking for a single line (`-n 1`)
+shows a fragment or an unrelated systemd line. Read a bounded time window
+instead:
 
 ```sh
-journalctl -u ci-burst-reap.service -n 1 -o cat
+journalctl -u ci-burst-reap.service --since -10min -o cat
 ```
+
+That window shows the recent runs' journal output; a run's document appears in
+full because the CLI writes it when the run ends. Find it by its top-level
+`decision`, then read the `cleanup` object in the same document for that run's
+counts:
 
 - `decision: planned` with exit `0` is a dry run.
 - `decision: termination_requested` with exit `0` means the pass refused

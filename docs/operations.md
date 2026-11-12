@@ -894,11 +894,13 @@ read produces it:
 | `expired` | well-formed expired candidates in this read |
 | `requested` | identifiers actually sent to `terminate` (zero on a dry run) |
 | `refused` | malformed ownership or expiry records |
-| `denied` | requested identifiers the provider did not accept |
+| `denied` | requests whose termination was refused or could not be confirmed; every `ProviderRefusal`, including an uncertain transport outcome, counts here |
 | `unresolved` | refused, expired and still-terminating records: not confirmed gone |
 
 `requested` is not `terminated`. The `confirmation` sentence is emitted only
 when identifiers were sent, and a later read is the only evidence of removal.
+`cleanup_failed` and `unresolved` remain the conservative signals: `denied`
+alone does not distinguish a provider rejection from an unconfirmed outcome.
 
 A `cleanup` block with `inventory_verified: true` and zero counts proves only
 that one complete inventory read returned no owned records for this deployment.

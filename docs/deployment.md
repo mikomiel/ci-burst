@@ -8,7 +8,7 @@ the order in which everything is installed. The details stay with their owners:
 | --- | --- |
 | [runner-setup.md](runner-setup.md) | worker IAM role, registration credential, network placement, launch template, user data |
 | [container.md](container.md) | image build, host paths, container mounts, credential files, systemd units |
-| [operations.md](operations.md) | configuration contract, queue contract, reservation scope, identities, rollback, status semantics |
+| [operations.md](operations.md) | configuration contract, queue contract, cost scope, identities, rollback, status semantics |
 | [pilot-checklist.md](pilot-checklist.md) | the preparation record you fill in, which is not authorization |
 | [../SECURITY.md](../SECURITY.md) | the threat model and what ci-burst deliberately does not do |
 
@@ -212,6 +212,7 @@ subnet_id = "subnet-0123456789abcdef0"
 window_seconds = 86400
 allowance = "10.00"
 non_compute_allowance = "0.50"
+incidental_per_hour = "0.005"
 
 [state]
 database = "/var/lib/ci-burst/state.sqlite3"
@@ -226,6 +227,14 @@ defaults to `1`, so a deployment that omits it keeps the original one-slot
 behaviour. Raise it only after one burst is understood; the allowance still caps
 every batch, and § Fleet size and fan-out in
 [operations.md](operations.md#fleet-size-and-fan-out) owns the admission rule.
+
+`budget.allowance` caps tracked spend in the anchored window.
+`budget.incidental_per_hour` is the estimated non-compute cost of one
+instance-hour, added to tracked cost, and defaults to zero (compute only).
+`budget.non_compute_allowance` is not spend: it is the buffer added to every live
+worker's forward commitment. § Cost tracking and the allowance in
+[operations.md](operations.md#cost-tracking-and-the-allowance) owns the formulas
+and the reconciliation with the provider bill.
 
 Start with the one candidate the scaling policy authorizes. Add a
 `[[aws.availability_zones]]` table per further candidate, in priority order,

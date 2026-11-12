@@ -78,7 +78,7 @@ cleanup bounds.
 ## 6. Ownership and cleanup evidence
 
 - [ ] A plan reports the exact template, Region, ordered candidates, selected
-      zone and reservation.
+      zone, tracked spend and forward commitment.
 - [ ] A launched worker's readback shows all four ownership tags and the expiry.
 - [ ] A refused or denied cleanup stays visible and does not free its slot.
 - [ ] The operator knows that an accepted termination request is not confirmed
@@ -93,7 +93,7 @@ cleanup bounds.
 ## 8. Acceptance
 
 - [ ] One comparable job completed and its cost was recorded against the
-      reservation and the operator's expectation.
+      tracked cost and the operator's expectation.
 - [ ] Abrupt instance loss was reconciled; Forgejo, not ci-burst, decided the
       job result.
 - [ ] No On-Demand fallback, automatic retry or manufactured success occurred.

@@ -12,8 +12,8 @@ scheduler:
 
 - Forgejo owns job assignment, dependencies, retries and CI results.
 - AWS owns instance lifecycle and billing.
-- ci-burst owns launch intent, ownership metadata and a conservative local
-  reservation.
+- ci-burst owns launch intent, ownership metadata and a conservative forward
+  cost commitment.
 
 The source ships an annotated release tag (`v0.1.0`) but no published image,
 deployment or live-qualified Forgejo contract. A green validation run proves
@@ -172,9 +172,10 @@ cumulative counters kept separately from the expiring per-instance records, so
 they do not fall when an instance ages out of the provider's record window or
 when a record is pruned. `ci_burst_worker_unregistered_total` counts workers
 that ended without ever showing the registration marker; evidence observed once
-is never un-learned by a later empty console. `ci_burst_ledger_*` series come
-from the read-only ledger and are omitted — with a `ledger_omitted` note in the
-JSON result — when it cannot be read.
+is never un-learned by a later empty console. `ci_burst_spend_micros`, `ci_burst_committed_micros`,
+`ci_burst_allowance_micros` and `ci_burst_remaining_micros` come from the
+read-only ledger, are gauges in micro-units, and are omitted — with a
+`ledger_omitted` note in the JSON result — when it cannot be read.
 `ci_burst_export_last_run_timestamp_seconds` is what a consumer uses to detect a
 stopped exporter.
 
@@ -424,116 +425,137 @@ Accepted risk, stated plainly:
   of `[worker].labels` alone still lets Forgejo assign a cloud-only job to a
   worker launched for pool congestion, because the worker keeps registering the
   label; taking it out of the bootstrap alone leaves the controller counting
-  cloud-only demand and spending reservations on a worker that cannot take those
+  cloud-only demand and committing cost to a worker that cannot take those
   jobs. Both sets change together, with the new template version this repository
   requires for any bootstrap change, and this section and the deployment example
   are the owners that record it.
 
-## Budget and reservations
+## Cost tracking and the allowance
 
-Before a launch, ci-burst computes an exact reservation in micro-units:
+Tracked cost is an estimate of what the fleet will be billed, in exact
+micro-units, not a provider invoice. Each operation records the Spot price of the
+request that was accepted and, on the first reconcile that observes the instance,
+the provider's launch time. Its cost is computed per second:
 
 ```
-reservation = ceil(max_spot_price * max_lifetime_seconds / 3600)
-            + non_compute_allowance
+cost = ceil(price * billable_seconds / 3600)
+     + ceil(incidental_per_hour * billable_seconds / 3600)
+billable_seconds = clamp(max(60, end - launch_time), 0, max_lifetime_seconds)
 ```
 
-Every worker in a batch reserves this same `per_launch` amount, so a batch of N
-launches needs `N × per_launch` of the current window's remaining allowance. The
-configured limit caps the batch; the allowance can cap it first.
+`price` is the accepted quote. A row without one — created before this ledger
+schema, or whose write was lost — uses `max_spot_price`, which over-states but
+never under-states. The 60-second floor is the provider's per-instance minimum.
+`incidental_per_hour` covers public IPv4 and EBS and defaults to zero: set it to
+the deployment's rates, or leave it zero and track compute only.
 
-`budget.remaining_after` in a decision still subtracts one worker's reservation,
-kept for compatibility with consumers that predate the fleet. The batch headroom
-is `per_launch_reservation × launch_count`, not `remaining_after`.
+Admission does not use accrued cost alone. For every non-terminal operation the
+controller commits:
 
-A launch is refused unless the selected candidate has a fresh Spot quote for the
-configured instance type and its availability zone, was observed no longer ago
-than `price_max_age_seconds`, and is not above `max_spot_price`. Freshness is the
-age of the **observation**: a Spot price records when it last *changed*, and a
-price that has been stable for hours is still current, so the provider's own
-timestamp is carried as evidence rather than used as the bound. Every configured
-candidate is priced in order; one whose quote is missing, stale, out of scope or
-above the ceiling is skipped and the next candidate is considered, so one
-expensive zone does not refuse a launch another configured zone can serve. The
-quote response must identify its own availability zone, instance type and
-`Linux/UNIX` product; missing metadata is not replaced with the requested scope.
-The reservation is computed from `max_spot_price`, never from an observed quote,
-and the current window must still have `allowance` left after it. The window is
-anchored at a multiple of `window_seconds`. Outstanding operations carry their
-reservation into later windows; a completed operation is charged to the window
-it started in. A **definite** provider rejection releases the reservation,
-because the provider proved that no instance was created; an uncertain outcome,
-or a rejected retry, keeps it until the intent is resolved. Requesting
-termination does not refund consumed allowance, and a restart does not reset it.
+```
+commitment = accrued cost
+           + ceil(remaining_price * remaining_seconds / 3600)
+           + ceil(incidental_per_hour * remaining_seconds / 3600)
+           + non_compute_allowance
+remaining_seconds = max(0, lifetime_seconds - elapsed)
+remaining_price = max(max_spot_price, accepted_price or 0)
+lifetime_seconds = max(60, ceil(expires_at - created_at))
+```
 
-The reservation estimates compute at the configured maximum price for the
-configured lifetime, plus the configured non-compute allowance. It does not
-bound EBS, data transfer, public addressing, log delivery, minimum billing
-increments, Spot price changes after launch, or resources left by failed
-cleanup. It is not a guaranteed cap on the AWS bill, and no status, lifetime or
+so a newly admitted worker commits `max_spot_price * max_lifetime +
+incidental_per_hour * max_lifetime + non_compute_allowance` — the earlier
+reservation plus the incidental term, which is zero unless configured — and that
+commitment shrinks every second it lives. The accepted price is a floor on `remaining_price`: lowering
+`max_spot_price` below a live operation's accepted price does not shrink that
+operation's commitment, because it still settles at the accepted price. The
+lifetime comes from the operation's own durable expiry window, so lowering
+`max_lifetime_seconds` applies to the next launch and never shortens a worker
+that is already admitted. A batch is affordable while the window's `spend` plus the forward
+commitment plus one new worker's worst case stays inside `allowance`:
+
+```
+affordable = (allowance - committed) // per_launch
+```
+
+`spend` is the settled cost of completed operations plus the accrued cost of
+operations still running; `committed` is `spend` plus the forward commitment.
+
+An operation settles once, when a reconcile observes its instance `terminated`.
+An instance that disappears before the provider retention window settles at a
+full configured lifetime at the price the launch was accepted at (the configured
+maximum when no price was recorded). That price keeps the settlement inside the
+commitment the operation carried while unresolved; settling at the maximum would
+charge more than admission reserved. A definite pre-launch rejection settles zero, and a
+settled or failed operation is never charged again. A restart does not reset the
+window.
+
+The unspent part of a commitment is released as the operation ages and fully
+released when it settles, so a one-job worker that exits after ten minutes stops
+reserving its full lifetime. That is the only release this accounting makes:
+money already spent stays counted, and a completed operation is charged to the
+window it started in. An accepted launch stays charged even if the instance
+never reaches `running`, and an uncertain outcome keeps its commitment until the
+intent is resolved.
+
+Tracked cost does not bound EBS, data transfer, public IPv4 beyond the configured
+rate, AMI and snapshot storage, log delivery, minimum billing increments, Spot
+price changes after launch, or resources left by failed cleanup. It is an
+estimate and not a guaranteed cap on the AWS bill, and no status, lifetime or
 alert in this project should be described as one.
+
+### Reconciling with the provider bill
+
+The provider's cost report is the billing reference, not this estimate. Compare
+a completed day's final `ci_burst_spend_micros` (the last sample before the
+window rolls) with the account's EC2 usage for that day. A difference is
+expected from data transfer, storage and price movement; a large or persistent
+difference means `incidental_per_hour` or `max_spot_price` does not describe the
+deployment. The product carries no billing permission, so the comparison is an
+operator read, not a controller call.
 
 ### Sizing the window
 
-Every launch the controller admits reserves the configured maximum price ×
-lifetime plus the non-compute allowance, and that reservation is charged to an
-**anchored** window: boundaries are floored from the epoch at a multiple of
-`window_seconds`, and outstanding operations carry into later windows. It is not
-a trailing period, so the end of one window and the start of the next are two
-budgets that can be spent back to back around the boundary.
+The window is anchored at a multiple of `window_seconds` from the epoch, not a
+trailing period, so the end of one window and the start of the next are two
+budgets that can be spent back to back. What carries between windows is the
+forward commitment of every non-terminal operation: a worker that started before
+the boundary and is still running keeps blocking admission in the new window
+until it settles, while its spend stays charged to the window it started in.
 
-A batch of N workers reserves N times the per-launch amount in one tick. The
-same allowance therefore admits `allowance // per_launch` launches per anchored
-window, whether they are admitted one tick at a time or several per tick up to
-`controller.max_instances`. That is a bound per window, not per rolling hour or
-per day: a full batch just before a boundary and another just after can reserve
-up to twice the allowance across the pair of windows. Size the allowance from
-launches per configured window; "per day" is the same statement only when
-`window_seconds` is 86400.
+The allowance admits roughly `allowance // per_launch` workers **at any
+instant**, not per window: as workers settle, their unspent commitment returns
+and later launches become affordable. A window can therefore settle far more
+than `allowance // per_launch` operations while its `spend` stays under
+`allowance`. "Per day" is the same statement only when `window_seconds` is 86400.
 
 "Per dispatch" is not a safe unit either. The controller admits a launch whenever
 eligible demand remains and a slot is free, so one dispatched workflow with
-several eligible jobs can spend several reservations as its one-job workers
-finish. Only a workload with an established one-launch-per-dispatch shape can be
-sized by dispatches; every other deployment is sized by admitted launches.
+several eligible jobs can spend several launches as its one-job workers finish.
 
-Which attempts stop charging is narrow:
-
-- a **proven rejection before creation** releases its reservation;
-- an **accepted launch** keeps its reservation even if the instance never
-  reaches `running` or dies during startup, because the provider may have created
-  and billed something;
-- an uncertain outcome keeps it until the intent is resolved.
-
-So a window can be exhausted without a job ever running — accepted launches that
-failed to start, or attempts left uncertain. That is the guard being
-conservative on purpose rather than a defect.
-
-Worked example from the pilot: a `0.1200` maximum price with a one-hour lifetime
-and a `0.50` non-compute allowance reserves `0.62` per launch, so a `5.00` window
-admits eight (`8 × 0.62 = 4.96`; a ninth would need `5.58`). One evening of
-shared-pool launches plus five capacity rejections from before the release rule
-consumed exactly that, and every cycle then refused with
-`budget_allowance_exhausted` until the window rolled.
+Worked example: a `0.1200` maximum price, a one-hour lifetime, a `0.0500`
+non-compute allowance and a `0.0050` incidental rate commit `0.1750` per new
+worker. A `5.00` window admits 28 workers at once (`28 * 0.175 = 4.90`); if each
+lives about ten minutes it settles near `0.025` each, so the window can settle
+far more than 28 launches while `spend` stays under `5.00`.
 
 ## Fleet size and fan-out
 
 Admission is demand-driven. One tick computes a batch size from three bounds:
 
 ```
-launches = min(waiting jobs, free slots, affordable reservations)
+launches = min(waiting jobs, free slots, affordable workers)
 ```
 
 - **Waiting jobs** is the eligible demand in the qualified queue observation.
 - **Free slots** is `controller.max_instances` minus the non-terminal owned
   operations in the ledger. An intent, starting, running, terminating or
   uncertain worker occupies a slot; a terminal or failed one does not.
-- **Affordable reservations** is `(allowance - consumed) // per_launch` for the
-  current anchored window, with `per_launch` as defined in § Budget and
-  reservations.
+- **Affordable workers** is `(allowance - committed) // per_launch` for the
+  current anchored window, with `committed` and `per_launch` as defined in
+  § Cost tracking and the allowance.
 
 A zero bound is not an error. No free slot waits with `slot_busy`, no demand waits
-with `no_runnable_demand`, and no affordable reservation refuses with
+with `no_runnable_demand`, and no affordable worker refuses with
 `budget_allowance_exhausted`. When the allowance allows fewer launches than both
 demand and free slots, the batch is capped and the decision carries the
 `budget_capped_batch` note. `plan` reports the same `demand`, `free_instances`
@@ -554,11 +576,12 @@ earlier candidates as `skipped` (`spot_price_stale`), and walks its own candidat
 order only on a definite capacity rejection.
 
 The worker contract stays one job per worker. An idle worker waits for one job
-until its own maximum lifetime, then shuts down and terminates; the reservation
-was charged when it launched and that termination does not refund it. Fan-out
-therefore trades reserved allowance for readiness: N workers can take N jobs at
-once, and a worker that never gets a job still costs up to its configured
-lifetime.
+until its own maximum lifetime, then shuts down and terminates. Its forward
+commitment is released only when it settles, so an idle worker keeps its worst
+case committed for as long as it lives, and money already spent is never
+refunded. Fan-out therefore trades committed allowance for readiness: N workers
+can take N jobs at once, and a worker that never gets a job still costs up to its
+configured lifetime.
 
 If any worker in the batch ends in anything other than an accepted launch, the
 controller stops the batch and leaves the workers already launched in place. It
@@ -591,7 +614,7 @@ cannot be read or is unusable refuses the plan with `template_unusable` and
 `template_error` rather than dropping that candidate.
 
 `apply` admits a batch of at most `controller.max_instances` workers, sized by
-waiting demand, free slots and affordable reservations (§ Fleet size and
+waiting demand, free slots and affordable workers (§ Fleet size and
 fan-out). Each worker in the batch is its own admission, with its own frozen
 request, ledger operation, client token and reservation; the batch stops as soon
 as one worker is not accepted. Within one worker, if the provider definitely
@@ -780,9 +803,9 @@ a registered runner, a ready runner or a successful job. When the provider is
 unavailable or cleanup cannot be confirmed, status reports the unresolved
 operation and failure; it never reports clean completion, a successful job or
 zero residual cost. It also reports the configured `controller.max_instances`,
-the anchored window's `allowance`, `consumed` and `launches`, the number of
-`busy_instances`, and the `hourly_ceiling` at that limit
-(`max_spot_price × max_instances`).
+the anchored window's `allowance`, `spend`, `committed`, `remaining` and
+`launches`, the number of `busy_instances`, and the `hourly_ceiling` at that
+limit (`(max_spot_price + incidental_per_hour) × max_instances`).
 
 ## Supported limits
 

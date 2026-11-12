@@ -351,10 +351,10 @@ class LaunchFallbackTests(MultiZoneCase):
         self.assertEqual(operation.instance_id, "i-0123456789abcdef0")
         self.assertEqual(operation.request()["Placement"]["AvailabilityZone"], "eu-central-1b")
         self.assertEqual(operation.client_token, runs[1]["ClientToken"])
-        # One admission: a single reservation, counted once.
+        # One admission: one forward commitment, counted once.
         self.assertEqual(operation.reservation_micros, 540_000)
         window = current_window(self.clock.now, config.budget.window_seconds)
-        self.assertEqual(ledger.consumed_micros(window), 540_000)
+        self.assertEqual(ledger.window_totals(window, controller.cost, self.clock.now)["committed"], 540_500)
 
     def test_each_candidate_is_attempted_at_most_once_in_order(self):
         config = self.config(
@@ -455,7 +455,8 @@ class LaunchFallbackTests(MultiZoneCase):
         # Nothing was created, so the admission releases its allowance instead
         # of charging the window for an attempt that never reached the provider.
         window = current_window(self.clock.now, controller.config.budget.window_seconds)
-        self.assertEqual(self.reopened().consumed_micros(window), 0)
+        totals = self.reopened().window_totals(window, controller.cost, self.clock.now)
+        self.assertEqual(totals["committed"], 0)
 
     def test_an_uncertain_first_attempt_does_not_fall_through(self):
         controller = self.build(

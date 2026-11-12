@@ -204,17 +204,53 @@ class ExporterTests(unittest.TestCase):
         ledger.close()
         exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
         result = self.run_export(exporter)
-        self.assertEqual(result["ledger_consumed_micros"], 0)
-        self.assertIn("ci_burst_ledger_consumed_micros", self.metrics.read_text())
+        self.assertEqual(result["spend_micros"], 0)
+        self.assertEqual(result["committed_micros"], 0)
+        self.assertIn("ci_burst_spend_micros", self.metrics.read_text())
         self.assertNotIn("ledger_omitted", result["notes"])
+
+    def test_ledger_commitment_is_reported(self):
+        from ci_burst.ledger import Ledger, current_window
+
+        path = self.root / "state" / "state.sqlite3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ledger = Ledger(path, clock=lambda: NOW)
+        ledger.acquire_writer()
+        ledger.connect()
+        with ledger.transaction():
+            ledger.new_operation(
+                operation_id="op-1",
+                client_token="ci-burst-op-1",
+                request={"seed": True},
+                request_sha256="0" * 64,
+                expires_at=NOW + 3600,
+                reservation_micros=540_000,
+                window_start=current_window(NOW, 86400),
+                region="eu-central-1",
+                account="111122223333",
+                price_micros=20_000,
+            )
+        ledger.set_state("op-1", "running", instance_id="i-0123456789abcdef0")
+        ledger.close()
+        exporter = self.build(
+            [instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT}
+        )
+        result = self.run_export(exporter, now=NOW + 600)
+        # 600 seconds at the accepted 0.02 price; the commitment adds the
+        # remaining life at the configured cap plus the buffer.
+        self.assertEqual(result["spend_micros"], 3_334)
+        self.assertGreater(result["committed_micros"], result["spend_micros"])
+        self.assertEqual(result["allowance_micros"], 10_000_000)
+        self.assertIn("ci_burst_committed_micros", self.metrics.read_text())
 
     def test_absent_ledger_is_reported_not_fatal(self):
         exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
         result = self.run_export(exporter)
-        self.assertIsNone(result["ledger_consumed_micros"])
+        self.assertIsNone(result["spend_micros"])
+        self.assertIsNone(result["committed_micros"])
         self.assertIn("ledger_omitted", result["notes"])
         text = self.metrics.read_text()
-        self.assertNotIn("ci_burst_ledger_consumed_micros", text)
+        self.assertNotIn("ci_burst_spend_micros", text)
         self.assertIn("ci_burst_worker_launches_total", text)
 
     def test_console_cap_refuses_more_live_workers_than_the_configured_limit(self):

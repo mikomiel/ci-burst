@@ -10,8 +10,9 @@ public project licensed under GPL-3.0-only.
   from an operator-prepared, pinned launch template while the queue has work and
   the budget allows it.
 - Keeps Forgejo as the only scheduler and job-result authority.
-- Persists launch intent, ownership and a conservative local reservation
-  before every cloud request.
+- Persists launch intent, ownership, the accepted Spot price and a conservative
+  forward cost commitment before every cloud request, and settles each worker's
+  tracked cost when it terminates.
 - Defaults to observation; requires an explicit apply to launch, and offers an
   independent expiry-cleanup path that never launches.
 - Turns the console of the workers it owns into deduplicated events and a
@@ -43,7 +44,7 @@ python -m ci_burst reap   --config deployment.toml [--apply]
 
 A minimal configuration is in [docs/operations.md](docs/operations.md), which
 also owns the queue contract, the worker image/template contract, labels,
-reservation scope, identities, rollback and status semantics. To build the
+cost scope, identities, rollback and status semantics. To build the
 operator-owned worker prerequisites, including the IAM role, SSM parameter and
 bootstrap, follow [docs/runner-setup.md](docs/runner-setup.md). Once those exist, the
 [deployment walkthrough](docs/deployment.md) sequences the control-plane

@@ -3,14 +3,16 @@ import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from ci_burst.config import load
 from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment
+from ci_burst.credit import CreditSpecification
 from ci_burst.errors import ConfigRefusal, DeadlineRefusal, ProviderRefusal, StateRefusal
-from ci_burst.aws import DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
+from ci_burst.aws import Aws, DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
 from ci_burst.ledger import Ledger, current_window
 from ci_burst.money import format_money
 
@@ -254,6 +256,170 @@ class PlanTests(ControllerCase):
         result = self.build(observation=observation_demand()).plan()
         self.assertIn("does not bound EBS", result["cost_scope"])
         self.assertIn("not a guaranteed cap", result["cost_scope"])
+        self.assertIn("surplus CPU credits", result["cost_scope"])
+
+
+class CreditEvidenceTests(ControllerCase):
+    """Burstable CPU credits are reported evidence, never a pricing control."""
+
+    def test_burstable_candidate_reports_the_unlimited_default(self):
+        result = self.build(observation=observation_demand()).plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": True,
+                "mode": "unlimited",
+                "mode_source": "aws-default",
+                "surplus_credits": "unquantified",
+            },
+        )
+        self.assertEqual(result["selected"]["credit"], result["candidates"][0]["credit"])
+
+    def test_template_credit_specification_outranks_the_default(self):
+        aws = FakeAws(
+            template_facts=template(credit_specification=CreditSpecification(present=True, value="standard")),
+            spot_quote=quote(clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(result["candidates"][0]["credit"]["mode"], "standard")
+        self.assertEqual(result["candidates"][0]["credit"]["mode_source"], "template")
+
+    def test_unrecognized_template_credit_specification_is_not_the_default(self):
+        # The template set a value, so reporting the family default here would
+        # invent evidence about a launch the provider would refuse.
+        aws = FakeAws(
+            template_facts=template(credit_specification=CreditSpecification(present=True, value="burst")),
+            spot_quote=quote(clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": True,
+                "mode": None,
+                "mode_source": "template-unrecognized",
+                "surplus_credits": "unknown",
+            },
+        )
+        self.assertEqual(result["selected"]["credit"], result["candidates"][0]["credit"])
+
+    def test_adapter_output_with_an_invalid_template_mode_is_not_the_default(self):
+        # The plan reads the template through the adapter, so this exercises
+        # the adapter's own parse of a provider response: an over-long value is
+        # present but not representable, and it must not become the default.
+        now = self.clock.now
+
+        class Client:
+            def describe_instances(self, **kwargs):
+                return {"Reservations": []}
+
+            def describe_launch_template_versions(self, **kwargs):
+                return {
+                    "LaunchTemplateVersions": [
+                        {
+                            "LaunchTemplateId": "lt-adapter",
+                            "VersionNumber": 3,
+                            "LaunchTemplateData": {
+                                "ImageId": "ami-0123456789abcdef0",
+                                "InstanceType": "t4g.small",
+                                "InstanceInitiatedShutdownBehavior": "terminate",
+                                "UserData": "AAAA",
+                                "CreditSpecification": {"CpuCredits": "x" * 40},
+                            },
+                        }
+                    ]
+                }
+
+            def describe_spot_price_history(self, **kwargs):
+                return {
+                    "SpotPriceHistory": [
+                        {
+                            "InstanceType": "t4g.small",
+                            "AvailabilityZone": "eu-central-1a",
+                            "ProductDescription": "Linux/UNIX",
+                            "SpotPrice": "0.020000",
+                            "Timestamp": datetime.fromtimestamp(now, timezone.utc),
+                        }
+                    ]
+                }
+
+        aws = Aws(self.config, client=Client(), clock=self.clock)
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": True,
+                "mode": None,
+                "mode_source": "template-unrecognized",
+                "surplus_credits": "unknown",
+            },
+        )
+
+    def test_non_burstable_candidate_reports_not_applicable(self):
+        aws = FakeAws(
+            template_facts=template(instance_type="m7g.xlarge"),
+            spot_quote=quote(instance_type="m7g.xlarge", clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": False,
+                "mode": None,
+                "mode_source": "not-applicable",
+                "surplus_credits": "not-applicable",
+            },
+        )
+
+    def test_non_burstable_candidate_reports_a_pinned_template_mode(self):
+        aws = FakeAws(
+            template_facts=template(
+                instance_type="m7g.xlarge",
+                credit_specification=CreditSpecification(present=True, value="standard"),
+            ),
+            spot_quote=quote(instance_type="m7g.xlarge", clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": False,
+                "mode": "standard",
+                "mode_source": "template",
+                "surplus_credits": "not-applicable",
+            },
+        )
+
+    def test_unknown_family_reports_unknown_instead_of_guessing(self):
+        aws = FakeAws(
+            template_facts=template(instance_type="z9.medium"),
+            spot_quote=quote(instance_type="z9.medium", clock=self.clock),
+        )
+        result = self.build(observation=observation_demand(), aws=aws).plan()
+        self.assertEqual(
+            result["candidates"][0]["credit"],
+            {
+                "burstable": None,
+                "mode": None,
+                "mode_source": "unknown",
+                "surplus_credits": "unknown",
+            },
+        )
+
+    def test_credit_evidence_does_not_change_pricing_or_the_launch_request(self):
+        controller = self.build(observation=observation_demand())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        run = [call for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(run), 1)
+        request = run[0][1]
+        self.assertNotIn("CreditSpecification", json.dumps(request))
+        self.assertNotIn("CpuCredits", json.dumps(request))
+        self.assertEqual(request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"], "0.040000")
+        self.assertEqual(result["price"]["price_display"], "0.020000")
+        self.assertEqual(result["reservation_micros"], controller.cost.per_launch_micros())
 
 
 class ApplyTests(ControllerCase):

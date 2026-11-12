@@ -43,9 +43,13 @@ the image and the fleet cannot drift silently. The current image carries
    `IMAGE_READY` on the serial console:
 
    ```sh
-   { printf 'export RUFF_VERSION=0.17.4\n'; cat deploy/runner/image/provision.sh; } \
+   sed '1a export RUFF_VERSION=0.17.4' deploy/runner/image/provision.sh \
      > /tmp/worker-image-user-data.sh
    ```
+
+   Keep the `#!/bin/bash` shebang on line 1; the inserted `export` must follow
+   it, or cloud-init runs the user data with `/bin/sh` and the recipe's process
+   substitution fails.
 
    Use the persistent fleet's current `ruff_version`; 0.17.4 is the source pin,
    0.17.3 reproduces the current image. The script prints `STEP` markers and a

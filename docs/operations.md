@@ -192,14 +192,20 @@ One JSON object per line:
 ```json
 {"id":"i-0123456789abcdef0:step:register","ts":"2026-11-11T16:55:17Z","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"step","step":"register"}
 {"id":"i-0123456789abcdef0:exit:0","ts":"...","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"exit","rc":0}
+{"id":"i-0123456789abcdef0:job-process:failed:42","ts":"...","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"job-process","outcome":"failed","rc":42}
 ```
 
 `event` is `step` (a step name from the shipped script's fixed set), `exit`
-(`bootstrap exiting rc=N`) or `error`, where `kind` is one of `forgejo_ping`,
-`ssm_timeout`, `apt_failed`, `register_failed` or `runner_error`. No console
-text is published: a failure line contributes its kind only. The console is not
-a trusted channel, and truncation is not redaction — read the raw line with the
-provider CLI when you need it.
+(`bootstrap exiting rc=N`), `job-process` (`bootstrap one-job <outcome> rc=N`,
+where `outcome` is one of `completed`, `failed` or `timeout`) or `error`, where
+`kind` is one of `forgejo_ping`, `ssm_timeout`, `apt_failed`, `register_failed`
+or `runner_error`. The `job-process` event and the `exit` marker describe the
+worker process lifecycle and never the Forgejo job result: a runner can exit 0
+after a job that failed, so no success metric or job verdict is derived from
+them and the job result stays with Forgejo. No console text is published: a
+failure line contributes its kind only. The console is not a trusted channel,
+and truncation is not redaction — read the raw line with the provider CLI when
+you need it.
 
 The file is replaced atomically on each run rather than appended to in place, so
 a collector must open it by path and must not hold a descriptor across runs; that
@@ -315,20 +321,15 @@ is therefore accepted and counted defensively — a server that starts returning
 it is not treated as an unknown status — but no live record has been observed
 and a deployment cannot qualify against one.
 
-The `labels` query narrows the observation deliberately; it is not a server
-requirement. In the v17.0.1 handler (`routers/api/v1/shared/runners.go`, tag
-`v17.0.1`) the label slice starts empty and, when no `labels` parameter is
-supplied, stays empty; an empty slice admits every `waiting` or `running` job.
-An absent parameter therefore returns the runnable set as a list when eligible
-jobs exist, and `null` otherwise. `null` is the handler's empty result (a nil
-slice) when nothing matched: an explicit filter with no match, or an empty
-queue. This adapter always sends the worker's bare label names (the part before
-the executor suffix, so `strong-ci` for `strong-ci:host`) and reads `null` as
-an empty queue. Omitting the filter would widen the observation to every
-runnable job in the repository, so the explicit request is a requirement of
-this adapter, not evidence that the server needs it. The filter is a union
-prefilter, so a job selected by one shared label is still compared against its
-complete `runs_on` set above; it never substitutes for that comparison.
+The `labels` query is mandatory, not an optimisation: the server applies no
+label filter when it is absent and admits every waiting or running job in the
+repository. The adapter sends the worker's bare label names (the part before the
+executor suffix, so `strong-ci` for `strong-ci:host`) and reads `null` as an
+empty queue, because the server marshals an empty selection — a filter that
+matches nothing, or no waiting or running job at all — as `null`. The filter is
+a union prefilter, so a job selected by one shared label is still compared
+against its complete `runs_on` set above; it never substitutes for that
+comparison.
 
 Attempts are deduplicated by `handle`. A retry is a new handle and remains
 distinguishable. ci-burst never assigns, requeues or reserves a job, and it does
@@ -350,23 +351,47 @@ To qualify a deployment, the operator must, with an owner-scoped read token:
 3. record the evidence with the deployment;
 4. only then set `qualification = "live-verified"`.
 
-This change separates two kinds of evidence. The recorded observation is
-deployment evidence from one deployment running `forgejo 17.0.1+gitea-1.22.0`,
-not the upstream contract: `runs_on` holds bare label names (`strong-ci`,
-`homelab`), an absent `labels` parameter returned `null` in that record, a
-non-matching filter also returns `null`, and the filter is a union over the
-job's labels. This change verified the handler above from source rather than
-from that record: it treats `null` as the empty result and admits every
-`waiting` or `running` job when the parameter is absent. The recorded `null` is
-therefore the empty result — consistent with no eligible job at that moment —
-and it does not establish a different contract. No live unfiltered request is
-claimed for this change: the absent-parameter reading above comes from the
-handler, not from a new observation. Statuses observed in one run
-(`mikolajm/ai-agents` run 25336, 2026-11-10): a job waiting for a runner
-reports `waiting` and still lists the dependency that already succeeded, while
-a dependent job reports `blocked` until it does. A changed response shape or a
+Observed on `forgejo 17.0.1+gitea-1.22.0`: `runs_on` holds bare label names
+(`strong-ci`, `homelab`), a non-matching filter returns `null`, and the filter
+is a union over the job's labels. Statuses observed in one run
+(`mikolajm/ai-agents` run 25336, 2026-11-10): a job waiting for a runner reports
+`waiting` and still lists the dependency that already succeeded, while a
+dependent job reports `blocked` until it does. A changed response shape or a
 different Forgejo version needs a new contract identifier, not a
 re-declaration; correcting how the adapter reads an unchanged shape does not.
+
+#### Replayable contract reading
+
+`tests/fixtures/forgejo/contract.json` is the versioned contract reading. It
+names the pinned upstream project and tag (`forgejo` `v17.0.1`), the handler
+(`GetActionRunJobs` in `routers/api/v1/shared/runners.go`), the response record,
+the request variant behind every fixture in `tests/fixtures/forgejo/`, and the
+demand, counters, notes or refusal the parser must produce for it. Each fixture
+is marked as a shape the pinned handler can emit or as a defensive shape that
+only exercises the parser. The manifest states that it is a reading of the
+source, not a live observation: no server, request, token or credential produced
+it. The reading shows that the handler selects only `waiting` and `running`
+jobs, and that an absent `labels` parameter applies no filter at all, so the
+response can list every waiting and running job in the repository rather than
+`null`.
+
+`tests/test_forgejo.py` replays every fixture through the real observer and
+compares the result with the manifest. The matrix therefore proves the parser's
+classification against the pinned contract — including shapes the endpoint does
+not emit — and that the adapter always sends an explicit, non-empty `labels`
+parameter. It proves nothing about a running server.
+
+Only an isolated operator canary can establish live compatibility: a
+repository-scoped ephemeral runner registers, takes exactly one job to
+completion and exits, and an idle worker expires without taking a job. The
+canary must record the exact Forgejo server version and the exact runner version
+it ran. This change ran no server and no runner, and the matrix does not set
+`qualification = "live-verified"`.
+
+Requalification is required when either recorded version changes, or when a
+server returns a response shape no fixture pins. A changed shape or a different
+Forgejo version needs a new contract identifier and a new manifest reading;
+passing the matrix does not re-qualify a server the operator has not run.
 
 ## Worker image and launch template
 

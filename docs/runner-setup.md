@@ -304,6 +304,15 @@ approved version is never edited in place
 ([operations.md § Worker image and launch template](operations.md#worker-image-and-launch-template)
 owns that rule).
 
+The bootstrap reports the one-job runner process with exactly one bounded marker
+— `bootstrap one-job completed rc=0`, `bootstrap one-job failed rc=<n>` or
+`bootstrap one-job timeout rc=<n>` (124 or 137) — and then exits with that
+status, so the `bootstrap exiting rc=<n>` line is truthful. These markers
+describe the worker process lifecycle and never the Forgejo job result: a runner
+can exit 0 after a job that failed, and the job's verdict stays with Forgejo.
+[operations.md § Worker evidence](operations.md#worker-evidence) owns how the
+exporter reads them.
+
 `one-job` polls the queue once. When nothing is queued it exits with
 `Error: no task received`; that is the expected empty-queue result, not a broken
 runner. `one-job -w` (`--wait`) blocks until Forgejo assigns a task. Trigger the

@@ -167,6 +167,15 @@ generated shape (above) and records the status itself. It always changes a
 sensitive path, so the merge policy never auto-merges it: a maintainer merges
 it.
 
+A version names a release, not a working copy. Between releases `pyproject.toml`
+and `ci_burst/__init__.py` carry the last released version, and that is the
+documented development-snapshot policy: an unreleased build is identified by its
+commit SHA, never by a version suffix such as `-dev` or a post-release increment.
+A source fix does not bump the version by hand; the next release pull request
+owns that value, and `tests/test_release_state.py` fails when the manifest,
+`pyproject.toml`, `ci_burst/__init__.py` and the newest released `CHANGELOG.md`
+section disagree.
+
 `release-please-config.json` and `.release-please-manifest.json` are part of
 the release boundary. The workflow authenticates as the fine-grained personal
 access token stored in the `RELEASE_PLEASE_TOKEN` secret; the default

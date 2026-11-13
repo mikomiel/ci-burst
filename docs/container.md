@@ -419,7 +419,10 @@ To freeze the serving image without stopping observation, write
 fetches the channel ref but skips the build and promotion, and the state document
 reports `pinned` with the distance behind. The installed unit sets the logical
 `CI_BURST_TARGET` (`controller`; the cleanup drop-in sets `reaper`), so the
-document never carries a hostname.
+document never carries a hostname. The channel observation is a separate
+`source-sha` marker written only after a successful fetch; until it exists the
+document reports unknown source freshness rather than inferring one from
+`FETCH_HEAD`.
 
 To roll back, follow the "Rollback" procedure below: it disables the timer and
 stops the service under the refresh lock before retagging, so an in-flight run

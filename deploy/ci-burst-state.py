@@ -82,11 +82,16 @@ def _image_label(image, name):
     return result.stdout.strip()
 
 
-def _git_ref_time(source, reference):
-    result = _run(["git", "-C", source, "rev-parse", "--git-path", reference])
-    if result is None or result.returncode != 0:
-        return 0
-    return _file_time(os.path.join(source, result.stdout.strip()))
+def read_observation(state_dir):
+    """The channel SHA and its observation time, from the success marker only.
+
+    ``FETCH_HEAD`` is bookkeeping that a failed fetch can still rewrite, so it
+    is never a freshness source. Absence of the marker is represented as an
+    empty ref and a zero timestamp; the document then reports unknown source
+    freshness rather than inventing one.
+    """
+    marker = os.path.join(state_dir, "source-sha")
+    return _sha(marker), _file_time(marker)
 
 
 def _drift(source, revision, units, unit_dir):
@@ -184,16 +189,7 @@ def main(argv=None):
     arguments = parser.parse_args(argv)
 
     now = arguments.now if arguments.now is not None else int(time.time())
-    source_file = os.path.join(arguments.state_dir, "source-sha")
-    source_ref = _sha(source_file)
-    source_checked_at = _file_time(source_file)
-    if not source_ref:
-        for reference in ("FETCH_HEAD", "refs/remotes/origin/main"):
-            result = _run(["git", "-C", arguments.source, "rev-parse", reference])
-            if result is not None and result.returncode == 0 and result.stdout.strip():
-                source_ref = result.stdout.strip()
-                source_checked_at = _git_ref_time(arguments.source, reference)
-                break
+    source_ref, source_checked_at = read_observation(arguments.state_dir)
     artifact_id = _image_id(arguments.image)
     deployed_ref = _image_label(arguments.image, REVISION_LABEL)
     deployed_version = _image_label(arguments.image, VERSION_LABEL)

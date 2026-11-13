@@ -104,6 +104,15 @@ class DeploymentStateTests(unittest.TestCase):
             path.write_text("not-a-sha\n")
             self.assertEqual(state._sha(str(path)), "")
 
+    def test_a_missing_observation_marker_is_not_inferred_from_fetch_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            (root / ".git" / "FETCH_HEAD").write_text("b" * 40 + "\n")
+            self.assertEqual(state.read_observation(directory), ("", 0))
+            (root / "source-sha").write_text("a" * 40 + "\n")
+            self.assertEqual(state.read_observation(directory)[0], "a" * 40)
+
     def test_a_failed_git_show_is_visible_as_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             drift = state._drift(directory, "a" * 40, ["ci-burst-apply.service"], directory)

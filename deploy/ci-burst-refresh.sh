@@ -1,11 +1,16 @@
 #!/bin/sh
 # Deploy the current ci-burst main to this host as the ci-burst image.
 #
-# One run compares the deployed commit with origin/main and does nothing when
-# they match. Otherwise it builds the image from a tar archive of exactly that
-# commit (never from the working tree, so an edited checkout cannot be deployed
-# under a clean commit's name), smoke-tests the candidate, and only then moves
-# the tag the scheduled units resolve.
+# One run compares the deployed commit with origin/main and promotes nothing
+# when they match. Otherwise it builds the image from a tar archive of exactly
+# that commit (never from the working tree, so an edited checkout cannot be
+# deployed under a clean commit's name), smoke-tests the candidate, and only
+# then moves the tag the scheduled units resolve.
+#
+# A run that has proven the serving image is the promoted one also reconciles
+# this host's build tags: one sha-<12> tag per merged commit accumulates at about
+# 150 MB each, which is how a 7.8 GB host ran out of disk. The retained set and
+# the deletion order are documented at the retention step below.
 #
 # The smoke run is one execution from the candidate against this host's own
 # configuration and its own credentials, and it must complete with a decision
@@ -57,6 +62,23 @@ UNITS=${CI_BURST_UNITS:-"ci-burst-apply.service ci-burst-apply.timer ci-burst-re
 
 log() { printf 'ci-burst-refresh: %s\n' "$*"; }
 
+# The build label every image this script builds carries. Retention uses it to
+# scope the dangling-image prune to this product's builds.
+REVISION_LABEL=org.opencontainers.image.revision
+# How many of the most recent sha-<12> builds to keep, in addition to every tag a
+# rollback or the deployment-state document can still name. The number is a host
+# property, so it is an explicit variable rather than a tuned constant: 0 keeps
+# only the named tags, and a value outside 0-99 is a configuration error that
+# refuses before anything is built, not one that silently keeps everything.
+RETAIN_BUILDS=${CI_BURST_RETAIN_BUILDS:-3}
+case "$RETAIN_BUILDS" in
+    0|[1-9]|[1-9][0-9]) ;;
+    *)
+        log "retained_builds_invalid: ${RETAIN_BUILDS}"
+        exit 2
+        ;;
+esac
+
 # podman renders `.Id` with and without the `sha256:` prefix depending on the
 # engine build, so normalise it once, before it becomes a path component, a
 # record field or a comparison. A full digest gains the prefix; any other form
@@ -98,6 +120,139 @@ case "$SMOKE_COMMAND" in
 esac
 
 
+# --- image tag retention -----------------------------------------------------
+# Every merged commit leaves one more localhost/ci-burst:sha-<12> tag, at about
+# 150 MB. Nothing removed them until this step existed, and a host with a 7.8 GB
+# root disk filled after about forty-five builds. Deleting a build is the only
+# irreversible act in this script, so the step is deliberately narrow:
+#
+#   * it runs only when this run has proven the serving image is the promoted
+#     one - the promote path, or the already-current path - never before the
+#     serving tag has moved;
+#   * it removes only sha-<12> tags this deployment created, and only those
+#     outside the retained set;
+#   * the retained set is latest, previous (the only rollback handle), the
+#     sha-<12> of the deployed ref recorded on this host, the sha-<12> of every
+#     40-hex ref the deployment-state document names, and the most recent
+#     RETAIN_BUILDS builds;
+#   * a tag whose image cannot be inspected is kept and reported: an unreadable
+#     engine is not evidence that the tag is disposable;
+#   * a refusal changes neither the exit status nor the promotion, because the
+#     serving image is already correct. The log line is the durable signal.
+
+retained_tag_suffixes() {
+    printf '%s\n' latest previous
+    deployed=$(cat "$STATE/deployed-sha" 2>/dev/null || true)
+    if [ "${#deployed}" -eq 40 ]; then
+        case "$deployed" in
+            *[!0-9a-f]*) ;;
+            *) printf 'sha-%s\n' "$(printf '%s' "$deployed" | cut -c1-12)" ;;
+        esac
+    fi
+    state_document=$STATE/deployment-state.json
+    [ -f "$state_document" ] || return 0
+    # The document names commits, never tags, and its shape is owned elsewhere.
+    # Only a full 40-hex string is read as a ref; every other value is ignored
+    # rather than interpreted, so a document change cannot widen what survives.
+    python3 - "$state_document" <<'PY' 2>/dev/null || true
+import json
+import re
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        document = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit(0)
+
+
+def strings(value):
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from strings(item)
+    elif isinstance(value, str):
+        yield value
+
+
+for value in strings(document):
+    if re.fullmatch(r"[0-9a-f]{40}", value):
+        print(f"sha-{value[:12]}")
+PY
+}
+
+reconcile_image_tags() {
+    work=$(mktemp -d 2>/dev/null) || {
+        log 'retention_failed: cannot create a work directory'
+        return 0
+    }
+    kept=$work/kept
+    builds=$work/builds
+    retained_tag_suffixes >"$kept" 2>/dev/null || : >"$kept"
+
+    if ! podman images --format '{{.Tag}}' "$IMAGE" >"$work/tags" 2>/dev/null; then
+        log 'retention_failed: cannot list the image tags'
+        rm -rf "$work"
+        return 0
+    fi
+
+    untagged=0
+    unverified=0
+    while IFS= read -r tag; do
+        # Only this deployment's immutable build tags are candidates. The shape
+        # check also keeps a malformed tag out of a podman argument.
+        case "$tag" in
+            sha-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) continue ;;
+        esac
+        if grep -Fqx "$tag" "$kept" 2>/dev/null; then
+            continue
+        fi
+        created=$(podman image inspect --format '{{.Created}}' "$IMAGE:$tag" 2>/dev/null) || created=
+        if [ -z "$created" ]; then
+            log "retention_kept: $tag cannot be inspected"
+            unverified=$((unverified + 1))
+            continue
+        fi
+        printf '%s|%s\n' "$created" "$tag" >>"$builds"
+    done <"$work/tags"
+
+    if [ -f "$builds" ]; then
+        # Newest first: the retained window is the last N builds, not the first N
+        # tags the engine happened to list.
+        sort -r "$builds" | tail -n "+$((RETAIN_BUILDS + 1))" >"$work/drop"
+        while IFS='|' read -r created tag; do
+            [ -n "$tag" ] || continue
+            if podman untag "$IMAGE:$tag" >/dev/null 2>&1; then
+                untagged=$((untagged + 1))
+            else
+                log "retention_failed: cannot untag $IMAGE:$tag"
+                unverified=$((unverified + 1))
+            fi
+        done <"$work/drop"
+    fi
+
+    if [ "$untagged" -gt 0 ]; then
+        # Untagging frees no bytes on its own: the build becomes a dangling image
+        # that still owns its layers. The label filter keeps this prune to images
+        # this build produced, so an unrelated dangling image is not touched.
+        if podman image prune -f --filter "label=$REVISION_LABEL" >/dev/null 2>&1; then
+            log "retention: untagged $untagged builds and pruned dangling images"
+        else
+            log "retention_failed: untagged $untagged builds, prune refused"
+        fi
+    else
+        log 'retention: nothing to remove'
+    fi
+    if [ "$unverified" -gt 0 ]; then
+        log "retention: kept $unverified tags unverified"
+    fi
+    rm -rf "$work"
+}
+# --- end image tag retention -------------------------------------------------
+
 install -d -m 0700 "$STATE"
 exec 9>"$STATE/refresh.lock"
 if ! flock -n 9; then
@@ -131,6 +286,7 @@ if [ "$want" = "$recorded" ]; then
     serving=$(podman image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE:latest" 2>/dev/null || true)
     if [ "$serving" = "$want" ]; then
         log "current: $want"
+        reconcile_image_tags
         exit 0
     fi
     # A rollback retags an older image without rewriting deployed-sha. The
@@ -598,3 +754,4 @@ podman rmi "$IMAGE:candidate" >/dev/null 2>&1 || true
 printf '%s\n' "$want" >"$STATE/deployed-sha.tmp"
 mv "$STATE/deployed-sha.tmp" "$STATE/deployed-sha"
 log "promoted: $want"
+reconcile_image_tags

@@ -486,6 +486,20 @@ What a promotion does and does not do:
   `localhost/ci-burst:previous`. That is the rollback handle for the first
   refresh too, when the serving image is a hand-built one with no `sha-<12>` tag
   of its own;
+- after the serving tag has moved, it removes the build tags it no longer owes.
+  Every merged commit used to leave one `sha-<12>` tag at about 150 MB forever,
+  which filled a 7.8 GB host; the retained set is `latest`, `previous`, the tag
+  of the deployed commit recorded on the host, the tag of every 40-hex ref the
+  deployment-state document names, and the most recent `CI_BURST_RETAIN_BUILDS`
+  builds (default 3, ordered by image creation time). Only `sha-<12>` tags this
+  deployment created are candidates, a tag whose image cannot be inspected is
+  kept and reported, and the step runs only where a run has proven the serving
+  image is the promoted one — the promote path, or the already-current path so a
+  failed cleanup is retried. It logs `retention: untagged <n> builds …`,
+  `retention: nothing to remove`, `retention_kept: <tag> cannot be inspected` or
+  `retention_failed: …`. A refusal changes neither the exit status nor the
+  promotion: the serving image is already correct, and the log line is the
+  durable signal;
 - it records the deployed commit in `/var/lib/ci-burst-image/deployed-sha`, and
   writes an authoritative build record after the smoke passes and before
   `latest` moves, at

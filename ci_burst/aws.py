@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .credit import CreditSpecification
-from .errors import ProviderRefusal
+from .errors import DeadlineRefusal, ProviderRefusal
 from .money import parse_money
 
 MANAGED_TAG = "ci-burst:managed"
@@ -41,6 +41,11 @@ MAX_CREDIT_SPECIFICATION_CHARS = 32
 #: client token. Botocore's transparent retries would hide that a launch may
 #: already have been sent, so the client is built without them.
 RETRY_POLICY = {"total_max_attempts": 1, "mode": "standard"}
+
+#: Transport bounds for one provider call. They stop a stalled connection or
+#: response from consuming the pass budget; retry counts stay unchanged.
+CONNECT_TIMEOUT_SECONDS = 10
+READ_TIMEOUT_SECONDS = 30
 
 #: Only these client error codes prove that RunInstances did not create an
 #: instance. Everything else -- throttling, service errors, unknown codes --
@@ -186,16 +191,29 @@ class Aws:
         self._session_cache = boto3.Session(profile_name=self._config.aws.profile)
         return self._session_cache
 
+    def _client_config(self):
+        """The one client configuration: guarded SDK import plus transport bounds."""
+        return _sdk_config(
+            connect_timeout=CONNECT_TIMEOUT_SECONDS,
+            read_timeout=READ_TIMEOUT_SECONDS,
+        )
+
     def _client(self):
         if self._client_cache is not None:
             return self._client_cache
-        config = _sdk_config()
+        # Resolve the guarded configuration first: a checkout without the SDK
+        # must refuse here, before the session is touched.
+        config = self._client_config()
         self._client_cache = self._session().client(
             "ec2",
             region_name=self._config.aws.region,
             config=config,
         )
         return self._client_cache
+
+    def _check_deadline(self, deadline, detail):
+        if deadline is not None and self._clock() >= deadline:
+            raise DeadlineRefusal(detail)
 
     def _call(self, method, **kwargs):
         client = self._client()
@@ -208,7 +226,7 @@ class Aws:
         """Return the AWS account the configured credential route reaches."""
         if self._account_cache is not None:
             return self._account_cache
-        config = _sdk_config()
+        config = self._client_config()
         sts = self._session().client("sts", region_name=self._config.aws.region, config=config)
         try:
             response = sts.get_caller_identity()
@@ -260,7 +278,8 @@ class Aws:
             credit_specification=_credit_specification(data),
         )
 
-    def spot_quote(self, instance_type, availability_zone):
+    def spot_quote(self, instance_type, availability_zone, *, deadline=None):
+        self._check_deadline(deadline, "Spot price read")
         start = datetime.fromtimestamp(self._clock() - self._config.aws.price_max_age_seconds, timezone.utc)
         response = self._call(
             "describe_spot_price_history",
@@ -276,13 +295,14 @@ class Aws:
             self._clock(),
         )
 
-    def owned_instances(self, deployment):
+    def owned_instances(self, deployment, *, deadline=None):
         filters = [
             {"Name": "tag:" + MANAGED_TAG, "Values": ["true"]},
             {"Name": "tag:" + DEPLOYMENT_TAG, "Values": [deployment]},
         ]
         items, token, pages = [], None, 0
         while True:
+            self._check_deadline(deadline, "DescribeInstances page")
             arguments = {"Filters": filters}
             if token:
                 arguments["NextToken"] = token
@@ -295,7 +315,7 @@ class Aws:
             if pages >= MAX_INVENTORY_PAGES:
                 raise ProviderRefusal("AWS_INVENTORY_INCOMPLETE", "DescribeInstances pagination limit reached")
 
-    def instances(self, instance_ids):
+    def instances(self, instance_ids, *, deadline=None):
         """Read the named instances, establishing absence per identifier.
 
         An EC2 by-ID read is rejected for the whole batch when any one
@@ -315,6 +335,7 @@ class Aws:
         identifiers = list(instance_ids)
         if not identifiers:
             return []
+        self._check_deadline(deadline, "DescribeInstances by-id read")
         client = self._client()
         try:
             response = client.describe_instances(InstanceIds=identifiers)
@@ -323,6 +344,7 @@ class Aws:
                 raise _translate_read(error) from None
             found = []
             for instance_id in identifiers:
+                self._check_deadline(deadline, "DescribeInstances by-id read")
                 try:
                     response = client.describe_instances(InstanceIds=[instance_id])
                 except Exception as member:  # noqa: BLE001 - classified below
@@ -333,7 +355,7 @@ class Aws:
             return found
         return _instances(response)
 
-    def console_output(self, instance_ids):
+    def console_output(self, instance_ids, *, deadline=None):
         """Read each owned instance's console once, bounded.
 
         The SDK presents ``Output`` as plaintext (the EC2 model declares it a
@@ -347,6 +369,7 @@ class Aws:
         """
         consoles = {}
         for instance_id in instance_ids:
+            self._check_deadline(deadline, "GetConsoleOutput read")
             try:
                 response = self._client().get_console_output(InstanceId=instance_id, Latest=True)
             except Exception as error:  # noqa: BLE001 - classified below
@@ -376,7 +399,7 @@ class Aws:
         return self._call("terminate_instances", InstanceIds=list(instance_ids))
 
 
-def _sdk_config():
+def _sdk_config(**overrides):
     """Build the client configuration, refusing when the runtime SDK is absent.
 
     The lazy import guard belongs at every entry point that needs an SDK type,
@@ -387,7 +410,7 @@ def _sdk_config():
         from botocore.config import Config
     except ImportError:
         raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
-    return Config(retries=RETRY_POLICY)
+    return Config(retries=RETRY_POLICY, **overrides)
 
 
 def _translate(error):

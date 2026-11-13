@@ -6,12 +6,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from ci_burst.aws import Aws, _definite_launch_error, _instances, _spot_quote, is_capacity_failure
+from ci_burst.aws import (
+    CONNECT_TIMEOUT_SECONDS,
+    READ_TIMEOUT_SECONDS,
+    Aws,
+    _definite_launch_error,
+    _instances,
+    _spot_quote,
+    is_capacity_failure,
+)
 from ci_burst.config import load
 from ci_burst.credit import CreditSpecification
-from ci_burst.errors import ProviderRefusal
+from ci_burst.errors import DeadlineRefusal, ProviderRefusal
 
-from support import write_config
+from support import Clock, write_config
 
 
 def history(price, timestamp, zone="eu-central-1a", instance_type="t4g.small", product="Linux/UNIX"):
@@ -200,12 +208,15 @@ class InstanceParsingTests(unittest.TestCase):
 
 
 class FakeClient:
-    def __init__(self):
+    def __init__(self, on_call=None):
         self.calls = []
         self.responses = []
+        self.on_call = on_call
 
     def _respond(self, name, kwargs):
         self.calls.append((name, kwargs))
+        if self.on_call is not None:
+            self.on_call(name, kwargs)
         return self.responses.pop(0)
 
     def describe_instances(self, **kwargs):
@@ -219,6 +230,9 @@ class FakeClient:
 
     def run_instances(self, **kwargs):
         return self._respond("run_instances", kwargs)
+
+    def get_console_output(self, **kwargs):
+        return self._respond("get_console_output", kwargs)
 
 
 class AdapterTests(unittest.TestCase):
@@ -248,6 +262,38 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaises(ProviderRefusal) as raised:
             self.aws().owned_instances("test-deployment")
         self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+
+    def test_inventory_stops_before_the_next_page_at_the_deadline(self):
+        clock = Clock()
+        client = FakeClient(on_call=lambda name, kwargs: clock.advance(10))
+        client.responses = [
+            {"Reservations": [], "NextToken": "page-2"},
+            {"Reservations": []},
+        ]
+        aws = Aws(self.config, client=client, clock=clock)
+        with self.assertRaises(DeadlineRefusal) as raised:
+            aws.owned_instances("test-deployment", deadline=clock.now + 5)
+        self.assertEqual(raised.exception.reason, "pass_deadline_exceeded")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_a_read_without_a_deadline_still_consumes_every_page(self):
+        self.client.responses = [
+            {"Reservations": [{"Instances": [{"InstanceId": "i-1"}]}], "NextToken": "page-2"},
+            {"Reservations": [{"Instances": [{"InstanceId": "i-2"}]}]},
+        ]
+        instances = self.aws().owned_instances("test-deployment", deadline=None)
+        self.assertEqual([item.instance_id for item in instances], ["i-1", "i-2"])
+        self.assertEqual(len(self.client.calls), 2)
+
+    def test_console_reads_stop_before_the_next_identifier_at_the_deadline(self):
+        clock = Clock()
+        client = FakeClient(on_call=lambda name, kwargs: clock.advance(10))
+        client.responses = [{"Output": "first"}]
+        aws = Aws(self.config, client=client, clock=clock)
+        with self.assertRaises(DeadlineRefusal) as raised:
+            aws.console_output(["i-1", "i-2"], deadline=clock.now + 5)
+        self.assertEqual(raised.exception.reason, "pass_deadline_exceeded")
+        self.assertEqual([call[1]["InstanceId"] for call in client.calls], ["i-1"])
 
     def test_owned_inventory_refuses_a_response_without_reservations(self):
         self.client.responses = [{}]
@@ -421,6 +467,8 @@ class AdapterTests(unittest.TestCase):
         ):
             Aws(self.config)._client()
         self.assertEqual(recorded["config"].kwargs["retries"]["total_max_attempts"], 1)
+        self.assertEqual(recorded["config"].kwargs["connect_timeout"], CONNECT_TIMEOUT_SECONDS)
+        self.assertEqual(recorded["config"].kwargs["read_timeout"], READ_TIMEOUT_SECONDS)
         self.assertEqual(recorded["service"], "ec2")
         self.assertEqual(recorded["region"], "eu-central-1")
 
@@ -550,6 +598,7 @@ class AdapterTests(unittest.TestCase):
         from unittest import mock
 
         sessions = []
+        configs = []
 
         boto3_module = types.ModuleType("boto3")
 
@@ -558,6 +607,7 @@ class AdapterTests(unittest.TestCase):
                 sessions.append(profile_name)
 
             def client(self, service, region_name=None, config=None):
+                configs.append(config)
                 if service == "sts":
                     class STS:
                         def get_caller_identity(self):
@@ -583,6 +633,10 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(aws.account_id(), "111122223333")
             aws._client()
         self.assertEqual(len(sessions), 1)
+        self.assertEqual(len(configs), 2)
+        for config in configs:
+            self.assertEqual(config.kwargs["connect_timeout"], CONNECT_TIMEOUT_SECONDS)
+            self.assertEqual(config.kwargs["read_timeout"], READ_TIMEOUT_SECONDS)
 
     def test_no_read_is_made_for_an_empty_instance_list(self):
         self.assertEqual(self.aws().instances([]), [])

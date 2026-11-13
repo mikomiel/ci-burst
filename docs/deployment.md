@@ -216,6 +216,9 @@ labels = ["cloud-ci:host", "strong-ci:host", "linux-arm64:host"]
 # Optional, integer 1..12, default 1. A worker launched for one job occupies one
 # slot until it terminates.
 max_instances = 4
+# Optional pass budget in seconds, integer 30..290, default 240. It ends one
+# apply pass with headroom below the shipped unit's TimeoutStartSec=300.
+pass_deadline_seconds = 240
 
 [aws]
 region = "eu-central-1"
@@ -251,6 +254,22 @@ defaults to `1`, so a deployment that omits it keeps the original one-slot
 behaviour. Raise it only after one burst is understood; the allowance still caps
 every batch, and § Fleet size and fan-out in
 [operations.md](operations.md#fleet-size-and-fan-out) owns the admission rule.
+
+`controller.pass_deadline_seconds` is optional: it bounds one `apply` pass to
+`30..290` seconds and defaults to `240`. The accepted range stays below the
+shipped unit's `TimeoutStartSec=300`, so a pass that reaches its budget can
+return `refused` with `pass_deadline_exceeded` and `phases_deferred` instead of
+being killed at the unit's outer bound. The connect (10 s) and read (30 s)
+transport timeouts bound a transport step, not a whole response or the whole
+pass, so a read already in flight is allowed to return and the next check
+reports the overrun. A deployment that needs a longer pass must raise the
+unit's `TimeoutStartSec`; `pass_deadline_seconds` is not offered above `290`.
+The pass budget is not the worker lifetime: `aws.max_lifetime_seconds` bounds
+the instance itself, and with the shipped defaults the order is
+`240 < 300 < 3600`. `reap`, `status` and `export` are not bounded by it.
+§ Scheduler, cleanup and rollback in
+[operations.md](operations.md#scheduler-cleanup-and-rollback) owns the full
+relation to the systemd unit and the transport timeouts.
 
 `budget.allowance` caps tracked spend in the anchored window.
 `budget.incidental_per_hour` is the estimated non-compute cost of one

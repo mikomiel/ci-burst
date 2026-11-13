@@ -9,6 +9,27 @@ The version, this file and the release tag are maintained by
 conventional commits on `main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases)
 owns the release boundary. Do not edit a released section by hand.
 
+## [0.4.0](https://github.com/mikomiel/ci-burst/compare/v0.3.0...v0.4.0) (2026-11-13)
+
+
+### Added
+
+* **aws:** bound provider reads and report an interrupted pass ([#118](https://github.com/mikomiel/ci-burst/issues/118)) ([278d10b](https://github.com/mikomiel/ci-burst/commit/278d10b226885ac4f2e6ea503d5a779b43f07655))
+* **cost:** report burstable CPU-credit exposure in plan evidence ([#115](https://github.com/mikomiel/ci-burst/issues/115)) ([87f1bfb](https://github.com/mikomiel/ci-burst/commit/87f1bfbebe2b42625f0e29161274ca04e0212260))
+* **deploy:** record immutable build inputs for built artefacts ([#116](https://github.com/mikomiel/ci-burst/issues/116)) ([76d4d3a](https://github.com/mikomiel/ci-burst/commit/76d4d3aaa13c6326902254109d1b22102d8c7178))
+
+
+### Fixed
+
+* **aws:** refuse a malformed inventory instead of reading it as empty ([#120](https://github.com/mikomiel/ci-burst/issues/120)) ([2831d2b](https://github.com/mikomiel/ci-burst/commit/2831d2bf7c1e3756aa3b49f959ba3159e2e70b47))
+* **aws:** resolve a mixed not-found instance batch per identifier ([#103](https://github.com/mikomiel/ci-burst/issues/103)) ([01b3204](https://github.com/mikomiel/ci-burst/commit/01b320440cf467367ea3c823d876421521758213))
+* **cleanup:** report a degraded cleanup result and its evidence ([#106](https://github.com/mikomiel/ci-burst/issues/106)) ([d0cecff](https://github.com/mikomiel/ci-burst/commit/d0cecff8e6e7e8b60fcdb30e351f7d4ac8d0e0a8))
+* **controller:** refuse a foreign deployment scope and report batch headroom ([#105](https://github.com/mikomiel/ci-burst/issues/105)) ([019091c](https://github.com/mikomiel/ci-burst/commit/019091cef0886b5635ade80b6291863e01327bf8))
+* **cost:** freeze admitted cost inputs and bill the minimum once ([#111](https://github.com/mikomiel/ci-burst/issues/111)) ([4f4717d](https://github.com/mikomiel/ci-burst/commit/4f4717d6c900b385f76708d381a067765f823b8b))
+* **export:** observe bounded evidence during a supported drain ([#112](https://github.com/mikomiel/ci-burst/issues/112)) ([cf14861](https://github.com/mikomiel/ci-burst/commit/cf14861aedd8e2791e52f497f591aeb4779e76f5))
+* **prerequisites:** treat an enabled source-destination check as drift ([#104](https://github.com/mikomiel/ci-burst/issues/104)) ([5c39db3](https://github.com/mikomiel/ci-burst/commit/5c39db38d7e8b81724e6864703d6f13389b89532))
+* **worker:** preserve the one-job process result through cleanup ([#110](https://github.com/mikomiel/ci-burst/issues/110)) ([8a83e98](https://github.com/mikomiel/ci-burst/commit/8a83e988a755ff1836797e38c333a8dfb3f87277))
+
 ## [0.3.0](https://github.com/mikomiel/ci-burst/compare/v0.2.0...v0.3.0) (2026-11-12)
 
 

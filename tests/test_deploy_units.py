@@ -386,7 +386,7 @@ class RefreshBehaviourTests(unittest.TestCase):
             '  *" rev-parse "*) printf "%s\\n" "$CI_BURST_TEST_WANT"; exit 0 ;;\n'
             '  *" archive "*) out= ; prev= ;\n'
             '    for a in "$@"; do [ "$prev" = "--output" ] && out=$a; prev=$a; done\n'
-            '    tar -cf "$out" -C "$CI_BURST_TEST_REPO" deploy; exit 0 ;;\n'
+            '    tar -cf "$out" -C "$CI_BURST_TEST_REPO" Dockerfile deploy; exit 0 ;;\n'
             "  *) exit 0 ;;\n"
             "esac",
         )
@@ -556,6 +556,9 @@ class RefreshBehaviourTests(unittest.TestCase):
         (repository / "ci_burst").mkdir()
         marker = repository / "ci_burst" / "marker.py"
         marker.write_text("committed\n", encoding="utf-8")
+        (repository / "Dockerfile").write_text(
+            (ROOT / "Dockerfile").read_text(encoding="utf-8"), encoding="utf-8"
+        )
         self._git(repository, "init", "--quiet", "--initial-branch=main")
         self._git(repository, "add", ".")
         self._git(

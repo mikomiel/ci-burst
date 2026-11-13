@@ -155,7 +155,13 @@ retained_tag_suffixes() {
         printf 'sha-%s\n' "$(printf '%s' "$deployed" | cut -c1-12)"
     fi
     state_document=$STATE/deployment-state.json
-    [ -f "$state_document" ] || return 0
+    # Only a genuinely absent path is an absent protection list. A directory, a
+    # device or a dangling symlink at that path exists and cannot be read, so it
+    # fails this function rather than silently authorising deletion.
+    if [ ! -e "$state_document" ] && [ ! -L "$state_document" ]; then
+        return 0
+    fi
+    [ -f "$state_document" ] || return 1
     # The document names commits, never tags, and its shape is owned elsewhere.
     # Only a full 40-hex string is read as a ref. A document that exists but
     # cannot be read fails here rather than returning an empty set: an unreadable

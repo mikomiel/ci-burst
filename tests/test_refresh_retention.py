@@ -185,7 +185,14 @@ class EngineHarness(unittest.TestCase):
 
     def untagged(self):
         return [
-            line.split()[2]
+            line.split()[1]
+            for line in self.calls.read_text().splitlines()
+            if line.startswith("untag ")
+        ]
+
+    def untag_calls(self):
+        return [
+            line.split()
             for line in self.calls.read_text().splitlines()
             if line.startswith("untag ")
         ]
@@ -268,6 +275,22 @@ class RetentionFunctionTests(EngineHarness):
         self.assertEqual(self.untagged(), [])
         self.assertIn(f"sha-{OLD[:12]}", self.host_tags())
 
+    def test_a_state_document_that_is_a_directory_removes_nothing(self):
+        (self.state / "deployment-state.json").mkdir()
+        done = self.run_block(retained=0)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("retention_failed: cannot read the retained refs", done.stdout)
+        self.assertEqual(self.untag_calls(), [])
+        self.assertEqual(self.prunes(), [])
+
+    def test_a_dangling_state_document_symlink_removes_nothing(self):
+        (self.state / "deployment-state.json").symlink_to(self.state / "missing.json")
+        done = self.run_block(retained=0)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("retention_failed: cannot read the retained refs", done.stdout)
+        self.assertEqual(self.untag_calls(), [])
+        self.assertEqual(self.prunes(), [])
+
     def test_a_corrupted_deployed_ref_removes_nothing(self):
         (self.state / "deployed-sha").write_text("not-a-commit\n")
         done = self.run_block(retained=0)
@@ -285,11 +308,16 @@ class RetentionFunctionTests(EngineHarness):
     def test_every_untag_names_one_full_reference(self):
         # podman treats each argument as an image name: a bare repository name
         # removes every name on that image, `latest` and `previous` included.
-        self.run_block(retained=0)
-        for line in self.calls.read_text().splitlines():
-            if line.startswith("untag "):
-                with self.subTest(line=line):
-                    self.assertIn(":", line.split()[1])
+        (self.state / "deployed-sha").write_text("e" * 40 + "\n")
+        done = self.run_block(retained=0)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        calls = self.untag_calls()
+        self.assertGreaterEqual(len(calls), 1, calls)
+        for call in calls:
+            with self.subTest(call=call):
+                # Exactly one operand, and it is a full repository:tag name.
+                self.assertEqual(len(call), 2, call)
+                self.assertRegex(call[1], r"^localhost/ci-burst:sha-[0-9a-f]{12}$")
         self.assertFalse((self.root / "untag-bulk").exists())
 
     def test_an_evicted_image_is_pruned_and_an_unrelated_one_survives(self):

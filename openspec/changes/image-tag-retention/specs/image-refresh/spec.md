@@ -46,6 +46,10 @@ A retained ref that exists but cannot be read MUST stop deletion for that run an
 - **WHEN** the recorded deployed ref is not a 40-hex commit
 - **THEN** the run removes nothing and logs a retention failure
 
+#### Scenario: A state path that is not a readable document
+- **WHEN** the deployment-state path exists but is a directory, a device or a dangling symlink
+- **THEN** the run removes nothing, prunes nothing and logs a retention failure
+
 ### Requirement: Pruning is owned and retryable
 The prune MUST filter on this deployment's own build label and MUST run on every pass that reaches retention, so a refused prune is retried even when that pass removed no tag.
 

@@ -150,6 +150,8 @@ class EngineHarness(unittest.TestCase):
             "  untag)\n"
             '    shift\n'
             '    for name in "$@"; do\n'
+            f'      if [ -f {self.root / "untag-fail"} ] && '
+            f'grep -Fqx "${{name##*:}}" {self.root / "untag-fail"}; then exit 1; fi\n'
             '      case "$name" in\n'
             '        *:*)\n'
             f'          removed=${{name##*:}}\n'
@@ -327,6 +329,19 @@ class RetentionFunctionTests(EngineHarness):
         self.assertNotIn("a" * 64, self.dangling_ids())
         self.assertNotIn("b" * 64, self.dangling_ids())
         self.assertIn("unrelated", self.dangling_ids())
+
+    def test_a_refused_untag_keeps_the_tag_and_does_not_abort(self):
+        # The engine can refuse one name while others succeed. The tag stays,
+        # the refusal is named, and the run still completes: the serving image is
+        # already correct.
+        (self.root / "untag-fail").write_text(f"sha-{MID[:12]}\n")
+        done = self.run_block(retained=0)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(f"sha-{MID[:12]}", self.host_tags())
+        self.assertIn(
+            f"retention_failed: cannot remove the tag sha-{MID[:12]}", done.stdout
+        )
+        self.assertIn("retention: removed", done.stdout)
 
     def test_the_prune_is_scoped_to_this_products_label(self):
         self.run_block(retained=0)

@@ -217,3 +217,118 @@ the whole eligible candidate list, preserving the original behaviour.
 - **WHEN** the admitted batch is larger than the number of eligible pools of the first configured type
 - **THEN** the extra workers start on that type's zones again in rotation
 - **AND** no worker starts on a later type without a definite capacity rejection
+
+### Requirement: Absence is proven per identifier
+
+The controller MUST establish absence one identifier at a time. When the
+provider reports that any identifier in a by-ID set is unknown, the controller
+MUST re-read each identifier on its own and MUST record absence only for an
+identifier whose own read reports it unknown. A provider read failure MUST
+refuse the reconcile without settling an operation, releasing a slot or
+releasing a commitment.
+
+#### Scenario: Mixed missing and live batch
+
+- **WHEN** one by-ID batch read is rejected because one identifier is unknown and
+  another identifier in the same batch is still running
+- **THEN** only the identifiers proven absent are treated as absent
+- **AND** the live operation stays nonterminal and keeps its slot
+
+#### Scenario: Live identifier without ownership tags
+
+- **WHEN** a by-ID read resolves a still-live instance whose ownership tags are
+  missing
+- **THEN** the operation is reconciled to its live state
+- **AND** an ownership discrepancy is reported instead of a clean result
+
+#### Scenario: Provider read failure
+
+- **WHEN** reading one identifier fails for a reason other than the provider
+  reporting it unknown
+- **THEN** the reconcile refuses as uncertain
+- **AND** no operation is settled and no slot or commitment is released
+
+#### Scenario: Genuinely aged-out identifier
+
+- **WHEN** a single identifier is proven absent and the retained-visibility
+  window has elapsed
+- **THEN** the operation keeps the existing conservative settlement and
+  visibility policy
+- **AND** its slot is released only by that policy
+
+### Requirement: Frozen intent carries its deployment scope
+Every nonterminal operation MUST be bound to the deployment in its frozen request's `ci-burst:deployment` tag. `apply` MUST refuse with `SCOPE_CHANGED` before resuming or expiring an operation whose recorded deployment is non-null and differs from the configured one, with no `RunInstances` call and no change to the request, hash, token or tags. `plan` MUST do the same without an AWS call. A row without a readable tag MUST be unbound. Terminal rows MUST NOT refuse a new deployment.
+
+#### Scenario: Deployment name changes while an intent is outstanding
+- **WHEN** a nonterminal operation's frozen request names deployment A and the configuration now names deployment B
+- **THEN** `apply` refuses with `SCOPE_CHANGED` and `owned_state_discrepancy`
+- **AND** no `RunInstances` request is sent
+- **AND** the operation stays in its recorded state with the same request, hash and client token
+
+#### Scenario: The refusal names the mismatch safely
+- **WHEN** `apply` or `plan` refuses because of a deployment-scope change
+- **THEN** the report names the recorded deployment and the operation
+- **AND** it does not print the frozen launch payload, its tags or a secret
+
+#### Scenario: Same deployment resumes idempotently
+- **WHEN** the configured deployment equals the deployment in the frozen request
+- **THEN** `apply` resumes the same request and client token
+- **AND** it records one operation row and sends one retry
+
+#### Scenario: A drained ledger is reused with its history retained
+- **WHEN** every row in the ledger is terminal or failed and the configured deployment differs from the rows' recorded deployment
+- **THEN** `apply` launches normally under the new deployment
+- **AND** the old rows keep their state, request, hash and reservation
+
+### Requirement: Batch headroom is reported per planned launch
+`budget.remaining_after` MUST report the allowance left after the planned batch: `allowance - committed - launch_count * per_launch_reservation`. It MUST subtract the reported `launch_count`, including zero, and MUST NOT change `affordable`, `launch_count` or admission. The value is planned headroom, not proof of completed launches.
+
+#### Scenario: Zero workers planned
+- **WHEN** admission plans no worker because the allowance cannot fund one
+- **THEN** `remaining_after` equals `remaining`
+- **AND** no reservation is subtracted
+
+#### Scenario: One worker planned
+- **WHEN** admission plans one worker
+- **THEN** `remaining_after` subtracts one per-launch reservation
+
+#### Scenario: Several workers planned
+- **WHEN** admission plans several workers within the allowance
+- **THEN** `remaining_after` subtracts one reservation per planned worker
+
+#### Scenario: The allowance caps the batch
+- **WHEN** the allowance admits fewer workers than the demand
+- **THEN** `remaining_after` subtracts only the admitted count
+- **AND** admission still launches exactly that count
+
+### Requirement: Inventory responses are parsed or refused
+
+An inventory response that cannot be parsed as a complete result MUST be refused as uncertain and MUST NOT be reported as a complete empty inventory. The response MUST contain a `Reservations` list; every reservation MUST be a mapping with an `Instances` list; every instance entry MUST be a mapping carrying a non-empty string `InstanceId`. An empty `Reservations` list MUST remain a valid, complete empty inventory.
+
+#### Scenario: Malformed inventory
+- **WHEN** `DescribeInstances` returns a response that is missing a `Reservations` list, contains a malformed reservation or entry, or names an entry without an `InstanceId`
+- **THEN** the read is refused with `AWS_INVENTORY_INCOMPLETE` as an uncertain outcome
+- **AND** no operation is settled and no replacement launch is admitted
+
+#### Scenario: Genuinely empty inventory
+- **WHEN** `DescribeInstances` returns an empty `Reservations` list
+- **THEN** the inventory is a complete empty result
+- **AND** the controller applies its normal absent-instance retention rules
+
+### Requirement: One-job process status is preserved through cleanup
+The bootstrap MUST capture the one-job runner process's exit status before its unconditional cleanup, emit exactly one bounded marker naming that status, and exit with it, so the console exit marker reports the real process status. A completed process (status 0), a failure (any other status) and a timeout (124 or 137) MUST be distinguishable. Token cleanup, registration-file removal, sync and shutdown MUST run on every path, including a failed or timed-out process.
+
+#### Scenario: The one-job process completes
+- **WHEN** the runner process exits 0
+- **THEN** the bootstrap emits one completed marker with status 0 and exits 0
+- **AND** the console exit marker reports the same status
+
+#### Scenario: The one-job process fails
+- **WHEN** the runner process exits with a nonzero status that is not a timeout
+- **THEN** the bootstrap emits one failed marker with that status and exits with it
+- **AND** token cleanup, registration-file removal, sync and shutdown still run
+
+#### Scenario: The one-job process times out
+- **WHEN** the lifetime `timeout` ends the runner process with 124 or 137
+- **THEN** the bootstrap emits one timeout marker with that status and exits with it
+- **AND** token cleanup, registration-file removal, sync and shutdown still run

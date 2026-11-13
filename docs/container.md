@@ -389,6 +389,7 @@ Install it beside the apply unit, from a clone of this repository:
 git clone https://github.com/mikomiel/ci-burst.git /opt/ci-burst-src
 install -d -m 0700 /var/lib/ci-burst-image
 install -m 0755 deploy/ci-burst-refresh.sh /usr/local/sbin/ci-burst-refresh
+install -m 0755 deploy/ci-burst-state.py /usr/local/sbin/ci-burst-state
 podman network create --opt mtu=1300 ci-burst   # once, see "The container network"
 install -m 0644 \
   deploy/ci-burst-refresh.service deploy/ci-burst-refresh.timer \
@@ -406,6 +407,30 @@ The script defaults to `/opt/ci-burst-src`, `/var/lib/ci-burst-image`,
 `ci-burst`) and `CI_BURST_UNITS` adapt the smoke and the drift list to a host
 whose role is cleanup-only.
 
+`ci-burst-refresh.service` runs `ci-burst-state` as its `ExecStopPost`, so every
+attempt writes `/var/lib/ci-burst-image/deployment-state.json`: the deployed and
+channel commits, the image ID, the last success, and any unit drift against the
+deployed commit. The document declares `schema: deployment-state.v1` and is
+written for any external metrics collector; no credential, host address or
+private path is included.
+
+To freeze the serving image without stopping observation, write
+`/var/lib/ci-burst-image/hold` with a short reason. The next refresh still
+fetches the channel ref but skips the build and promotion, and the state document
+reports `pinned` with the distance behind. The installed unit sets the logical
+`CI_BURST_TARGET` (`controller`; the cleanup drop-in sets `reaper`), so the
+document never carries a hostname. The channel observation is a separate
+`source-sha` marker written only after a successful fetch; until it exists the
+document reports unknown source freshness rather than inferring one from
+`FETCH_HEAD`.
+
+To roll back, follow the "Rollback" procedure below: it disables the timer and
+stops the service under the refresh lock before retagging, so an in-flight run
+cannot promote over the rollback. Write the hold before restarting the timer.
+Removing the hold later rebuilds the channel image because the serving revision
+label no longer matches the channel, rather than silently reporting the old
+`deployed-sha` as current.
+
 A cleanup-only host runs the same unit and script with a drop-in, because its
 scheduled operation is `reap` rather than `apply`:
 
@@ -414,6 +439,7 @@ scheduled operation is `reap` rather than `apply`:
 git clone https://github.com/mikomiel/ci-burst.git /opt/ci-burst-src
 install -d -m 0700 /var/lib/ci-burst-image
 install -m 0755 deploy/ci-burst-refresh.sh /usr/local/sbin/ci-burst-refresh
+install -m 0755 deploy/ci-burst-state.py /usr/local/sbin/ci-burst-state
 install -m 0644 \
   deploy/ci-burst-refresh.service deploy/ci-burst-refresh.timer \
   /etc/systemd/system/
@@ -428,6 +454,9 @@ systemctl list-timers 'ci-burst-*'
 If the host cannot use podman's named network, install
 `deploy/ci-burst-reap-host-network.conf` beside the reap unit at the same time and
 keep `CI_BURST_SMOKE_NETWORK=host` in the refresh drop-in; see the networking
+The cleanup drop-in also sets `CI_BURST_TARGET=reaper` and its own
+`CI_BURST_UNITS` list; do not install it on the controller.
+
 paragraph below. Without that drop-in, remove the line so the smoke uses the
 shipped unit's network.
 
@@ -604,8 +633,10 @@ script's own lock.
 ```sh
 systemctl disable --now ci-burst-refresh.timer   # no new runs, from here on
 systemctl stop ci-burst-refresh.service          # waits for a run in progress
-flock /var/lib/ci-burst-image/refresh.lock \
-  podman tag localhost/ci-burst:previous localhost/ci-burst:latest
+flock /var/lib/ci-burst-image/refresh.lock sh -c \
+  'podman tag localhost/ci-burst:previous localhost/ci-burst:latest &&
+   printf "%s\n" "rollback: <reason>" > /var/lib/ci-burst-image/hold'
+systemctl enable --now ci-burst-refresh.timer   # honors the hold; no promotion
 ```
 
 `previous` is whatever `latest` pointed at before the last promotion, including

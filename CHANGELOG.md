@@ -9,6 +9,13 @@ The version, this file and the release tag are maintained by
 conventional commits on `main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases)
 owns the release boundary. Do not edit a released section by hand.
 
+## [0.6.0](https://github.com/mikomiel/ci-burst/compare/v0.5.1...v0.6.0) (2026-11-13)
+
+
+### Added
+
+* **observe:** record a bounded fleet snapshot per apply pass ([#130](https://github.com/mikomiel/ci-burst/issues/130)) ([3b0be80](https://github.com/mikomiel/ci-burst/commit/3b0be80b766be317384a2fe6837bd216078317a7))
+
 ## [0.5.1](https://github.com/mikomiel/ci-burst/compare/v0.5.0...v0.5.1) (2026-11-13)
 
 

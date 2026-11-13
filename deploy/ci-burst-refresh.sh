@@ -62,9 +62,11 @@ UNITS=${CI_BURST_UNITS:-"ci-burst-apply.service ci-burst-apply.timer ci-burst-re
 
 log() { printf 'ci-burst-refresh: %s\n' "$*"; }
 
-# The build label every image this script builds carries. Retention uses it to
-# scope the dangling-image prune to this product's builds.
+# The standard revision label every build carries, and a label of this
+# deployment's own. Retention prunes on the second: the first is a convention
+# many products follow, so it cannot establish that an image is ours.
 REVISION_LABEL=org.opencontainers.image.revision
+OWNERSHIP_LABEL=org.ci-burst.build
 # How many of the most recent sha-<12> builds to keep, in addition to every tag a
 # rollback or the deployment-state document can still name. The number is a host
 # property, so it is an explicit variable rather than a tuned constant: 0 keeps
@@ -129,32 +131,36 @@ esac
 #   * it runs only when this run has proven the serving image is the promoted
 #     one - the promote path, or the already-current path - never before the
 #     serving tag has moved;
-#   * it removes only sha-<12> tags this deployment created, and only those
-#     outside the retained set;
 #   * the retained set is latest, previous (the only rollback handle), the
 #     sha-<12> of the deployed ref recorded on this host, the sha-<12> of every
-#     40-hex ref the deployment-state document names, and the most recent
-#     RETAIN_BUILDS builds;
-#   * a tag whose image cannot be inspected is kept and reported: an unreadable
-#     engine is not evidence that the tag is disposable;
+#     40-hex ref the deployment-state document names, and the newest
+#     RETAIN_BUILDS builds overall;
+#   * it removes one name at a time, and only names this deployment created. A
+#     build that shares its image with another tag keeps that other tag: an
+#     untag removes the named tag, never the image;
+#   * a tag whose image cannot be inspected is kept and reported;
+#   * a retained ref that cannot be read fails closed: a present document that
+#     does not parse, or a corrupted deployed ref, removes nothing;
 #   * a refusal changes neither the exit status nor the promotion, because the
 #     serving image is already correct. The log line is the durable signal.
 
 retained_tag_suffixes() {
     printf '%s\n' latest previous
-    deployed=$(cat "$STATE/deployed-sha" 2>/dev/null || true)
-    if [ "${#deployed}" -eq 40 ]; then
+    if [ -e "$STATE/deployed-sha" ]; then
+        deployed=$(cat "$STATE/deployed-sha" 2>/dev/null || true)
         case "$deployed" in
-            *[!0-9a-f]*) ;;
-            *) printf 'sha-%s\n' "$(printf '%s' "$deployed" | cut -c1-12)" ;;
+            *[!0-9a-f]*|"") return 1 ;;
         esac
+        [ "${#deployed}" -eq 40 ] || return 1
+        printf 'sha-%s\n' "$(printf '%s' "$deployed" | cut -c1-12)"
     fi
     state_document=$STATE/deployment-state.json
     [ -f "$state_document" ] || return 0
     # The document names commits, never tags, and its shape is owned elsewhere.
-    # Only a full 40-hex string is read as a ref; every other value is ignored
-    # rather than interpreted, so a document change cannot widen what survives.
-    python3 - "$state_document" <<'PY' 2>/dev/null || true
+    # Only a full 40-hex string is read as a ref. A document that exists but
+    # cannot be read fails here rather than returning an empty set: an unreadable
+    # protection list must not authorise deletions.
+    python3 - "$state_document" <<'PY'
 import json
 import re
 import sys
@@ -163,7 +169,7 @@ try:
     with open(sys.argv[1], encoding="utf-8") as handle:
         document = json.load(handle)
 except (OSError, ValueError):
-    raise SystemExit(0)
+    raise SystemExit(1)
 
 
 def strings(value):
@@ -183,23 +189,29 @@ for value in strings(document):
 PY
 }
 
-reconcile_image_tags() {
-    work=$(mktemp -d 2>/dev/null) || {
+reconcile_image_tags() (
+    # A subshell: this function must not write to any variable the caller still
+    # uses, in particular $work, which the EXIT trap removes after the run.
+    retention_work=$(mktemp -d 2>/dev/null) || {
         log 'retention_failed: cannot create a work directory'
-        return 0
+        exit 0
     }
-    kept=$work/kept
-    builds=$work/builds
-    retained_tag_suffixes >"$kept" 2>/dev/null || : >"$kept"
-
-    if ! podman images --format '{{.Tag}}' "$IMAGE" >"$work/tags" 2>/dev/null; then
+    if ! retained_tag_suffixes >"$retention_work/kept" 2>/dev/null; then
+        log 'retention_failed: cannot read the retained refs; removing nothing'
+        rm -rf "$retention_work"
+        exit 0
+    fi
+    if ! podman images --format '{{.Tag}}' "$IMAGE" >"$retention_work/tags" 2>/dev/null; then
         log 'retention_failed: cannot list the image tags'
-        rm -rf "$work"
-        return 0
+        rm -rf "$retention_work"
+        exit 0
     fi
 
-    untagged=0
+    # Rank every inspectable build, named or not, by creation time. The window is
+    # the newest RETAIN_BUILDS of that whole set, then united with the named
+    # refs: a named build does not consume a place in the window.
     unverified=0
+    : >"$retention_work/ranked"
     while IFS= read -r tag; do
         # Only this deployment's immutable build tags are candidates. The shape
         # check also keeps a malformed tag out of a podman argument.
@@ -207,51 +219,58 @@ reconcile_image_tags() {
             sha-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
             *) continue ;;
         esac
-        if grep -Fqx "$tag" "$kept" 2>/dev/null; then
-            continue
-        fi
         created=$(podman image inspect --format '{{.Created}}' "$IMAGE:$tag" 2>/dev/null) || created=
         if [ -z "$created" ]; then
             log "retention_kept: $tag cannot be inspected"
             unverified=$((unverified + 1))
             continue
         fi
-        printf '%s|%s\n' "$created" "$tag" >>"$builds"
-    done <"$work/tags"
+        printf '%s|%s\n' "$created" "$tag" >>"$retention_work/ranked"
+    done <"$retention_work/tags"
 
-    if [ -f "$builds" ]; then
-        # Newest first: the retained window is the last N builds, not the first N
-        # tags the engine happened to list.
-        sort -r "$builds" | tail -n "+$((RETAIN_BUILDS + 1))" >"$work/drop"
-        while IFS='|' read -r created tag; do
-            [ -n "$tag" ] || continue
-            if podman untag "$IMAGE:$tag" >/dev/null 2>&1; then
-                untagged=$((untagged + 1))
-            else
-                log "retention_failed: cannot untag $IMAGE:$tag"
-                unverified=$((unverified + 1))
-            fi
-        done <"$work/drop"
+    : >"$retention_work/window"
+    if [ "$RETAIN_BUILDS" -gt 0 ] && [ -s "$retention_work/ranked" ]; then
+        sort -r "$retention_work/ranked" | head -n "$RETAIN_BUILDS" |
+            while IFS='|' read -r created tag; do
+                printf '%s\n' "$tag"
+            done >"$retention_work/window"
     fi
 
-    if [ "$untagged" -gt 0 ]; then
-        # Untagging frees no bytes on its own: the build becomes a dangling image
-        # that still owns its layers. The label filter keeps this prune to images
-        # this build produced, so an unrelated dangling image is not touched.
-        if podman image prune -f --filter "label=$REVISION_LABEL" >/dev/null 2>&1; then
-            log "retention: untagged $untagged builds and pruned dangling images"
-        else
-            log "retention_failed: untagged $untagged builds, prune refused"
+    untagged=0
+    while IFS='|' read -r created tag; do
+        [ -n "$tag" ] || continue
+        if grep -Fqx "$tag" "$retention_work/kept" 2>/dev/null; then
+            continue
         fi
+        if grep -Fqx "$tag" "$retention_work/window" 2>/dev/null; then
+            continue
+        fi
+        # One name at a time: an image shared with another tag keeps that tag.
+        if podman untag "$IMAGE" "$tag" >/dev/null 2>&1; then
+            untagged=$((untagged + 1))
+        else
+            log "retention_failed: cannot remove the tag $tag"
+            unverified=$((unverified + 1))
+        fi
+    done <"$retention_work/ranked"
+
+    # Prune on every run, not only when this run removed a name: a prune that was
+    # refused must be retried on the next run, or the dangling images stay. The
+    # filter is this deployment's own build label, so an image another product
+    # built - even one carrying the standard OCI revision label - is never a
+    # candidate, and images built before the label existed are left alone.
+    if podman image prune -f --filter "label=$OWNERSHIP_LABEL=refresh" >/dev/null 2>&1; then
+        log "retention: removed $untagged build tags, pruned owned dangling images"
     else
-        log 'retention: nothing to remove'
+        log "retention_failed: removed $untagged build tags, prune refused"
     fi
     if [ "$unverified" -gt 0 ]; then
         log "retention: kept $unverified tags unverified"
     fi
-    rm -rf "$work"
-}
+    rm -rf "$retention_work"
+)
 # --- end image tag retention -------------------------------------------------
+
 
 install -d -m 0700 "$STATE"
 exec 9>"$STATE/refresh.lock"
@@ -317,7 +336,8 @@ fi
 # exercises exactly the networking they use.
 version=$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$work/src/ci_burst/__init__.py" 2>/dev/null | head -n 1)
 set -- build --quiet --network=host --tag "$IMAGE:candidate" \
-    --label "org.opencontainers.image.revision=$want"
+    --label "org.opencontainers.image.revision=$want" \
+    --label "$OWNERSHIP_LABEL=refresh"
 if [ -n "$version" ]; then
     set -- "$@" --label "org.opencontainers.image.version=$version"
 fi

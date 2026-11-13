@@ -2,14 +2,14 @@
 
 Retention deletes local builds, so it is the one irreversible act in
 ``deploy/ci-burst-refresh.sh``. One sha-<12> tag per merged commit accumulates at
-about 150 MB and filled a 7.8 GB host (HB-3340), but the fix must never remove a
-tag a rollback or the deployment-state document still names, and it must not run
-before a promotion has succeeded.
+about 150 MB and filled a 7.8 GB host (HB-3340), but it must never remove a name
+a rollback, the serving tag or the deployment-state document still resolves, and
+it must not run before a promotion has succeeded.
 
-The script is executed here against a stubbed engine and a stubbed source, so
-these cases pin behaviour rather than source text: what a successful promote
-leaves behind, that a failed promote removes nothing, and that an unreadable tag
-is kept rather than guessed at.
+The stub engine here keeps a real tag-to-image table and a dangling-image table,
+so these cases assert the surviving tag set rather than the calls alone: a shared
+image keeps its other names, a failed promote removes nothing, a refused prune is
+retried on the next run, and an unrelated dangling image is never a candidate.
 """
 
 import json
@@ -23,32 +23,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deploy" / "ci-burst-refresh.sh"
 
-#: A 40-hex commit and its matching sha-<12> tag, as the script derives them.
 WANT = "6e1451e7080726b62dd0f69bdd4f705b17bfae58"
 TREE = "1" * 40
 SHORT = WANT[:12]
 OLD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-NEWER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-TAGS = [
-    "latest",
-    "previous",
-    f"sha-{SHORT}",
-    f"sha-{OLD[:12]}",
-    f"sha-{NEWER[:12]}",
-    "sha-cccccccccccc",
-    "sha-dddddddddddd",
+MID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+NEW = "cccccccccccccccccccccccccccccccccccccccc"
+CANDIDATE_ID = "3" * 64
+
+# Builds this host already holds, oldest first: (commit, image id, created).
+BUILDS = [
+    (OLD, "a" * 64, "2026-11-10 10:00:00.000000000 +0000 UTC"),
+    (MID, "b" * 64, "2026-11-11 10:00:00.000000000 +0000 UTC"),
+    (NEW, "c" * 64, "2026-11-12 10:00:00.000000000 +0000 UTC"),
 ]
-CREATED = {
-    f"sha-{OLD[:12]}": "2026-11-10 10:00:00.000000000 +0000 UTC",
-    f"sha-{WANT[:12]}": "2026-11-11 10:00:00.000000000 +0000 UTC",
-    f"sha-{NEWER[:12]}": "2026-11-12 10:00:00.000000000 +0000 UTC",
-    "sha-cccccccccccc": "2026-11-13 10:00:00.000000000 +0000 UTC",
-    "sha-dddddddddddd": "2026-11-13 20:00:00.000000000 +0000 UTC",
-}
 
 
 def retention_block():
-    """The shipped retention block, for the function-level cases."""
     lines = SCRIPT.read_text(encoding="utf-8").splitlines()
     start = next(
         index for index, line in enumerate(lines) if line.startswith("# --- image tag retention")
@@ -61,8 +52,8 @@ def retention_block():
     return "\n".join(lines[start : end + 1])
 
 
-class RetentionHarness(unittest.TestCase):
-    """Shared fixture: a stubbed engine that records every call it receives."""
+class EngineHarness(unittest.TestCase):
+    """A stub engine with a tag table, an image table and dangling images."""
 
     def setUp(self):
         self._directory = tempfile.TemporaryDirectory()
@@ -73,42 +64,130 @@ class RetentionHarness(unittest.TestCase):
         self.calls = self.root / "calls"
         self.calls.write_text("")
         self.tags = self.root / "tags"
-        self.tags.write_text("\n".join(TAGS) + "\n")
-        self.created = self.root / "created"
-        self.created.write_text(
-            "\n".join(f"{tag}|{stamp}" for tag, stamp in CREATED.items()) + "\n"
-        )
+        self.images = self.root / "images"
+        self.dangling = self.root / "dangling"
         self.state = self.root / "state"
         self.state.mkdir()
-        (self.state / "deployed-sha").write_text(f"{WANT}\n")
-        (self.bin / "podman").write_text(
+        self.prune_status = self.root / "prune-status"
+        self.prune_status.write_text("0")
+        self.prune_log = self.root / "prunes"
+        self.write_host(
+            tags=[("latest", "d" * 64), ("previous", "a" * 64)]
+            + [(f"sha-{build[0][:12]}", build[1]) for build in BUILDS],
+            images=[(build[1], build[2]) for build in BUILDS] + [("d" * 64, BUILDS[2][2])],
+        )
+        # An unrelated product's dangling image. It carries the standard OCI
+        # revision label, which is exactly why that label cannot scope a prune.
+        self.dangling.write_text("unrelated|org.opencontainers.image.revision=deadbeef\n")
+        self.engine = self.bin / "podman"
+        self.engine.write_text(self.engine_source())
+        self.engine.chmod(0o755)
+        (self.state / "deployed-sha").write_text(f"{OLD}\n")
+
+    def engine_source(self):
+        return (
             "#!/bin/bash\n"
-            'printf "%s\\n" "$*" >> ' + str(self.calls) + "\n"
+            f'printf "%s\\n" "$*" >> {self.calls}\n'
+            "ref_id() {\n"
+            '  case "$1" in\n'
+            '    sha256:*) printf "%s" "${1#sha256:}"; return 0 ;;\n'
+            "  esac\n"
+            f'  awk -F"|" -v t="${{1##*:}}" \'$1==t {{print $2}}\' {self.tags}\n'
+            "}\n"
             'case "$1" in\n'
-            "  images) cat " + str(self.tags) + " ;;\n"
+            "  --version) printf 'podman version 5.0.0\\n' ;;\n"
+            "  build)\n"
+            f'    printf "candidate|%s\\n" {CANDIDATE_ID} >> {self.tags}\n'
+            f'    printf "%s|2026-11-14 00:00:00.000000000 +0000 UTC\\n" {CANDIDATE_ID} >> {self.images}\n'
+            "    exit 0 ;;\n"
+            "  run)\n"
+            '    case "$*" in\n'
+            '      *"pip list"*) printf "requests==2.0\\n" ;;\n'
+            '      *) printf \'{"decision":"wait"}\\n\' ;;\n'
+            "    esac\n"
+            "    exit 0 ;;\n"
             "  image)\n"
             '    case "$2" in\n'
+            "      exists) exit 0 ;;\n"
             "      inspect)\n"
-            '        tag=${5##*:}\n'
-            "        created=$(awk -F'|' -v t=\"$tag\" '$1==t {print $2}' " + str(self.created) + ")\n"
-            '        [ -n "$created" ] || exit 125\n'
-            '        printf "%s\\n" "$created" ;;\n'
-            "      prune) exit 0 ;;\n"
-            "    esac ;;\n"
-            "  untag) exit 0 ;;\n"
-            'esac\n'
+            '        ref=${!#}\n'
+            '        id=$(ref_id "$ref")\n'
+            '        case "$*" in\n'
+            "          *.Config.Labels*)\n"
+            f'            printf "%s\\n" {WANT} ;;\n'
+            "          *'{{.Id}}'*)\n"
+            '            [ -n "$id" ] || exit 125\n'
+            '            printf "sha256:%s\\n" "$id" ;;\n'
+            "          *'{{.Created}}'*)\n"
+            '            [ -n "$id" ] || exit 125\n'
+            f'            created=$(awk -F"|" -v i="$id" \'$1==i {{print $2}}\' {self.images})\n'
+            '            [ -n "$created" ] || exit 125\n'
+            '            printf "%s\\n" "$created" ;;\n'
+            "        esac ;;\n"
+            "      prune)\n"
+            f'        printf "%s\\n" "$*" >> {self.prune_log}\n'
+            f'        if [ "$(cat {self.prune_status})" != "0" ]; then exit 1; fi\n'
+            '        case "$*" in\n'
+            f'          *"label=org.ci-burst.build=refresh"*)\n'
+            f'            awk -F"|" \'$2=="org.ci-burst.build=refresh"\' {self.dangling} > {self.dangling}.owned\n'
+            f'            grep -v "org.ci-burst.build=refresh" {self.dangling} >> {self.dangling}.owned || true\n'
+            f'            mv {self.dangling}.owned {self.dangling}\n'
+            "            ;;\n"
+            "        esac\n"
+            "        exit 0 ;;\n"
+            "    esac\n"
+            "    exit 0 ;;\n"
+            "  tag)\n"
+            '    id=$(ref_id "$2")\n'
+            f'    printf "%s|%s\\n" "${{3##*:}}" "$id" >> {self.tags}\n'
+            "    exit 0 ;;\n"
+            "  rmi)\n"
+            '    ref=${!#}\n'
+            '    named=${ref##*:}\n'
+            f'    grep -v "^$named|" {self.tags} > {self.tags}.new || true\n'
+            f'    mv {self.tags}.new {self.tags}\n'
+            "    exit 0 ;;\n"
+            f"  images) cut -d'|' -f1 {self.tags} ;;\n"
+            "  untag)\n"
+            '    removed=${3}\n'
+            f'    id=$(awk -F"|" -v t="$removed" \'$1==t {{print $2}}\' {self.tags})\n'
+            f'    grep -v "^$removed|" {self.tags} > {self.tags}.new || true\n'
+            f'    mv {self.tags}.new {self.tags}\n'
+            f'    if [ -n "$id" ] && ! grep -q "|$id$" {self.tags}; then\n'
+            f'      printf "%s|org.ci-burst.build=refresh\\n" "$id" >> {self.dangling}\n'
+            "    fi\n"
+            "    exit 0 ;;\n"
+            "esac\n"
             "exit 0\n"
         )
-        (self.bin / "podman").chmod(0o755)
 
-    def call_lines(self):
-        return [line for line in self.calls.read_text().splitlines() if line]
+    def rewrite_engine(self):
+        self.engine.write_text(self.engine_source())
+        self.engine.chmod(0o755)
+
+    def write_host(self, tags, images):
+        self.tags.write_text("".join(f"{tag}|{image}\n" for tag, image in tags))
+        self.images.write_text("".join(f"{image}|{created}\n" for image, created in images))
+
+    def host_tags(self):
+        return {line.split("|")[0] for line in self.tags.read_text().splitlines() if line}
 
     def untagged(self):
-        return [line.split()[1] for line in self.call_lines() if line.startswith("untag ")]
+        return [
+            line.split()[2]
+            for line in self.calls.read_text().splitlines()
+            if line.startswith("untag ")
+        ]
+
+    def prunes(self):
+        return self.prune_log.read_text().splitlines() if self.prune_log.exists() else []
+
+    def dangling_ids(self):
+        return {line.split("|")[0] for line in self.dangling.read_text().splitlines() if line}
 
     def run_block(self, retained=1):
         runner = self.root / "run.sh"
+        (self.root / "retention.sh").write_text(retention_block())
         runner.write_text(
             "#!/bin/bash\n"
             "set -eu\n"
@@ -116,76 +195,90 @@ class RetentionHarness(unittest.TestCase):
             "IMAGE=localhost/ci-burst\n"
             f"STATE={self.state}\n"
             "REVISION_LABEL=org.opencontainers.image.revision\n"
+            "OWNERSHIP_LABEL=org.ci-burst.build\n"
             f"RETAIN_BUILDS={retained}\n"
             'log() { printf "ci-burst-refresh: %s\\n" "$*"; }\n'
             f"source {self.root / 'retention.sh'}\n"
             "reconcile_image_tags\n"
         )
-        (self.root / "retention.sh").write_text(retention_block())
         runner.chmod(0o755)
         return subprocess.run(["bash", str(runner)], capture_output=True, text=True, timeout=60)
 
 
-class RetentionFunctionTests(RetentionHarness):
-    def test_a_promote_leaves_the_declared_set(self):
+class RetentionFunctionTests(EngineHarness):
+    def test_the_window_is_the_newest_builds_overall_not_extra_builds(self):
+        # The deployed build (NEW) is also the newest. With a window of one, it
+        # occupies the window and consumes the place: nothing older survives on
+        # the window alone, and no named ref may add back an older build.
+        (self.state / "deployed-sha").write_text(f"{NEW}\n")
         done = self.run_block(retained=1)
         self.assertEqual(done.returncode, 0, done.stderr)
-        untagged = self.untagged()
-        # latest and previous are not builds. With the window at one build, the
-        # newest build survives on the window and the deployed ref survives as a
-        # named ref; every older build outside both is removed.
-        self.assertNotIn("localhost/ci-burst:sha-" + SHORT, untagged)
-        self.assertIn("localhost/ci-burst:sha-" + OLD[:12], untagged)
-        self.assertIn("localhost/ci-burst:sha-cccccccccccc", untagged)
-        self.assertIn("localhost/ci-burst:sha-" + NEWER[:12], untagged)
-        self.assertNotIn("localhost/ci-burst:sha-dddddddddddd", untagged)
-        prune = [line for line in self.call_lines() if line.startswith("image prune")]
-        self.assertEqual(len(prune), 1, prune)
-        self.assertIn("label=org.opencontainers.image.revision", prune[0])
+        self.assertEqual(
+            self.host_tags(), {"latest", "previous", f"sha-{NEW[:12]}"}
+        )
 
-    def test_a_ref_the_state_document_names_survives(self):
+    def test_a_named_ref_outside_the_window_survives(self):
         (self.state / "deployment-state.json").write_text(
             json.dumps({"schema": "deployment-state.v1", "deployed_ref": OLD})
         )
+        done = self.run_block(retained=1)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(f"sha-{OLD[:12]}", self.host_tags())
+        self.assertNotIn(f"sha-{MID[:12]}", self.host_tags())
+
+    def test_a_shared_image_keeps_its_other_names(self):
+        # `previous` and the OLD build tag name the same image. Removing the
+        # build name must not remove the rollback handle.
+        (self.state / "deployed-sha").write_text("e" * 40 + "\n")
         done = self.run_block(retained=0)
         self.assertEqual(done.returncode, 0, done.stderr)
-        untagged = self.untagged()
-        self.assertNotIn("localhost/ci-burst:sha-" + OLD[:12], untagged)
-        self.assertIn("localhost/ci-burst:sha-cccccccccccc", untagged)
-        self.assertIn("localhost/ci-burst:sha-dddddddddddd", untagged)
+        self.assertIn("previous", self.host_tags())
+        self.assertNotIn(f"sha-{OLD[:12]}", self.host_tags())
+        self.assertNotIn("a" * 64, self.dangling_ids())
 
     def test_an_uninspectable_tag_is_kept_and_reported(self):
-        self.created.write_text(
-            "\n".join(
-                f"{tag}|{stamp}"
-                for tag, stamp in CREATED.items()
-                if tag != "sha-cccccccccccc"
+        self.images.write_text(
+            "".join(
+                f"{build[1]}|{build[2]}\n"
+                for build in BUILDS
+                if build[1] != BUILDS[1][1]
             )
-            + "\n"
         )
         done = self.run_block(retained=0)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertNotIn("localhost/ci-burst:sha-cccccccccccc", self.untagged())
-        self.assertIn("retention_kept: sha-cccccccccccc cannot be inspected", done.stdout)
+        self.assertIn(f"sha-{MID[:12]}", self.host_tags())
+        self.assertIn(f"retention_kept: sha-{MID[:12]} cannot be inspected", done.stdout)
+
+    def test_an_unreadable_state_document_removes_nothing(self):
+        (self.state / "deployment-state.json").write_text("{ this is not json")
+        done = self.run_block(retained=0)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("retention_failed: cannot read the retained refs", done.stdout)
+        self.assertEqual(self.untagged(), [])
+        self.assertIn(f"sha-{OLD[:12]}", self.host_tags())
+
+    def test_a_corrupted_deployed_ref_removes_nothing(self):
+        (self.state / "deployed-sha").write_text("not-a-commit\n")
+        done = self.run_block(retained=0)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("retention_failed: cannot read the retained refs", done.stdout)
+        self.assertEqual(self.untagged(), [])
 
     def test_nothing_to_remove_is_reported_and_removes_nothing(self):
-        (self.state / "deployed-sha").write_text("")
-        self.tags.write_text("latest\nprevious\n")
+        self.write_host(tags=[("latest", "d" * 64), ("previous", "a" * 64)], images=[])
         done = self.run_block(retained=0)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.untagged(), [])
-        self.assertIn("retention: nothing to remove", done.stdout)
+        self.assertIn("removed 0 build tags", done.stdout)
 
-    def test_a_refused_untag_is_reported_and_does_not_abort(self):
-        (self.bin / "podman").write_text(
-            (self.bin / "podman").read_text().replace(
-                "  untag) exit 0 ;;",
-                '  untag) [ "${2##*:}" = "sha-cccccccccccc" ] && exit 1; exit 0 ;;',
-            )
-        )
-        done = self.run_block(retained=1)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("retention_failed: cannot untag localhost/ci-burst:sha-cccccccccccc", done.stdout)
+    def test_the_prune_is_scoped_to_this_products_label(self):
+        self.run_block(retained=0)
+        prunes = self.prunes()
+        self.assertEqual(len(prunes), 1, prunes)
+        self.assertIn("label=org.ci-burst.build=refresh", prunes[0])
+        self.assertNotIn("org.opencontainers.image.revision", prunes[0])
+        # The unrelated product's dangling image is still there.
+        self.assertIn("unrelated", self.dangling_ids())
 
 
 class RefreshOrderTests(unittest.TestCase):
@@ -208,13 +301,8 @@ class RefreshOrderTests(unittest.TestCase):
         ]
         self.assertEqual(len(calls), 2, calls)
         current, promote = calls
-        # The already-current path: after the serving label is proven equal, and
-        # inside that branch.
         self.assertGreater(current, self.index('if [ "$serving" = "$want" ]; then'))
         self.assertGreater(current, self.index('log "current: $want"'))
-        # The promote path: after the serving tag moves and the deployed ref is
-        # recorded, never before. This is what makes a failed promote remove
-        # nothing: the only deletion site is below a completed promotion.
         self.assertGreater(promote, self.index('podman tag "$IMAGE:candidate" "$IMAGE:latest"'))
         self.assertGreater(
             promote, self.index('mv "$STATE/deployed-sha.tmp" "$STATE/deployed-sha"')
@@ -225,13 +313,24 @@ class RefreshOrderTests(unittest.TestCase):
         start = self.index("# --- image tag retention")
         end = self.index("# --- end image tag retention")
         for needle in ("podman untag", "podman image prune"):
-            positions = [
-                index
-                for index, line in enumerate(self.lines)
-                if needle in line and line.lstrip().startswith(("podman", "if podman"))
-            ]
             with self.subTest(needle=needle):
+                positions = [
+                    index
+                    for index, line in enumerate(self.lines)
+                    if needle in line and line.lstrip().startswith(("podman", "if podman"))
+                ]
                 self.assertTrue(all(start < position < end for position in positions), positions)
+
+    def test_retention_cannot_clobber_the_callers_work_directory(self):
+        # The promote path's EXIT trap removes $work. A function that reuses that
+        # name would leak the build context on every promoted run.
+        text = SCRIPT.read_text(encoding="utf-8")
+        start = text.index("reconcile_image_tags() (")
+        end = text.index("# --- end image tag retention")
+        body = text[start:end]
+        self.assertIn("retention_work=$(mktemp", body)
+        for line in body.splitlines():
+            self.assertNotEqual(line.strip().split("=")[0], "work")
 
     def test_a_malformed_window_is_refused_before_any_build(self):
         self.assertIn('CI_BURST_RETAIN_BUILDS:-3', SCRIPT.read_text(encoding="utf-8"))
@@ -253,7 +352,7 @@ class RefreshOrderTests(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("sh"), "the refresh script runs under sh")
-class RefreshPromoteTests(RetentionHarness):
+class RefreshPromoteTests(EngineHarness):
     """The whole script, with the engine and the source stubbed."""
 
     def setUp(self):
@@ -275,7 +374,7 @@ class RefreshPromoteTests(RetentionHarness):
             "      *) exit 1 ;;\n"
             "    esac ;;\n"
             "  archive)\n"
-            '    out="";\n'
+            '    out=""\n'
             '    while [ $# -gt 0 ]; do [ "$1" = "--output" ] && out=$2; shift; done\n'
             '    ( cd "$FIXTURE" && tar -cf "$out" Dockerfile ci_burst ) ;;\n'
             "esac\n"
@@ -283,47 +382,17 @@ class RefreshPromoteTests(RetentionHarness):
         )
         (self.bin / "git").chmod(0o755)
 
-    def engine(self, promote_fails):
-        return (
-            "#!/bin/bash\n"
-            'printf "%s\\n" "$*" >> ' + str(self.calls) + "\n"
-            'case "$1" in\n'
-            "  --version) printf 'podman version 5.0.0\\n' ;;\n"
-            "  build) exit 0 ;;\n"
-            "  run)\n"
-            '    case "$*" in\n'
-            '      *"pip list"*) printf "requests==2.0\\n"; exit 0 ;;\n'
-            '      *) printf \'{"decision":"wait"}\\n\'; exit 0 ;;\n'
-            "    esac ;;\n"
-            "  image)\n"
-            '    case "$2" in\n'
-            "      exists) exit 0 ;;\n"
-            "      inspect)\n"
-            '        case "$*" in\n'
-            "          *.Config.Labels*)\n"
-            f"            printf '%s\\n' {WANT} ;;\n"
-            f"          *) printf 'sha256:%s\\n' {'2' * 64} ;;\n"
-            "        esac ;;\n"
-            "      prune) exit 0 ;;\n"
-            "    esac ;;\n"
-            "  tag)\n"
-            '    case "$3" in\n'
-            '      *:latest) ' + ("exit 1" if promote_fails else "exit 0") + " ;;\n"
-            "    esac\n"
-            "    exit 0 ;;\n"
-            "  rmi) exit 0 ;;\n"
-            "  images) cat " + str(self.tags) + " ;;\n"
-            "  untag) exit 0 ;;\n"
-            "esac\n"
-            "exit 0\n"
-        )
-
-    def run_script(self, promote_fails=False):
-        # A host serving an older commit takes the promote path; the tag it is
-        # serving becomes `previous` before the serving tag moves.
-        (self.state / "deployed-sha").write_text(f"{OLD}\n")
-        (self.bin / "podman").write_text(self.engine(promote_fails))
-        (self.bin / "podman").chmod(0o755)
+    def run_script(self, promote_fails=False, now_current=False):
+        if now_current:
+            # A host already serving the channel commit takes the current path;
+            # its tag table is whatever the earlier run left behind.
+            (self.state / "deployed-sha").write_text(f"{WANT}\n")
+        if promote_fails:
+            text = self.engine_source().replace(
+                '  tag)\n', '  tag)\n    case "$3" in *:latest) exit 1 ;; esac\n'
+            )
+            self.engine.write_text(text)
+            self.engine.chmod(0o755)
         source = self.root / "source"
         source.mkdir(exist_ok=True)
         config = self.root / "deployment.toml"
@@ -338,28 +407,41 @@ class RefreshPromoteTests(RetentionHarness):
             CI_BURST_TOKEN_ENV="",
             CI_BURST_UNITS="",
             CI_BURST_SMOKE_COMMAND="plan",
-            CI_BURST_RETAIN_BUILDS="1",
+            CI_BURST_RETAIN_BUILDS="2",
             PATH=f"{self.bin}:/usr/local/bin:/usr/bin:/bin",
         )
         return subprocess.run(
             ["sh", str(SCRIPT)], capture_output=True, text=True, timeout=120, env=environment
         )
 
-    def test_a_successful_promote_untags_only_outside_the_retained_set(self):
+    def test_a_successful_promote_leaves_exactly_the_declared_set(self):
         done = self.run_script()
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         self.assertIn(f"promoted: {WANT}", done.stdout)
-        untagged = self.untagged()
-        self.assertIn("localhost/ci-burst:sha-cccccccccccc", untagged)
-        self.assertIn("localhost/ci-burst:sha-" + OLD[:12], untagged)
-        self.assertNotIn("localhost/ci-burst:sha-" + SHORT, untagged)
-        self.assertNotIn("localhost/ci-burst:sha-dddddddddddd", untagged)
+        # latest moves to the candidate, previous captures the old latest, the
+        # new build keeps its sha tag, and the newest build holds the one-place
+        # window. Every older unnamed build is gone.
+        self.assertEqual(
+            self.host_tags(), {"latest", "previous", f"sha-{SHORT}", f"sha-{NEW[:12]}"}
+        )
 
     def test_a_failed_promote_removes_nothing(self):
         done = self.run_script(promote_fails=True)
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertIn(f"promote_failed: {WANT}", done.stdout)
         self.assertEqual(self.untagged(), [])
-        self.assertEqual(
-            [line for line in self.call_lines() if line.startswith("image prune")], []
-        )
+        self.assertEqual(self.prunes(), [])
+
+    def test_a_refused_prune_is_retried_on_an_already_current_run(self):
+        self.prune_status.write_text("1")
+        first = self.run_script()
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        self.assertIn("prune refused", first.stdout)
+        self.prune_status.write_text("0")
+        second = self.run_script(now_current=True)
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+        self.assertIn(f"current: {WANT}", second.stdout)
+        # Two attempts: the refused one, and the retry on a run that removed no
+        # tag at all.
+        self.assertEqual(len(self.prunes()), 2)
+        self.assertIn("removed 0 build tags", second.stdout)

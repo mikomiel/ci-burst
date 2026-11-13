@@ -561,9 +561,11 @@ class ApplyTests(ControllerCase):
             write_config(self.root, config={"controller": {"pass_deadline_seconds": 30}})
         )
         clock = self.clock
+        observed = {}
 
         class SlowObserver(FakeObserver):
             def runners(inner):
+                observed["mutations_before_read"] = len(self.aws.mutations())
                 clock.advance(31)
                 return super().runners()
 
@@ -571,7 +573,10 @@ class ApplyTests(ControllerCase):
         controller = self.build(config=config, observer=observer)
         result = controller.apply()
         self.assertEqual(result["decision"], "launched")
-        self.assertEqual(len(self.aws.mutations()), 1)
+        self.assertEqual(observer.runner_calls, 1)
+        # The launch mutation was already recorded when the auxiliary read began:
+        # the read cannot have influenced admission.
+        self.assertEqual(observed["mutations_before_read"], 1)
 
     def test_fleet_read_is_skipped_when_the_budget_cannot_cover_the_timeout(self):
         config = load(

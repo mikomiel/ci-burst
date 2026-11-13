@@ -24,8 +24,9 @@ no cloud change.
 
 ## 3. Controller
 
-- [x] 3.1 Read the registration snapshot once per pass, before the admission
-  decision, and report it in the result.
+- [x] 3.1 Read the registration snapshot once per pass after the admission
+  decision — and after the launch when the pass launches — and report it in the
+  result.
 - [x] 3.2 Report a refused read as `fleet.available: false` without refusing the
   pass, and a refused write as `persisted: false`.
 - [x] 3.3 Report the newest snapshot in `status` without a new credential.

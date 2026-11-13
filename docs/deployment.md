@@ -180,9 +180,11 @@ scaler identity would take cleanup with it.
 
 ### The Forgejo read token
 
-The scaler reads the repository's runner-job list. Create an access token for
-an account that can read the repository, scoped to `read:repository` (Forgejo
-calls it `repo` in the UI), and put it in `/etc/ci-burst/forgejo.env`:
+The scaler reads the repository's runner-job list. That endpoint admits only
+the repository owner or a site administrator: an account that can read the
+repository but is neither is refused with `403 user should be the owner of the
+repo`. Create an owner-scoped access token with `read:repository` (Forgejo calls
+it `repo` in the UI) and put it in `/etc/ci-burst/forgejo.env`:
 
 ```sh
 CI_BURST_FORGEJO_TOKEN=<token>

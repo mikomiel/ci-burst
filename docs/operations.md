@@ -386,6 +386,11 @@ jobs, and that an absent `labels` parameter applies no filter at all, so the
 response can list every waiting and running job in the repository rather than
 `null`.
 
+The manifest also records the route's authorization: the repository-scoped route
+is registered with `reqOwner`, which admits the repository owner or a site
+administrator and otherwise answers `403 user should be the owner of the repo`;
+an account that can merely read the repository is refused.
+
 `tests/test_forgejo.py` replays every fixture through the real observer and
 compares the result with the manifest. The matrix therefore proves the parser's
 classification against the pinned contract — including shapes the endpoint does

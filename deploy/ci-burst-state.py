@@ -65,11 +65,25 @@ def _version(source, revision):
     return match.group(1) if match else ""
 
 
+def _normalize_image_id(value):
+    """Return the canonical ``sha256:<hex>`` identity for an engine image ID.
+
+    podman 5 prints ``.Id`` with and without the prefix depending on the engine
+    build. The document is compared across hosts, so both forms render the same
+    way; anything that is not a full digest is passed through unchanged rather
+    than guessed at.
+    """
+    value = value.strip()
+    if re.fullmatch(r"[0-9a-f]{64}", value):
+        return f"sha256:{value}"
+    return value
+
+
 def _image_id(image):
     result = _run(["podman", "image", "inspect", "--format", "{{.Id}}", image])
     if result is None or result.returncode != 0:
         return ""
-    return result.stdout.strip()
+    return _normalize_image_id(result.stdout)
 
 
 def _image_label(image, name):

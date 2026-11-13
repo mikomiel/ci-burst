@@ -6,4 +6,4 @@ instances. This controller only decides how many workers, up to the configured
 limit, should exist.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"

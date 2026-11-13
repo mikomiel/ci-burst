@@ -9,6 +9,13 @@ The version, this file and the release tag are maintained by
 conventional commits on `main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases)
 owns the release boundary. Do not edit a released section by hand.
 
+## [0.5.0](https://github.com/mikomiel/ci-burst/compare/v0.4.0...v0.5.0) (2026-11-13)
+
+
+### Added
+
+* **deploy:** publish deployment state after each refresh ([#123](https://github.com/mikomiel/ci-burst/issues/123)) ([98f0e12](https://github.com/mikomiel/ci-burst/commit/98f0e128ba8f91405ffc043d23c65cdf9f025521))
+
 ## [0.4.0](https://github.com/mikomiel/ci-burst/compare/v0.3.0...v0.4.0) (2026-11-13)
 
 

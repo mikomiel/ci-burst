@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ci-burst"
-version = "0.4.0"
+version = "0.5.0"
 description = "Bounded AWS Spot runner capacity for one Forgejo repository queue"
 readme = "README.md"
 requires-python = ">=3.12"

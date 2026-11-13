@@ -14,7 +14,11 @@ of progress and failure markers, and writes two files:
 The command mutates nothing, holds no queue credential, and copies no console
 text at all. A line contributes only a marker *name* from a fixed list: a step
 name from the shipped first-boot script, an exit status, or one failure kind.
-Truncation is not redaction, so nothing else from the console is published.
+The single exception is the Spot interruption marker, which contributes three
+validated values and no free text: the notice's action, one of a closed set; the
+worker hostname, matched against a fixed pattern; and the runner's registration
+id, matched against the identifier's pattern. Truncation is not redaction, so
+nothing else from the console is published.
 
 Delivery is at least once. The event line carries a stable ``id`` that is a
 function of the instance and the marker, so a consumer can deduplicate the
@@ -106,6 +110,21 @@ EVENT_SCHEMA = {
         {"id", "ts", "deployment", "instance", "zone", "operation", "event", "outcome", "rc"}
     ),
     "error": frozenset({"id", "ts", "deployment", "instance", "zone", "operation", "event", "kind"}),
+    "spot-interruption": frozenset(
+        {
+            "id",
+            "ts",
+            "deployment",
+            "instance",
+            "zone",
+            "operation",
+            "event",
+            "reason",
+            "action",
+            "host",
+            "runner",
+        }
+    ),
 }
 TIMESTAMP_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 DEPLOYMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -169,6 +188,37 @@ JOB_PROCESS_IDENTITIES = frozenset(
     if _job_process(outcome, status)
 )
 
+#: The Spot interruption marker: the worker read the two-minute notice and ended
+#: its one job. ``action`` is the notice's own value, and ``unknown`` is the
+#: shipped fallback for a notice whose body carried no documented action;
+#: ``runner`` is the registration id the worker read, or ``unknown`` when the
+#: notice arrived before registration. Every value is validated before it is
+#: published, and the marker contributes no other console text.
+SPOT_PATTERN = re.compile(
+    r"\bbootstrap spot-interruption action=([a-z]{1,12}) "
+    r"host=([A-Za-z0-9][A-Za-z0-9.-]{0,63}) "
+    r"runner=([0-9a-f-]{36}|unknown)(?=$|\s)"
+)
+SPOT_ACTIONS = frozenset({"terminate", "stop", "hibernate", "unknown"})
+HOST_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,63}")
+RUNNER_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _spot_interruption(action, host, runner):
+    """Return the triple when every value is one the bootstrap can emit.
+
+    ``runner`` is ``None`` for the shipped ``unknown`` fallback: a notice before
+    registration has no registration id, and the event states that rather than
+    inventing one.
+    """
+    if action not in SPOT_ACTIONS or _match(HOST_PATTERN, host) is None:
+        return None
+    if runner == "unknown":
+        return (action, host, None)
+    if _match(RUNNER_PATTERN, runner) is None:
+        return None
+    return (action, host, runner)
+
 
 @dataclass(frozen=True)
 class ConsoleFacts:
@@ -178,6 +228,7 @@ class ConsoleFacts:
     exit_code: int | None
     errors: tuple
     job_process: tuple | None = None
+    spot_interruption: tuple | None = None
 
     @property
     def registered(self):
@@ -189,6 +240,9 @@ class ConsoleFacts:
             "exit_code": self.exit_code,
             "errors": list(self.errors),
             "job_process": list(self.job_process) if self.job_process is not None else None,
+            "spot_interruption": (
+                list(self.spot_interruption) if self.spot_interruption is not None else None
+            ),
         }
 
 
@@ -200,9 +254,16 @@ def parse_console(text):
     position.
     """
     steps, errors, exit_code, job_process = [], [], None, None
+    spot_interruption = None
     for raw_line in (text or "").splitlines():
         line = raw_line.strip()
         if not line:
+            continue
+        match = SPOT_PATTERN.search(line)
+        if match is not None:
+            pair = _spot_interruption(match.group(1), match.group(2), match.group(3))
+            if pair is not None and spot_interruption is None:
+                spot_interruption = pair
             continue
         match = ONE_JOB_PATTERN.search(line)
         if match is not None:
@@ -231,7 +292,7 @@ def parse_console(text):
                 if kind not in errors:
                     errors.append(kind)
                 break
-    return ConsoleFacts(tuple(steps), exit_code, tuple(errors), job_process)
+    return ConsoleFacts(tuple(steps), exit_code, tuple(errors), job_process, spot_interruption)
 
 
 def _empty_totals():
@@ -337,6 +398,10 @@ def _marker_key_is_valid(key):
         return key in EXIT_IDENTITIES
     if prefix == "job-process":
         return key in JOB_PROCESS_IDENTITIES
+    if prefix == "spot-interruption":
+        action, _, rest = value.partition(":")
+        host, _, runner = rest.partition(":")
+        return _spot_interruption(action, host, runner) is not None
     return False
 
 
@@ -398,6 +463,21 @@ def _sanitize_record(record):
         job_process = None
     if job_process != record.get("job_process"):
         changed = True
+    spot_interruption = record.get("spot_interruption")
+    if not (
+        isinstance(spot_interruption, list)
+        and len(spot_interruption) == 3
+        and isinstance(spot_interruption[0], str)
+        and isinstance(spot_interruption[1], str)
+        and (spot_interruption[2] is None or isinstance(spot_interruption[2], str))
+        and _spot_interruption(
+            spot_interruption[0], spot_interruption[1], spot_interruption[2] or "unknown"
+        )
+        is not None
+    ):
+        spot_interruption = None
+    if spot_interruption != record.get("spot_interruption"):
+        changed = True
     emitted = record.get("emitted")
     emitted = [key for key in emitted if _marker_key_is_valid(key)] if isinstance(emitted, list) else []
     if not isinstance(record.get("emitted"), list) or len(emitted) != len(record.get("emitted") or []):
@@ -419,6 +499,7 @@ def _sanitize_record(record):
         "errors": kept_kinds,
         "exit_code": exit_code,
         "job_process": job_process,
+        "spot_interruption": spot_interruption,
         "registered": bool(registered),
         "emitted": emitted,
         "counted_registered": bool(record.get("counted_registered")),
@@ -665,6 +746,7 @@ def _record_for(state, instance_id, now):
             "registered": False,
             "exit_code": None,
             "job_process": None,
+            "spot_interruption": None,
         }
         state["instances"][instance_id] = record
         return record, True
@@ -697,6 +779,8 @@ def _merge_record(record, instance, facts, now, provider_state):
         record["exit_code"] = facts.exit_code
     if facts.job_process is not None and record.get("job_process") is None:
         record["job_process"] = list(facts.job_process)
+    if facts.spot_interruption is not None and record.get("spot_interruption") is None:
+        record["spot_interruption"] = list(facts.spot_interruption)
     record["registered"] = bool(record.get("registered")) or facts.registered
 
 
@@ -752,6 +836,19 @@ def _events_for(instance, record, now, deployment):
         )
     for kind in record["errors"]:
         publish("error:" + kind, {"event": "error", "kind": kind})
+    spot_interruption = record.get("spot_interruption")
+    if spot_interruption is not None:
+        action, host, runner = spot_interruption
+        publish(
+            f"spot-interruption:{action}:{host}:{runner or 'unknown'}",
+            {
+                "event": "spot-interruption",
+                "reason": "spot_interruption",
+                "action": action,
+                "host": host,
+                "runner": runner,
+            },
+        )
     return events
 
 
@@ -802,6 +899,19 @@ def _event_line_is_valid(event, deployment):
         if not isinstance(outcome, str) or type(status) is not int:
             return False
         return marker == f"job-process:{outcome}:{status}" and marker in JOB_PROCESS_IDENTITIES
+    if kind == "spot-interruption":
+        action = event.get("action")
+        host = event.get("host")
+        runner = event.get("runner")
+        if not isinstance(action, str) or not isinstance(host, str):
+            return False
+        if runner is not None and not isinstance(runner, str):
+            return False
+        if event.get("reason") != "spot_interruption":
+            return False
+        if _spot_interruption(action, host, runner or "unknown") is None:
+            return False
+        return marker == f"spot-interruption:{action}:{host}:{runner or 'unknown'}"
     error_kind = event.get("kind")
     return isinstance(error_kind, str) and error_kind in KNOWN_ERROR_KINDS and marker == f"error:{error_kind}"
 

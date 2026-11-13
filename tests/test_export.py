@@ -55,6 +55,13 @@ cloud-init: bootstrap one-job failed rc=0
 cloud-init: bootstrap one-job failed rc=124
 """
 
+SPOT_NOTICE = """\
+cloud-init: STEP job
+cloud-init: bootstrap spot-interruption action=terminate host=ip-10-0-0-1 runner=0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b
+cloud-init: bootstrap one-job failed rc=143
+cloud-init: bootstrap exiting rc=143
+"""
+
 
 class ParseConsoleTests(unittest.TestCase):
     def test_clean_boot_yields_steps_and_clean_exit(self):
@@ -89,6 +96,58 @@ class ParseConsoleTests(unittest.TestCase):
         self.assertEqual(facts.exit_code, 0)
         self.assertEqual(facts.job_process, ("failed", 42))
         self.assertEqual(facts.steps.count("job"), 1)
+
+    def test_a_spot_notice_keeps_its_action_worker_host_and_registration(self):
+        facts = parse_console(SPOT_NOTICE)
+        self.assertEqual(
+            facts.spot_interruption, ("terminate", "ip-10-0-0-1", "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b")
+        )
+        # The notice is not a step: it says nothing about which job step ran.
+        self.assertEqual(facts.steps, ("job",))
+
+    def test_the_notice_action_host_and_runner_are_a_closed_vocabulary(self):
+        runner = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
+        for line, expected in (
+            (
+                f"bootstrap spot-interruption action=stop host=ip-10-0-0-1 runner={runner}",
+                ("stop", "ip-10-0-0-1", runner),
+            ),
+            (
+                f"bootstrap spot-interruption action=hibernate host=ip-10-0-0-1 runner={runner}",
+                ("hibernate", "ip-10-0-0-1", runner),
+            ),
+            (
+                # The shipped fallbacks: a notice with no documented action, and
+                # one that arrives before the runner registered.
+                f"bootstrap spot-interruption action=unknown host=ip-10-0-0-1 runner={runner}",
+                ("unknown", "ip-10-0-0-1", runner),
+            ),
+            (
+                "bootstrap spot-interruption action=terminate host=ip-10-0-0-1 runner=unknown",
+                ("terminate", "ip-10-0-0-1", None),
+            ),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(parse_console(line).spot_interruption, expected)
+
+    def test_an_unshipped_notice_value_is_not_a_marker(self):
+        # Every published value is validated rather than trusted: a forged
+        # action, an uppercase action, an empty or traversing host and a
+        # malformed registration id are not markers, and the line contributes
+        # nothing.
+        for line in (
+            "bootstrap spot-interruption action=evacuate host=ip-10-0-0-1 runner=unknown",
+            "bootstrap spot-interruption action=TERMINATE host=ip-10-0-0-1 runner=unknown",
+            "bootstrap spot-interruption action=terminate host= runner=unknown",
+            "bootstrap spot-interruption action=terminate host=../../etc/passwd runner=unknown",
+            "bootstrap spot-interruption action=terminate host=ip-10-0-0-1 runner=not-a-uuid",
+            "bootstrap spot-interruption action=terminate host=ip-10-0-0-1",
+            "bootstrap spot-interruption action=terminate",
+        ):
+            with self.subTest(line=line):
+                facts = parse_console(line)
+                self.assertIsNone(facts.spot_interruption)
+                self.assertEqual(facts.steps, ())
 
     def test_duplicated_serial_stream_is_deduplicated(self):
         facts = parse_console(CLEAN_BOOT + CLEAN_BOOT)
@@ -753,6 +812,132 @@ class ExporterTests(ExportCase):
         self.assertNotIn("job_process", self.metrics.read_text())
         # The marker is deduplicated by its stable identity like any other.
         self.assertEqual(self.run_export(exporter)["events_emitted"], 0)
+
+    def test_a_spot_interruption_publishes_the_worker_identity_and_no_job_verdict(self):
+        exporter = self.build(
+            [instance("i-0123456789abcdef0", state="terminated")],
+            {"i-0123456789abcdef0": SPOT_NOTICE},
+        )
+        result = self.run_export(exporter)
+        notices = [event for event in self.events_read() if event["event"] == "spot-interruption"]
+        self.assertEqual(len(notices), 1)
+        event = notices[0]
+        self.assertEqual(
+            event["id"],
+            "i-0123456789abcdef0:spot-interruption:terminate:ip-10-0-0-1:0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
+        )
+        self.assertEqual(
+            set(event),
+            {
+                "id",
+                "ts",
+                "deployment",
+                "instance",
+                "zone",
+                "operation",
+                "event",
+                "reason",
+                "action",
+                "host",
+                "runner",
+            },
+        )
+        # reason is the stable value a consumer filters on; event names the
+        # stream kind, and the notice's own action stays separate.
+        self.assertEqual(event["reason"], "spot_interruption")
+        self.assertEqual(event["action"], "terminate")
+        self.assertEqual(event["host"], "ip-10-0-0-1")
+        self.assertEqual(event["runner"], "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b")
+        self.assertEqual(event["instance"], "i-0123456789abcdef0")
+        # The marker records that the worker ended; it is never a job verdict.
+        for forbidden in ("success", "verdict", "job_result", "conclusion"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, json.dumps(event))
+                self.assertNotIn(forbidden, self.metrics.read_text())
+                self.assertNotIn(forbidden, json.dumps(result))
+        self.assertEqual(self.run_export(exporter)["events_emitted"], 0)
+
+    def test_a_retained_spot_line_validates_and_a_forged_one_is_dropped(self):
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        common = {
+            "ts": "2026-11-11T00:00:00Z",
+            "deployment": "test-deployment",
+            "instance": "i-0123456789abcdef1",
+            "zone": None,
+            "operation": None,
+            "event": "spot-interruption",
+            "reason": "spot_interruption",
+            "host": "ip-10-0-0-1",
+            "runner": "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
+        }
+        valid = dict(
+            common,
+            id="i-0123456789abcdef1:spot-interruption:terminate:ip-10-0-0-1:0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
+            action="terminate",
+        )
+        forged_action = dict(
+            valid,
+            id="i-0123456789abcdef1:spot-interruption:evacuate:ip-10-0-0-1:0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
+            action="evacuate",
+        )
+        # A line whose reason or host disagrees with the contract is not this
+        # command's line, and neither is one whose identity disagrees with its
+        # own values.
+        wrong_reason = dict(valid, reason="spot-interruption")
+        mismatched_host = dict(
+            valid,
+            id="i-0123456789abcdef1:spot-interruption:terminate:ip-10-0-0-2:0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
+        )
+        forged_runner = dict(valid, runner="not-a-uuid")
+        self.events.write_text(
+            "".join(
+                json.dumps(line, sort_keys=True) + "\n"
+                for line in (valid, forged_action, wrong_reason, mismatched_host, forged_runner)
+            )
+        )
+        result = self.run_export(self.build([], {}))
+        self.assertIn("events_pruned", result["notes"])
+        body = self.events.read_text()
+        self.assertIn(
+            ":spot-interruption:terminate:ip-10-0-0-1:0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
+            body,
+        )
+        self.assertNotIn("evacuate", body)
+        self.assertNotIn("ip-10-0-0-2", body)
+        self.assertNotIn('"reason": "spot-interruption"', body)
+
+    def test_a_persisted_spot_record_is_validated_against_the_closed_vocabulary(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": 1,
+                    "totals": {"launches": 1, "registered": 1, "unregistered": 0},
+                    "instances": {
+                        "i-0123456789abcdef0": {
+                            "seen": NOW,
+                            "emitted": ["spot-interruption:evacuate:ip-10-0-0-1"],
+                            "steps": [],
+                            "errors": [],
+                            "exit_code": None,
+                            "job_process": None,
+                            "spot_interruption": ["evacuate", "../../etc/passwd", "not-a-uuid"],
+                            "registered": True,
+                        }
+                    },
+                }
+            )
+        )
+        exporter = self.build(
+            [instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": NOISE}
+        )
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        self.assertNotIn("passwd", self.state_file.read_text())
+        self.assertNotIn("evacuate", self.state_file.read_text())
+        if self.events.exists():
+            self.assertNotIn("evacuate", self.events.read_text())
 
     def test_a_pre_change_exit_event_line_still_validates(self):
         self.events.parent.mkdir(parents=True, exist_ok=True)

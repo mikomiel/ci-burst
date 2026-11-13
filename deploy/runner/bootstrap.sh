@@ -10,8 +10,12 @@ cleanup_token() {
     shred -u "$TOKEN_FILE" 2>/dev/null || rm -f "$TOKEN_FILE"
   fi
 }
+SPOT_WATCH_PID=""
 on_exit() {
   rc=$?
+  if [ -n "${SPOT_WATCH_PID}" ]; then
+    kill "$SPOT_WATCH_PID" 2>/dev/null || true
+  fi
   echo "bootstrap exiting rc=$rc"
   cleanup_token
   sync
@@ -45,6 +49,62 @@ echo "STEP register"
 
 iptables -A OUTPUT -m owner --uid-owner runner -d 169.254.169.254 -j REJECT
 iptables -A OUTPUT -m owner --uid-owner runner -d 169.254.170.2 -j REJECT
+
+# AWS sends a two-minute notice before it reclaims a Spot instance. The job
+# account cannot reach the metadata service (the REJECT rules above), so root
+# reads the notice here. On a notice the worker publishes one fixed marker on
+# this console and ends the one job; the controller turns that marker into a
+# worker-event. The marker is deliberately not a job step: the head controls
+# its own steps, so the evidence has to come from the worker.
+#
+# A worker that cannot read the notice behaves exactly as before - the instance
+# lifetime and the job timeout still bound it - so a failed metadata read is not
+# fatal.
+end_one_job() {
+  local cmdline pid
+  for cmdline in /proc/[0-9]*/cmdline; do
+    [ -r "$cmdline" ] || continue
+    pid=${cmdline#/proc/}
+    pid=${pid%/cmdline}
+    [ "$(stat -c '%U' "/proc/$pid" 2>/dev/null)" = runner ] || continue
+    grep -qa 'forgejo-runner' "$cmdline" 2>/dev/null || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+}
+spot_watch() {
+  local token body action host runner
+  host=$(hostname)
+  while :; do
+    token=$(curl -fsS --max-time 2 -X PUT \
+      -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+      http://169.254.169.254/latest/api/token) || token=""
+    if [ -n "$token" ]; then
+      if body=$(curl -fsS --max-time 2 -H "X-aws-ec2-metadata-token: $token" \
+        http://169.254.169.254/latest/meta-data/spot/instance-action); then
+        action=$(printf '%s' "$body" | jq -r '.action // empty' 2>/dev/null) || action=""
+        case "$action" in
+          terminate|stop|hibernate) ;;
+          *) action=unknown ;;
+        esac
+        # The runner's registration id, so the instance-to-runner mapping is
+        # recorded rather than inferred. The file also carries the registration
+        # token, so only this field is read and nothing is printed on failure.
+        # A notice before registration leaves the field unknown.
+        runner=$(jq -r '.uuid // empty' /var/lib/forgejo-runner/.runner 2>/dev/null) || runner=""
+        if ! printf '%s' "$runner" | grep -Eq \
+          '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+          runner=unknown
+        fi
+        echo "bootstrap spot-interruption action=$action host=$host runner=$runner"
+        end_one_job
+        return 0
+      fi
+    fi
+    sleep 5
+  done
+}
+spot_watch &
+SPOT_WATCH_PID=$!
 
 install -d -o runner -g runner -m 0700 /var/lib/forgejo-runner/work
 cd /var/lib/forgejo-runner

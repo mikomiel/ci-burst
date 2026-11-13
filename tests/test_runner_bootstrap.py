@@ -43,9 +43,16 @@ PUBLISHED_TEMPLATE_SHA256 = (
 #: version, update the deployment TOML's ``launch_template_version``, then flip
 #: these constants in a follow-up change (published becomes the pending pair and
 #: both PENDING values become ``None``).
+#:
+#: Version 5 is still owed: #110 prepared it for the one-job process status, and
+#: that version was never published. This change joins it, because only one
+#: publication may be outstanding at a time, so the operator publishes one
+#: version 5 that carries both changes. If version 5 is published from the bytes
+#: without this change first, the next version is 6 and these constants move with
+#: it instead.
 PENDING_TEMPLATE_VERSION = 5
 PENDING_TEMPLATE_SHA256 = (
-    "645a16d8c9576549039cc22667d79368622a411486676b5efcf553ad49eb4852"
+    "bc85ae28abfb0ddf9bbc456e5ee969115978871779b837a3756b1f6d4471928b"
 )
 
 
@@ -239,6 +246,72 @@ class RunnerBootstrapTests(unittest.TestCase):
         for address in ("169.254.169.254", "169.254.170.2"):
             with self.subTest(address=address):
                 self.assertIn(f"--uid-owner runner -d {address} -j REJECT", self.script)
+
+    def test_watches_the_spot_notice_as_root_before_the_job_starts(self):
+        # The job account is denied the metadata service above, so the watcher
+        # runs as root and must be running before the one job it can end.
+        self.assertIn("/latest/api/token", self.script)
+        self.assertIn("/latest/meta-data/spot/instance-action", self.script)
+        self.assertIn("spot_watch &", self.script)
+        self.assertIn("SPOT_WATCH_PID=$!", self.script)
+        self.assertLess(
+            self._line_index("-d 169.254.169.254 -j REJECT"),
+            self._line_index("spot_watch &"),
+        )
+        self.assertLess(self._line_index("spot_watch &"), self._line_index("one-job --wait"))
+
+    def test_publishes_one_fixed_marker_with_closed_values_only(self):
+        # The controller turns this exact line into the worker-event, so the
+        # marker is one string of validated values, never free console text.
+        # `unknown` is the shipped fallback for a notice without a documented
+        # action and for a notice that arrives before the runner registered.
+        self.assertEqual(self.script.count("bootstrap spot-interruption"), 1)
+        self.assertIn(
+            'echo "bootstrap spot-interruption action=$action host=$host runner=$runner"',
+            self.script,
+        )
+        self.assertIn("terminate|stop|hibernate)", self.script)
+        self.assertIn("*) action=unknown ;;", self.script)
+        self.assertIn("runner=unknown", self.script)
+        self.assertIn('host=$(hostname)', self.script)
+
+    def test_reads_only_the_registration_id_and_never_the_token(self):
+        # The registration file also holds the runner token, so the watcher reads
+        # one field with jq and validates its shape; it never prints or copies the
+        # file, and a missing file leaves the field unknown.
+        body = self.script[self.script.index("spot_watch()") :]
+        body = body[: body.index("\n}\n") + 3]
+        self.assertIn("jq -r '.uuid // empty' /var/lib/forgejo-runner/.runner", body)
+        self.assertIn("grep -Eq", body)
+        # One read of the registration file, and never its content: no cat, no
+        # copy, no token field.
+        self.assertEqual(body.count("/var/lib/forgejo-runner/.runner"), 1)
+        for forbidden in ("cat /var/lib/forgejo-runner/.runner", "TOKEN_FILE", "shred"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, body)
+
+    def test_ends_only_the_job_accounts_runner_process(self):
+        # The watcher signals the one process it can prove belongs to the job
+        # account; it never kills by name alone and never touches Forgejo.
+        watcher = self.script[self.script.index("end_one_job()") :]
+        self.assertIn("stat -c '%U'", watcher)
+        self.assertIn("= runner ]", watcher)
+        self.assertIn("grep -qa 'forgejo-runner'", watcher)
+        self.assertIn('kill -TERM "$pid"', watcher)
+        self.assertNotIn("kill -9", self.script)
+        self.assertNotIn("forgejo-runner daemon", self.script)
+
+    def test_a_metadata_failure_is_not_fatal_and_the_watcher_is_removed(self):
+        # A worker that cannot read the notice keeps the old lifetime and job
+        # timeout bounds, and the watcher must not outlive the bootstrap.
+        self.assertIn('|| token=""', self.script)
+        self.assertIn('|| action=""', self.script)
+        self.assertIn("sleep 5", self.script)
+        self.assertIn('kill "$SPOT_WATCH_PID"', self.script)
+        self.assertLess(
+            self._line_index('kill "$SPOT_WATCH_PID"'),
+            self._line_index("bootstrap exiting rc="),
+        )
 
     def test_installs_and_downloads_nothing(self):
         # The worker boots a baked image. An apt call or a download would make

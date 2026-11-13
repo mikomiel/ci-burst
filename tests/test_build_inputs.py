@@ -122,7 +122,8 @@ class RefreshBuildRecordShapeTests(unittest.TestCase):
     def test_validates_the_image_identity_before_using_it_in_a_path(self):
         # A case pattern, not a line-based matcher: an embedded newline must
         # not be able to smuggle a separator into the record path.
-        self.assertIn("sha256:*[!A-Za-z0-9._-]*)", self.script)
+        self.assertIn('""|*[!A-Za-z0-9._-]*) return 1', self.script)
+        self.assertIn('candidate=$(image_identity "$raw_candidate")', self.script)
         self.assertIn('image_key=${candidate#sha256:}', self.script)
         self.assertIn("build_inputs_failed: unusable image identity", self.script)
 
@@ -289,7 +290,7 @@ class RefreshBuildRecordBehaviourTests(unittest.TestCase):
             '  "tag "*)\n'
             # The promotion step itself refuses to tag an image whose complete
             # record is not on disk: ordering is a behaviour, not source text.
-            f'    python3 {check} "$CI_BURST_TEST_BUILDS" "$CI_BURST_TEST_IMAGE_ID" || exit 70 ;\n'
+            f'    python3 {check} "$CI_BURST_TEST_BUILDS" "${{CI_BURST_TEST_RECORD_ID:-$CI_BURST_TEST_IMAGE_ID}}" || exit 70 ;\n'
             '    case "$*" in\n'
             '      *":latest")\n'
             '        [ "${CI_BURST_TEST_FAIL_LATEST_TAG:-0}" = "0" ] || exit 1\n'
@@ -333,6 +334,23 @@ class RefreshBuildRecordBehaviourTests(unittest.TestCase):
 
     def reference_path(self, source_sha=SOURCE_SHA):
         return self.state / "builds" / f"sha-{source_sha[:12]}.json"
+
+    def test_an_unprefixed_image_id_is_normalised_before_recording(self):
+        # podman 5 reports `.Id` without the prefix on some engines; the engine
+        # still names the image that was built, so the record must use one
+        # canonical identity rather than refuse.
+        completed = self.run_script(
+            image_id="a" * 64,
+            CI_BURST_TEST_RECORD_ID=IMAGE_A,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertNotIn("unusable image identity", completed.stdout)
+        document = json.loads(
+            self.image_record_path(IMAGE_A).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["image_id"], IMAGE_A)
+        reference = json.loads(self.reference_path().read_text(encoding="utf-8"))
+        self.assertEqual(reference["image_id"], IMAGE_A)
 
     def test_records_exactly_one_complete_record_per_image(self):
         completed = self.run_script()

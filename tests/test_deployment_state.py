@@ -74,6 +74,14 @@ class DeploymentStateTests(unittest.TestCase):
         document = _document(artifact_id="")
         self.assertFalse(document["integrity_ok"])
 
+    def test_an_unprefixed_image_id_is_normalised(self):
+        digest = "a" * 64
+        self.assertEqual(state._normalize_image_id(digest), f"sha256:{digest}")
+        self.assertEqual(
+            state._normalize_image_id(f"sha256:{digest}"), f"sha256:{digest}"
+        )
+        self.assertEqual(state._normalize_image_id("sha256:short"), "sha256:short")
+
     def test_the_default_target_is_never_a_hostname(self):
         self.assertEqual(state.DEFAULT_TARGET, "controller")
         self.assertNotIn("gethostname", inspect.getsource(state))

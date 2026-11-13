@@ -57,6 +57,33 @@ UNITS=${CI_BURST_UNITS:-"ci-burst-apply.service ci-burst-apply.timer ci-burst-re
 
 log() { printf 'ci-burst-refresh: %s\n' "$*"; }
 
+# podman renders `.Id` with and without the `sha256:` prefix depending on the
+# engine build, so normalise it once, before it becomes a path component, a
+# record field or a comparison. A full digest gains the prefix; any other form
+# the engine reports keeps its own spelling. Either way the value must stay a
+# safe path component: sanitising a different shape could map two identities
+# onto one record.
+image_identity() {
+    case "$1" in
+        sha256:*) key=${1#sha256:} ;;
+        *) key=$1 ;;
+    esac
+    case "$key" in
+        ""|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    [ "${#key}" -le 128 ] || return 1
+    if [ "${#key}" -eq 64 ]; then
+        case "$key" in
+            *[!0-9a-f]*) ;;
+            *)
+                printf 'sha256:%s\n' "$key"
+                return 0
+                ;;
+        esac
+    fi
+    printf '%s\n' "$1"
+}
+
 # The accepted decision depends on the role's command: `plan` reports `wait` or
 # `would_launch` when it observed and decided to do nothing; `reap` without
 # `--apply` reports `planned` after selecting expired instances without
@@ -216,22 +243,15 @@ fi
 # more than once: a retry after an interrupted promotion is exactly that. A
 # source-keyed record would let that retry replace the record of the image
 # still serving. The engine generates the image ID but it becomes a path
-# component, so validate it against a path-safe alphabet rather than
-# sanitizing it: sanitizing could map two different IDs onto one file and
-# defeat the immutability this exists for. A case pattern is used because it
-# also rejects an embedded newline, which a line-based matcher would accept.
-case "$candidate" in
-    sha256:*[!A-Za-z0-9._-]*)
-        image_key= ;;
-    sha256:*)
-        image_key=${candidate#sha256:} ;;
-    *)
-        image_key= ;;
-esac
-if [ -z "$image_key" ] || [ "${#image_key}" -gt 128 ]; then
-    log "build_inputs_failed: unusable image identity: $candidate"
+# component, so it is normalised and validated as path-safe rather than
+# sanitised: sanitising could map two different IDs onto one file and defeat
+# the immutability this exists for.
+raw_candidate=$candidate
+candidate=$(image_identity "$raw_candidate") || {
+    log "build_inputs_failed: unusable image identity: $raw_candidate"
     exit 2
-fi
+}
+image_key=${candidate#sha256:}
 
 tree=$(git -C "$SOURCE" rev-parse "$want^{tree}") || {
     log "build_inputs_failed: cannot resolve the tree of $want"
@@ -511,14 +531,17 @@ exists_rc=0
 podman image exists "$IMAGE:latest" || exists_rc=$?
 case "$exists_rc" in
     0)
-        current=$(podman image inspect --format '{{.Id}}' "$IMAGE:latest") || {
+        raw_current=$(podman image inspect --format '{{.Id}}' "$IMAGE:latest") || {
             log "inspect_failed: $IMAGE:latest"
             exit 2
         }
-        if [ -z "$current" ]; then
+        if [ -z "$raw_current" ]; then
             log "inspect_failed: $IMAGE:latest"
             exit 2
         fi
+        # Normalise the same way as the candidate, so the previous tag is only
+        # written when the serving image really is a different identity.
+        current=$(image_identity "$raw_current") || current=$raw_current
         ;;
     1)
         # `podman image exists` documents 1 as "absent"; that is the only status

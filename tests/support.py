@@ -78,6 +78,8 @@ class FakeAws:
         self.run_error = None
         self.run_result = None
         self.run_count = 0
+        self.owned_instances_error = None
+        self.instances_error = None
         self.terminate_error = None
         self.terminated = []
         self.instances_by_id = {}
@@ -128,6 +130,8 @@ class FakeAws:
         if self.on_owned_instances is not None:
             self.on_owned_instances()
         self._maybe_raise()
+        if self.owned_instances_error is not None:
+            raise self.owned_instances_error
         return list(self.instances_result)
 
     def console_output(self, instance_ids, *, deadline=None):
@@ -141,6 +145,8 @@ class FakeAws:
     def instances(self, instance_ids, *, deadline=None):
         self._check_deadline(deadline, "DescribeInstances by-id read")
         self.calls.append(("instances", list(instance_ids)))
+        if self.instances_error is not None:
+            raise self.instances_error
         if self.on_instances is not None:
             self.on_instances()
         return [self.instances_by_id[identifier] for identifier in instance_ids if identifier in self.instances_by_id]

@@ -233,6 +233,13 @@ class RefreshTests(unittest.TestCase):
         )
         self.assertGreaterEqual(int(self.service["Service"]["timeoutstartsec"]), 900)
 
+    def test_writes_deployment_state_after_every_run(self):
+        self.assertEqual(
+            self.service["Service"]["execstoppost"], "/usr/local/sbin/ci-burst-state"
+        )
+        self.assertIn('if [ -f "$STATE/hold" ]', self.script)
+        self.assertIn('log "hold:', self.script)
+
     def test_timer_runs_at_boot_and_after_each_finished_run(self):
         self.assertEqual(self.timer["Timer"]["unit"], "ci-burst-refresh.service")
         self.assertEqual(self.timer["Timer"]["onbootsec"], "2min")

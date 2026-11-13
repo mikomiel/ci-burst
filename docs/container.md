@@ -389,6 +389,7 @@ Install it beside the apply unit, from a clone of this repository:
 git clone https://github.com/mikomiel/ci-burst.git /opt/ci-burst-src
 install -d -m 0700 /var/lib/ci-burst-image
 install -m 0755 deploy/ci-burst-refresh.sh /usr/local/sbin/ci-burst-refresh
+install -m 0755 deploy/ci-burst-state.py /usr/local/sbin/ci-burst-state
 podman network create --opt mtu=1300 ci-burst   # once, see "The container network"
 install -m 0644 \
   deploy/ci-burst-refresh.service deploy/ci-burst-refresh.timer \
@@ -406,6 +407,24 @@ The script defaults to `/opt/ci-burst-src`, `/var/lib/ci-burst-image`,
 `ci-burst`) and `CI_BURST_UNITS` adapt the smoke and the drift list to a host
 whose role is cleanup-only.
 
+`ci-burst-refresh.service` runs `ci-burst-state` as its `ExecStopPost`, so every
+attempt writes `/var/lib/ci-burst-image/deployment-state.json`: the deployed and
+channel commits, the image ID, the last success, and any unit drift against the
+deployed commit. The document declares `schema: deployment-state.v1` and is
+written for any external metrics collector; no credential, host address or
+private path is included.
+
+To freeze the serving image without stopping observation, write
+`/var/lib/ci-burst-image/hold` with a short reason. The next refresh still
+fetches the channel ref but skips the build and promotion, and the state document
+reports `pinned` with the distance behind. Remove the file to resume. Roll back
+by retagging the previous image before writing the hold:
+
+```sh
+podman tag localhost/ci-burst:previous localhost/ci-burst:latest
+printf '%s\n' 'rollback: <reason>' > /var/lib/ci-burst-image/hold
+```
+
 A cleanup-only host runs the same unit and script with a drop-in, because its
 scheduled operation is `reap` rather than `apply`:
 
@@ -414,6 +433,7 @@ scheduled operation is `reap` rather than `apply`:
 git clone https://github.com/mikomiel/ci-burst.git /opt/ci-burst-src
 install -d -m 0700 /var/lib/ci-burst-image
 install -m 0755 deploy/ci-burst-refresh.sh /usr/local/sbin/ci-burst-refresh
+install -m 0755 deploy/ci-burst-state.py /usr/local/sbin/ci-burst-state
 install -m 0644 \
   deploy/ci-burst-refresh.service deploy/ci-burst-refresh.timer \
   /etc/systemd/system/

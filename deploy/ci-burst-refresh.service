@@ -22,3 +22,4 @@ Type=oneshot
 TimeoutStartSec=900
 Nice=10
 ExecStart=/usr/local/sbin/ci-burst-refresh
+ExecStopPost=/usr/local/sbin/ci-burst-state

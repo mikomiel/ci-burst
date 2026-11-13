@@ -86,6 +86,15 @@ if ! git -C "$SOURCE" fetch --quiet --depth=1 origin main; then
 fi
 want=$(git -C "$SOURCE" rev-parse FETCH_HEAD) || { log 'resolve_failed'; exit 2; }
 
+# A hold freezes the serving image without stopping the observation: the
+# fetch above already refreshed the channel ref, so the deployment-state
+# producer can still report how far behind the held artifact is. Removing the
+# file resumes promotion on the next run.
+if [ -f "$STATE/hold" ]; then
+    log "hold: $(cat "$STATE/hold" 2>/dev/null || true)"
+    exit 0
+fi
+
 if [ "$want" = "$recorded" ]; then
     log "current: $want"
     exit 0

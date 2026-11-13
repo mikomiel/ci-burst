@@ -2,6 +2,28 @@
 
 ## MODIFIED Requirements
 
+### Requirement: Provider-only bounded observation
+
+The command MUST read evidence only from the provider console of instances that carry this
+deployment's ownership tags. It MUST NOT call the queue interface, hold a queue
+credential, or mutate any provider resource. It MUST bound one run at a small fixed number
+of console reads and a fixed number of bytes per console.
+
+#### Scenario: Owned instances are observed
+- **WHEN** the deployment owns instances and the command runs
+- **THEN** each owned instance contributes at most one console read
+- **AND** a record already observed in a terminal state contributes none
+- **AND** no queue request is made and no resource is created, modified or terminated
+
+#### Scenario: The bound is exceeded
+- **WHEN** more unfinished non-terminal owned instances than `MAX_CONSOLE_READS` (16) are candidates in one run
+- **THEN** the command refuses with `console_read_cap_exceeded` and exit code 2
+- **AND** it writes no event and no metrics file
+
+#### Scenario: An instance ages out
+- **WHEN** the provider no longer knows one of the owned instance identifiers
+- **THEN** that instance is skipped without failing the run
+
 ### Requirement: Observation refuses only when owned instances exceed the limit
 
 The read budget is independent of the admission ceiling. More non-terminal owned
@@ -25,8 +47,6 @@ non-terminal candidates exceed `MAX_CONSOLE_READS` (16), with
 #### Scenario: Turnover is not a bound violation
 - **WHEN** the number of owned instances exceeds the configured limit but every one is reported `terminated`
 - **THEN** the command does not refuse
-
-## MODIFIED Requirements
 
 ### Requirement: Turnover defers surplus candidates rather than refusing
 

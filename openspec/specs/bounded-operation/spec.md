@@ -146,3 +146,122 @@ The program MUST report stable decision/refusal reasons, operation identity and 
 - **WHEN** cleanup or provider readback is unavailable
 - **THEN** status identifies the unresolved operation and failure
 - **AND** it does not report successful cleanup, successful CI or zero residual cost
+
+### Requirement: Provider reads and the pass are bounded
+Every AWS client MUST carry bounded connect and read timeouts without changing retry counts. `owned_instances`, `instances`, `spot_quote` and `console_output` MUST accept an optional deadline and MUST refuse before the next page or identifier once it is reached. One `apply` MUST bound its pass by `controller.pass_deadline_seconds` (30..290, default 240), an accepted range below the shipped unit's `TimeoutStartSec=300`. A read called without a deadline MUST behave as before.
+
+#### Scenario: Inventory pagination reaches the deadline
+- **WHEN** the clock reaches the pass deadline between two `DescribeInstances` pages
+- **THEN** the read stops before requesting the next page
+- **AND** it raises the local deadline refusal and makes no further call
+
+#### Scenario: A read has no deadline
+- **WHEN** a read is called without a deadline
+- **THEN** it consumes every page and identifier exactly as before
+
+#### Scenario: A deployment needs a longer pass
+- **WHEN** a deployment needs a pass longer than `290` seconds
+- **THEN** it raises the unit's `TimeoutStartSec` instead of setting a larger `pass_deadline_seconds`
+- **AND** a larger value is refused as invalid configuration
+
+### Requirement: A slow provider produces a bounded incomplete pass
+When the pass deadline is reached, `apply` MUST return `decision="refused"` with `reasons=["pass_deadline_exceeded"]` and a `phases_deferred` list naming the phases that did not complete, including when the read that crossed it returned no usable quote. It MUST NOT send an expired intent or a quote the deadline interrupted, and it MUST NOT terminate an instance it did not select. A phase that has already started MUST complete.
+
+#### Scenario: A slow quote read exhausts the pass
+- **WHEN** a Spot quote read advances the clock past the pass deadline
+- **THEN** `apply` refuses with `pass_deadline_exceeded`
+- **AND** no `RunInstances` or `TerminateInstances` call is made
+- **AND** `phases_deferred` names the phases that did not complete
+
+#### Scenario: A final admission read exhausts the pass
+- **WHEN** the last admission read returns after the pass deadline with no quote, an above-cap quote or a provider refusal
+- **THEN** `apply` reports `pass_deadline_exceeded` and defers `admission` and `launch` instead of returning the ordinary refusal
+- **AND** no `RunInstances` or `TerminateInstances` call is made
+
+#### Scenario: A refusal is decided before the deadline
+- **WHEN** the last admission read returns before the pass deadline with no usable quote
+- **THEN** `apply` returns the ordinary refusal
+- **AND** the result has no `pass_deadline_exceeded` reason and no `phases_deferred`
+
+#### Scenario: The deadline reaches before expiry cleanup
+- **WHEN** the pass deadline is reached before `expire` starts
+- **THEN** no owned instance is terminated
+- **AND** the pass reports `expire` and the later phases as deferred
+
+### Requirement: Mutations do not take the pass deadline
+The deadline MUST NOT be passed into `_send`, `RunInstances` or `TerminateInstances`. A frozen intent and its client token MUST be committed before the send, so a cancellation after a possibly accepted launch keeps the existing uncertain reconciliation path and resumes with the same token.
+
+#### Scenario: A launch may have been accepted when the pass is cancelled
+- **WHEN** the process stops after `RunInstances` may have been accepted and before a response was recorded
+- **THEN** the operation remains non-terminal with its frozen request and token
+- **AND** the next pass resumes that request instead of allocating a replacement
+
+### Requirement: The independent reaper is outside the pass deadline
+`reap`, `status` and `export` MUST keep their existing behaviour and MUST NOT take `controller.pass_deadline_seconds`. Expiry cleanup MUST remain schedulable on its own host and timer when the scaler's pass is deferred, refuses or is stopped.
+
+#### Scenario: The reaper runs while the scaler pass is deferred
+- **WHEN** an `apply` pass ends with `pass_deadline_exceeded`
+- **THEN** an independently scheduled `reap --apply` can still select and terminate an expired owned instance
+- **AND** the reaper is not bounded by the scaler's pass deadline
+
+### Requirement: Cleanup outcome and evidence
+
+An applied cleanup pass that refused any owned resource MUST report
+`cleanup_degraded` and exit nonzero; `termination_requested` MUST mean none was
+refused. `cleanup_failed` stays the provider refusal. Malformed ownership MUST
+NEVER authorize termination. The result MUST carry one `cleanup` object from the
+same read with verification, clocks and observed, skipped, terminated,
+terminating, expired, requested, refused, denied and unresolved counts. A
+request MUST NOT count as a confirmed removal.
+
+#### Scenario: Every candidate is refused
+
+- **WHEN** an applied cleanup pass refuses every owned candidate and sends no
+  termination request
+- **THEN** the decision is `cleanup_degraded`
+- **AND** the command exits nonzero
+- **AND** `termination_requested` is empty and no confirmation is emitted
+- **AND** the provider receives no terminate call
+
+#### Scenario: Proven and refused resources share one inventory
+
+- **WHEN** one owned instance has a valid expired expiry tag and another has a
+  malformed tag
+- **THEN** only the proven instance is terminated
+- **AND** the result reports `cleanup_degraded`
+- **AND** both the expired and the refused outcome are retained
+
+#### Scenario: Inventory is verified empty
+
+- **WHEN** the complete owned-instance read returns no records
+- **THEN** the decision is `termination_requested` with an empty request list
+- **AND** the cleanup block reports `inventory_verified: true` and zero counts
+- **AND** the run does not claim a confirmed removal
+
+#### Scenario: Malformed ownership or expiry
+
+- **WHEN** an owned instance has a missing, empty, `pending` or malformed
+  ownership or expiry tag
+- **THEN** it is reported as refused
+- **AND** no termination is requested for it
+
+#### Scenario: Heartbeat is absent or stale
+
+- **WHEN** no cleanup document exists for the interval, or the newest one is old
+- **THEN** the cleanup path is unobserved
+- **AND** that absence is not evidence of an empty inventory, a zero bill or a
+  completed cleanup
+
+#### Scenario: Delayed terminal readback
+
+- **WHEN** a run requests termination and later inventory reads report
+  `shutting-down` and then `terminated`
+- **THEN** the requesting run reports a request, not a confirmed removal
+- **AND** only the read that observes `terminated` reports a terminal count
+
+#### Scenario: No confirmed removal without a provider terminal state
+
+- **WHEN** the provider has not reported a terminal state for a requested or
+  refused instance
+- **THEN** the cleanup evidence keeps it unresolved
+- **AND** a requested or denied termination is not counted as removed

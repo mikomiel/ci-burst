@@ -105,7 +105,8 @@ no cloud change.
 - [x] 6.3 Document the schema, the verified backup, the observation compatibility
   window and the rollback restore in `docs/container.md`.
 - [x] 6.4 Update the cost paragraph in `README.md`.
-- [x] 6.5 Regenerate the changelog with `scripts/render_changelog.py --write`.
+- [x] 6.5 Regenerate the changelog; release-please owns `CHANGELOG.md` from the
+  merged conventional commits (the bespoke renderer was removed in #101).
 - [x] 6.6 Document the frozen admitted basis, the single-count rule, the surplus
   CPU credit residual and the settlement bound in `docs/operations.md`; the
   schema-3 `.pre-v3.` backup and restore in `docs/container.md`; and that cost

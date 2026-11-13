@@ -22,9 +22,8 @@ of console reads and a fixed number of bytes per console.
 - **AND** no queue request is made and no resource is created, modified or terminated
 
 #### Scenario: The bound is exceeded
-- **WHEN** the number of non-terminal owned instances exceeds the configured
-  `controller.max_instances`
-- **THEN** the command refuses with a stable reason code and exit code 2
+- **WHEN** more unfinished non-terminal owned instances than `MAX_CONSOLE_READS` (16) are candidates in one run
+- **THEN** the command refuses with `console_read_cap_exceeded` and exit code 2
 - **AND** it writes no event and no metrics file
 
 #### Scenario: An instance ages out
@@ -32,19 +31,24 @@ of console reads and a fixed number of bytes per console.
 - **THEN** that instance is skipped without failing the run
 
 ### Requirement: Closed marker vocabulary
-
-The command MUST recognise only a closed vocabulary: a step name from the
-shipped first-boot script's fixed set, the `bootstrap exiting rc=<n>` status,
-and a fixed set of failure kinds. It MUST NOT publish console text, so
-truncation MUST NOT be used as redaction.
+The command MUST recognise only a closed vocabulary: a step name from the shipped first-boot script's fixed set; the `bootstrap one-job <outcome> rc=<n>` marker with outcome `completed`, `failed` or `timeout`; the `bootstrap exiting rc=<n>` status, which now reports the one-job process's real status; and fixed failure kinds. The process marker MUST NOT be read as a Forgejo job verdict, and no console text MAY be published, so truncation MUST NOT be used as redaction.
 
 #### Scenario: A worker registers
 - **WHEN** a console contains the registration step marker
 - **THEN** the instance records a registration event naming that step
 - **AND** no console text is emitted
 
+#### Scenario: A worker's one-job process ends
+- **WHEN** a console contains one `bootstrap one-job completed|failed|timeout rc=<n>` marker
+- **THEN** the instance records one `job-process` event naming that outcome and status
+- **AND** no job verdict or console text is published
+
 #### Scenario: An unshipped step name or unrelated text
 - **WHEN** a console line names a step outside the fixed set, or matches no marker
+- **THEN** it is ignored and never reaches the event stream
+
+#### Scenario: An unshipped process outcome
+- **WHEN** a console line names a one-job outcome outside `completed`, `failed` and `timeout`, or pairs an outcome with a status the bootstrap cannot emit
 - **THEN** it is ignored and never reaches the event stream
 
 ### Requirement: Failure classification publishes a kind only
@@ -160,25 +164,44 @@ finish while the instance and its console carry on.
 
 ### Requirement: Turnover defers surplus candidates rather than refusing
 
-A finished record MUST NOT be read again, so normal turnover cannot consume the budget,
-and live workers MUST be read before termination history. When the candidates exceed the
-per-run budget the command MUST defer the rest and report the deferral; it MUST NOT
-refuse, because a deferred record is a candidate again on the next run while the provider
-still knows it.
+A finished record MUST NOT be read again, so normal turnover cannot consume the
+budget, and live workers MUST be read before termination history. Surplus
+candidates the run will not read MUST be deferred and reported, and MUST be read
+on a later run. The deferral applies while the unfinished non-terminal candidates
+fit within the per-run read budget; above it the command MUST refuse under the
+refusal requirement, because live evidence cannot be covered in one run.
+
+#### Scenario: Surplus terminal history is deferred
+- **WHEN** the unfinished non-terminal candidates fit within the per-run read budget and terminal owned instances push the candidate count above it
+- **THEN** the run reports `console_read_deferred` and does not refuse
 
 #### Scenario: Turnover exceeds the per-run read budget
 - **WHEN** the provider still lists terminal owned instances and the run has more
-  candidates than the per-run read budget
+  candidates than the per-run read budget, while its unfinished non-terminal
+  candidates fit within that budget
 - **THEN** the run reads up to the budget and reports the deferral
 - **AND** it publishes the events and metrics for the records it read
 - **AND** the deferred records are read on a later run
 
 ### Requirement: Observation refuses only when owned instances exceed the limit
 
-The command MUST refuse when the number of non-terminal owned instances exceeds the
-configured `controller.max_instances`, counting every instance the provider does not
-report as `terminated`: that is the ownership tags disagreeing with the deployment, not
-turnover.
+The read budget is independent of the admission ceiling. More non-terminal owned
+instances than `controller.max_instances` MUST be reported with
+`above_configured_limit`, not refused: a supported drain still writes events and
+metrics. A deferred run MUST report the deferral and MUST NOT present itself as
+complete. The command MUST refuse, writing no file, only when unfinished
+non-terminal candidates exceed `MAX_CONSOLE_READS` (16), with
+`console_read_cap_exceeded`.
+
+#### Scenario: A supported drain is reported, not refused
+- **WHEN** two non-terminal owned workers run with `controller.max_instances` set to 1
+- **THEN** the decision is `reported` with two console reads and the `above_configured_limit` note
+- **AND** the events file and the metrics file are both written
+
+#### Scenario: Live workers exceed the read budget
+- **WHEN** 17 unfinished non-terminal owned workers are candidates in one run
+- **THEN** the command refuses with `console_read_cap_exceeded` and exit code 2
+- **AND** it writes no event and no metrics file
 
 #### Scenario: Turnover is not a bound violation
 - **WHEN** the number of owned instances exceeds the configured limit but every one is reported `terminated`

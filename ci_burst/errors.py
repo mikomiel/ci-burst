@@ -39,5 +39,17 @@ class ProviderRefusal(Refusal):
     """AWS refused or could not answer the requested read or mutation."""
 
 
+#: The local pass budget ended before the next read, phase or mutation could
+#: start. This is not a provider answer, so it has its own reason code.
+PASS_DEADLINE_EXCEEDED = "pass_deadline_exceeded"
+
+
+class DeadlineRefusal(Refusal):
+    """The pass's local time budget ended before the next read or phase."""
+
+    def __init__(self, detail=""):
+        super().__init__(PASS_DEADLINE_EXCEEDED, detail)
+
+
 class AdmissionRefusal(Refusal):
     """A live launch was requested but at least one admission condition failed."""

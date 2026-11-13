@@ -9,6 +9,13 @@ The version, this file and the release tag are maintained by
 conventional commits on `main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases)
 owns the release boundary. Do not edit a released section by hand.
 
+## [0.5.1](https://github.com/mikomiel/ci-burst/compare/v0.5.0...v0.5.1) (2026-11-13)
+
+
+### Fixed
+
+* **deploy:** normalise engine image IDs across prefix forms ([#128](https://github.com/mikomiel/ci-burst/issues/128)) ([5aa08ff](https://github.com/mikomiel/ci-burst/commit/5aa08ffae5f0f3603304937f0649037fcaf4b96e))
+
 ## [0.5.0](https://github.com/mikomiel/ci-burst/compare/v0.4.0...v0.5.0) (2026-11-13)
 
 

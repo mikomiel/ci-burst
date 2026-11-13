@@ -229,8 +229,18 @@ operator-owned prerequisite; this repository carries the build recipe at
 [`deploy/runner/image/provision.sh`](../deploy/runner/image/provision.sh) and
 the operator steps at
 [`deploy/runner/image/README.md`](../deploy/runner/image/README.md), but it
-neither builds nor publishes the image. The image must provide what the
-bootstrap below assumes:
+neither builds nor publishes the image. The build inputs are portable and
+listed there: a fresh Debian 13 arm64 base, root on the builder, egress to the
+Debian apt repositories, GitHub, `nodejs.org`, `code.forgejo.org` and the
+Python package index (`pypi.org` and `files.pythonhosted.org`), including the
+redirect targets of those hosts, and one value the recipe takes as input —
+`RUFF_VERSION`, the ruff release to install (for example `0.17.4`). The index
+is needed because the recipe installs ruff with `uv tool install` on a fresh
+builder with no cached wheel. The other tool versions are literal pins in the
+recipe. Nothing in that section needs a private repository or an existing
+fleet.
+
+The image must provide what the bootstrap below assumes:
 
 - `forgejo-runner` **13.2.1** at `/usr/local/bin/forgejo-runner` — the pin lives
   in the image, not in a download;
@@ -253,23 +263,33 @@ bootstrap below assumes:
   resolves the file relative to its working directory.
 
 A deployment that starts from a stock image can bake the toolchain with the
-recipe, or put the install into the bootstrap it publishes. Either way the
-bootstrap file here is the bytes actually published, so it cannot carry values
-an operator is expected to edit before use.
+recipe, or put the install into the bootstrap it publishes. The versions and
+history recorded in the image directory describe the maintainers' deployment,
+not a prerequisite for yours; an independent operator supplies a base image and
+`RUFF_VERSION` and records the result with their own deployment. The bootstrap
+file here is the recorded deployment's captured template user data, not a
+parameterised example; if your deployment needs different values, fork it and
+publish your own version (see [Worker bootstrap](#worker-bootstrap)).
 
 ### Worker bootstrap
 
 User data (no secret in it). The bootstrap is the repository-owned file
 [`deploy/runner/bootstrap.sh`](../deploy/runner/bootstrap.sh), and it is the
-bytes published as the template version — not a template or an example. It runs
-as root, reads the registration token from the SSM SecureString parameter,
-registers one ephemeral runner named `burst-<hostname>`, blocks the metadata
-service for the job account, runs exactly one job and always terminates the
-instance.
+bytes published as the recorded deployment's template version — not a template
+or an example. The byte hash pinned in
+[`tests/test_runner_bootstrap.py`](../tests/test_runner_bootstrap.py) describes
+that captured artifact only; it does not describe or validate a version you
+publish. It runs as root, reads the registration token from the SSM SecureString
+parameter, registers one ephemeral runner named `burst-<hostname>`, blocks the
+metadata service for the job account, runs exactly one job and always terminates
+the instance.
 
 The labels, the Forgejo URL and the parameter name are literal in the file. That
 is deliberate: a deployment that needs different values edits the file, publishes
-a new template version and bumps `launch_template_version`. Publishing:
+a new template version and bumps `launch_template_version`. Editing and
+publishing your own version is the independence path: that fork is your own
+artefact, with its own validation and versioning, and this repository does not
+maintain a second copy of it. Publishing:
 
 ```sh
 aws ec2 create-launch-template-version --launch-template-name <template> \
@@ -300,9 +320,9 @@ worker only after you observe queue demand, or pass `--wait`; an idle launch
 otherwise pays for a boot that does no work.
 
 The bootstrap runs with `umask 077` while it handles the registration token, then
-lowers to `umask 0022` before starting the job, because that is what the
-persistent fleet's runner produces under systemd's default `UMask=0022`. Without
-the second umask the job would create `0600`/`0700` files where the fleet creates
+lowers to `umask 0022` before starting the job, because that is what a
+systemd-managed runner produces under its default `UMask=0022`. Without the
+second umask the job would create `0600`/`0700` files where that runner creates
 `0644`/`0755`. That difference is invisible until a job asserts a mode, and then
 it fails only on burst capacity — a false red that looks like a defect in the
 change under test.

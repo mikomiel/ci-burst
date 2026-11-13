@@ -60,17 +60,22 @@ A live launch MUST require explicit apply, fresh qualified demand, reconciled ow
 - **AND** the launch is refused only when no configured candidate is eligible
 
 ### Requirement: Plan reports ordered placement candidates
-The plan MUST report every configured availability-zone candidate in order with the Spot price used for it, or an explicit null when no price was read, and MUST identify the selected candidate. A candidate above the configured price ceiling MUST be skipped rather than treated as a fatal error while another candidate remains eligible.
+The plan MUST report every configured placement pool in order — its instance type, availability-zone candidate, subnet and launch-template version — with the Spot price used for it, or an explicit null when no price was read, and MUST identify the selected pool. A pool above the configured price ceiling MUST be skipped rather than treated as a fatal error while another pool remains eligible.
 
 #### Scenario: One candidate exceeds the price ceiling
-- **WHEN** a configured candidate has a fresh quote above the configured maximum price
-- **THEN** that candidate is reported as skipped with a stable reason
-- **AND** the first eligible candidate in order is reported as selected
+- **WHEN** a configured pool has a fresh quote above the configured maximum price
+- **THEN** that pool is reported as skipped with a stable reason
+- **AND** the first eligible pool in order is reported as selected
+
+#### Scenario: A later type is eligible while the first is not
+- **WHEN** every pool of the first configured type is skipped and a pool of a later type is eligible
+- **THEN** the plan reports the selected pool with its type and zone
+- **AND** the launch uses that pool without changing the configured order
 
 #### Scenario: No candidate is eligible
-- **WHEN** no configured candidate has a usable price or placement prerequisite
+- **WHEN** no configured pool has a usable price or placement prerequisite
 - **THEN** the plan is refused
-- **AND** every candidate's skip reason is reported
+- **AND** every pool's skip reason is reported
 
 ### Requirement: Conservative persistent reservations
 The controller MUST commit the required monetary reservation before requesting a launch and preserve it through restart and uncertain cleanup. Reservation accounting MUST use exact units rather than floating-point currency. Instance termination MUST NOT automatically refund already consumed budget allowance.

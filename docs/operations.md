@@ -15,9 +15,9 @@ scheduler:
 - ci-burst owns launch intent, ownership metadata and a conservative forward
   cost commitment.
 
-The source ships an annotated release tag (`v0.1.0`) but no published image,
-deployment or live-qualified Forgejo contract. A green validation run proves
-source behavior only.
+The source is released under annotated semantic-version tags but publishes no
+image, deployment or live-qualified Forgejo contract. A green validation run
+proves source behavior only.
 
 ## Configuration
 
@@ -353,8 +353,9 @@ must match a bounded identifier shape or is reported as `<redacted>`.
 `qualification = "fixtures-only"` is the shipped default and blocks `apply`.
 To qualify a deployment, the operator must, with an owner-scoped read token:
 
-1. confirm the endpoint returns the shape above for the repository, including
-   the mandatory `labels` filter and `null` for no match;
+1. confirm the endpoint returns the shape above for the repository when the
+   adapter's explicit `labels` filter is sent — this qualification does not use
+   an unfiltered request;
 2. observe one known waiting job and one running job, and verify the demand
    classification. Dependency-blocked work cannot be part of this evidence: the
    endpoint does not list it (see § Queue contract);

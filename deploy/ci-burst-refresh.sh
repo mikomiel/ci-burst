@@ -53,7 +53,7 @@ UNIT_DIR=${CI_BURST_UNIT_DIR:-/etc/systemd/system}
 # control that are disproportionate to how rarely a unit changes. A host with a
 # different role overrides the list, so its drift report describes that host
 # instead of reporting the other role's units as missing.
-UNITS=${CI_BURST_UNITS:-"ci-burst-apply.service ci-burst-apply.timer ci-burst-refresh.service ci-burst-refresh.timer"}
+UNITS=${CI_BURST_UNITS:-"ci-burst-apply.service ci-burst-apply.timer ci-burst-refresh.service ci-burst-refresh.timer ci-burst-export.service ci-burst-export.timer"}
 
 log() { printf 'ci-burst-refresh: %s\n' "$*"; }
 
@@ -85,6 +85,11 @@ if ! git -C "$SOURCE" fetch --quiet --depth=1 origin main; then
     exit 2
 fi
 want=$(git -C "$SOURCE" rev-parse FETCH_HEAD) || { log 'resolve_failed'; exit 2; }
+# Record the channel observation only after a successful fetch. The state
+# producer reads this file and its mtime, so a failed fetch can never present
+# an old commit as freshly checked.
+printf '%s\n' "$want" >"$STATE/source-sha.tmp"
+mv "$STATE/source-sha.tmp" "$STATE/source-sha"
 
 # A hold freezes the serving image without stopping the observation: the
 # fetch above already refreshed the channel ref, so the deployment-state
@@ -96,8 +101,15 @@ if [ -f "$STATE/hold" ]; then
 fi
 
 if [ "$want" = "$recorded" ]; then
-    log "current: $want"
-    exit 0
+    serving=$(podman image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE:latest" 2>/dev/null || true)
+    if [ "$serving" = "$want" ]; then
+        log "current: $want"
+        exit 0
+    fi
+    # A rollback retags an older image without rewriting deployed-sha. The
+    # serving label is the truth; rebuild the channel image rather than
+    # reporting a deployed commit that is not actually serving.
+    log "serving_mismatch: recorded $recorded serving ${serving:-unknown}"
 fi
 
 work=$(mktemp -d)
@@ -120,7 +132,13 @@ fi
 # MTU is larger than the host path MTU stalls those transfers with no error.
 # The smoke run below uses the same named network as the scheduled units, so it
 # exercises exactly the networking they use.
-if ! podman build --quiet --network=host --tag "$IMAGE:candidate" "$work/src" >/dev/null; then
+version=$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$work/src/ci_burst/__init__.py" 2>/dev/null | head -n 1)
+set -- build --quiet --network=host --tag "$IMAGE:candidate" \
+    --label "org.opencontainers.image.revision=$want"
+if [ -n "$version" ]; then
+    set -- "$@" --label "org.opencontainers.image.version=$version"
+fi
+if ! podman "$@" "$work/src" >/dev/null; then
     log "build_failed: $want"
     exit 2
 fi

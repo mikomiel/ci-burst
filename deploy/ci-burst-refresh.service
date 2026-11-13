@@ -23,3 +23,7 @@ TimeoutStartSec=900
 Nice=10
 ExecStart=/usr/local/sbin/ci-burst-refresh
 ExecStopPost=/usr/local/sbin/ci-burst-state
+# Logical, public-safe deployment target and the controller's unit list. The
+# cleanup drop-in overrides both for the reaper host.
+Environment=CI_BURST_TARGET=controller
+Environment="CI_BURST_UNITS=ci-burst-apply.service ci-burst-apply.timer ci-burst-refresh.service ci-burst-refresh.timer ci-burst-export.service ci-burst-export.timer"

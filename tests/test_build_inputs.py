@@ -181,10 +181,10 @@ class RefreshBuildRecordShapeTests(unittest.TestCase):
     def test_writes_the_record_after_the_build_and_before_promotion(self):
         record = self.script.index('log "build_inputs: $record"')
         reference = self.script.index('log "build_inputs_ref: $reference"')
-        self.assertLess(self.script.index("podman build"), record)
+        self.assertLess(self.script.index("set -- build"), record)
         self.assertLess(record, reference)
         self.assertLess(reference, self.script.index('"$IMAGE:sha-$short"'))
-        self.assertLess(reference, self.script.index('"$IMAGE:latest"'))
+        self.assertLess(reference, self.script.index('tag "$IMAGE:candidate" "$IMAGE:latest"'))
 
     def test_a_record_failure_is_a_named_refusal(self):
         self.assertIn('log "build_inputs_failed:', self.script)

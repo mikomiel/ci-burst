@@ -417,13 +417,16 @@ private path is included.
 To freeze the serving image without stopping observation, write
 `/var/lib/ci-burst-image/hold` with a short reason. The next refresh still
 fetches the channel ref but skips the build and promotion, and the state document
-reports `pinned` with the distance behind. Remove the file to resume. Roll back
-by retagging the previous image before writing the hold:
+reports `pinned` with the distance behind. The installed unit sets the logical
+`CI_BURST_TARGET` (`controller`; the cleanup drop-in sets `reaper`), so the
+document never carries a hostname.
 
-```sh
-podman tag localhost/ci-burst:previous localhost/ci-burst:latest
-printf '%s\n' 'rollback: <reason>' > /var/lib/ci-burst-image/hold
-```
+To roll back, follow the "Rollback" procedure below: it disables the timer and
+stops the service under the refresh lock before retagging, so an in-flight run
+cannot promote over the rollback. Write the hold before restarting the timer.
+Removing the hold later rebuilds the channel image because the serving revision
+label no longer matches the channel, rather than silently reporting the old
+`deployed-sha` as current.
 
 A cleanup-only host runs the same unit and script with a drop-in, because its
 scheduled operation is `reap` rather than `apply`:
@@ -448,6 +451,9 @@ systemctl list-timers 'ci-burst-*'
 If the host cannot use podman's named network, install
 `deploy/ci-burst-reap-host-network.conf` beside the reap unit at the same time and
 keep `CI_BURST_SMOKE_NETWORK=host` in the refresh drop-in; see the networking
+The cleanup drop-in also sets `CI_BURST_TARGET=reaper` and its own
+`CI_BURST_UNITS` list; do not install it on the controller.
+
 paragraph below. Without that drop-in, remove the line so the smoke uses the
 shipped unit's network.
 
@@ -624,8 +630,10 @@ script's own lock.
 ```sh
 systemctl disable --now ci-burst-refresh.timer   # no new runs, from here on
 systemctl stop ci-burst-refresh.service          # waits for a run in progress
-flock /var/lib/ci-burst-image/refresh.lock \
-  podman tag localhost/ci-burst:previous localhost/ci-burst:latest
+flock /var/lib/ci-burst-image/refresh.lock sh -c \
+  'podman tag localhost/ci-burst:previous localhost/ci-burst:latest &&
+   printf "%s\n" "rollback: <reason>" > /var/lib/ci-burst-image/hold'
+systemctl enable --now ci-burst-refresh.timer   # honors the hold; no promotion
 ```
 
 `previous` is whatever `latest` pointed at before the last promotion, including

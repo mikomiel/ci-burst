@@ -240,6 +240,21 @@ class RefreshTests(unittest.TestCase):
         self.assertIn('if [ -f "$STATE/hold" ]', self.script)
         self.assertIn('log "hold:', self.script)
 
+    def test_installs_the_logical_target_and_unit_list_for_the_producer(self):
+        text = (DEPLOY / "ci-burst-refresh.service").read_text(encoding="utf-8")
+        self.assertIn("Environment=CI_BURST_TARGET=controller", text)
+        self.assertIn('Environment="CI_BURST_UNITS=ci-burst-apply.service', text)
+        self.assertIn("ci-burst-export.service", text)
+
+    def test_records_the_channel_observation_only_after_a_successful_fetch(self):
+        self.assertIn('"$STATE/source-sha.tmp"', self.script)
+        self.assertIn('"$STATE/source-sha"', self.script)
+
+    def test_checks_the_serving_image_revision_not_only_deployed_sha(self):
+        self.assertIn("serving_mismatch", self.script)
+        self.assertIn("org.opencontainers.image.revision", self.script)
+        self.assertIn("--label", self.script)
+
     def test_timer_runs_at_boot_and_after_each_finished_run(self):
         self.assertEqual(self.timer["Timer"]["unit"], "ci-burst-refresh.service")
         self.assertEqual(self.timer["Timer"]["onbootsec"], "2min")
@@ -249,7 +264,7 @@ class RefreshTests(unittest.TestCase):
     def test_compares_origin_main_before_building_anything(self):
         self.assertIn("fetch --quiet --depth=1 origin main", self.script)
         self.assertLess(
-            self.script.index("deployed-sha"), self.script.index("podman build")
+            self.script.index("deployed-sha"), self.script.index("set -- build")
         )
 
     def test_builds_an_archive_of_the_exact_commit(self):
@@ -264,7 +279,7 @@ class RefreshTests(unittest.TestCase):
     def test_builds_with_host_networking_but_smokes_on_the_unit_network(self):
         # A container bridge MTU above the host path MTU stalls large downloads;
         # the build needs the network, the smoke must mirror the scheduled units.
-        self.assertIn("podman build --quiet --network=host --tag", self.script)
+        self.assertIn("set -- build --quiet --network=host --tag", self.script)
         self.assertIn("SMOKE_NETWORK=${CI_BURST_SMOKE_NETWORK:-ci-burst}", self.script)
         smoke = self.script[self.script.index("set -- run --rm") :]
         smoke = smoke[: smoke.index("done\n")]
@@ -273,8 +288,8 @@ class RefreshTests(unittest.TestCase):
 
     def test_smoke_tests_the_candidate_before_promoting_it(self):
         smoke = self.script.index('"$SMOKE_COMMAND" --config')
-        self.assertLess(self.script.index("podman build"), smoke)
-        self.assertLess(smoke, self.script.index('"$IMAGE:latest"'))
+        self.assertLess(self.script.index("set -- build"), smoke)
+        self.assertLess(smoke, self.script.index('tag "$IMAGE:candidate" "$IMAGE:latest"'))
         # A completed decision is required, not "any document": a config refusal
         # is exit 2 and must fail the smoke.
         self.assertIn('if [ "$attempt" -ge 2 ]', self.script)
@@ -317,6 +332,7 @@ class RefreshTests(unittest.TestCase):
         drop_in = (DEPLOY / "ci-burst-refresh-cleanup.conf").read_text(encoding="utf-8")
         for assignment in (
             "Environment=CI_BURST_SMOKE_COMMAND=reap",
+            "Environment=CI_BURST_TARGET=reaper",
             "Environment=CI_BURST_AWS_DIR=/etc/ci-burst/aws-cleanup",
             "Environment=CI_BURST_SMOKE_NETWORK=host",
             "Environment=CI_BURST_TOKEN_ENV=",
@@ -411,6 +427,8 @@ class RefreshBehaviourTests(unittest.TestCase):
             '    { find "$ctx" -type f | sort; echo marker:; cat "$ctx/ci_burst/marker.py" 2>/dev/null; } '
             '> "$CI_BURST_TEST_CONTEXT"; exit 0 ;;\n'
             '  "image exists "*) exit "${CI_BURST_TEST_EXISTS_RC:-0}" ;;\n'
+            '  "image inspect "*"org.opencontainers.image.revision"*) '
+            'printf "%s\\n" "${CI_BURST_TEST_SERVING:-}"; exit 0 ;;\n'
             '  "image inspect "*"latest"*) [ "${CI_BURST_TEST_INSPECT_RC:-0}" = "0" ] '
             '|| exit "${CI_BURST_TEST_INSPECT_RC}"\n'
             '    printf "%s\\n" sha256:old; exit 0 ;;\n'
@@ -439,6 +457,7 @@ class RefreshBehaviourTests(unittest.TestCase):
             "CI_BURST_AWS_DIR": str(self.root / "aws"),
             "CI_BURST_TOKEN_ENV": str(self.root / "forgejo.env"),
             "CI_BURST_TEST_WANT": self.want,
+            "CI_BURST_TEST_SERVING": self.want,
             "CI_BURST_TEST_SMOKE": smoke,
             "CI_BURST_TEST_SMOKE_RC": smoke_rc,
             "CI_BURST_TEST_CONTEXT": str(self.root / "context.txt"),
@@ -652,7 +671,8 @@ class RefreshBehaviourTests(unittest.TestCase):
 
     def test_reports_units_current_when_they_match(self):
         for unit in ("ci-burst-apply.service", "ci-burst-apply.timer",
-                     "ci-burst-refresh.service", "ci-burst-refresh.timer"):
+                     "ci-burst-refresh.service", "ci-burst-refresh.timer",
+                     "ci-burst-export.service", "ci-burst-export.timer"):
             self._installed_unit(unit)
         completed = self.run_script()
         self.assertEqual(completed.returncode, 0, completed.stderr)

@@ -49,12 +49,11 @@ npm run check:spec
 
 - Use a task branch and one focused pull request. Keep one writer per branch
   and worktree. Preserve unrelated work.
-- Do not push to `main` and do not rewrite published history. Branch
-  protection enforces both.
+- Do not push to protected `main` and do not rewrite published history.
 - Required CI and the independent review must describe the exact current
   head. A new commit needs fresh CI and a fresh review.
 - The merge automation owns ordinary merges. An authoring agent does not
-  merge its own pull request and does not enable a standing auto-merge order.
+  merge manually and does not enable a standing auto-merge order.
   When the automation cannot merge, stop and report the pull request and the
   tested head to the maintainer.
 - `scripts/pr_policy.py` owns the merge policy. Only `README.md`,

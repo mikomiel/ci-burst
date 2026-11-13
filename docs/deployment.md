@@ -190,6 +190,13 @@ it `repo` in the UI) and put it in `/etc/ci-burst/forgejo.env`:
 CI_BURST_FORGEJO_TOKEN=<token>
 ```
 
+For this read token the env-file is the provisioning contract: Podman loads the
+file into the container environment, and ci-burst reads the variable named by
+`forgejo.token_env` (`CI_BURST_FORGEJO_TOKEN` here). How the file is produced is
+the operator's choice — written by hand, rendered by configuration management,
+or fetched from a secret manager. ci-burst integrates with no secret manager
+and does not require one.
+
 The env-file is visible in `podman inspect`; treat inspect access on the scaler
 as token access, keep the file mode `0600`, and rotate the token if that access
 changes hands. See [container.md](container.md) § "Forgejo token".

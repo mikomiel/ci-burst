@@ -23,19 +23,19 @@ state = _load()
 
 
 def _document(**overrides):
-    values = dict(
-        dependency="ci-burst",
-        target="controller",
-        deployed_ref="a" * 40,
-        source_ref="a" * 40,
-        deployed_version="0.4.0",
-        artifact_id="sha256:abc",
-        pinned=False,
-        service_result="success",
-        last_success=10,
-        now=20,
-        drift=[],
-    )
+    values = {
+        "dependency": "ci-burst",
+        "target": "controller",
+        "deployed_ref": "a" * 40,
+        "source_ref": "a" * 40,
+        "deployed_version": "0.4.0",
+        "artifact_id": "sha256:abc",
+        "pinned": False,
+        "service_result": "success",
+        "last_success": 10,
+        "now": 20,
+        "drift": [],
+    }
     values.update(overrides)
     return state.build_document(**values)
 

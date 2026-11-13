@@ -188,8 +188,9 @@ JOB_PROCESS_IDENTITIES = frozenset(
     if _job_process(outcome, status)
 )
 
-#: The Spot interruption marker: the worker read the two-minute notice and ended
-#: its one job. ``action`` is the notice's own value, and ``unknown`` is the
+#: The Spot interruption marker: the worker observed the two-minute notice and
+#: attempted to end its one job within a bounded window. ``action`` is the
+#: notice's own value, and ``unknown`` is the
 #: shipped fallback for a notice whose body carried no documented action;
 #: ``runner`` is the registration id the worker captured, or ``unknown`` when it
 #: could not capture one. Every value is validated before it is published, and

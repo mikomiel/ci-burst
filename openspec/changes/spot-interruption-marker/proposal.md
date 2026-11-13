@@ -18,8 +18,8 @@ account. What it cannot express today is an interruption.
 
 - The bootstrap watches the Spot interruption notice as root, polling IMDSv2
   every five seconds, and on a notice prints one fixed marker carrying the
-  notice's action and the worker hostname, then ends the job account's runner
-  process so the job stops before the instance is reclaimed.
+  notice's action, the worker hostname and the registration id, then attempts
+  to end the job account's runner process within a bounded window.
 - `export` recognises that marker as one more closed-vocabulary event,
   `spot-interruption`, with three validated values and no free console text.
 - The event stream, the worker-setup guide and the policy tests describe the

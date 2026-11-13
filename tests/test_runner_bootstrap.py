@@ -18,6 +18,7 @@ launch-template version and a configuration change, never an in-place edit.
 import hashlib
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -52,8 +53,27 @@ PUBLISHED_TEMPLATE_SHA256 = (
 #: it instead.
 PENDING_TEMPLATE_VERSION = 5
 PENDING_TEMPLATE_SHA256 = (
-    "4ed6136299c2f05238ba08f7351102300f3dedc38a20453ae861b1946acaa78a"
+    "f8606af5ef6942b1b46bb9f64ef5dcf1b6f18ecb10ab8f07eb7c8a45390dbc6d"
 )
+
+
+def _capture_snippet():
+    """The shipped registration-id block, for an execution test."""
+    lines = BOOTSTRAP.read_text(encoding="utf-8").splitlines()
+    start = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("RUNNER_FILE=/var/lib/forgejo-runner/.runner")
+    )
+    fallback = next(
+        index
+        for index, line in enumerate(lines)
+        if index > start and line.strip() == "RUNNER_UUID=unknown"
+    )
+    end = next(
+        index for index, line in enumerate(lines) if index > fallback and line.strip() == "fi"
+    )
+    return "\n".join(lines[start : end + 1])
 
 
 class RunnerBootstrapTests(unittest.TestCase):
@@ -280,14 +300,17 @@ class RunnerBootstrapTests(unittest.TestCase):
         # let job code block the watcher with a FIFO, so the id is captured while
         # the file is still root-owned, bounded, and shape-checked as a whole
         # value rather than line by line.
-        capture = self._line_index("RUNNER_UUID=$(head -c 4096")
+        capture = self._line_index("RUNNER_FILE=/var/lib/forgejo-runner/.runner")
         self.assertLess(capture, self._line_index("chown -R runner:runner"))
         self.assertIn("jq -ser", self.script)
         # One JSON document, its raw string checked inside jq before command
-        # substitution can strip a trailing newline or fold a second document.
+        # substitution can strip a trailing newline or fold a second document,
+        # and a file over the bound rejected rather than truncated.
         self.assertIn("if length == 1", self.script)
         self.assertIn('.[0].uuid | type) == "string"', self.script)
         self.assertIn('test("[\\n\\r]") | not', self.script)
+        self.assertIn("stat -c '%s'", self.script)
+        self.assertIn('-le 4096', self.script)
         self.assertIn('[[ ! "$RUNNER_UUID" =~ ', self.script)
         self.assertNotIn("grep -Eq", self.script)
         # The watcher never opens the file: the captured value is all it uses.
@@ -357,6 +380,76 @@ class RunnerBootstrapTests(unittest.TestCase):
         guide = SETUP_GUIDE.read_text(encoding="utf-8")
         self.assertIn("[`deploy/runner/bootstrap.sh`](../deploy/runner/bootstrap.sh)", guide)
         self.assertNotIn("#!/bin/bash", guide)
+
+
+@unittest.skipUnless(
+    shutil.which("bash") and shutil.which("jq"),
+    "the shipped image provides bash and jq; the capture is exercised with them",
+)
+class RegistrationIdCaptureTests(unittest.TestCase):
+    """Run the shipped capture block against fixture registration files.
+
+    The source-contract checks above pin the shape; these cases pin the
+    behaviour a malformed or hostile registration file must not change.
+    """
+
+    UUID = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
+
+    def capture(self, content):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runner.json"
+            if content is not None:
+                path.write_bytes(content)
+            snippet = _capture_snippet().replace(
+                "/var/lib/forgejo-runner/.runner", str(path)
+            )
+            script = "set -euo pipefail\n" + snippet + '\nprintf "%s" "$RUNNER_UUID"\n'
+            done = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return done.stdout
+
+    def test_one_valid_document_yields_the_registration_id(self):
+        document = '{"uuid":"%s","token":"SECRET-TOKEN"}' % self.UUID
+        captured = self.capture(document.encode())
+        self.assertEqual(captured, self.UUID)
+        self.assertNotIn("SECRET-TOKEN", captured)
+
+    def test_malformed_registration_input_fails_closed(self):
+        uuid = self.UUID
+        cases = {
+            "missing file": None,
+            "empty file": b"",
+            "uuid is null": b'{"uuid":null}',
+            "uuid is not a string": b'{"uuid":42}',
+            "trailing newline inside the string": (
+                '{"uuid":"%s\\n"}' % uuid
+            ).encode(),
+            "second document": (
+                '{"uuid":"%s"}\n{"uuid":null}' % uuid
+            ).encode(),
+            "junk trailing line": (
+                '{"uuid":"%s"}\njunk' % uuid
+            ).encode(),
+            "truncated json": b'{"uuid":"0f1e2d3c-4b5a',
+            # A valid document followed by padding past the 4096-byte bound and
+            # then a second value: rejecting the file, not truncating it, is the
+            # point.
+            "oversized file": (
+                '{"uuid":"%s"}\n' % uuid
+            ).encode()
+            + b" " * 5000
+            + b'\n{"uuid":null}',
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.capture(content), "unknown")
+
+    def test_a_padded_but_bounded_document_still_yields_the_id(self):
+        document = '{"uuid":"%s"}' % self.UUID
+        captured = self.capture((document + " " * 100).encode())
+        self.assertEqual(captured, self.UUID)
 
 
 class BootstrapTailTests(unittest.TestCase):

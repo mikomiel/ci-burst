@@ -4,8 +4,9 @@
 
 The worker writes one fixed marker to its serial console; the controller's
 existing console reader turns it into a `spot-interruption` worker-event on the
-controller. The job account's runner process is signalled `SIGTERM` so the job
-stops before the instance is reclaimed.
+controller. After printing the marker, the worker attempts to end the job
+account's runner process with `SIGTERM` in a bounded window; the marker records
+the observed notice, not a completed termination.
 
 ## Why this channel
 
@@ -39,10 +40,11 @@ account: it walks `/proc`, keeps only processes owned by `runner` whose command
 line names `forgejo-runner`, and sends `SIGTERM`. It does not kill by name alone,
 it does not signal another account's process, and it never calls Forgejo.
 
-The job then ends with the runner's status, the existing `bootstrap one-job`
-marker reports it, and the bootstrap's EXIT path still removes the registration
-file and shuts the instance down. A signal that cannot be delivered is not fatal:
-the instance is reclaimed either way.
+If the job's runner is stopped, the existing `bootstrap one-job` marker reports
+its status and the bootstrap's EXIT path still removes the registration file and
+shuts the instance down. A signal that cannot be delivered is not fatal, and
+neither a delivered signal nor the marker proves the job ended: the instance is
+reclaimed either way.
 
 ## What this does not claim
 

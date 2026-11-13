@@ -214,8 +214,9 @@ need it.
 ### The Spot interruption marker
 
 The worker's bootstrap reads the two-minute Spot interruption notice and, on the
-notice, prints one fixed marker to its console and ends its one job; the
-`spot-interruption` event above is that marker. It carries four validated values:
+notice, prints one fixed marker to its console and then tries to end its one
+job within a bounded window; the `spot-interruption` event above is that
+marker. It carries four validated values:
 `reason`, the constant `spot_interruption` that a consumer filters on; `action`,
 the notice's own value (`terminate`, `stop`, `hibernate`, or `unknown` when the
 notice body has no documented action); `host`, the worker's hostname; and
@@ -227,8 +228,9 @@ could not capture it). Nothing else from the line is copied.
 without a provider call. `runner` is the registration id, so the same join can be
 made from a runner registration when attribution is missing; it is not a job
 identity, because a Forgejo job record carries no runner field. The marker is
-evidence that the notice was observed and the job was signalled; it is not proof
-that the worker or the job actually ended, and it is never a job result. Like
+evidence that the notice was observed and that a signal delivery was attempted;
+it is not proof that the worker or the job ended, and it is never a job
+result. Like
 every line in this file it comes from the console, which no party is trusted to
 write, so treat a marker as one input among the job's, not as proof on its own.
 

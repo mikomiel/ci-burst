@@ -20,6 +20,13 @@
     "absent_labels": "no label filter: every waiting or running job in the repository is admitted",
     "empty_selection": "JSON null: the handler marshals a nil slice"
   },
+  "authorization": {
+    "route_registration": "routers/api/v1/api.go: addActionsRoutes(m, reqOwner(unit.TypeActions), repo.NewAction()) inside the /repos/{username}/{reponame} group",
+    "permission_source": "routers/api/v1/permissions/req_owner.go",
+    "permission": "the caller must be the repository owner or a site administrator, with the Actions unit enabled; repository read access alone is not sufficient",
+    "refusal": "HTTP 403 user should be the owner of the repo",
+    "reference": "https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/permissions/req_owner.go"
+  },
   "provenance_legend": {
     "upstream-shape": "the pinned handler can emit this body for the stated request variant",
     "defensive-synthetic": "a synthetic body no conforming handler emits for that variant; the parser must still classify or refuse it"

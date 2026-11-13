@@ -77,6 +77,22 @@ The job-account permission and inventory-check notes below record failure modes
 from the same deployment; they describe what a build must keep, not an input
 value.
 
+## Build inputs
+
+Before `IMAGE_READY`, the recipe writes `/etc/ci-burst/build-inputs.txt` inside
+the image. It records the Debian version and architecture, the executed
+recipe's sha256, the ruff/uv/node/forgejo-runner/promtool versions and the
+sha256 of the installed binaries (plus the declared download checksum where the
+recipe verifies one), the probe counts, and the full `dpkg-query -W` package
+inventory. The apt layer is not pinned, so the file records what a particular
+build resolved; it does not make a later build resolve the same set.
+
+A build that cannot write the file exits non-zero and never prints
+`IMAGE_READY`, so a ready builder is one whose inputs were recorded. The file
+stays inside the image; the recipe sends it nowhere. Qualification remains
+operator-run: [Build](#build) step 5 checks the toolchain on a launched worker,
+and this file records what was installed, not that the check passed.
+
 ## Build
 
 1. Launch a disposable builder matching the worker architecture — a fresh

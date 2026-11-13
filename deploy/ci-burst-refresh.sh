@@ -92,7 +92,10 @@ if [ "$want" = "$recorded" ]; then
 fi
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT INT TERM
+record_tmp=
+candidate_record=
+reference_tmp=
+trap 'rm -rf "$work"; [ -z "$record_tmp" ] || rm -f "$record_tmp"; [ -z "$candidate_record" ] || rm -f "$candidate_record"; [ -z "$reference_tmp" ] || rm -f "$reference_tmp"' EXIT INT TERM
 mkdir "$work/src"
 if ! git -C "$SOURCE" archive --format=tar --output "$work/tree.tar" "$want"; then
     log "archive_failed: $want"
@@ -167,6 +170,306 @@ if document.get("decision") not in accepted:
 fi
 
 short=$(printf '%s' "$want" | cut -c1-12)
+
+# A source commit identifies the source, not the bytes. The base image and the
+# Python dependency set are resolved when the image is built, so two builds of
+# one commit can differ. Record what this build actually resolved, and do it
+# before any promotion tag moves, so the image on the host can be traced to its
+# inputs instead of to the commit alone.
+candidate=$(podman image inspect --format '{{.Id}}' "$IMAGE:candidate") || {
+    log "inspect_failed: $IMAGE:candidate"
+    exit 2
+}
+if [ -z "$candidate" ]; then
+    log "inspect_failed: $IMAGE:candidate"
+    exit 2
+fi
+
+# The record is keyed by image identity, because one source SHA can be built
+# more than once: a retry after an interrupted promotion is exactly that. A
+# source-keyed record would let that retry replace the record of the image
+# still serving. The engine generates the image ID but it becomes a path
+# component, so validate it against a path-safe alphabet rather than
+# sanitizing it: sanitizing could map two different IDs onto one file and
+# defeat the immutability this exists for. A case pattern is used because it
+# also rejects an embedded newline, which a line-based matcher would accept.
+case "$candidate" in
+    sha256:*[!A-Za-z0-9._-]*)
+        image_key= ;;
+    sha256:*)
+        image_key=${candidate#sha256:} ;;
+    *)
+        image_key= ;;
+esac
+if [ -z "$image_key" ] || [ "${#image_key}" -gt 128 ]; then
+    log "build_inputs_failed: unusable image identity: $candidate"
+    exit 2
+fi
+
+tree=$(git -C "$SOURCE" rev-parse "$want^{tree}") || {
+    log "build_inputs_failed: cannot resolve the tree of $want"
+    exit 2
+}
+dockerfile_sha256=$(sha256sum "$work/src/Dockerfile" | awk '{print $1}')
+if [ -z "$dockerfile_sha256" ]; then
+    log "build_inputs_failed: cannot hash the build's Dockerfile"
+    exit 2
+fi
+from_line=$(sed -n '/^FROM /{p;q;}' "$work/src/Dockerfile" 2>/dev/null) || from_line=
+if [ -z "$from_line" ]; then
+    log "build_inputs_failed: no FROM line in the build's Dockerfile"
+    exit 2
+fi
+from_ref=$(printf '%s\n' "$from_line" | awk '{print $NF}')
+case "$from_ref" in
+    *@sha256:*)
+        # A digest-pinned FROM carries the base digest itself.
+        base_digest=${from_ref##*@}
+        ;;
+    *)
+        # For an unpinned line the engine may still report what it resolved.
+        # Record nothing rather than inventing a digest when it cannot.
+        base_digest=$(podman image inspect --format '{{.Digest}}' "$from_ref" 2>/dev/null || true)
+        ;;
+esac
+engine=$(podman --version 2>/dev/null || true)
+
+# Read the dependency set from inside the candidate, with no network path.
+distributions="$work/python-distributions.txt"
+if ! podman run --rm --network=none --entrypoint python "$IMAGE:candidate" \
+        -m pip list --format=freeze >"$distributions" 2>/dev/null; then
+    log "build_inputs_failed: cannot read the candidate's Python distributions"
+    exit 2
+fi
+
+# The image-keyed record is the authoritative copy; the source-keyed file is a
+# reference to whichever image this source most recently recorded, so a retry
+# moves the reference and never the inputs. Both names are published by a
+# rename inside their own directory and both are written before promotion.
+#
+# One image ID can be produced by more than one source commit: a commit that
+# changes only files the build ignores leaves the image bytes identical. The
+# record therefore carries a bounded list of attestations instead of one source
+# identity, and appending one republishes the whole record atomically.
+records="$STATE/builds/images"
+if ! mkdir -p "$records"; then
+    log "build_inputs_failed: cannot create $records"
+    exit 2
+fi
+record="$records/$image_key.json"
+reference="$STATE/builds/sha-$short.json"
+candidate_record=$(mktemp "$records/.$image_key.candidate.XXXXXX") || {
+    log "build_inputs_failed: cannot create a temporary candidate record"
+    exit 2
+}
+reference_tmp=$(mktemp "$STATE/builds/.sha-$short.XXXXXX") || {
+    rm -f "$candidate_record"
+    candidate_record=
+    log "build_inputs_failed: cannot create a temporary reference"
+    exit 2
+}
+if ! SOURCE_SHA="$want" TREE_SHA="$tree" DOCKERFILE_SHA256="$dockerfile_sha256" \
+        FROM_LINE="$from_line" BASE_DIGEST="$base_digest" IMAGE_ID="$candidate" \
+        ENGINE="$engine" CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        python3 - "$distributions" >"$candidate_record" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    distributions = [line.strip() for line in handle if line.strip()]
+
+document = {
+    "schema": "ci-burst.build-inputs.v2",
+    "image_id": os.environ["IMAGE_ID"],
+    "dockerfile_sha256": os.environ["DOCKERFILE_SHA256"],
+    "from": os.environ["FROM_LINE"],
+    "base_digest": os.environ["BASE_DIGEST"] or None,
+    "python_distributions": distributions,
+    "attestations": [
+        {
+            "source_sha": os.environ["SOURCE_SHA"],
+            "tree_sha": os.environ["TREE_SHA"],
+            "engine": os.environ["ENGINE"] or "unknown",
+            "created_at": os.environ["CREATED_AT"],
+        }
+    ],
+}
+json.dump(document, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PY
+then
+    rm -f "$candidate_record"
+    candidate_record=
+    log "build_inputs_failed: cannot render $record"
+    exit 2
+fi
+chmod 0644 "$candidate_record"
+if [ -e "$record" ]; then
+    # An existing record contradicts this build only when the build inputs
+    # differ. A different source commit that resolves the same inputs is not a
+    # contradiction: the image ID is the same bytes, so append its attestation.
+    # A source and tree already listed is the same build recorded again, and
+    # an existing record at the cap refuses rather than dropping an older
+    # attestation that a tag may still name.
+    record_tmp=$(mktemp "$records/.$image_key.XXXXXX") || {
+        rm -f "$candidate_record"
+        candidate_record=
+        log "build_inputs_failed: cannot create a temporary record"
+        exit 2
+    }
+    merge_rc=0
+    python3 - "$record" "$candidate_record" >"$record_tmp" <<'PY' || merge_rc=$?
+import json
+import sys
+
+# The list is bounded so one record stays small and readable. A new source that
+# would exceed it is refused (exit 12), not silently paid for by deleting an
+# attestation an earlier reference may still name.
+CAP = 8
+INPUTS = (
+    "image_id",
+    "from",
+    "base_digest",
+    "dockerfile_sha256",
+    "python_distributions",
+)
+
+
+def load(path):
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+    if not isinstance(document, dict) or document.get("schema") != "ci-burst.build-inputs.v2":
+        raise ValueError("not a build-inputs record")
+    attestations = document.get("attestations")
+    if not isinstance(attestations, list) or not all(
+        isinstance(item, dict) for item in attestations
+    ):
+        raise ValueError("no attestation list")
+    return document
+
+
+# Statuses are deliberately not 1: an uncaught Python error exits 1, and an
+# internal failure must land in the shell's named-failure branch, never be read
+# as a conflict and written beside the record.
+try:
+    existing = load(sys.argv[1])
+    candidate = load(sys.argv[2])
+except (OSError, ValueError):
+    raise SystemExit(2)
+
+if any(key not in existing or key not in candidate for key in INPUTS):
+    raise SystemExit(2)
+if {key: existing[key] for key in INPUTS} != {key: candidate[key] for key in INPUTS}:
+    raise SystemExit(10)
+
+attestations = existing["attestations"]
+new = candidate["attestations"][0]
+if any(
+    item.get("source_sha") == new.get("source_sha")
+    and item.get("tree_sha") == new.get("tree_sha")
+    for item in attestations
+):
+    raise SystemExit(11)
+if len(attestations) >= CAP:
+    raise SystemExit(12)
+
+merged = {key: existing[key] for key in INPUTS}
+merged["schema"] = existing["schema"]
+merged["attestations"] = attestations + [new]
+json.dump(merged, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PY
+    case "$merge_rc" in
+        0)
+            if ! mv -f "$record_tmp" "$record"; then
+                rm -f "$record_tmp" "$candidate_record"
+                record_tmp=
+                candidate_record=
+                log "build_inputs_failed: cannot publish $record"
+                exit 2
+            fi
+            record_tmp=
+            rm -f "$candidate_record"
+            candidate_record=
+            log "build_inputs_attested: $record source=$want"
+            ;;
+        10)
+            conflict="$record.conflict"
+            if ! mv -f "$candidate_record" "$conflict"; then
+                rm -f "$record_tmp" "$candidate_record"
+                record_tmp=
+                candidate_record=
+                log "build_inputs_failed: image record conflict at $record, and $conflict cannot be written"
+                exit 2
+            fi
+            candidate_record=
+            rm -f "$record_tmp"
+            record_tmp=
+            log "build_inputs_failed: image record conflict at $record; kept the first record, wrote $conflict"
+            exit 2
+            ;;
+        11)
+            rm -f "$record_tmp" "$candidate_record"
+            record_tmp=
+            candidate_record=
+            log "build_inputs_kept: $record"
+            ;;
+        12)
+            rm -f "$record_tmp" "$candidate_record"
+            record_tmp=
+            candidate_record=
+            log "build_inputs_full: $record already attests 8 sources; prune it before recording another"
+            exit 2
+            ;;
+        *)
+            rm -f "$record_tmp" "$candidate_record"
+            record_tmp=
+            candidate_record=
+            log "build_inputs_failed: cannot compare with the existing record at $record"
+            exit 2
+            ;;
+    esac
+else
+    if ! mv -f "$candidate_record" "$record"; then
+        rm -f "$candidate_record"
+        candidate_record=
+        log "build_inputs_failed: cannot publish $record"
+        exit 2
+    fi
+    candidate_record=
+    log "build_inputs: $record"
+fi
+
+if ! SOURCE_SHA="$want" IMAGE_ID="$candidate" RECORD="images/$image_key.json" \
+        python3 - >"$reference_tmp" <<'PY'
+import json
+import os
+import sys
+
+document = {
+    "schema": "ci-burst.build-inputs-ref.v1",
+    "source_sha": os.environ["SOURCE_SHA"],
+    "image_id": os.environ["IMAGE_ID"],
+    "record": os.environ["RECORD"],
+}
+json.dump(document, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PY
+then
+    rm -f "$reference_tmp"
+    reference_tmp=
+    log "build_inputs_failed: cannot render $reference"
+    exit 2
+fi
+chmod 0644 "$reference_tmp"
+if ! mv -f "$reference_tmp" "$reference"; then
+    log "build_inputs_failed: cannot publish $reference"
+    exit 2
+fi
+reference_tmp=
+log "build_inputs_ref: $reference"
+
 if ! podman tag "$IMAGE:candidate" "$IMAGE:sha-$short"; then
     log "tag_failed: $want"
     exit 2
@@ -176,14 +479,6 @@ fi
 # `latest` rather than assumed: the first refresh after a manual install
 # replaces an image that has no sha tag of its own. An inspection failure is
 # not "no image": only a confirmed absent tag may skip the handle.
-candidate=$(podman image inspect --format '{{.Id}}' "$IMAGE:candidate") || {
-    log "inspect_failed: $IMAGE:candidate"
-    exit 2
-}
-if [ -z "$candidate" ]; then
-    log "inspect_failed: $IMAGE:candidate"
-    exit 2
-fi
 current=
 exists_rc=0
 podman image exists "$IMAGE:latest" || exists_rc=$?

@@ -27,10 +27,16 @@ umask 077
 exec > >(tee -a /dev/ttyS0) 2>&1 || true
 export DEBIAN_FRONTEND=noninteractive
 
+# Removed by the EXIT trap when the build stops before the file is published.
+inputs_tmp=
+
 # A failed build must not leave a running instance. A successful build reaches
 # the sleep below, which is the operator's window for the snapshot.
 on_exit() {
   rc=$?
+  if [ -n "${inputs_tmp}" ]; then
+    rm -f "$inputs_tmp"
+  fi
   echo "provision exiting rc=$rc"
   sync
   shutdown -h now
@@ -230,6 +236,83 @@ if [ "$miss" -ne 0 ]; then
   echo "provision: missing required tools; fix the image before snapshotting" >&2
   exit 1
 fi
+
+# Record this build's own inputs inside the image before announcing it. The
+# image is an artefact whose bytes are not identified by this script's source:
+# the apt layer resolves at build time and ruff comes from PyPI. The file is
+# evidence of what this build installed, not a claim that a rebuild repeats it.
+# `set -e` makes every failure below fail the build before IMAGE_READY, and the
+# EXIT trap removes the unpublished temp file.
+script_path=$0
+if [ ! -r "$script_path" ]; then
+  # cloud-init may run the user data from a copy it owns rather than from the
+  # checkout; the saved user data is the bytes that actually ran.
+  script_path=/var/lib/cloud/instance/user-data.txt
+fi
+if [ ! -r "$script_path" ]; then
+  echo "provision: cannot read the executed recipe for its sha256" >&2
+  exit 1
+fi
+script_sha256=$(sha256sum "$script_path" | awk '{print $1}')
+if [ -z "$script_sha256" ]; then
+  echo "provision: cannot hash the executed recipe" >&2
+  exit 1
+fi
+debian_version=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')
+if [ -z "$debian_version" ]; then
+  echo "provision: cannot read the Debian version from /etc/os-release" >&2
+  exit 1
+fi
+architecture=$(dpkg --print-architecture)
+
+sha256_of() {
+  sum=$(sha256sum "$1" | awk '{print $1}')
+  if [ -z "$sum" ]; then
+    echo "provision: cannot hash installed file $1" >&2
+    exit 1
+  fi
+  printf '%s\n' "$sum"
+}
+
+ruff_sha256=$(sha256_of /usr/local/bin/ruff)
+uv_sha256=$(sha256_of /usr/local/lib/uv-toolchain/uv)
+node_sha256=$(sha256_of /usr/local/lib/node-toolchain/bin/node)
+runner_sha256=$(sha256_of /usr/local/bin/forgejo-runner)
+promtool_sha256=$(sha256_of /usr/local/bin/promtool)
+
+build_inputs=/etc/ci-burst/build-inputs.txt
+install -d -m 0755 /etc/ci-burst
+inputs_tmp=$(mktemp /etc/ci-burst/.build-inputs.XXXXXX)
+{
+  printf 'schema=ci-burst.worker-build-inputs.v1\n'
+  printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'debian=%s\n' "$debian_version"
+  printf 'architecture=%s\n' "$architecture"
+  printf 'provision_script=%s\n' "$script_path"
+  printf 'provision_script_sha256=%s\n' "$script_sha256"
+  printf 'tool.ruff.version=%s\n' "$RUFF_VERSION"
+  printf 'tool.ruff.binary_sha256=%s\n' "$ruff_sha256"
+  printf 'tool.uv.version=%s\n' "$UV_VERSION"
+  printf 'tool.uv.download_sha256=%s\n' "$UV_SHA"
+  printf 'tool.uv.binary_sha256=%s\n' "$uv_sha256"
+  printf 'tool.node.version=%s\n' "$NODE_VERSION"
+  printf 'tool.node.download_sha256=%s\n' "$NODE_SHA"
+  printf 'tool.node.binary_sha256=%s\n' "$node_sha256"
+  printf 'tool.runner.version=%s\n' "$RUNNER_VERSION"
+  printf 'tool.runner.download_sha256=%s\n' "$RUNNER_SHA"
+  printf 'tool.runner.binary_sha256=%s\n' "$runner_sha256"
+  printf 'tool.promtool.version=%s\n' "$PROMTOOL_VERSION"
+  printf 'tool.promtool.download_sha256=%s\n' "$PROMTOOL_SHA"
+  printf 'tool.promtool.binary_sha256=%s\n' "$promtool_sha256"
+  printf 'probe.have=%s\n' "$have"
+  printf 'probe.miss=%s\n' "$miss"
+  printf 'packages:\n'
+  dpkg-query -W -f='  ${Package}=${Version}\n' | sort
+} >"$inputs_tmp"
+chmod 0644 "$inputs_tmp"
+mv -f "$inputs_tmp" "$build_inputs"
+inputs_tmp=
+echo "BUILD_INPUTS $build_inputs"
 
 echo "IMAGE_READY"
 sync

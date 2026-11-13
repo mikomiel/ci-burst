@@ -1,10 +1,10 @@
 """Durable local state for one deployment.
 
-One SQLite file records frozen launch intent, operation identity, tracked cost
-and the budget commitment built from it. One OS-backed writer lock excludes a
-second mutating process; the supported topology is a single controller host with
-a single ledger, and resource tags are ownership metadata rather than a
-distributed lock.
+One SQLite file records frozen launch intent, operation identity, tracked cost,
+the budget commitment built from it and the bounded fleet snapshots the
+controller observes. One OS-backed writer lock excludes a second mutating
+process; the supported topology is a single controller host with a single
+ledger, and resource tags are ownership metadata rather than a distributed lock.
 """
 
 import fcntl
@@ -20,12 +20,27 @@ from pathlib import Path
 from .errors import StateRefusal
 from .money import hourly_cost_micros
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 #: Read-only commands accept every earlier schema so a running deployment keeps
 #: observing while the next writable run migrates the file.
-READABLE_SCHEMA_VERSIONS = (1, 2, 3)
+READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4)
 NONTERMINAL = ("intent", "starting", "running", "terminating", "uncertain")
 TERMINAL = ("terminal", "failed")
+
+#: Fleet snapshots are evidence, not decision state: keep one week so a trend
+#: survives a weekend without turning the ledger into a log store.
+FLEET_RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+#: One definition used by both the initial schema and the schema-4 upgrade.
+_FLEET_TABLE_SQL = """
+    CREATE TABLE fleet_observations (
+        observed_at REAL PRIMARY KEY,
+        contract TEXT NOT NULL,
+        running_attempts INTEGER NOT NULL,
+        active_registrations INTEGER NOT NULL,
+        offline_registrations INTEGER NOT NULL
+    )
+"""
 
 
 @dataclass(frozen=True)
@@ -142,6 +157,9 @@ class Ledger:
                     )
                 self._migrate(connection, version, backfill)
                 version = SCHEMA_VERSION
+            elif version == 3:
+                self._migrate_v4(connection)
+                version = SCHEMA_VERSION
             elif version != SCHEMA_VERSION:
                 raise StateRefusal("STATE_VERSION_UNSUPPORTED", f"schema {version}")
             self._version = version
@@ -187,7 +205,7 @@ class Ledger:
 
     def _create_schema(self, connection):
         connection.executescript(
-            """
+            f"""
             CREATE TABLE operations (
                 id TEXT PRIMARY KEY,
                 client_token TEXT NOT NULL UNIQUE,
@@ -213,12 +231,13 @@ class Ledger:
             );
             CREATE INDEX operations_state ON operations (state);
             CREATE INDEX operations_window ON operations (reservation_window);
-            PRAGMA user_version = 3;
+            {_FLEET_TABLE_SQL};
+            PRAGMA user_version = {SCHEMA_VERSION};
             """
         )
 
     def _migrate(self, connection, version, backfill):
-        """Upgrade an earlier file to schema 3, once, after a verified copy.
+        """Upgrade a schema-1 or schema-2 file to schema 4, after a verified copy.
 
         A version-1 file passes through the version-2 shape in the same
         transaction: its terminal operations are settled from their recorded
@@ -229,13 +248,14 @@ class Ledger:
         nonterminal row also records ``admitted_inputs_backfilled = 1``, which
         makes its reservation floor a persisted decision rather than an
         inference from an estimate that includes the current configuration. The
-        caller holds the deployment writer lock; this method takes no lock of
-        its own. A failed copy refuses before the first schema write, and an
-        interrupted upgrade rolls the whole transaction back, so the file stays
-        readable by the version that wrote it.
+        same transaction creates the fleet-observation table. The caller holds
+        the deployment writer lock; this method takes no lock of its own. A
+        failed copy refuses before the first schema write, and an interrupted
+        upgrade rolls the whole transaction back, so the file stays readable by
+        the version that wrote it.
         """
         price_micros, incidental_per_hour, buffer_micros = backfill
-        backup = Path(str(self.path) + ".pre-v3.%d" % int(self._clock()))
+        backup = Path(str(self.path) + ".pre-v4.%d" % int(self._clock()))
         try:
             shutil.copy2(self.path, backup)
             copied = backup.stat().st_size
@@ -278,6 +298,34 @@ class Ledger:
                 " WHERE state IN (%s)" % ",".join("?" * len(NONTERMINAL)),
                 (incidental_per_hour, buffer_micros, *NONTERMINAL),
             )
+            connection.execute(_FLEET_TABLE_SQL)
+            connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
+            connection.execute("COMMIT")
+        except sqlite3.DatabaseError as error:
+            _rollback(connection)
+            raise StateRefusal("STATE_MIGRATION_FAILED", type(error).__name__) from None
+        except BaseException:
+            _rollback(connection)
+            raise
+
+    def _migrate_v4(self, connection):
+        """Add the fleet-observation table to a schema-3 file.
+
+        The upgrade creates one table and writes no row, so it needs no
+        backfill parameters. It still copies the file first: the previous
+        release refuses schema 4, so the copy is the rollback path.
+        """
+        backup = Path(str(self.path) + ".pre-v4.%d" % int(self._clock()))
+        try:
+            shutil.copy2(self.path, backup)
+            copied = backup.stat().st_size
+        except OSError as error:
+            raise StateRefusal("STATE_BACKUP_FAILED", type(error).__name__) from None
+        if copied != self.path.stat().st_size:
+            raise StateRefusal("STATE_BACKUP_FAILED", "copy size differs")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_FLEET_TABLE_SQL)
             connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
             connection.execute("COMMIT")
         except sqlite3.DatabaseError as error:
@@ -541,6 +589,61 @@ class Ledger:
             (window_start,),
         ).fetchone()
         return int(row[0])
+
+    def record_fleet_observation(
+        self, *, observed_at, contract, running_attempts, active_registrations, offline_registrations
+    ):
+        """Persist one controller fleet snapshot and prune the old ones.
+
+        The row is evidence, not decision state: it never feeds admission and a
+        reader must not treat its counts as an assignment or a job verdict. A
+        write failure is a state failure like any other; the caller decides
+        whether auxiliary evidence may be skipped.
+        """
+        connection = self._require()
+        try:
+            connection.execute(
+                "INSERT OR REPLACE INTO fleet_observations"
+                " (observed_at, contract, running_attempts, active_registrations, offline_registrations)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (observed_at, contract, running_attempts, active_registrations, offline_registrations),
+            )
+            connection.execute(
+                "DELETE FROM fleet_observations WHERE observed_at < ?",
+                (observed_at - FLEET_RETENTION_SECONDS,),
+            )
+        except sqlite3.DatabaseError as error:
+            raise StateRefusal("STATE_WRITE_FAILED", type(error).__name__) from None
+
+    def latest_fleet_observation(self):
+        """The newest fleet snapshot, or ``None`` on an older readable schema.
+
+        A schema-3 file opened read-only has no fleet table; that is an absent
+        observation, not an unreadable ledger.
+        """
+        connection = self._require()
+        try:
+            row = connection.execute(
+                "SELECT observed_at, contract, running_attempts, active_registrations,"
+                " offline_registrations FROM fleet_observations ORDER BY observed_at DESC LIMIT 1"
+            ).fetchone()
+        except sqlite3.OperationalError as error:
+            # A schema-3 file has no fleet table. Any other operational failure
+            # is an unreadable ledger, not an absent observation.
+            if "no such table" in str(error):
+                return None
+            raise StateRefusal("STATE_UNREADABLE", type(error).__name__) from None
+        except sqlite3.DatabaseError as error:
+            raise StateRefusal("STATE_UNREADABLE", type(error).__name__) from None
+        if row is None:
+            return None
+        return {
+            "observed_at": row["observed_at"],
+            "contract": row["contract"],
+            "running_attempts": row["running_attempts"],
+            "active_registrations": row["active_registrations"],
+            "offline_registrations": row["offline_registrations"],
+        }
 
     def _require(self):
         if self._connection is None:

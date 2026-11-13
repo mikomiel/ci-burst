@@ -248,6 +248,94 @@ class ExporterTests(ExportCase):
         self.assertIn("ci_burst_spend_micros", self.metrics.read_text())
         self.assertNotIn("ledger_omitted", result["notes"])
 
+    def test_fleet_gauges_come_from_the_ledger_snapshot(self):
+        from ci_burst.ledger import Ledger
+
+        path = self.root / "state" / "state.sqlite3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ledger = Ledger(path, clock=lambda: NOW)
+        ledger.connect()
+        ledger.record_fleet_observation(
+            observed_at=NOW,
+            contract="forgejo-17.0.1-runners",
+            running_attempts=2,
+            active_registrations=3,
+            offline_registrations=1,
+        )
+        ledger.close()
+        exporter = self.build(
+            [instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT}
+        )
+        result = self.run_export(exporter)
+        self.assertEqual(result["fleet"]["active_registrations"], 3)
+        self.assertEqual(result["fleet"]["running_attempts"], 2)
+        self.assertNotIn("fleet_omitted", result["notes"])
+        text = self.metrics.read_text()
+        self.assertIn("ci_burst_fleet_observation_timestamp_seconds", text)
+        self.assertIn('ci_burst_fleet_active_registrations{deployment="test-deployment"} 3', text)
+        self.assertIn('ci_burst_fleet_running_attempts{deployment="test-deployment"} 2', text)
+        self.assertIn('ci_burst_fleet_idle_registrations{deployment="test-deployment"} 1', text)
+
+    def test_a_stale_fleet_snapshot_publishes_only_the_timestamp(self):
+        from ci_burst.ledger import Ledger
+
+        path = self.root / "state" / "state.sqlite3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ledger = Ledger(path, clock=lambda: NOW)
+        ledger.connect()
+        ledger.record_fleet_observation(
+            observed_at=NOW - 901,
+            contract="forgejo-17.0.1-runners",
+            running_attempts=1,
+            active_registrations=1,
+            offline_registrations=0,
+        )
+        ledger.close()
+        exporter = self.build(
+            [instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT}
+        )
+        result = self.run_export(exporter)
+        self.assertIn("fleet_stale", result["notes"])
+        text = self.metrics.read_text()
+        self.assertIn("ci_burst_fleet_observation_timestamp_seconds", text)
+        self.assertNotIn("ci_burst_fleet_active_registrations", text)
+        self.assertNotIn("ci_burst_fleet_running_attempts", text)
+        self.assertNotIn("ci_burst_fleet_idle_registrations", text)
+
+    def test_a_snapshot_exactly_fifteen_minutes_old_is_still_current(self):
+        from ci_burst.ledger import Ledger
+
+        path = self.root / "state" / "state.sqlite3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ledger = Ledger(path, clock=lambda: NOW)
+        ledger.connect()
+        ledger.record_fleet_observation(
+            observed_at=NOW - 900,
+            contract="forgejo-17.0.1-runners",
+            running_attempts=0,
+            active_registrations=1,
+            offline_registrations=0,
+        )
+        ledger.close()
+        exporter = self.build(
+            [instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT}
+        )
+        result = self.run_export(exporter)
+        self.assertNotIn("fleet_stale", result["notes"])
+        self.assertIn("ci_burst_fleet_active_registrations", self.metrics.read_text())
+
+    def test_an_unreadable_ledger_reports_both_omissions(self):
+        path = self.root / "state" / "state.sqlite3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"not a sqlite database")
+        exporter = self.build(
+            [instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT}
+        )
+        result = self.run_export(exporter)
+        self.assertIn("ledger_omitted", result["notes"])
+        self.assertIn("fleet_omitted", result["notes"])
+        self.assertIn("ci_burst_worker_launches_total", self.metrics.read_text())
+
     def test_ledger_commitment_is_reported(self):
         from ci_burst.ledger import Ledger, current_window
 
@@ -288,6 +376,7 @@ class ExporterTests(ExportCase):
         self.assertIsNone(result["spend_micros"])
         self.assertIsNone(result["committed_micros"])
         self.assertIn("ledger_omitted", result["notes"])
+        self.assertIn("fleet_omitted", result["notes"])
         text = self.metrics.read_text()
         self.assertNotIn("ci_burst_spend_micros", text)
         self.assertIn("ci_burst_worker_launches_total", text)

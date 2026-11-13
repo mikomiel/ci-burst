@@ -285,6 +285,7 @@ class Controller:
                     return self._deferred(result, PHASE_ADMISSION)
                 result.update(decision)
                 result["decision"] = decision["decision"]
+                self._fleet_evidence(observation, result, deadline=deadline)
                 return result
             result.update(decision)
             # Mutations never take the deadline. Once the intent is committed
@@ -292,7 +293,9 @@ class Controller:
             # reconciliation path owns the outcome.
             if self._deadline_reached(deadline):
                 return self._deferred(result, PHASE_LAUNCH)
-            return self._launch(result, decision, plans, account)
+            launched = self._launch(result, decision, plans, account)
+            self._fleet_evidence(observation, launched, deadline=deadline)
+            return launched
         finally:
             self.ledger.close()
 
@@ -308,6 +311,7 @@ class Controller:
         state = self._read_state(required=False)
         result["state"] = state
         result["slot"] = self._slot_from_state(state)
+        result["fleet"] = self._latest_fleet()
         window_start = current_window(self.clock(), self.config.budget.window_seconds)
         totals = (
             self.ledger.window_totals(window_start, self.cost, self.clock())
@@ -513,6 +517,61 @@ class Controller:
             result["refusal"] = refusal.as_dict()
             result["decision"] = "refused"
             return None
+
+    def _fleet_evidence(self, observation, result, *, deadline=None):
+        """Record one bounded registration snapshot as auxiliary evidence.
+
+        The snapshot answers "how many ephemeral runners are registered against
+        how many running attempts" and nothing else: it does not link a runner
+        to a job, does not claim an assignment and never changes admission. It
+        runs after the decision and, when the pass launches, after the launch,
+        so a slow or refused read cannot consume the admission budget. A read or
+        a write failure is reported in the result and does not refuse the pass.
+        """
+        if deadline is not None and deadline - self.clock() < self.config.forgejo.timeout_seconds:
+            result["fleet"] = {"available": False, "refusal": {"reason": PASS_DEADLINE_EXCEEDED}}
+            return
+        try:
+            runners = self.observer.runners()
+        except Refusal as refusal:
+            result["fleet"] = {"available": False, "refusal": refusal.as_dict()}
+            return
+        running = observation.running
+        data = {
+            "available": True,
+            "contract": runners.contract,
+            "running_attempts": running,
+            "active_registrations": runners.ephemeral_active,
+            "offline_registrations": runners.ephemeral_offline,
+            "idle_registrations": max(0, runners.ephemeral_active - running),
+        }
+        if runners.ephemeral_active < running:
+            data["note"] = "more running attempts than active registrations; the two reads are not atomic"
+        result["fleet"] = data
+        try:
+            self.ledger.record_fleet_observation(
+                observed_at=self.clock(),
+                contract=runners.contract,
+                running_attempts=running,
+                active_registrations=runners.ephemeral_active,
+                offline_registrations=runners.ephemeral_offline,
+            )
+        except StateRefusal as refusal:
+            data["persisted"] = False
+            data["persist_refusal"] = refusal.as_dict()
+        else:
+            data["persisted"] = True
+
+    def _latest_fleet(self):
+        if not self.ledger.available:
+            return {"available": False}
+        try:
+            latest = self.ledger.latest_fleet_observation()
+        except StateRefusal as refusal:
+            return {"available": False, "refusal": refusal.as_dict()}
+        if latest is None:
+            return {"available": False}
+        return {"available": True, **latest}
 
     def _templates(self, decision, *, deadline=None):
         """Read each distinct configured template version once."""

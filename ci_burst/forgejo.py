@@ -1,11 +1,13 @@
-"""Qualified, read-only observation of one Forgejo repository job queue.
+"""Qualified, read-only observation of one Forgejo repository.
 
-The adapter knows exactly one interface: a JSON array of ``ActionRunJob``
-records from the repository runner-jobs endpoint, filtered by the labels the
-worker advertises. It performs no mutation, sets no job fields, and never treats
-an unreadable or unexpected response as an empty queue. Live provisioning
-additionally requires the operator to declare ``live-verified`` in
-configuration; the bundled contract is validated against synthetic fixtures.
+The adapter knows two interfaces: a JSON array of ``ActionRunJob`` records from
+the repository runner-jobs endpoint, from which demand is derived, and a JSON
+array of runner registrations from the repository runners endpoint, from which
+the fleet snapshot is derived. Both are read-only: the adapter performs no
+mutation, sets no job fields, and never treats an unreadable or unexpected
+response as an empty queue. Live provisioning additionally requires the operator
+to declare ``live-verified`` in configuration; the bundled contracts are
+validated against synthetic fixtures.
 """
 
 import json
@@ -19,6 +21,12 @@ from dataclasses import dataclass, field
 from .errors import ObservationRefusal
 
 CONTRACT = "forgejo-17.0.1-runners-jobs"
+
+#: The registration list is a second interface with its own qualified shape.
+#: The endpoint is owner-scoped in Forgejo 17.0.1, the same requirement the
+#: runner-jobs endpoint carries, so the controller's existing token serves both.
+RUNNERS_CONTRACT = "forgejo-17.0.1-runners"
+RUNNER_STATUSES = frozenset({"active", "offline"})
 
 #: Statuses the qualified contract understands. A record with any other value
 #: makes runnable semantics unproven for the whole observation, so demand is
@@ -58,6 +66,10 @@ class Observation:
     assigned: int
     incompatible: int
     duplicates: int
+    #: Running attempts whose complete label set the configured worker supports.
+    #: This is fleet context, never demand: a running attempt is already
+    #: assigned, and nothing here claims that this deployment's workers run it.
+    running: int = 0
     notes: tuple = field(default=())
 
     @property
@@ -76,10 +88,30 @@ class Observation:
             "jobs_seen": self.seen,
             "blocked": self.blocked,
             "assigned_or_finished": self.assigned,
+            "running_attempts": self.running,
             "incompatible_labels": self.incompatible,
             "duplicate_records": self.duplicates,
             "notes": list(self.notes),
         }
+
+
+@dataclass(frozen=True)
+class Runners:
+    """One bounded snapshot of a repository's runner registrations.
+
+    Counts only: a registration is evidence that *some* worker registered, not
+    that this deployment launched it, and no field here links a registration to
+    a job attempt. The ephemeral counts are the fleet's own workers because the
+    shipped bootstrap registers an ephemeral runner.
+    """
+
+    contract: str
+    total: int
+    active: int
+    offline: int
+    ephemeral_total: int
+    ephemeral_active: int
+    ephemeral_offline: int
 
 
 class UrllibTransport:
@@ -133,12 +165,15 @@ class ForgejoObserver:
         self._environ = environ if environ is not None else os.environ
 
     def endpoint(self):
-        owner, repository = self._config.forgejo.repository.split("/", 1)
         query = urllib.parse.urlencode({"labels": self._label_filter()})
-        return (
-            f"{self._config.forgejo.base_url}/api/v1/repos/{owner}/{repository}"
-            f"/actions/runners/jobs?{query}"
-        )
+        return self._repository_api("/actions/runners/jobs?" + query)
+
+    def runners_endpoint(self):
+        return self._repository_api("/actions/runners")
+
+    def _repository_api(self, suffix):
+        owner, repository = self._config.forgejo.repository.split("/", 1)
+        return f"{self._config.forgejo.base_url}/api/v1/repos/{owner}/{repository}{suffix}"
 
     def _label_filter(self):
         """The bare label names the worker advertises, as the server expects.
@@ -152,20 +187,33 @@ class ForgejoObserver:
         """
         return ",".join(sorted({label.split(":", 1)[0] for label in self._config.worker.labels}))
 
-    def observe(self):
+    def _token(self):
         token = self._environ.get(self._config.forgejo.token_env)
         if not token:
             raise ObservationRefusal("FORGEJO_TOKEN_MISSING", self._config.forgejo.token_env)
-        body = self._transport.get(
-            self.endpoint(),
-            {
-                "Authorization": f"token {token}",
-                "Accept": "application/json",
-                "User-Agent": "ci-burst/0.1",
-            },
-        )
+        return token
+
+    def _headers(self, token):
+        return {
+            "Authorization": f"token {token}",
+            "Accept": "application/json",
+            "User-Agent": "ci-burst/0.1",
+        }
+
+    def observe(self):
+        body = self._transport.get(self.endpoint(), self._headers(self._token()))
         records = _parse_records(body)
         return _reduce(records, self._worker_label_names())
+
+    def runners(self):
+        """Read the registration list, a contract separate from the queue.
+
+        The caller must treat a refusal as unavailable fleet evidence, not as
+        an admission refusal: the queue remains the only gate on launching.
+        """
+        body = self._transport.get(self.runners_endpoint(), self._headers(self._token()))
+        records = _parse_runners(body)
+        return _reduce_runners(records)
 
     def _worker_label_names(self):
         names = set()
@@ -234,16 +282,81 @@ def _record(record, index):
     return handle, job_id, attempt, status, tuple(runs_on), tuple(needs or ())
 
 
+def _parse_runners(body):
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ObservationRefusal("FORGEJO_RUNNERS_INVALID_JSON") from None
+    if payload is None:
+        # A nil slice marshals as JSON null: a verified empty registration list.
+        return []
+    if not isinstance(payload, list):
+        raise ObservationRefusal("FORGEJO_RUNNERS_UNEXPECTED_SHAPE", "expected a JSON array of runners")
+    return payload
+
+
+def _runner_record(record, index):
+    where = f"runner {index}"
+    if not isinstance(record, dict):
+        raise ObservationRefusal("FORGEJO_RUNNERS_UNEXPECTED_SHAPE", f"{where} is not an object")
+    name = record.get("name")
+    if not isinstance(name, str) or not name:
+        raise ObservationRefusal("FORGEJO_RUNNERS_UNEXPECTED_SHAPE", f"{where}.name must be a non-empty string")
+    status = record.get("status")
+    if not isinstance(status, str) or status not in RUNNER_STATUSES:
+        raise ObservationRefusal("FORGEJO_RUNNERS_UNKNOWN_STATUS", where)
+    labels = record.get("labels")
+    if not isinstance(labels, list) or any(not isinstance(label, str) or not label for label in labels):
+        raise ObservationRefusal("FORGEJO_RUNNERS_UNEXPECTED_SHAPE", f"{where}.labels must be an array of labels")
+    ephemeral = record.get("ephemeral")
+    if type(ephemeral) is not bool:
+        raise ObservationRefusal("FORGEJO_RUNNERS_UNEXPECTED_SHAPE", f"{where}.ephemeral must be a boolean")
+    return status, ephemeral
+
+
+def _reduce_runners(records):
+    """Count registrations by status and by the ephemeral flag.
+
+    The shipped bootstrap registers an ephemeral runner, so only those counts
+    describe this deployment's own workers; a persistent runner on the same
+    repository is counted in the totals and left out of the fleet estimate.
+    """
+    total = active = offline = ephemeral_total = ephemeral_active = ephemeral_offline = 0
+    for index, record in enumerate(records):
+        status, ephemeral = _runner_record(record, index)
+        total += 1
+        if status == "active":
+            active += 1
+        else:
+            offline += 1
+        if ephemeral:
+            ephemeral_total += 1
+            if status == "active":
+                ephemeral_active += 1
+            else:
+                ephemeral_offline += 1
+    return Runners(
+        contract=RUNNERS_CONTRACT,
+        total=total,
+        active=active,
+        offline=offline,
+        ephemeral_total=ephemeral_total,
+        ephemeral_active=ephemeral_active,
+        ephemeral_offline=ephemeral_offline,
+    )
+
+
 def _reduce(records, worker_labels):
     """Deduplicate attempts and keep only runnable, label-compatible demand.
 
     A ``waiting`` record is demand whatever its ``needs`` says; a ``blocked``
     record is dependency-blocked work and is counted, never launched; anything
-    already assigned or finished is counted as such.
+    already assigned or finished is counted as such. A ``running`` record whose
+    labels the worker supports is also counted as fleet context, never demand.
     """
     attempts = []
     seen = {}
-    blocked = assigned = incompatible = duplicates = 0
+    blocked = assigned = incompatible = duplicates = running = 0
     notes = []
     for index, record in enumerate(records):
         handle, job_id, attempt, status, labels, needs = _record(record, index)
@@ -257,6 +370,8 @@ def _reduce(records, worker_labels):
         if status == BLOCKED_STATUS:
             blocked += 1
             continue
+        if status == "running" and labels and set(labels).issubset(worker_labels):
+            running += 1
         if status != RUNNABLE_STATUS:
             assigned += 1
             continue
@@ -277,5 +392,6 @@ def _reduce(records, worker_labels):
         assigned=assigned,
         incompatible=incompatible,
         duplicates=duplicates,
+        running=running,
         notes=tuple(notes),
     )

@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "name": "burst-ip-10-0-0-1",
+    "status": "active",
+    "labels": ["cloud-ci", "strong-ci"],
+    "ephemeral": true,
+    "version": "v13.2.1"
+  },
+  {
+    "id": 2,
+    "name": "burst-ip-10-0-0-2",
+    "status": "offline",
+    "labels": ["cloud-ci", "strong-ci"],
+    "ephemeral": true,
+    "version": "v13.2.1"
+  },
+  {
+    "id": 3,
+    "name": "steady-runner",
+    "status": "active",
+    "labels": ["homelab"],
+    "ephemeral": false,
+    "version": "v13.2.1"
+  }
+]

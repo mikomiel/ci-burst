@@ -6,7 +6,7 @@ from unittest import mock
 from pathlib import Path
 
 from ci_burst.errors import StateRefusal
-from ci_burst.ledger import SCHEMA_VERSION, TERMINAL, Ledger, current_window
+from ci_burst.ledger import FLEET_RETENTION_SECONDS, SCHEMA_VERSION, TERMINAL, Ledger, current_window
 
 
 class LedgerTestCase(unittest.TestCase):
@@ -308,11 +308,41 @@ V2_SCHEMA = """
     PRAGMA user_version = 2;
 """
 
+V3_SCHEMA = """
+    CREATE TABLE operations (
+        id TEXT PRIMARY KEY,
+        client_token TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        expires_at REAL NOT NULL,
+        reservation_micros INTEGER NOT NULL,
+        reservation_window REAL NOT NULL,
+        region TEXT NOT NULL,
+        account TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        instance_id TEXT,
+        detail TEXT NOT NULL DEFAULT '',
+        price_micros INTEGER NOT NULL DEFAULT 0,
+        launch_time REAL,
+        settled_micros INTEGER,
+        settled_at REAL,
+        admitted_incidental_per_hour_micros INTEGER,
+        admitted_buffer_micros INTEGER,
+        admitted_inputs_backfilled INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX operations_state ON operations (state);
+    CREATE INDEX operations_window ON operations (reservation_window);
+    PRAGMA user_version = 3;
+"""
+
 V1_COLUMNS = (
     "id, client_token, state, created_at, updated_at, expires_at, reservation_micros,"
     " reservation_window, region, account, request_json, request_sha256, instance_id, detail"
 )
 V2_COLUMNS = V1_COLUMNS + ", price_micros, launch_time, settled_micros, settled_at"
+V3_COLUMNS = V2_COLUMNS + ", admitted_incidental_per_hour_micros, admitted_buffer_micros, admitted_inputs_backfilled"
 
 
 class MigrationTests(unittest.TestCase):
@@ -338,10 +368,15 @@ class MigrationTests(unittest.TestCase):
         )
         if version == 1:
             return [terminal, nonterminal], V1_COLUMNS
+        if version == 2:
+            return [
+                terminal + (30_000, self.now - 600, 12_345, self.now - 400),
+                nonterminal + (20_000, self.now - 300, None, None),
+            ], V2_COLUMNS
         return [
-            terminal + (30_000, self.now - 600, 12_345, self.now - 400),
-            nonterminal + (20_000, self.now - 300, None, None),
-        ], V2_COLUMNS
+            terminal + (30_000, self.now - 600, 12_345, self.now - 400, None, None, 0),
+            nonterminal + (20_000, self.now - 300, None, None, 5_000, 7_000, 1),
+        ], V3_COLUMNS
 
     def _write(self, version):
         try:
@@ -349,7 +384,9 @@ class MigrationTests(unittest.TestCase):
         except FileNotFoundError:
             pass
         connection = sqlite3.connect(self.path)
-        connection.executescript(V1_SCHEMA if version == 1 else V2_SCHEMA)
+        schema = {1: V1_SCHEMA, 2: V2_SCHEMA, 3: V3_SCHEMA}[version]
+        connection.executescript(schema)
+        rows, columns = self._rows(version)
         rows, columns = self._rows(version)
         for row in rows:
             connection.execute(
@@ -367,7 +404,7 @@ class MigrationTests(unittest.TestCase):
         return ledger
 
     def backups(self):
-        return sorted(self.path.parent.glob("state.sqlite3.pre-v3.*"))
+        return sorted(self.path.parent.glob("state.sqlite3.pre-v4.*"))
 
     def user_version(self):
         connection = sqlite3.connect(self.path)
@@ -380,6 +417,16 @@ class MigrationTests(unittest.TestCase):
         connection = sqlite3.connect(self.path)
         try:
             return {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
+        finally:
+            connection.close()
+
+    def tables(self):
+        connection = sqlite3.connect(self.path)
+        try:
+            return {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
         finally:
             connection.close()
 
@@ -396,7 +443,7 @@ class MigrationTests(unittest.TestCase):
         # normally admitted row: observation only, never admission.
         self.assertEqual(operation.admitted_inputs_backfilled, 0)
 
-    def test_v1_upgrade_creates_one_v3_backup_and_backfills(self):
+    def test_v1_upgrade_creates_one_v4_backup_and_backfills(self):
         ledger = self.writable()
         self.assertEqual(ledger.version, SCHEMA_VERSION)
         self.assertEqual(len(self.backups()), 1)
@@ -564,6 +611,125 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(rolled_back.version, 2)
         self.assertEqual(rolled_back.operation("old-op").settled_micros, 12_345)
         self.assertIsNone(rolled_back.operation("live-op").admitted_buffer_micros)
+
+    def test_v3_upgrade_adds_the_fleet_table_once(self):
+        self._write(3)
+        ledger = self.writable()
+        self.assertEqual(ledger.version, SCHEMA_VERSION)
+        self.assertEqual(len(self.backups()), 1)
+        # The schema-3 rows are untouched: the upgrade only creates a table.
+        self.assertEqual(ledger.operation("old-op").settled_micros, 12_345)
+        self.assertEqual(ledger.operation("live-op").admitted_buffer_micros, 7_000)
+        self.assertIn("fleet_observations", self.tables())
+        self.assertIsNone(ledger.latest_fleet_observation())
+
+    def test_a_v3_copy_failure_leaves_the_database_unchanged(self):
+        self._write(3)
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=OSError("denied")):
+            with self.assertRaises(StateRefusal) as raised:
+                ledger.connect(create=True)
+        self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
+        self.assertEqual(self.user_version(), 3)
+        self.assertNotIn("fleet_observations", self.tables())
+        self.assertEqual(self.backups(), [])
+        # The refusal is retryable and the retry creates the table once.
+        ledger.connect(create=True)
+        self.assertEqual(ledger.version, SCHEMA_VERSION)
+        ledger.close()
+        reopened = Ledger(self.path, clock=lambda: self.now).connect(create=True)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.version, SCHEMA_VERSION)
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_a_v3_size_mismatch_refuses_before_any_schema_write(self):
+        self._write(3)
+
+        def truncated(source, target):
+            Path(target).write_bytes(b"")
+
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=truncated):
+            with self.assertRaises(StateRefusal) as raised:
+                ledger.connect(create=True)
+        self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
+        self.assertEqual(self.user_version(), 3)
+        self.assertNotIn("fleet_observations", self.tables())
+
+    def test_read_only_v3_reports_no_fleet_observation(self):
+        self._write(3)
+        ledger = Ledger(self.path, clock=lambda: self.now).connect(create=False, read_only=True)
+        self.addCleanup(ledger.close)
+        self.assertEqual(ledger.version, 3)
+        # An older readable schema has no table: that is an absent observation,
+        # not an unreadable ledger.
+        self.assertIsNone(ledger.latest_fleet_observation())
+
+
+class FleetObservationTests(unittest.TestCase):
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.path = Path(self._directory.name) / "state.sqlite3"
+        self.now = 1_800_000_000.0
+        self.ledger = Ledger(self.path, clock=lambda: self.now).connect()
+        self.addCleanup(self.ledger.close)
+
+    def _count(self):
+        connection = sqlite3.connect(self.path)
+        try:
+            return connection.execute("SELECT COUNT(*) FROM fleet_observations").fetchone()[0]
+        finally:
+            connection.close()
+
+    def test_records_and_reads_the_newest_snapshot(self):
+        self.ledger.record_fleet_observation(
+            observed_at=self.now,
+            contract="forgejo-17.0.1-runners",
+            running_attempts=2,
+            active_registrations=3,
+            offline_registrations=4,
+        )
+        self.assertEqual(
+            self.ledger.latest_fleet_observation(),
+            {
+                "observed_at": self.now,
+                "contract": "forgejo-17.0.1-runners",
+                "running_attempts": 2,
+                "active_registrations": 3,
+                "offline_registrations": 4,
+            },
+        )
+        self.ledger.record_fleet_observation(
+            observed_at=self.now + 60,
+            contract="forgejo-17.0.1-runners",
+            running_attempts=0,
+            active_registrations=1,
+            offline_registrations=0,
+        )
+        self.assertEqual(self.ledger.latest_fleet_observation()["observed_at"], self.now + 60)
+        self.assertEqual(self._count(), 2)
+
+    def test_prunes_snapshots_older_than_the_retention(self):
+        self.ledger.record_fleet_observation(
+            observed_at=self.now,
+            contract="forgejo-17.0.1-runners",
+            running_attempts=1,
+            active_registrations=1,
+            offline_registrations=0,
+        )
+        self.ledger.record_fleet_observation(
+            observed_at=self.now + FLEET_RETENTION_SECONDS + 1,
+            contract="forgejo-17.0.1-runners",
+            running_attempts=0,
+            active_registrations=0,
+            offline_registrations=0,
+        )
+        self.assertEqual(self._count(), 1)
 
 
 if __name__ == "__main__":

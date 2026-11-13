@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ci_burst.aws import Instance, SpotQuote, Template
 from ci_burst.errors import DeadlineRefusal
-from ci_burst.forgejo import Attempt, Observation
+from ci_burst.forgejo import Attempt, Observation, Runners
 
 
 class Clock:
@@ -179,16 +179,50 @@ class FakeAws:
 
 
 class FakeObserver:
-    def __init__(self, observation=None, error=None):
+    def __init__(self, observation=None, error=None, runners=None, runners_error=None):
         self.observation = observation if observation is not None else observation_empty()
         self.error = error
+        self.runners_snapshot = runners if runners is not None else runners_empty()
+        self.runners_error = runners_error
         self.calls = 0
+        self.runner_calls = 0
 
     def observe(self):
         self.calls += 1
         if self.error is not None:
             raise self.error
         return self.observation
+
+    def runners(self):
+        self.runner_calls += 1
+        if self.runners_error is not None:
+            raise self.runners_error
+        return self.runners_snapshot
+
+
+def runners_empty():
+    return Runners(
+        contract="forgejo-17.0.1-runners",
+        total=0,
+        active=0,
+        offline=0,
+        ephemeral_total=0,
+        ephemeral_active=0,
+        ephemeral_offline=0,
+    )
+
+
+def runners_snapshot(*, active=0, offline=0, persistent=0):
+    """An ephemeral fleet plus optionally that many persistent registrations."""
+    return Runners(
+        contract="forgejo-17.0.1-runners",
+        total=active + offline + persistent,
+        active=active + persistent,
+        offline=offline,
+        ephemeral_total=active + offline,
+        ephemeral_active=active,
+        ephemeral_offline=offline,
+    )
 
 
 def observation_empty():

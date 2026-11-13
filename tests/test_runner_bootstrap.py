@@ -57,6 +57,16 @@ PENDING_TEMPLATE_SHA256 = (
 )
 
 
+def _end_one_job_snippet():
+    """The shipped signal helper, for an execution test."""
+    lines = BOOTSTRAP.read_text(encoding="utf-8").splitlines()
+    start = next(
+        index for index, line in enumerate(lines) if line.startswith("end_one_job() {")
+    )
+    end = next(index for index, line in enumerate(lines) if index > start and line == "}")
+    return "\n".join(lines[start : end + 1])
+
+
 def _capture_snippet():
     """The shipped registration-id block, for an execution test."""
     lines = BOOTSTRAP.read_text(encoding="utf-8").splitlines()
@@ -450,6 +460,56 @@ class RegistrationIdCaptureTests(unittest.TestCase):
         document = '{"uuid":"%s"}' % self.UUID
         captured = self.capture((document + " " * 100).encode())
         self.assertEqual(captured, self.UUID)
+
+    def test_the_size_bound_is_exact(self):
+        # A document padded to the bound is accepted; one byte more is rejected
+        # rather than truncated.
+        document = ('{"uuid":"%s"}' % self.UUID).encode()
+        at_bound = document + b" " * (4096 - len(document))
+        over_bound = document + b" " * (4097 - len(document))
+        self.assertEqual(len(at_bound), 4096)
+        self.assertEqual(len(over_bound), 4097)
+        self.assertEqual(self.capture(at_bound), self.UUID)
+        self.assertEqual(self.capture(over_bound), "unknown")
+
+
+@unittest.skipUnless(shutil.which("bash"), "the watcher runs under bash")
+class EndOneJobTests(unittest.TestCase):
+    """Run the signal helper against a stubbed process table.
+
+    A delivered signal is the only thing that may end the retry window; a
+    process found but not signalled must keep it open.
+    """
+
+    def run_helper(self, kill_status):
+        with tempfile.TemporaryDirectory() as directory:
+            process = Path(directory) / "proc" / "4242"
+            process.mkdir(parents=True)
+            (process / "cmdline").write_bytes(
+                b"/usr/local/bin/forgejo-runner\0one-job\0"
+            )
+            snippet = _end_one_job_snippet().replace(
+                "/proc/", str(Path(directory) / "proc") + "/"
+            )
+            script = (
+                "set -uo pipefail\n"
+                "stat() { printf runner; }\n"
+                "grep() { return 0; }\n"
+                f"kill() {{ return {kill_status}; }}\n" + snippet + "\nend_one_job\necho rc=$?\n"
+            )
+            done = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return done.stdout.strip()
+
+    def test_a_delivered_signal_reports_success(self):
+        self.assertEqual(self.run_helper(0), "rc=0")
+
+    def test_a_failed_signal_reports_failure(self):
+        # The retry loop depends on this: a process that vanished before the
+        # signal must not end the window.
+        self.assertEqual(self.run_helper(1), "rc=1")
 
 
 class BootstrapTailTests(unittest.TestCase):

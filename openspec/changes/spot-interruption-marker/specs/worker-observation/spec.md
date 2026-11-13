@@ -37,7 +37,7 @@ The command MUST recognise only a closed vocabulary: a step name from the shippe
 ### Requirement: Interruption evidence identifies the worker
 The `spot-interruption` event MUST identify the instance, the worker hostname and the runner registration id when the worker knows it, and MUST carry the fixed `reason` value `spot_interruption` for a consumer to filter on. A value the worker cannot establish MUST be published as the shipped `unknown` fallback rather than inferred.
 
-#### Scenario: A worker ends on the interruption notice
+#### Scenario: A worker observes the interruption notice
 - **WHEN** the bootstrap reads the two-minute interruption notice and attempts to end its one job
 - **THEN** the event stream carries one `spot-interruption` event for that instance with its reason, action, hostname and registration id
 - **AND** no free console text is published

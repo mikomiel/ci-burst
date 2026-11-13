@@ -316,8 +316,8 @@ exporter reads them.
 The bootstrap also watches the Spot interruption notice, as root, because the job
 account is denied the metadata service. It polls IMDSv2 every five seconds; on a
 notice it prints one marker, `bootstrap spot-interruption action=<action>
-host=<hostname> runner=<uuid|unknown>`, and sends `SIGTERM` to the job account's
-runner process so the one job ends before AWS reclaims the instance. The `runner`
+host=<hostname> runner=<uuid|unknown>`, and attempts to end the job account's
+runner process with `SIGTERM` so it stops before AWS reclaims the instance. The `runner`
 value is captured at registration, before the job account owns that directory,
 and read with `jq` as one field only: the file's token is never copied or
 printed. A value that cannot be captured is published as `unknown` and becomes

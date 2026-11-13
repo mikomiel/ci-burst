@@ -34,8 +34,9 @@ account. What it cannot express today is an interruption.
   marker travels on the console the exporter already reads.
 - A worker that cannot read the notice behaves exactly as it did before; the
   instance lifetime and the job timeout remain its bounds.
-- The marker is evidence that the notice was observed and the job was
-  signalled, never a job verdict and not proof that the worker ended; the console
+- The marker is evidence that the notice was observed and that a signal
+  delivery was attempted, never a job verdict and not proof that the worker
+  ended; the console
   is not a trusted channel, so a marker alone does not prove an infrastructure
   loss.
 - Activation is a deployment step, not a source step: the bootstrap bytes are the

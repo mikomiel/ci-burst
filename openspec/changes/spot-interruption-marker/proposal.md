@@ -21,7 +21,7 @@ account. What it cannot express today is an interruption.
   notice's action and the worker hostname, then ends the job account's runner
   process so the job stops before the instance is reclaimed.
 - `export` recognises that marker as one more closed-vocabulary event,
-  `spot-interruption`, with two validated values and no free console text.
+  `spot-interruption`, with three validated values and no free console text.
 - The event stream, the worker-setup guide and the policy tests describe the
   marker, its fields and its limits.
 
@@ -34,9 +34,10 @@ account. What it cannot express today is an interruption.
   marker travels on the console the exporter already reads.
 - A worker that cannot read the notice behaves exactly as it did before; the
   instance lifetime and the job timeout remain its bounds.
-- The marker is evidence that a worker ended, never a job verdict, and the
-  console is not a trusted channel: a marker alone does not prove an
-  infrastructure loss.
+- The marker is evidence that the notice was observed and the job was
+  signalled, never a job verdict and not proof that the worker ended; the console
+  is not a trusted channel, so a marker alone does not prove an infrastructure
+  loss.
 - Activation is a deployment step, not a source step: the bootstrap bytes are the
   launch-template user data, so an operator publishes a template version before
   any worker watches the notice.

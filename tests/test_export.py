@@ -849,7 +849,8 @@ class ExporterTests(ExportCase):
         self.assertEqual(event["host"], "ip-10-0-0-1")
         self.assertEqual(event["runner"], "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b")
         self.assertEqual(event["instance"], "i-0123456789abcdef0")
-        # The marker records that the worker ended; it is never a job verdict.
+        # The marker records the observed notice and the signal attempt; it is
+        # never a job verdict or proof that the job ended.
         for forbidden in ("success", "verdict", "job_result", "conclusion"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, json.dumps(event))

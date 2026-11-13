@@ -52,7 +52,7 @@ PUBLISHED_TEMPLATE_SHA256 = (
 #: it instead.
 PENDING_TEMPLATE_VERSION = 5
 PENDING_TEMPLATE_SHA256 = (
-    "ed666f56c7b2deededec49e6840a3b0602b5cf1d35f9c0ab77e723dafbd1f205"
+    "4ed6136299c2f05238ba08f7351102300f3dedc38a20453ae861b1946acaa78a"
 )
 
 
@@ -282,7 +282,12 @@ class RunnerBootstrapTests(unittest.TestCase):
         # value rather than line by line.
         capture = self._line_index("RUNNER_UUID=$(head -c 4096")
         self.assertLess(capture, self._line_index("chown -R runner:runner"))
-        self.assertIn("jq -r '.uuid // empty'", self.script)
+        self.assertIn("jq -ser", self.script)
+        # One JSON document, its raw string checked inside jq before command
+        # substitution can strip a trailing newline or fold a second document.
+        self.assertIn("if length == 1", self.script)
+        self.assertIn('.[0].uuid | type) == "string"', self.script)
+        self.assertIn('test("[\\n\\r]") | not', self.script)
         self.assertIn('[[ ! "$RUNNER_UUID" =~ ', self.script)
         self.assertNotIn("grep -Eq", self.script)
         # The watcher never opens the file: the captured value is all it uses.

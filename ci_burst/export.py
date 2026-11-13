@@ -191,9 +191,9 @@ JOB_PROCESS_IDENTITIES = frozenset(
 #: The Spot interruption marker: the worker read the two-minute notice and ended
 #: its one job. ``action`` is the notice's own value, and ``unknown`` is the
 #: shipped fallback for a notice whose body carried no documented action;
-#: ``runner`` is the registration id the worker read, or ``unknown`` when the
-#: notice arrived before registration. Every value is validated before it is
-#: published, and the marker contributes no other console text.
+#: ``runner`` is the registration id the worker captured, or ``unknown`` when it
+#: could not capture one. Every value is validated before it is published, and
+#: the marker contributes no other console text.
 SPOT_PATTERN = re.compile(
     r"\bbootstrap spot-interruption action=([a-z]{1,12}) "
     r"host=([A-Za-z0-9][A-Za-z0-9.-]{0,63}) "
@@ -207,9 +207,9 @@ RUNNER_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 def _spot_interruption(action, host, runner):
     """Return the triple when every value is one the bootstrap can emit.
 
-    ``runner`` is ``None`` for the shipped ``unknown`` fallback: a notice before
-    registration has no registration id, and the event states that rather than
-    inventing one.
+    ``runner`` is ``None`` for the shipped ``unknown`` fallback: a worker that
+    could not capture a registration id has none, and the event states that
+    rather than inventing one.
     """
     if action not in SPOT_ACTIONS or _match(HOST_PATTERN, host) is None:
         return None

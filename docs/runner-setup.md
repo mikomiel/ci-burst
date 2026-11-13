@@ -325,7 +325,9 @@ printed. A value that cannot be captured is published as `unknown` and becomes
 during registration is not observed. A metadata read that fails is not fatal: the worker keeps the
 lifetime and job-timeout bounds it had before, and no marker is written. The marker becomes the `spot-interruption` worker-event
 ([operations.md § The Spot interruption marker](operations.md#the-spot-interruption-marker));
-it records that the worker ended and is never a substitute for a job result.
+it records that the notice was observed and the job was signalled - not that the
+worker or the job actually ended - and it is never a substitute for a job
+result.
 
 `one-job` polls the queue once. When nothing is queued it exits with
 `Error: no task received`; that is the expected empty-queue result, not a broken

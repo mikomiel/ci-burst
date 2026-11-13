@@ -18,7 +18,7 @@ template publication and no cloud change.
 
 ## 2. Reader
 
-- [x] 2.1 Recognise the marker in `parse_console` only when both values are in the
+- [x] 2.1 Recognise the marker in `parse_console` only when every value is in the
   closed vocabulary, and keep it out of the step vocabulary.
 - [x] 2.2 Publish one `spot-interruption` event per instance with `action` and
   `host`, a stable identity and the instance's deployment, zone and operation.

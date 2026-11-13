@@ -227,9 +227,10 @@ could not capture it). Nothing else from the line is copied.
 without a provider call. `runner` is the registration id, so the same join can be
 made from a runner registration when attribution is missing; it is not a job
 identity, because a Forgejo job record carries no runner field. The marker is
-evidence that the worker ended; it is not a job result. Like every line in this
-file it comes from the console, which no party is trusted to write, so treat a
-marker as one input among the job's, not as proof on its own.
+evidence that the notice was observed and the job was signalled; it is not proof
+that the worker or the job actually ended, and it is never a job result. Like
+every line in this file it comes from the console, which no party is trusted to
+write, so treat a marker as one input among the job's, not as proof on its own.
 
 The notice is read by the bootstrap as root because the job account is denied the
 metadata service, and the watcher starts after registration, so a notice during

@@ -50,7 +50,14 @@ cleanup_token
 # an oversized file from being parsed. The id is published in the marker; the
 # file also holds the registration token, which is never read or printed.
 RUNNER_UUID=$(head -c 4096 /var/lib/forgejo-runner/.runner 2>/dev/null \
-  | jq -r '.uuid // empty' 2>/dev/null) || RUNNER_UUID=""
+  | jq -ser 'if length == 1
+               and (.[0] | type) == "object"
+               and (.[0].uuid | type) == "string"
+               and (.[0].uuid | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+               and (.[0].uuid | test("[\n\r]") | not)
+             then .[0].uuid
+             else empty
+             end' 2>/dev/null) || RUNNER_UUID=""
 if [[ ! "$RUNNER_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
   RUNNER_UUID=unknown
 fi
@@ -78,8 +85,9 @@ end_one_job() {
     pid=${pid%/cmdline}
     [ "$(stat -c '%U' "/proc/$pid" 2>/dev/null)" = runner ] || continue
     grep -qa 'forgejo-runner' "$cmdline" 2>/dev/null || continue
-    kill -TERM "$pid" 2>/dev/null || true
-    signalled=0
+    if kill -TERM "$pid" 2>/dev/null; then
+      signalled=0
+    fi
   done
   return "$signalled"
 }

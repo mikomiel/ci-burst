@@ -167,10 +167,11 @@ python -m ci_burst reap   --config deployment.toml --apply
 ```
 
 Exit codes: `0` for a completed decision, `2` for a refusal (nothing was
-mutated), `1` for a provider or cleanup failure. Every command prints one JSON
-document with stable reason codes. `plan`, `status` and `export` perform no
-cloud mutation and no ledger write; `apply` is the only launch path; `reap`
-never needs Forgejo or the scaling ledger.
+mutated), `1` for a provider or cleanup failure. A cleanup pass that refused at
+least one owned resource is `cleanup_degraded`, a cleanup failure, and exits
+`1`. Every command prints one JSON document with stable reason codes. `plan`,
+`status` and `export` perform no cloud mutation and no ledger write; `apply` is
+the only launch path; `reap` never needs Forgejo or the scaling ledger.
 
 ## Worker evidence
 
@@ -1028,6 +1029,59 @@ zero residual cost. It also reports the configured `controller.max_instances`,
 the anchored window's `allowance`, `spend`, `committed`, `remaining` and
 `launches`, the number of `busy_instances`, and the `hourly_ceiling` at that
 limit (`(max_spot_price + incidental_per_hour) × max_instances`).
+
+## Cleanup result
+
+`reap --apply` is the independent expiry path. It reads the owned inventory once
+with the cleanup identity and terminates only an instance that is both present
+in that inventory and carries a valid, non-empty, non-`pending`
+`ci-burst:operation` tag and a valid, expired `ci-burst:expires-at` tag. It needs
+no Forgejo token, no ledger and no launch permission, so it keeps working while
+admission or the scaler host is down.
+
+The decision names the outcome of that run:
+
+| decision | exit | meaning |
+|---|---|---|
+| `planned` | 0 | dry run; nothing was requested |
+| `termination_requested` | 0 | applied pass with no refusal; a request is not confirmed removal |
+| `cleanup_degraded` | 1 | applied pass that refused at least one owned resource |
+| `cleanup_failed` | 1 | the provider refused the termination call |
+| `refused` / error document | 2 | the inventory could not be read; nothing was mutated |
+
+A refused resource does not stop the proven expired targets from being
+terminated in the same run: the run is degraded, not aborted. Malformed
+ownership or expiry never authorizes termination.
+
+Every `reap` document carries a top-level `cleanup` object built from that same
+single inventory read. No additional provider call, export, ledger or Forgejo
+read produces it:
+
+| field | meaning |
+|---|---|
+| `inventory_verified` | `true` when the owned-instance read completed |
+| `attempted_at`, `completed_at` | Unix epoch seconds on the cleanup host, before the read and after the termination attempt |
+| `observed` | owned instances the read returned |
+| `skipped` | records already `shutting-down` or `terminated` |
+| `terminating` / `terminated` | the split of `skipped` by provider state |
+| `expired` | well-formed expired candidates in this read |
+| `requested` | identifiers actually sent to `terminate` (zero on a dry run) |
+| `refused` | malformed ownership or expiry records |
+| `denied` | requests whose termination was refused or could not be confirmed; every `ProviderRefusal`, including an uncertain transport outcome, counts here |
+| `unresolved` | refused, expired and still-terminating records: not confirmed gone |
+
+`requested` is not `terminated`. The `confirmation` sentence is emitted only
+when identifiers were sent, and a later read is the only evidence of removal.
+`cleanup_failed` and `unresolved` remain the conservative signals: `denied`
+alone does not distinguish a provider rejection from an unconfirmed outcome.
+
+A `cleanup` block with `inventory_verified: true` and zero counts proves only
+that one complete inventory read returned no owned records for this deployment.
+It is not a zero AWS bill, and it is not proof that an earlier request reached
+the provider or reached a terminal state. An **absent or stale** document proves
+nothing at all: journald rotation, a down cleanup host and a timer that was never
+installed produce the same absence. Read that absence as unobserved, never as an
+empty inventory.
 
 ## Supported limits
 

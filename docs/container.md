@@ -22,8 +22,9 @@ needs a credential.
 - Non-root: the process runs as UID/GID 10001.
 - No daemon, no published ports, no healthcheck. A run finishes with the
   controller's exit code: `0` completed decision, `2` refusal with nothing
-  mutated, `1` provider or cleanup failure. The exit code is the only
-  completion signal.
+  mutated, `1` provider or cleanup failure. A cleanup pass that refused an owned
+  resource (`cleanup_degraded`) is a cleanup failure and exits `1`. The exit
+  code is the only completion signal.
 - The units run it with a read-only root filesystem and a tmpfs for `/tmp`.
   Every durable write belongs in the mounted state directory; the tmpfs covers
   transient files.
@@ -341,6 +342,38 @@ systemctl status ci-burst-reap.service
 A failed run does not stop the timers; the next scheduled run tries again. A
 persistent refusal is a signal to read the JSON reason code and `status`, not
 to raise the run frequency or remove the lock.
+
+The cleanup host is monitored from the journal, because `reap` has no exporter,
+textfile or healthcheck. The exit status says whether systemd saw the run
+complete; the document says what that run established. The CLI pretty-prints
+one JSON document over several lines, so asking for a single line (`-n 1`)
+shows a fragment or an unrelated systemd line. Read a bounded time window
+instead:
+
+```sh
+journalctl -u ci-burst-reap.service --since -10min -o cat
+```
+
+That window shows the recent runs' journal output; a run's document appears in
+full because the CLI writes it when the run ends. Find it by its top-level
+`decision`, then read the `cleanup` object in the same document for that run's
+counts:
+
+- `decision: planned` with exit `0` is a dry run.
+- `decision: termination_requested` with exit `0` means the pass refused
+  nothing. Read its `cleanup` block: `requested` is not `terminated`,
+  `inventory_verified: true` with zero counts means one complete read returned
+  no owned records, and neither is a zero AWS bill.
+- `decision: cleanup_degraded`, exit `1`, means at least one owned instance was
+  refused and is still unresolved; `refused_resources` names it. The graded
+  counts stay in `cleanup`.
+- `decision: cleanup_failed`, exit `1`, means the provider refused the
+  termination call; `denied` counts the requested identifiers.
+
+An absent or stale `ci-burst-reap` journal entry proves nothing by itself:
+journald rotation, a down cleanup host and a timer that was never installed all
+look the same. Alert on the scheduled run's absence or nonzero exit, never on a
+missing or zero-count document.
 
 ## Keep the image current
 

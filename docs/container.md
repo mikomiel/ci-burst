@@ -314,6 +314,14 @@ executing: stop the service and remove its named container before state is
 inspected or moved. `systemctl is-active` describes the launcher only, never a
 surviving container.
 
+The apply unit's `TimeoutStartSec=300` is the outer bound. The controller's own
+`controller.pass_deadline_seconds` (default 240) is shorter, so a pass that
+reaches its own budget exits with `pass_deadline_exceeded` and
+`phases_deferred` before systemd stops the unit at 300 seconds. The worker
+lifetime (`aws.max_lifetime_seconds`, default 3600) is the instance's lifetime,
+not this pass bound. The reap unit has its own `TimeoutStartSec` and timer, and
+does not use the scaler's pass deadline.
+
 `ci-burst-reap.timer` runs `reap --apply` five minutes after the previous run
 finished, on the cleanup host.
 

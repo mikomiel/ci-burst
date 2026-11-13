@@ -8,8 +8,9 @@ from pathlib import Path
 from unittest import mock
 
 from ci_burst.cli import main
+from ci_burst.controller import Controller
 
-from support import write_config
+from support import FakeAws, instance, write_config
 
 
 class CliTests(unittest.TestCase):
@@ -46,6 +47,7 @@ class CliTests(unittest.TestCase):
             ({"decision": "launch_failed"}, 1),
             ({"decision": "uncertain"}, 1),
             ({"decision": "cleanup_failed"}, 1),
+            ({"decision": "cleanup_degraded"}, 1),
         ]
         for result, expected in cases:
             with self.subTest(decision=result["decision"]):
@@ -54,6 +56,25 @@ class CliTests(unittest.TestCase):
                     code, payload = self.run_cli(["reap", "--config", str(write_config(self.root))])
                 self.assertEqual(code, expected)
                 self.assertEqual(payload["decision"], result["decision"])
+
+    def test_reap_apply_all_refused_exits_one_without_a_mutation(self):
+        # End to end through the real Controller and the CLI boundary: the
+        # scheduled unit observes the exit status, so a refused inventory must
+        # not look like a completed cleanup.
+        aws = FakeAws(instances=[instance(instance_id="i-bad-expiry", operation="a")])
+        config = write_config(self.root)
+
+        def controller(configuration):
+            return Controller(configuration, aws=aws)
+
+        with mock.patch("ci_burst.cli.Controller", controller):
+            code, payload = self.run_cli(["reap", "--config", str(config), "--apply"])
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["decision"], "cleanup_degraded")
+        self.assertEqual(payload["termination_requested"], [])
+        self.assertNotIn("confirmation", payload)
+        self.assertEqual(aws.mutations(), [])
+        self.assertFalse((self.root / "state.sqlite3").exists())
 
     def test_apply_without_the_aws_sdk_reports_the_documented_refusal(self):
         missing = {"boto3": None, "botocore": None, "botocore.config": None}

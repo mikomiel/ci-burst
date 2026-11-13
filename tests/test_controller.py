@@ -11,7 +11,13 @@ from unittest import mock
 from ci_burst.config import load
 from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment
 from ci_burst.credit import CreditSpecification
-from ci_burst.errors import ConfigRefusal, ProviderRefusal, StateRefusal
+from ci_burst.errors import (
+    ConfigRefusal,
+    DeadlineRefusal,
+    ObservationRefusal,
+    ProviderRefusal,
+    StateRefusal,
+)
 from ci_burst.aws import Aws, DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
 from ci_burst.ledger import Ledger, current_window
 from ci_burst.money import format_money
@@ -64,10 +70,10 @@ class ControllerCase(unittest.TestCase):
         self.clock = Clock()
         self.config = load(write_config(self.root))
 
-    def build(self, *, observation=None, aws=None, config=None, ledger=None):
+    def build(self, *, observation=None, aws=None, config=None, ledger=None, observer=None):
         self.config = config or self.config
         self.aws = aws or FakeAws(spot_quote=quote(clock=self.clock))
-        self.observer = FakeObserver(observation or observation_empty())
+        self.observer = observer or FakeObserver(observation or observation_empty())
         self.ledger = ledger or Ledger(self.config.state.database, clock=self.clock)
         return Controller(
             self.config,
@@ -957,6 +963,191 @@ class ApplyTests(ControllerCase):
         dumped = json.dumps(result)
         self.assertNotIn("UserData", dumped)
         self.assertNotIn("Authorization", dumped)
+
+
+class SlowRefusingObserver:
+    """An observer whose refusal arrives only after the pass budget is spent."""
+
+    def __init__(self, clock, seconds=300):
+        self.clock = clock
+        self.seconds = seconds
+        self.calls = 0
+
+    def observe(self):
+        self.calls += 1
+        self.clock.advance(self.seconds)
+        raise ObservationRefusal("FORGEJO_UNREACHABLE", "slow read")
+
+
+class PassDeadlineTests(ControllerCase):
+    def slow_quote(self, seconds=300):
+        aws = FakeAws(spot_quote=quote(clock=self.clock), clock=self.clock)
+        aws.on_quote = lambda: self.clock.advance(seconds)
+        return aws
+
+    def test_a_slow_quote_read_defers_the_launch_without_mutation(self):
+        controller = self.build(observation=observation_demand(), aws=self.slow_quote())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["launch"])
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_a_deadline_between_candidate_quotes_defers_admission(self):
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "aws": {
+                        "availability_zones": [
+                            {"zone": "eu-central-1a", "subnet_id": "subnet-0123456789abcdef0"},
+                            {"zone": "eu-central-1b", "subnet_id": "subnet-0123456789abcdef1"},
+                        ]
+                    }
+                },
+            )
+        )
+        quotes = {
+            ("t4g.small", "eu-central-1a"): quote(clock=self.clock),
+            ("t4g.small", "eu-central-1b"): quote(clock=self.clock),
+        }
+        aws = FakeAws(spot_quote=quotes, clock=self.clock)
+        aws.on_quote = lambda: self.clock.advance(300)
+        controller = self.build(observation=observation_demand(), aws=aws, config=config)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["admission", "launch"])
+        self.assertEqual(aws.mutations(), [])
+
+    def slow_final_read(self, seconds=300, **overrides):
+        """A pass whose last Spot read returns after the deadline."""
+        aws = FakeAws(clock=self.clock, **overrides)
+        aws.on_quote = lambda: self.clock.advance(seconds)
+        return aws
+
+    def test_a_final_slow_read_without_a_quote_defers_admission(self):
+        aws = self.slow_final_read(spot_quote=None)
+        result = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["admission", "launch"])
+        self.assertNotIn("refusal", result)
+        self.assertEqual(aws.mutations(), [])
+
+    def test_a_final_slow_read_with_an_above_cap_quote_defers_admission(self):
+        aws = self.slow_final_read(spot_quote=quote(price_micros=50_000, clock=self.clock))
+        result = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["admission", "launch"])
+        self.assertNotIn("refusal", result)
+        self.assertEqual(aws.mutations(), [])
+
+    def test_a_provider_refusal_during_the_final_slow_read_defers_admission(self):
+        aws = self.slow_final_read(
+            spot_quote=ProviderRefusal("AWS_REFUSED", "DescribeSpotPriceHistory")
+        )
+        result = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["admission", "launch"])
+        self.assertNotIn("refusal", result)
+        self.assertEqual(aws.mutations(), [])
+
+    def test_a_refusal_before_the_deadline_is_unchanged(self):
+        aws = FakeAws(spot_quote=quote(price_micros=50_000, clock=self.clock), clock=self.clock)
+        result = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("spot_price_above_cap", result["reasons"])
+        self.assertNotIn("pass_deadline_exceeded", result["reasons"])
+        self.assertNotIn("phases_deferred", result)
+
+    def test_a_deadline_refusal_from_the_by_id_read_rolls_back_reconciliation(self):
+        operation_id = self.seed(state="running", expires_at=self.clock.now + 3600)
+        aws = FakeAws(spot_quote=quote(clock=self.clock), clock=self.clock)
+
+        def refuse_by_id(instance_ids, *, deadline=None):
+            aws.calls.append(("instances", list(instance_ids)))
+            raise DeadlineRefusal("DescribeInstances by-id read")
+
+        aws.instances = refuse_by_id
+        result = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"][0], "reconcile")
+        operation = self.reopened().operation(operation_id)
+        self.assertEqual(operation.state, "running")
+        self.assertIsNone(operation.settled_micros)
+        self.assertEqual(operation.reservation_micros, 1_000_000)
+
+    def test_a_deadline_before_expiry_cleanup_terminates_nothing(self):
+        operation_id = self.seed(state="running", expires_at=self.clock.now - 10)
+        aws = FakeAws(spot_quote=quote(clock=self.clock), clock=self.clock)
+        aws.instances_result = [
+            instance(instance_id="i-seed", operation=operation_id, expires_at=self.clock.now - 10)
+        ]
+        aws.on_owned_instances = lambda: self.clock.advance(300)
+        controller = self.build(observation=observation_demand(), aws=aws)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertIn("expire", result["phases_deferred"])
+        self.assertEqual(aws.terminated, [])
+        self.assertEqual([call for call in aws.calls if call[0] == "terminate"], [])
+
+    def test_a_deadline_after_a_possibly_accepted_launch_keeps_the_intent_for_resume(self):
+        aws = FakeAws(spot_quote=quote(clock=self.clock), clock=self.clock)
+        aws.on_run = lambda request: self.clock.advance(300)
+        aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        controller = self.build(observation=observation_demand(), aws=aws)
+        first = controller.apply()
+        self.assertEqual(first["decision"], "uncertain")
+        self.assertNotIn("pass_deadline_exceeded", first.get("reasons", []))
+        operation = self.reopened().operation(first["operation"])
+        self.assertEqual(operation.state, "uncertain")
+        token = operation.client_token
+        aws.run_error = None
+        aws.on_run = None
+        second = self.build(observation=observation_demand(), aws=aws).apply()
+        self.assertEqual(second["decision"], "resumed")
+        runs = [call for call in aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[0][1], runs[1][1])
+        self.assertEqual(runs[1][1]["ClientToken"], token)
+
+    def test_a_fast_pass_is_unchanged(self):
+        result = self.build(observation=observation_demand()).apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertNotIn("phases_deferred", result)
+
+    def test_a_slow_observation_refusal_reports_the_deadline(self):
+        controller = self.build(observer=SlowRefusingObserver(self.clock))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded"])
+        self.assertEqual(result["phases_deferred"], ["observe", "admission", "launch"])
+        self.assertEqual(result["refusal"]["reason"], "FORGEJO_UNREACHABLE")
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_a_by_id_read_that_ends_after_the_deadline_reports_both_truths(self):
+        operation_id = self.seed(state="running")
+        controller = self.build(observation=observation_demand())
+        self.aws.instances_result = []
+        self.aws.instances_by_id = {"i-seed": instance(instance_id="i-seed", state="running")}
+        self.aws.on_instances = lambda: self.clock.advance(300)
+
+        result = controller.apply()
+
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["pass_deadline_exceeded", "owned_state_discrepancy"])
+        self.assertEqual(
+            result["phases_deferred"],
+            ["reconcile", "resume", "expire", "observe", "admission", "launch"],
+        )
+        self.assertEqual(result["slot"]["discrepancies"][0]["reason"], "OWNERSHIP_TAGS_MISSING")
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(self.reopened().operation(operation_id).state, "running")
 
 
 class InventoryClient:
@@ -2499,6 +2690,11 @@ class ReapTests(ControllerCase):
         self.assertEqual(result["termination_requested"], ["i-expired"])
         self.assertEqual(result["refused_resources"], [])
         self.assertEqual(result["refusal"]["reason"], "AWS_REFUSED")
+        self.assertNotIn("confirmation", result)
+        self.assertEqual(result["cleanup"]["requested"], 1)
+        self.assertEqual(result["cleanup"]["denied"], 1)
+        self.assertEqual(result["cleanup"]["unresolved"], 1)
+        self.assertEqual(result["cleanup"]["terminated"], 0)
 
     def test_reap_apply_requests_termination_and_does_not_claim_confirmation(self):
         controller = self.build()
@@ -2537,6 +2733,111 @@ class ReapTests(ControllerCase):
         self.aws.instances_result = [instance(instance_id="i-expired", operation="a", expires_at=self.clock.now - 5)]
         controller.reap(apply=True)
         self.assertEqual([call[0] for call in self.aws.mutations()], ["terminate"])
+
+    def test_reap_apply_reports_an_all_refused_inventory_as_degraded(self):
+        controller = self.build()
+        self.aws.instances_result = [instance(instance_id="i-bad-expiry", operation="a")]
+        result = controller.reap(apply=True)
+        self.assertEqual(result["decision"], "cleanup_degraded")
+        self.assertEqual(result["termination_requested"], [])
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertNotIn("confirmation", result)
+        self.assertEqual(
+            {
+                key: result["cleanup"][key]
+                for key in ("inventory_verified", "observed", "expired", "requested", "refused", "denied", "unresolved")
+            },
+            {
+                "inventory_verified": True,
+                "observed": 1,
+                "expired": 0,
+                "requested": 0,
+                "refused": 1,
+                "denied": 0,
+                "unresolved": 1,
+            },
+        )
+
+    def test_reap_apply_mixed_inventory_keeps_both_outcomes(self):
+        controller = self.build()
+        self.aws.instances_result = [
+            instance(instance_id="i-expired", operation="a", expires_at=self.clock.now - 5),
+            instance(instance_id="i-bad-expiry", operation="b"),
+        ]
+        result = controller.reap(apply=True)
+        self.assertEqual(result["decision"], "cleanup_degraded")
+        self.assertEqual(self.aws.terminated, ["i-expired"])
+        self.assertEqual(result["termination_requested"], ["i-expired"])
+        self.assertEqual([item["instance_id"] for item in result["expired"]], ["i-expired"])
+        self.assertEqual([item["instance_id"] for item in result["refused_resources"]], ["i-bad-expiry"])
+        self.assertEqual(result["cleanup"]["requested"], 1)
+        self.assertEqual(result["cleanup"]["refused"], 1)
+        self.assertIn("not confirmed removal", result["confirmation"])
+
+    def test_reap_apply_with_a_verified_empty_inventory_succeeds(self):
+        controller = self.build()
+        self.aws.instances_result = []
+        result = controller.reap(apply=True)
+        self.assertEqual(result["decision"], "termination_requested")
+        self.assertEqual(result["termination_requested"], [])
+        self.assertNotIn("confirmation", result)
+        self.assertTrue(result["cleanup"]["inventory_verified"])
+        self.assertEqual(result["cleanup"]["observed"], 0)
+        self.assertEqual(result["cleanup"]["unresolved"], 0)
+        self.assertEqual(result["cleanup"]["attempted_at"], self.clock.now)
+        self.assertEqual(result["cleanup"]["completed_at"], self.clock.now)
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_reap_apply_never_terminates_malformed_ownership_or_expiry(self):
+        controller = self.build()
+        self.aws.instances_result = [
+            instance(instance_id="i-pending", operation="pending", expires_at=self.clock.now - 5),
+            instance(instance_id="i-bad-expiry", operation="a", **{"ci-burst:expires-at": "not-a-number"}),
+        ]
+        result = controller.reap(apply=True)
+        self.assertEqual(result["decision"], "cleanup_degraded")
+        self.assertEqual(result["termination_requested"], [])
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(result["cleanup"]["requested"], 0)
+        self.assertEqual(result["cleanup"]["refused"], 2)
+        self.assertEqual(
+            [item["reason"] for item in result["refused_resources"]],
+            ["OPERATION_TAG_INVALID", "EXPIRY_TAG_INVALID"],
+        )
+
+    def test_reap_delayed_readback_never_claims_confirmed_removal(self):
+        controller = self.build()
+        self.aws.instances_result = [
+            instance(instance_id="i-expired", operation="a", expires_at=self.clock.now - 5)
+        ]
+        requested = controller.reap(apply=True)
+        self.assertEqual(requested["decision"], "termination_requested")
+        self.assertEqual(requested["cleanup"]["requested"], 1)
+        self.assertEqual(requested["cleanup"]["terminating"], 0)
+        self.assertEqual(requested["cleanup"]["terminated"], 0)
+        self.assertEqual(requested["cleanup"]["unresolved"], 1)
+
+        self.aws.instances_result = [
+            instance(
+                instance_id="i-expired", operation="a", state="shutting-down", expires_at=self.clock.now - 5
+            )
+        ]
+        stopping = controller.reap(apply=True)
+        self.assertEqual(stopping["cleanup"]["requested"], 0)
+        self.assertEqual(stopping["cleanup"]["skipped"], 1)
+        self.assertEqual(stopping["cleanup"]["terminating"], 1)
+        self.assertEqual(stopping["cleanup"]["terminated"], 0)
+        self.assertEqual(stopping["cleanup"]["unresolved"], 1)
+
+        self.aws.instances_result = [
+            instance(instance_id="i-expired", operation="a", state="terminated", expires_at=self.clock.now - 5)
+        ]
+        terminated = controller.reap(apply=True)
+        self.assertEqual(terminated["decision"], "termination_requested")
+        self.assertEqual(terminated["cleanup"]["skipped"], 1)
+        self.assertEqual(terminated["cleanup"]["terminating"], 0)
+        self.assertEqual(terminated["cleanup"]["terminated"], 1)
+        self.assertEqual(terminated["cleanup"]["unresolved"], 0)
 
 
 class StatusTests(ControllerCase):

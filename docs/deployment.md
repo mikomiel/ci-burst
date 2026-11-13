@@ -216,6 +216,9 @@ labels = ["cloud-ci:host", "strong-ci:host", "linux-arm64:host"]
 # Optional, integer 1..12, default 1. A worker launched for one job occupies one
 # slot until it terminates.
 max_instances = 4
+# Optional pass budget in seconds, integer 30..290, default 240. It ends one
+# apply pass with headroom below the shipped unit's TimeoutStartSec=300.
+pass_deadline_seconds = 240
 
 [aws]
 region = "eu-central-1"
@@ -251,6 +254,22 @@ defaults to `1`, so a deployment that omits it keeps the original one-slot
 behaviour. Raise it only after one burst is understood; the allowance still caps
 every batch, and § Fleet size and fan-out in
 [operations.md](operations.md#fleet-size-and-fan-out) owns the admission rule.
+
+`controller.pass_deadline_seconds` is optional: it bounds one `apply` pass to
+`30..290` seconds and defaults to `240`. The accepted range stays below the
+shipped unit's `TimeoutStartSec=300`, so a pass that reaches its budget can
+return `refused` with `pass_deadline_exceeded` and `phases_deferred` instead of
+being killed at the unit's outer bound. The connect (10 s) and read (30 s)
+transport timeouts bound a transport step, not a whole response or the whole
+pass, so a read already in flight is allowed to return and the next check
+reports the overrun. A deployment that needs a longer pass must raise the
+unit's `TimeoutStartSec`; `pass_deadline_seconds` is not offered above `290`.
+The pass budget is not the worker lifetime: `aws.max_lifetime_seconds` bounds
+the instance itself, and with the shipped defaults the order is
+`240 < 300 < 3600`. `reap`, `status` and `export` are not bounded by it.
+§ Scheduler, cleanup and rollback in
+[operations.md](operations.md#scheduler-cleanup-and-rollback) owns the full
+relation to the systemd unit and the transport timeouts.
 
 `budget.allowance` caps tracked spend in the anchored window.
 `budget.incidental_per_hour` is the estimated non-compute cost of one
@@ -480,24 +499,33 @@ To see it work, arrange for the reaper to be the only actor that may act:
    production input;
 3. observe the termination. The reap timer is already enabled here, so it may act
    before a manual command does, and either route is evidence — but only a
-   **successful** one. The same four conditions apply to a scheduled
+   **successful** one. The same conditions apply to a scheduled
    `ci-burst-reap` journal entry and to a manual `reap --apply`:
 
    - `"decision": "termination_requested"`;
    - the canary's id in `termination_requested`;
    - `"refused_resources": []`;
+   - a top-level `cleanup` object with `inventory_verified: true`, `observed`
+     at least `1`, `refused: 0`, `denied: 0`, `requested` at least `1` and
+     `terminated: 0` — a request is not a confirmed removal;
    - **no top-level `refusal`**.
 
-   The last one is not redundant. `termination_requested` is filled in before the
-   provider call, so a denied termination returns `"decision": "cleanup_failed"`
-   with a top-level `refusal` and still lists the id with an empty
-   `refused_resources`, which describes tag validation rather than the call. A
-   Spot instance later reclaimed by the provider would then satisfy the terminal
-   check below without the cleanup identity ever having terminated anything. If
-   no scheduled run has happened, run `reap --apply` by hand and read all four
-   fields;
+   `"decision": "cleanup_degraded"` (exit `1`) is **not** success, even when a
+   different instance was terminated in the same run: the reaper refused at
+   least one owned resource, and the scheduled unit reports a failure until it
+   is resolved. The last condition is not redundant. `termination_requested` is
+   filled in before the provider call, so a denied termination returns
+   `"decision": "cleanup_failed"` with a top-level `refusal`, a `cleanup.denied`
+   count and an empty `refused_resources`, which describes tag validation rather
+   than the call. A Spot instance later reclaimed by the provider would then
+   satisfy the terminal check below without the cleanup identity ever having
+   terminated anything. If no scheduled run has happened, run `reap --apply` by
+   hand and read all of these fields;
 4. confirm the instance reaches `terminated` with `status` or
-   `describe-instances`: a termination request is not confirmed removal;
+   `describe-instances`: a termination request is not confirmed removal. A later
+   `reap` run — a dry run is enough — adds inventory evidence: the canary is
+   counted in `cleanup.terminated`, `cleanup.unresolved` drops, and `requested`
+   is zero because that run sent no request;
 5. re-enable admission only if it was enabled before this test **and** the
    deployment has completed qualification (Step 8).
 

@@ -318,9 +318,11 @@ account is denied the metadata service. It polls IMDSv2 every five seconds; on a
 notice it prints one marker, `bootstrap spot-interruption action=<action>
 host=<hostname> runner=<uuid|unknown>`, and sends `SIGTERM` to the job account's
 runner process so the one job ends before AWS reclaims the instance. The `runner`
-value is read from the registration file with `jq`, one field only: the file's
-token is never copied or printed, and a notice before registration leaves the
-value `unknown`. A metadata read that fails is not fatal: the worker keeps the
+value is captured at registration, before the job account owns that directory,
+and read with `jq` as one field only: the file's token is never copied or
+printed. A value that cannot be captured is published as `unknown` and becomes
+`null` in the worker-event. The watcher starts after registration, so a notice
+during registration is not observed. A metadata read that fails is not fatal: the worker keeps the
 lifetime and job-timeout bounds it had before, and no marker is written. The marker becomes the `spot-interruption` worker-event
 ([operations.md § The Spot interruption marker](operations.md#the-spot-interruption-marker));
 it records that the worker ended and is never a substitute for a job result.

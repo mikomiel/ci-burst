@@ -44,6 +44,16 @@ aws ssm get-parameter --region eu-central-1 --name "$PARAM" \
   --labels cloud-ci:host,strong-ci:host,linux-arm64:host \
   --ephemeral
 cleanup_token
+# The registration id is read now, while the file is still root-owned and before
+# the job account can touch it. Reading it at notice time would let job code
+# replace the file with a FIFO and block the watcher forever, and the bound keeps
+# an oversized file from being parsed. The id is published in the marker; the
+# file also holds the registration token, which is never read or printed.
+RUNNER_UUID=$(head -c 4096 /var/lib/forgejo-runner/.runner 2>/dev/null \
+  | jq -r '.uuid // empty' 2>/dev/null) || RUNNER_UUID=""
+if [[ ! "$RUNNER_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+  RUNNER_UUID=unknown
+fi
 chown -R runner:runner /var/lib/forgejo-runner
 echo "STEP register"
 
@@ -61,7 +71,7 @@ iptables -A OUTPUT -m owner --uid-owner runner -d 169.254.170.2 -j REJECT
 # lifetime and the job timeout still bound it - so a failed metadata read is not
 # fatal.
 end_one_job() {
-  local cmdline pid
+  local cmdline pid signalled=1
   for cmdline in /proc/[0-9]*/cmdline; do
     [ -r "$cmdline" ] || continue
     pid=${cmdline#/proc/}
@@ -69,10 +79,12 @@ end_one_job() {
     [ "$(stat -c '%U' "/proc/$pid" 2>/dev/null)" = runner ] || continue
     grep -qa 'forgejo-runner' "$cmdline" 2>/dev/null || continue
     kill -TERM "$pid" 2>/dev/null || true
+    signalled=0
   done
+  return "$signalled"
 }
 spot_watch() {
-  local token body action host runner
+  local token body action host
   host=$(hostname)
   while :; do
     token=$(curl -fsS --max-time 2 -X PUT \
@@ -86,17 +98,17 @@ spot_watch() {
           terminate|stop|hibernate) ;;
           *) action=unknown ;;
         esac
-        # The runner's registration id, so the instance-to-runner mapping is
-        # recorded rather than inferred. The file also carries the registration
-        # token, so only this field is read and nothing is printed on failure.
-        # A notice before registration leaves the field unknown.
-        runner=$(jq -r '.uuid // empty' /var/lib/forgejo-runner/.runner 2>/dev/null) || runner=""
-        if ! printf '%s' "$runner" | grep -Eq \
-          '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
-          runner=unknown
-        fi
-        echo "bootstrap spot-interruption action=$action host=$host runner=$runner"
-        end_one_job
+        echo "bootstrap spot-interruption action=$action host=$host runner=$RUNNER_UUID"
+        # The job may not be running yet: the watcher starts before it. Keep
+        # trying until the runner exists, so a notice that arrives during setup
+        # still ends the job instead of signalling nothing. The bound is the
+        # notice window, and a runner that never starts ends with the instance.
+        for _ in $(seq 1 120); do
+          if end_one_job; then
+            return 0
+          fi
+          sleep 1
+        done
         return 0
       fi
     fi

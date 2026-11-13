@@ -52,7 +52,7 @@ PUBLISHED_TEMPLATE_SHA256 = (
 #: it instead.
 PENDING_TEMPLATE_VERSION = 5
 PENDING_TEMPLATE_SHA256 = (
-    "bc85ae28abfb0ddf9bbc456e5ee969115978871779b837a3756b1f6d4471928b"
+    "ed666f56c7b2deededec49e6840a3b0602b5cf1d35f9c0ab77e723dafbd1f205"
 )
 
 
@@ -264,31 +264,50 @@ class RunnerBootstrapTests(unittest.TestCase):
         # The controller turns this exact line into the worker-event, so the
         # marker is one string of validated values, never free console text.
         # `unknown` is the shipped fallback for a notice without a documented
-        # action and for a notice that arrives before the runner registered.
+        # action and for a registration id that was not captured.
         self.assertEqual(self.script.count("bootstrap spot-interruption"), 1)
         self.assertIn(
-            'echo "bootstrap spot-interruption action=$action host=$host runner=$runner"',
+            'echo "bootstrap spot-interruption action=$action host=$host runner=$RUNNER_UUID"',
             self.script,
         )
         self.assertIn("terminate|stop|hibernate)", self.script)
         self.assertIn("*) action=unknown ;;", self.script)
-        self.assertIn("runner=unknown", self.script)
         self.assertIn('host=$(hostname)', self.script)
 
-    def test_reads_only_the_registration_id_and_never_the_token(self):
-        # The registration file also holds the runner token, so the watcher reads
-        # one field with jq and validates its shape; it never prints or copies the
-        # file, and a missing file leaves the field unknown.
-        body = self.script[self.script.index("spot_watch()") :]
-        body = body[: body.index("\n}\n") + 3]
-        self.assertIn("jq -r '.uuid // empty' /var/lib/forgejo-runner/.runner", body)
-        self.assertIn("grep -Eq", body)
-        # One read of the registration file, and never its content: no cat, no
-        # copy, no token field.
-        self.assertEqual(body.count("/var/lib/forgejo-runner/.runner"), 1)
+    def test_captures_the_registration_id_before_the_job_account_owns_the_file(self):
+        # The registration file also holds the token, and the job account can
+        # replace anything in its directory. Reading the id at notice time would
+        # let job code block the watcher with a FIFO, so the id is captured while
+        # the file is still root-owned, bounded, and shape-checked as a whole
+        # value rather than line by line.
+        capture = self._line_index("RUNNER_UUID=$(head -c 4096")
+        self.assertLess(capture, self._line_index("chown -R runner:runner"))
+        self.assertIn("jq -r '.uuid // empty'", self.script)
+        self.assertIn('[[ ! "$RUNNER_UUID" =~ ', self.script)
+        self.assertNotIn("grep -Eq", self.script)
+        # The watcher never opens the file: the captured value is all it uses.
+        watcher = self.script[self.script.index("spot_watch()") :]
+        watcher = watcher[: watcher.index("\n}\n") + 3]
+        self.assertNotIn("/var/lib/forgejo-runner/.runner", watcher)
+        self.assertNotIn(".uuid", watcher)
         for forbidden in ("cat /var/lib/forgejo-runner/.runner", "TOKEN_FILE", "shred"):
             with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, body)
+                self.assertNotIn(forbidden, watcher)
+
+    def test_keeps_trying_to_end_the_job_after_the_marker(self):
+        # The watcher starts before the job, so a notice can arrive while nothing
+        # is running. The marker is printed once, then the signal is retried
+        # within the notice window instead of being dropped.
+        self.assertIn("for _ in $(seq 1 120); do", self.script)
+        self.assertIn("if end_one_job; then", self.script)
+        marker = self._line_index('echo "bootstrap spot-interruption')
+        retry = self._line_index("for _ in $(seq 1 120); do")
+        self.assertLess(marker, retry)
+        # end_one_job reports whether it signalled anything, so the retry loop
+        # can tell "no runner yet" from "signalled".
+        self.assertIn("signalled=1", self.script)
+        self.assertIn("signalled=0", self.script)
+        self.assertIn('return "$signalled"', self.script)
 
     def test_ends_only_the_job_accounts_runner_process(self):
         # The watcher signals the one process it can prove belongs to the job

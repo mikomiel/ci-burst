@@ -76,9 +76,11 @@ the instance is reclaimed either way.
 
 ## Rollback
 
-Revert the change and publish the next template version. The reader keeps
-validating old event lines, so a rollback republishes a stream it still accepts;
-workers on the previous version simply never write the marker.
+Revert the change and publish the next template version. The event kind leaves
+`EVENT_SCHEMA`, so the next run prunes any retained `spot-interruption` lines
+from the stream rather than republishing them; that is accepted, because the
+lines are evidence for a consumer, not state this command needs. Workers on the
+previous version simply never write the marker.
 
 ## Evidence gaps
 

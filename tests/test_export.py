@@ -906,6 +906,80 @@ class ExporterTests(ExportCase):
         self.assertNotIn("ip-10-0-0-2", body)
         self.assertNotIn('"reason": "spot-interruption"', body)
 
+    def test_a_retained_spot_line_carries_null_or_a_uuid_only(self):
+        # The console spelling "unknown" is translated at the parsing boundary.
+        # A retained line that carries it, or an empty string, is not one this
+        # command could have written and must not be republished.
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        common = {
+            "ts": "2026-11-11T00:00:00Z",
+            "deployment": "test-deployment",
+            "instance": "i-0123456789abcdef1",
+            "zone": None,
+            "operation": None,
+            "event": "spot-interruption",
+            "reason": "spot_interruption",
+            "action": "terminate",
+            "host": "ip-10-0-0-1",
+            "id": "i-0123456789abcdef1:spot-interruption:terminate:ip-10-0-0-1:unknown",
+        }
+        valid_null = dict(common, runner=None)
+        literal_unknown = dict(common, runner="unknown")
+        empty_runner = dict(common, runner="")
+        self.events.write_text(
+            "".join(
+                json.dumps(line, sort_keys=True) + "\n"
+                for line in (valid_null, literal_unknown, empty_runner)
+            )
+        )
+        result = self.run_export(self.build([], {}))
+        self.assertIn("events_pruned", result["notes"])
+        body = self.events.read_text()
+        self.assertIn(":spot-interruption:terminate:ip-10-0-0-1:unknown", body)
+        self.assertNotIn('"runner": "unknown"', body)
+        self.assertNotIn('"runner": ""', body)
+
+    def test_a_persisted_runner_value_is_normalised_to_the_published_schema(self):
+        # "" and the console spelling "unknown" are not registration ids this
+        # command publishes; a rewrite drops them rather than carrying them on.
+        for stored in ("", "unknown"):
+            with self.subTest(stored=stored):
+                self.state_file.parent.mkdir(parents=True, exist_ok=True)
+                self.state_file.write_text(
+                    json.dumps(
+                        {
+                            "version": 2,
+                            "console_reads": 1,
+                            "totals": {"launches": 1, "registered": 1, "unregistered": 0},
+                            "instances": {
+                                "i-0123456789abcdef0": {
+                                    "seen": NOW,
+                                    "emitted": [
+                                        "spot-interruption:terminate:ip-10-0-0-1:unknown"
+                                    ],
+                                    "steps": [],
+                                    "errors": [],
+                                    "exit_code": None,
+                                    "job_process": None,
+                                    "spot_interruption": ["terminate", "ip-10-0-0-1", stored],
+                                    "registered": True,
+                                }
+                            },
+                        }
+                    )
+                )
+                exporter = self.build(
+                    [instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": NOISE}
+                )
+                result = self.run_export(exporter)
+                self.assertIn("state_rebuilt", result["notes"])
+                record = json.loads(self.state_file.read_text())["instances"][
+                    "i-0123456789abcdef0"
+                ]
+                self.assertEqual(
+                    record["spot_interruption"], ["terminate", "ip-10-0-0-1", None]
+                )
+
     def test_a_persisted_spot_record_is_validated_against_the_closed_vocabulary(self):
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.write_text(

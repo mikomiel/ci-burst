@@ -219,8 +219,8 @@ notice, prints one fixed marker to its console and ends its one job; the
 `reason`, the constant `spot_interruption` that a consumer filters on; `action`,
 the notice's own value (`terminate`, `stop`, `hibernate`, or `unknown` when the
 notice body has no documented action); `host`, the worker's hostname; and
-`runner`, the registration id the worker read (`null` when the notice arrived
-before registration). Nothing else from the line is copied.
+`runner`, the registration id captured at registration (`null` when the worker
+could not capture it). Nothing else from the line is copied.
 
 `host` is the value the job's own `forgejo-ci-attribution` line records as
 `host=`, so a consumer that has that line can join the marker to a run and a job
@@ -232,8 +232,11 @@ file it comes from the console, which no party is trusted to write, so treat a
 marker as one input among the job's, not as proof on its own.
 
 The notice is read by the bootstrap as root because the job account is denied the
-metadata service. A worker that cannot read the notice behaves as before: the
-instance lifetime and the job timeout still bound it, and no marker is written.
+metadata service, and the watcher starts after registration, so a notice during
+registration is not observed. A worker that cannot read the notice behaves as
+before: the instance lifetime and the job timeout still bound it, and no marker
+is written. The watcher prints the marker once and then keeps trying to signal
+the runner for up to two minutes, because it starts before the job does.
 
 The file is replaced atomically on each run rather than appended to in place, so
 a collector must open it by path and must not hold a descriptor across runs; that

@@ -42,9 +42,9 @@ The `spot-interruption` event MUST identify the instance, the worker hostname an
 - **THEN** the event stream carries one `spot-interruption` event for that instance with its reason, action, hostname and registration id
 - **AND** no free console text is published
 
-#### Scenario: The notice arrives before registration
-- **WHEN** the notice is read before the runner registered
-- **THEN** the event carries the `unknown` fallback for the registration id
+#### Scenario: The registration id was not captured
+- **WHEN** the worker cannot capture its registration id (for example a missing or malformed registration file)
+- **THEN** the console marker carries `unknown` and the event carries `null` for the registration id
 - **AND** the instance, hostname, action and reason are still published
 
 #### Scenario: The notice cannot be read

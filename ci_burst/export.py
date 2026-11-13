@@ -464,18 +464,21 @@ def _sanitize_record(record):
     if job_process != record.get("job_process"):
         changed = True
     spot_interruption = record.get("spot_interruption")
-    if not (
+    normalized = None
+    if (
         isinstance(spot_interruption, list)
         and len(spot_interruption) == 3
         and isinstance(spot_interruption[0], str)
         and isinstance(spot_interruption[1], str)
         and (spot_interruption[2] is None or isinstance(spot_interruption[2], str))
-        and _spot_interruption(
+    ):
+        normalized = _spot_interruption(
             spot_interruption[0], spot_interruption[1], spot_interruption[2] or "unknown"
         )
-        is not None
-    ):
-        spot_interruption = None
+    # The stored value is the normalised triple, never the console spelling: an
+    # empty string or the literal "unknown" is not a registration id this
+    # command publishes, so it must not survive a rewrite.
+    spot_interruption = list(normalized) if normalized is not None else None
     if spot_interruption != record.get("spot_interruption"):
         changed = True
     emitted = record.get("emitted")
@@ -905,11 +908,13 @@ def _event_line_is_valid(event, deployment):
         runner = event.get("runner")
         if not isinstance(action, str) or not isinstance(host, str):
             return False
-        if runner is not None and not isinstance(runner, str):
+        if runner is not None and (
+            not isinstance(runner, str) or _match(RUNNER_PATTERN, runner) is None
+        ):
             return False
         if event.get("reason") != "spot_interruption":
             return False
-        if _spot_interruption(action, host, runner or "unknown") is None:
+        if action not in SPOT_ACTIONS or _match(HOST_PATTERN, host) is None:
             return False
         return marker == f"spot-interruption:{action}:{host}:{runner or 'unknown'}"
     error_kind = event.get("kind")

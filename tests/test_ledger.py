@@ -420,6 +420,16 @@ class MigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def tables(self):
+        connection = sqlite3.connect(self.path)
+        try:
+            return {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+        finally:
+            connection.close()
+
     def test_read_only_accepts_the_previous_schema(self):
         ledger = Ledger(self.path, clock=lambda: self.now).connect(create=False, read_only=True)
         self.addCleanup(ledger.close)
@@ -610,7 +620,45 @@ class MigrationTests(unittest.TestCase):
         # The schema-3 rows are untouched: the upgrade only creates a table.
         self.assertEqual(ledger.operation("old-op").settled_micros, 12_345)
         self.assertEqual(ledger.operation("live-op").admitted_buffer_micros, 7_000)
+        self.assertIn("fleet_observations", self.tables())
         self.assertIsNone(ledger.latest_fleet_observation())
+
+    def test_a_v3_copy_failure_leaves_the_database_unchanged(self):
+        self._write(3)
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=OSError("denied")):
+            with self.assertRaises(StateRefusal) as raised:
+                ledger.connect(create=True)
+        self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
+        self.assertEqual(self.user_version(), 3)
+        self.assertNotIn("fleet_observations", self.tables())
+        self.assertEqual(self.backups(), [])
+        # The refusal is retryable and the retry creates the table once.
+        ledger.connect(create=True)
+        self.assertEqual(ledger.version, SCHEMA_VERSION)
+        ledger.close()
+        reopened = Ledger(self.path, clock=lambda: self.now).connect(create=True)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.version, SCHEMA_VERSION)
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_a_v3_size_mismatch_refuses_before_any_schema_write(self):
+        self._write(3)
+
+        def truncated(source, target):
+            Path(target).write_bytes(b"")
+
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=truncated):
+            with self.assertRaises(StateRefusal) as raised:
+                ledger.connect(create=True)
+        self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
+        self.assertEqual(self.user_version(), 3)
+        self.assertNotIn("fleet_observations", self.tables())
 
     def test_read_only_v3_reports_no_fleet_observation(self):
         self._write(3)

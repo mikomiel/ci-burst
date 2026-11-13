@@ -271,7 +271,6 @@ class Controller:
                     return self._deferred(result, PHASE_OBSERVE)
                 return result
             result["observation"] = observation.as_dict()
-            self._fleet_evidence(observation, result)
             try:
                 decision, plans = self._decide(observation, slot, deadline=deadline)
             except DeadlineRefusal:
@@ -286,6 +285,7 @@ class Controller:
                     return self._deferred(result, PHASE_ADMISSION)
                 result.update(decision)
                 result["decision"] = decision["decision"]
+                self._fleet_evidence(observation, result, deadline=deadline)
                 return result
             result.update(decision)
             # Mutations never take the deadline. Once the intent is committed
@@ -293,7 +293,9 @@ class Controller:
             # reconciliation path owns the outcome.
             if self._deadline_reached(deadline):
                 return self._deferred(result, PHASE_LAUNCH)
-            return self._launch(result, decision, plans, account)
+            launched = self._launch(result, decision, plans, account)
+            self._fleet_evidence(observation, launched, deadline=deadline)
+            return launched
         finally:
             self.ledger.close()
 
@@ -516,15 +518,19 @@ class Controller:
             result["decision"] = "refused"
             return None
 
-    def _fleet_evidence(self, observation, result):
+    def _fleet_evidence(self, observation, result, *, deadline=None):
         """Record one bounded registration snapshot as auxiliary evidence.
 
         The snapshot answers "how many ephemeral runners are registered against
         how many running attempts" and nothing else: it does not link a runner
-        to a job, does not claim an assignment and never changes admission. A
-        read or a write failure is reported in the result and does not refuse
-        the pass.
+        to a job, does not claim an assignment and never changes admission. It
+        runs after the decision and, when the pass launches, after the launch,
+        so a slow or refused read cannot consume the admission budget. A read or
+        a write failure is reported in the result and does not refuse the pass.
         """
+        if deadline is not None and deadline - self.clock() < self.config.forgejo.timeout_seconds:
+            result["fleet"] = {"available": False, "refusal": {"reason": PASS_DEADLINE_EXCEEDED}}
+            return
         try:
             runners = self.observer.runners()
         except Refusal as refusal:

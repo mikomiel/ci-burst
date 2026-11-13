@@ -126,6 +126,8 @@ class ObserverTests(unittest.TestCase):
             (b"not-json", "FORGEJO_RUNNERS_INVALID_JSON"),
             (b'{"name": "x"}', "FORGEJO_RUNNERS_UNEXPECTED_SHAPE"),
             (b'[{"name": "x", "status": "busy", "labels": [], "ephemeral": true}]', "FORGEJO_RUNNERS_UNKNOWN_STATUS"),
+            (b'[{"name": "x", "status": [], "labels": [], "ephemeral": true}]', "FORGEJO_RUNNERS_UNKNOWN_STATUS"),
+            (b'[{"name": "x", "status": {}, "labels": [], "ephemeral": true}]', "FORGEJO_RUNNERS_UNKNOWN_STATUS"),
             (b'[{"name": "x", "status": "active", "labels": [], "ephemeral": "yes"}]', "FORGEJO_RUNNERS_UNEXPECTED_SHAPE"),
             (b'[{"name": "", "status": "active", "labels": [], "ephemeral": true}]', "FORGEJO_RUNNERS_UNEXPECTED_SHAPE"),
             (b'[{"name": "x", "status": "active", "labels": [1], "ephemeral": true}]', "FORGEJO_RUNNERS_UNEXPECTED_SHAPE"),

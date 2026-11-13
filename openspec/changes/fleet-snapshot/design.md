@@ -45,12 +45,15 @@ inflate the idle estimate.
 
 ### Best-effort evidence, separate from admission
 
-The registration read and its ledger write are auxiliary. A refused read is
-reported as `fleet.available: false` with the refusal, and a refused write is
-reported as `persisted: false`; neither changes the decision. The queue read
-remains fail-closed and is still the only launch gate. This ordering is
-deliberate: a monitoring endpoint that is briefly unavailable must not stop
-capacity, and a record that could not be stored must not be invented.
+The registration read and its ledger write are auxiliary, and they run only
+after the admission decision is fixed — after the launch when the pass launches.
+A refused read is reported as `fleet.available: false` with the refusal, and a
+refused write as `persisted: false`; neither changes the decision. The read is
+skipped when the remaining pass budget is below the configured Forgejo timeout,
+so a slow auxiliary endpoint cannot consume the budget the queue and admission
+path need. The queue read remains fail-closed and is still the only launch
+gate: a monitoring endpoint that is briefly unavailable must not stop capacity,
+and a record that could not be stored must not be invented.
 
 ### One row per pass, seven-day retention
 

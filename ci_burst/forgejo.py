@@ -303,7 +303,7 @@ def _runner_record(record, index):
     if not isinstance(name, str) or not name:
         raise ObservationRefusal("FORGEJO_RUNNERS_UNEXPECTED_SHAPE", f"{where}.name must be a non-empty string")
     status = record.get("status")
-    if status not in RUNNER_STATUSES:
+    if not isinstance(status, str) or status not in RUNNER_STATUSES:
         raise ObservationRefusal("FORGEJO_RUNNERS_UNKNOWN_STATUS", where)
     labels = record.get("labels")
     if not isinstance(labels, list) or any(not isinstance(label, str) or not label for label in labels):

@@ -314,8 +314,10 @@ claims an assignment; the job result remains Forgejo's.
 
 The controller writes the counts to the ledger (`fleet_observations`, schema 4,
 one row per successful pass, pruned after seven days) and keeps the previous
-pass when the read fails: a refusal is reported as `fleet.available: false`
-with its reason and never changes the admission decision. `status` prints the
+pass when the read fails. It reads the snapshot only after the admission
+decision is fixed, and after the launch when the pass launches; it skips the
+read when the remaining pass budget is below the configured Forgejo timeout.
+Either case reports `fleet.available: false` and never changes the decision. `status` prints the
 newest row. `export` emits `ci_burst_fleet_active_registrations`,
 `ci_burst_fleet_running_attempts` and `ci_burst_fleet_idle_registrations` as
 gauges, plus `ci_burst_fleet_observation_timestamp_seconds`; a snapshot older

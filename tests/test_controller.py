@@ -497,6 +497,7 @@ class ApplyTests(ControllerCase):
         self.assertEqual(result["fleet"]["offline_registrations"], 1)
         self.assertEqual(result["fleet"]["idle_registrations"], 2)
         self.assertTrue(result["fleet"]["persisted"])
+        self.assertEqual(self.observer.runner_calls, 1)
         latest = self.reopened().latest_fleet_observation()
         self.assertEqual(latest["active_registrations"], 2)
 
@@ -531,6 +532,63 @@ class ApplyTests(ControllerCase):
         self.assertTrue(status["fleet"]["available"])
         self.assertEqual(status["fleet"]["active_registrations"], 2)
         self.assertEqual(status["fleet"]["running_attempts"], 0)
+
+    def test_more_running_attempts_than_registrations_is_a_note(self):
+        observation = replace(observation_demand(), running=3)
+        controller = self.build(
+            observation=observation,
+            observer=FakeObserver(observation, runners=runners_snapshot(active=2)),
+        )
+        result = controller.apply()
+        self.assertEqual(result["fleet"]["idle_registrations"], 0)
+        self.assertIn("note", result["fleet"])
+
+    def test_a_fleet_write_failure_does_not_refuse_the_launch(self):
+        controller = self.build(observation=observation_demand())
+        with mock.patch.object(
+            controller.ledger,
+            "record_fleet_observation",
+            side_effect=StateRefusal("STATE_WRITE_FAILED", "disk"),
+        ):
+            result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(self.aws.mutations()), 1)
+        self.assertFalse(result["fleet"]["persisted"])
+        self.assertEqual(result["fleet"]["persist_refusal"]["reason"], "STATE_WRITE_FAILED")
+
+    def test_a_slow_fleet_read_does_not_prevent_the_launch(self):
+        config = load(
+            write_config(self.root, config={"controller": {"pass_deadline_seconds": 30}})
+        )
+        clock = self.clock
+
+        class SlowObserver(FakeObserver):
+            def runners(inner):
+                clock.advance(31)
+                return super().runners()
+
+        observer = SlowObserver(observation_demand(), runners=runners_snapshot(active=1))
+        controller = self.build(config=config, observer=observer)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(len(self.aws.mutations()), 1)
+
+    def test_fleet_read_is_skipped_when_the_budget_cannot_cover_the_timeout(self):
+        config = load(
+            write_config(
+                self.root,
+                config={
+                    "controller": {"pass_deadline_seconds": 30},
+                    "forgejo": {"timeout_seconds": 60},
+                },
+            )
+        )
+        observer = FakeObserver(observation_demand(), runners=runners_snapshot(active=1))
+        controller = self.build(config=config, observer=observer)
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(observer.runner_calls, 0)
+        self.assertFalse(result["fleet"]["available"])
 
     def test_definite_launch_failure_releases_the_slot_and_the_allowance(self):
         # A definite rejection proves no instance was created, so the attempt

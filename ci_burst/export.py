@@ -638,8 +638,9 @@ class Exporter:
             summary.allowance_micros = None
             summary.remaining_micros = None
             summary.ledger_operations = {}
-            if "ledger_omitted" not in summary.notes:
-                summary.notes.append("ledger_omitted")
+            for note in ("ledger_omitted", "fleet_omitted"):
+                if note not in summary.notes:
+                    summary.notes.append(note)
         finally:
             if created:
                 try:

@@ -29,6 +29,8 @@ no cloud change.
 - [x] 3.2 Report a refused read as `fleet.available: false` without refusing the
   pass, and a refused write as `persisted: false`.
 - [x] 3.3 Report the newest snapshot in `status` without a new credential.
+- [x] 3.4 Collect the snapshot after the decision and, on launch, after the
+  launch; skip it when the remaining pass budget is below the Forgejo timeout.
 
 ## 4. Export
 

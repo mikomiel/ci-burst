@@ -8,7 +8,7 @@ running attempts without claiming a worker-to-job association.
 ## ADDED Requirements
 
 ### Requirement: Bounded registration snapshot
-The controller MUST read the repository registration list at most once per apply pass, using the same owner-scoped credential as the queue read. The response MUST be validated against its own qualified contract before any count is published. A refused read MUST be reported as unavailable fleet evidence and MUST NOT refuse the pass or change the admission decision.
+The controller MUST read the repository registration list at most once per apply pass that reaches a decision, with the queue's owner-scoped credential, and MUST validate its qualified contract before publishing a count. It MUST collect the snapshot only after the decision is fixed — after the launch when the pass launches — and MUST skip it when the remaining pass budget is below the Forgejo timeout. A refused or skipped read MUST be reported as unavailable and MUST NOT change the decision.
 
 #### Scenario: Snapshot read succeeds
 - **WHEN** the registration list matches the qualified contract
@@ -19,6 +19,11 @@ The controller MUST read the repository registration list at most once per apply
 - **WHEN** authentication, transport, parsing or the response shape fails
 - **THEN** the result reports an unavailable snapshot with the refusal
 - **AND** the launch decision is unchanged
+
+#### Scenario: The pass budget cannot cover the read
+- **WHEN** the remaining pass budget is below the configured Forgejo timeout
+- **THEN** the snapshot is reported as unavailable without an HTTP request
+- **AND** a launch already decided by the pass still proceeds
 
 ### Requirement: Counts are not an association
 The snapshot MUST NOT state or imply that a registration belongs to a job attempt, and MUST NOT present the idle estimate as proof that a worker is idle. Running attempts MUST be counted from the queue response only, and only when their complete label set is supported by the configured worker.

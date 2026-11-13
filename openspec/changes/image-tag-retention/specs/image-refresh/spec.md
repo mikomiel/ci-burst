@@ -17,7 +17,7 @@ may occur before that proof, so a failed promotion removes nothing.
 - **THEN** no tag is removed and no image is pruned
 
 ### Requirement: The retained set is explicit
-Retention MUST keep `latest`, `previous`, the `sha-<12>` tag of the deployed ref recorded on the host, the `sha-<12>` tag of every 40-hex ref the deployment-state document names, and the newest `CI_BURST_RETAIN_BUILDS` builds overall by image creation time. It MUST remove only `sha-<12>` tags outside that set, one name at a time, and MUST NOT remove a name from an image that another retained tag still names.
+Retention MUST keep `latest`, `previous`, the `sha-<12>` tag of the deployed ref recorded on the host, the `sha-<12>` tag of every 40-hex ref the deployment-state document names, and the newest `CI_BURST_RETAIN_BUILDS` builds overall by image creation time. It MUST remove only `sha-<12>` tags outside that set, naming one full `IMAGE:TAG` reference per removal, and MUST leave every other name on that image resolvable.
 
 #### Scenario: An old build outside the set
 - **WHEN** a build tag is older than the retained window and is not named by either ref source

@@ -129,8 +129,7 @@ class EngineHarness(unittest.TestCase):
             f'        if [ "$(cat {self.prune_status})" != "0" ]; then exit 1; fi\n'
             '        case "$*" in\n'
             f'          *"label=org.ci-burst.build=refresh"*)\n'
-            f'            awk -F"|" \'$2=="org.ci-burst.build=refresh"\' {self.dangling} > {self.dangling}.owned\n'
-            f'            grep -v "org.ci-burst.build=refresh" {self.dangling} >> {self.dangling}.owned || true\n'
+            f'            grep -Fv "org.ci-burst.build=refresh" {self.dangling} > {self.dangling}.owned || true\n'
             f'            mv {self.dangling}.owned {self.dangling}\n'
             "            ;;\n"
             "        esac\n"
@@ -149,13 +148,25 @@ class EngineHarness(unittest.TestCase):
             "    exit 0 ;;\n"
             f"  images) cut -d'|' -f1 {self.tags} ;;\n"
             "  untag)\n"
-            '    removed=${3}\n'
-            f'    id=$(awk -F"|" -v t="$removed" \'$1==t {{print $2}}\' {self.tags})\n'
-            f'    grep -v "^$removed|" {self.tags} > {self.tags}.new || true\n'
-            f'    mv {self.tags}.new {self.tags}\n'
-            f'    if [ -n "$id" ] && ! grep -q "|$id$" {self.tags}; then\n'
-            f'      printf "%s|org.ci-burst.build=refresh\\n" "$id" >> {self.dangling}\n'
-            "    fi\n"
+            '    shift\n'
+            '    for name in "$@"; do\n'
+            '      case "$name" in\n'
+            '        *:*)\n'
+            f'          removed=${{name##*:}}\n'
+            f'          id=$(awk -F"|" -v t="$removed" \'$1==t {{print $2}}\' {self.tags})\n'
+            f'          grep -v "^$removed|" {self.tags} > {self.tags}.new || true\n'
+            f'          mv {self.tags}.new {self.tags}\n'
+            f'          if [ -n "$id" ] && ! grep -q "|$id$" {self.tags}; then\n'
+            f'            printf "%s|org.ci-burst.build=refresh\\n" "$id" >> {self.dangling}\n'
+            "          fi\n"
+            "          ;;\n"
+            "        *)\n"
+            f'          # A bare repository name removes every name on that image.\n'
+            f'          cat {self.tags} >> {self.root}/untag-bulk\n'
+            f'          : > {self.tags}\n'
+            "          ;;\n"
+            "      esac\n"
+            "    done\n"
             "    exit 0 ;;\n"
             "esac\n"
             "exit 0\n"
@@ -270,6 +281,24 @@ class RetentionFunctionTests(EngineHarness):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.untagged(), [])
         self.assertIn("removed 0 build tags", done.stdout)
+
+    def test_every_untag_names_one_full_reference(self):
+        # podman treats each argument as an image name: a bare repository name
+        # removes every name on that image, `latest` and `previous` included.
+        self.run_block(retained=0)
+        for line in self.calls.read_text().splitlines():
+            if line.startswith("untag "):
+                with self.subTest(line=line):
+                    self.assertIn(":", line.split()[1])
+        self.assertFalse((self.root / "untag-bulk").exists())
+
+    def test_an_evicted_image_is_pruned_and_an_unrelated_one_survives(self):
+        (self.state / "deployed-sha").write_text("e" * 40 + "\n")
+        self.run_block(retained=0)
+        # The evicted builds were owned dangling images; the prune removed them.
+        self.assertNotIn("a" * 64, self.dangling_ids())
+        self.assertNotIn("b" * 64, self.dangling_ids())
+        self.assertIn("unrelated", self.dangling_ids())
 
     def test_the_prune_is_scoped_to_this_products_label(self):
         self.run_block(retained=0)
@@ -437,11 +466,44 @@ class RefreshPromoteTests(EngineHarness):
         first = self.run_script()
         self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
         self.assertIn("prune refused", first.stdout)
+        # The evicted build (the middle one: `previous` keeps the oldest name)
+        # is dangling and still on disk after the refusal.
+        self.assertIn("b" * 64, self.dangling_ids())
         self.prune_status.write_text("0")
         second = self.run_script(now_current=True)
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertIn(f"current: {WANT}", second.stdout)
         # Two attempts: the refused one, and the retry on a run that removed no
-        # tag at all.
+        # tag at all. The retry is what actually frees the bytes.
         self.assertEqual(len(self.prunes()), 2)
         self.assertIn("removed 0 build tags", second.stdout)
+        self.assertNotIn("b" * 64, self.dangling_ids())
+        self.assertIn("unrelated", self.dangling_ids())
+
+    def test_retention_leaves_the_callers_work_variable_and_directory_alone(self):
+        # The promote path's EXIT trap removes $work; retention must not touch it.
+        work = self.root / "promote-work"
+        work.mkdir()
+        (work / "marker").write_text("keep")
+        (self.root / "retention.sh").write_text(retention_block())
+        runner = self.root / "run-work.sh"
+        runner.write_text(
+            "#!/bin/bash\n"
+            "set -eu\n"
+            f"PATH={self.bin}:/usr/local/bin:/usr/bin:/bin\n"
+            "IMAGE=localhost/ci-burst\n"
+            f"STATE={self.state}\n"
+            "REVISION_LABEL=org.opencontainers.image.revision\n"
+            "OWNERSHIP_LABEL=org.ci-burst.build\n"
+            "RETAIN_BUILDS=0\n"
+            f'work={work}\n'
+            'log() { printf "ci-burst-refresh: %s\\n" "$*"; }\n'
+            f"source {self.root / 'retention.sh'}\n"
+            "reconcile_image_tags\n"
+            'printf "work=%s\\n" "$work"\n'
+        )
+        runner.chmod(0o755)
+        done = subprocess.run(["bash", str(runner)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(f"work={work}", done.stdout)
+        self.assertTrue((work / "marker").exists())

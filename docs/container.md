@@ -661,8 +661,9 @@ systemctl enable --now ci-burst-refresh.timer   # honors the hold; no promotion
 ```
 
 `previous` is whatever `latest` pointed at before the last promotion, including
-the hand-built image a fresh install starts with. Any promoted commit is also
-available as `localhost/ci-burst:sha-<12>`:
+the hand-built image a fresh install starts with. A recent promoted commit is
+also available as `localhost/ci-burst:sha-<12>`, within the retained window
+described above; an older one has to be rebuilt from its commit:
 
 ```sh
 flock /var/lib/ci-burst-image/refresh.lock \

@@ -33,9 +33,14 @@ the strength of a failed promotion.
 ## Deletion order and failure behaviour
 
 Untag first, then prune. Untagging alone frees no bytes, because the build
-becomes a dangling image that still owns its layers; the prune is filtered by
-`org.opencontainers.image.revision`, the label every build from this script
-carries, so an unrelated dangling image is not touched.
+becomes a dangling image that still owns its layers. Each untag names one full
+reference (`IMAGE:TAG`), because `podman untag` takes image names: a bare
+repository name would remove every name on that image, `latest` and `previous`
+included. The prune is filtered by `org.ci-burst.build=refresh`, a label this
+build sets itself and no other product uses; the standard
+`org.opencontainers.image.revision` label is shared convention and cannot
+establish that an image is ours. Images built before the ownership label existed
+are left alone.
 
 A failure is reported, never guessed around: an image that cannot be inspected
 keeps its tag, and a refused untag or prune logs `retention_failed`. Neither

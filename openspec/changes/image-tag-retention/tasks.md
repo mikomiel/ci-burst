@@ -10,8 +10,9 @@ no cleanup on any host.
 - [x] 1.2 Compute the retained tag set from this host's deployed ref and every
   40-hex ref in the deployment-state document, and never interpret another
   value.
-- [x] 1.3 Untag `sha-<12>` builds outside the set plus the newest N, and prune
-  dangling images filtered by this product's revision label.
+- [x] 1.3 Untag `sha-<12>` builds outside the set plus the newest N, one full
+  `IMAGE:TAG` name at a time, and prune dangling images filtered by this
+  deployment's own `org.ci-burst.build=refresh` label, which the build sets.
 - [x] 1.4 Keep and report a tag whose image cannot be inspected, and make a
   refusal change neither the promotion nor the exit status.
 

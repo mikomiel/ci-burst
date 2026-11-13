@@ -295,6 +295,33 @@ cannot be validated is discarded, not published. The
 command never calls Forgejo and never mutates a resource, so it keeps working
 when the queue or the admission path is the thing that is broken.
 
+### Fleet snapshot
+
+`apply` also records one bounded registration snapshot per pass. It reads
+`GET /api/v1/repos/{owner}/{repo}/actions/runners` with the same owner-scoped
+token as the queue and reports `running_attempts` (running jobs whose labels the
+worker supports, from the same queue response), `active_registrations` and
+`offline_registrations` (ephemeral registrations only), and
+`idle_registrations = max(0, active - running)`.
+
+The two endpoints are read separately and are not atomic: the snapshot can show
+more running attempts than active registrations, and the result then carries a
+note rather than a negative estimate. The registrations are the repository's,
+not this deployment's: a persistent runner on the same repository is excluded
+from the ephemeral counts, while the queue counts still include every job with
+the supported labels. Nothing here links a registration to a job attempt or
+claims an assignment; the job result remains Forgejo's.
+
+The controller writes the counts to the ledger (`fleet_observations`, schema 4,
+one row per successful pass, pruned after seven days) and keeps the previous
+pass when the read fails: a refusal is reported as `fleet.available: false`
+with its reason and never changes the admission decision. `status` prints the
+newest row. `export` emits `ci_burst_fleet_active_registrations`,
+`ci_burst_fleet_running_attempts` and `ci_burst_fleet_idle_registrations` as
+gauges, plus `ci_burst_fleet_observation_timestamp_seconds`; a snapshot older
+than fifteen minutes is not published as current (`fleet_stale` in the result)
+and only its timestamp remains, so an alert can fire on staleness itself.
+
 
 ## Queue contract
 

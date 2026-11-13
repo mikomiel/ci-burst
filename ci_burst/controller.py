@@ -271,6 +271,7 @@ class Controller:
                     return self._deferred(result, PHASE_OBSERVE)
                 return result
             result["observation"] = observation.as_dict()
+            self._fleet_evidence(observation, result)
             try:
                 decision, plans = self._decide(observation, slot, deadline=deadline)
             except DeadlineRefusal:
@@ -308,6 +309,7 @@ class Controller:
         state = self._read_state(required=False)
         result["state"] = state
         result["slot"] = self._slot_from_state(state)
+        result["fleet"] = self._latest_fleet()
         window_start = current_window(self.clock(), self.config.budget.window_seconds)
         totals = (
             self.ledger.window_totals(window_start, self.cost, self.clock())
@@ -513,6 +515,57 @@ class Controller:
             result["refusal"] = refusal.as_dict()
             result["decision"] = "refused"
             return None
+
+    def _fleet_evidence(self, observation, result):
+        """Record one bounded registration snapshot as auxiliary evidence.
+
+        The snapshot answers "how many ephemeral runners are registered against
+        how many running attempts" and nothing else: it does not link a runner
+        to a job, does not claim an assignment and never changes admission. A
+        read or a write failure is reported in the result and does not refuse
+        the pass.
+        """
+        try:
+            runners = self.observer.runners()
+        except Refusal as refusal:
+            result["fleet"] = {"available": False, "refusal": refusal.as_dict()}
+            return
+        running = observation.running
+        data = {
+            "available": True,
+            "contract": runners.contract,
+            "running_attempts": running,
+            "active_registrations": runners.ephemeral_active,
+            "offline_registrations": runners.ephemeral_offline,
+            "idle_registrations": max(0, runners.ephemeral_active - running),
+        }
+        if runners.ephemeral_active < running:
+            data["note"] = "more running attempts than active registrations; the two reads are not atomic"
+        result["fleet"] = data
+        try:
+            self.ledger.record_fleet_observation(
+                observed_at=self.clock(),
+                contract=runners.contract,
+                running_attempts=running,
+                active_registrations=runners.ephemeral_active,
+                offline_registrations=runners.ephemeral_offline,
+            )
+        except StateRefusal as refusal:
+            data["persisted"] = False
+            data["persist_refusal"] = refusal.as_dict()
+        else:
+            data["persisted"] = True
+
+    def _latest_fleet(self):
+        if not self.ledger.available:
+            return {"available": False}
+        try:
+            latest = self.ledger.latest_fleet_observation()
+        except StateRefusal as refusal:
+            return {"available": False, "refusal": refusal.as_dict()}
+        if latest is None:
+            return {"available": False}
+        return {"available": True, **latest}
 
     def _templates(self, decision, *, deadline=None):
         """Read each distinct configured template version once."""

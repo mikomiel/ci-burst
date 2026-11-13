@@ -12,6 +12,7 @@ from support import write_config
 
 FIXTURES = Path(__file__).parent / "fixtures" / "forgejo"
 CONTRACT_MANIFEST = FIXTURES / "contract.json"
+RUNNERS_FIXTURE = FIXTURES.parent / "forgejo-runners.json"
 
 
 class StubTransport:
@@ -89,6 +90,57 @@ class ObserverTests(unittest.TestCase):
             self.config, transport=transport, environ={"CI_BURST_TEST_TOKEN": token} if token else {}
         )
         return observer.observe(), transport
+
+    def runners(self, body, token="secret-token"):
+        transport = StubTransport(body=body)
+        observer = ForgejoObserver(
+            self.config, transport=transport, environ={"CI_BURST_TEST_TOKEN": token} if token else {}
+        )
+        return observer.runners(), transport
+
+    def test_registration_fixture_is_counted_by_status_and_ephemerality(self):
+        snapshot, transport = self.runners(RUNNERS_FIXTURE.read_bytes())
+        self.assertEqual(snapshot.contract, "forgejo-17.0.1-runners")
+        self.assertEqual((snapshot.total, snapshot.active, snapshot.offline), (3, 2, 1))
+        self.assertEqual(
+            (snapshot.ephemeral_total, snapshot.ephemeral_active, snapshot.ephemeral_offline),
+            (2, 1, 1),
+        )
+        url, headers = transport.calls[0]
+        self.assertEqual(urllib.parse.urlsplit(url).path, "/api/v1/repos/owner/repo/actions/runners")
+        self.assertEqual(headers["Authorization"], "token secret-token")
+
+    def test_null_registration_list_is_a_verified_empty_fleet(self):
+        snapshot, _ = self.runners(b"null")
+        self.assertEqual(snapshot.total, 0)
+        self.assertEqual(snapshot.ephemeral_active, 0)
+
+    def test_running_attempt_is_fleet_context_not_demand(self):
+        observation, _ = self.observe(fixture("jobs_mixed_waiting_running.json"))
+        self.assertEqual(observation.demand, 1)
+        self.assertEqual(observation.running, 1)
+        self.assertEqual(observation.assigned, 1)
+
+    def test_registration_shape_errors_are_refused(self):
+        cases = [
+            (b"not-json", "FORGEJO_RUNNERS_INVALID_JSON"),
+            (b'{"name": "x"}', "FORGEJO_RUNNERS_UNEXPECTED_SHAPE"),
+            (b'[{"name": "x", "status": "busy", "labels": [], "ephemeral": true}]', "FORGEJO_RUNNERS_UNKNOWN_STATUS"),
+            (b'[{"name": "x", "status": "active", "labels": [], "ephemeral": "yes"}]', "FORGEJO_RUNNERS_UNEXPECTED_SHAPE"),
+            (b'[{"name": "", "status": "active", "labels": [], "ephemeral": true}]', "FORGEJO_RUNNERS_UNEXPECTED_SHAPE"),
+            (b'[{"name": "x", "status": "active", "labels": [1], "ephemeral": true}]', "FORGEJO_RUNNERS_UNEXPECTED_SHAPE"),
+        ]
+        for body, reason in cases:
+            with self.subTest(body=body):
+                with self.assertRaises(ObservationRefusal) as raised:
+                    self.runners(body)
+                self.assertEqual(raised.exception.reason, reason)
+
+    def test_missing_token_refuses_registration_read(self):
+        with self.assertRaises(ObservationRefusal) as raised:
+            self.runners(RUNNERS_FIXTURE.read_bytes(), token=None)
+        self.assertEqual(raised.exception.reason, "FORGEJO_TOKEN_MISSING")
+        self.assertNotIn("secret", str(raised.exception))
 
     def test_runnable_fixture_contributes_demand(self):
         observation, transport = self.observe(fixture("jobs_runnable.json"))

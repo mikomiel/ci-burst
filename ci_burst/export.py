@@ -68,6 +68,11 @@ MAX_COUNTER = 10**9
 #: Instance states in which no further console line can arrive.
 TERMINAL_STATES = frozenset({"terminated", "shutting-down", "stopping", "stopped"})
 
+#: A fleet snapshot older than this is not published as current: the count
+#: gauges are omitted and the run says so, while the timestamp series stays
+#: readable so a consumer can alert on staleness itself.
+FLEET_STALE_SECONDS = 15 * 60
+
 #: The controller generates an operation id from ``uuid.uuid4().hex``. An
 #: instance tag carrying anything else is not one of ours, and the value is
 #: published in every event, so it is validated rather than trusted.
@@ -462,6 +467,8 @@ class RunSummary:
     allowance_micros: int | None = None
     remaining_micros: int | None = None
     ledger_operations: dict = field(default_factory=dict)
+    fleet: dict | None = None
+    fleet_stale: bool = False
     notes: list = field(default_factory=list)
     duration: float = 0.0
 
@@ -478,6 +485,7 @@ class RunSummary:
             "allowance_micros": self.allowance_micros,
             "remaining_micros": self.remaining_micros,
             "ledger_operations": dict(sorted(self.ledger_operations.items())),
+            "fleet": self.fleet,
             "duration_seconds": round(self.duration, 3),
             "notes": list(self.notes),
         }
@@ -609,6 +617,21 @@ class Exporter:
             summary.ledger_operations = counts
             if "invalid" in counts and "ledger_state_unknown" not in summary.notes:
                 summary.notes.append("ledger_state_unknown")
+            try:
+                fleet = ledger.latest_fleet_observation()
+            except Exception:  # noqa: BLE001 - auxiliary evidence, never the run
+                fleet = None
+                if "fleet_omitted" not in summary.notes:
+                    summary.notes.append("fleet_omitted")
+            else:
+                if fleet is None:
+                    if "fleet_omitted" not in summary.notes:
+                        summary.notes.append("fleet_omitted")
+                else:
+                    summary.fleet = fleet
+                    summary.fleet_stale = now - fleet["observed_at"] > FLEET_STALE_SECONDS
+                    if summary.fleet_stale and "fleet_stale" not in summary.notes:
+                        summary.notes.append("fleet_stale")
         except Exception:  # noqa: BLE001 - an absent ledger must not fail the run
             summary.spend_micros = None
             summary.committed_micros = None
@@ -926,6 +949,34 @@ def render_metrics(summary, now, console_reads_total):
             "Ledger operations by state.",
             [({"state": state}, count) for state, count in summary.ledger_operations.items()],
         )
+    if summary.fleet is not None:
+        emit(
+            "ci_burst_fleet_observation_timestamp_seconds",
+            "gauge",
+            "Unix time of the newest controller fleet snapshot.",
+            [({}, int(summary.fleet["observed_at"]))],
+        )
+        if not summary.fleet_stale:
+            running = summary.fleet["running_attempts"]
+            active = summary.fleet["active_registrations"]
+            emit(
+                "ci_burst_fleet_running_attempts",
+                "gauge",
+                "Running job attempts with labels the configured worker supports, from the newest fleet snapshot.",
+                [({}, running)],
+            )
+            emit(
+                "ci_burst_fleet_active_registrations",
+                "gauge",
+                "Active ephemeral runner registrations in the newest fleet snapshot.",
+                [({}, active)],
+            )
+            emit(
+                "ci_burst_fleet_idle_registrations",
+                "gauge",
+                "Active ephemeral registrations with no running attempt to account for; the endpoints are not atomic, so this is an estimate.",
+                [({}, max(0, active - running))],
+            )
     emit(
         "ci_burst_export_last_run_timestamp_seconds",
         "gauge",

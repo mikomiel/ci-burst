@@ -385,6 +385,26 @@ class RetentionFunctionTests(EngineHarness):
         self.assertIn(f"-t ci-burst-refresh -p user.warning -- {expected}", self.logger_calls.read_text())
         self.assertIn("retention: removed", done.stdout)
 
+    def test_a_membership_lookup_error_removes_nothing(self):
+        # grep exits 1 for "not present" and 2 for a read error. Only 1 may
+        # authorise deletion; an error has to stop the whole pass.
+        grep = self.bin / "grep"
+        grep.write_text(
+            "#!/bin/bash\n"
+            'case "${!#}" in\n'
+            "  */kept) exit 2 ;;\n"
+            "esac\n"
+            "exec /bin/grep \"$@\"\n"
+        )
+        grep.chmod(0o755)
+        done = self.run_block(retained=0)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("retention_failed: cannot read the kept set, removing nothing", done.stderr)
+        self.assertIn("tags left", done.stderr)
+        self.assertEqual(self.untag_calls(), [])
+        self.assertEqual(self.prunes(), [])
+        self.assertIn(f"sha-{OLD[:12]}", self.host_tags())
+
     def test_a_failed_ranking_stage_removes_nothing(self):
         # A pipeline would report only its last command's status: a failed sort
         # used to leave an empty window and delete the newest builds.

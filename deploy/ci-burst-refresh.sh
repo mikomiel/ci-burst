@@ -306,16 +306,44 @@ reconcile_image_tags() (
         fi
     fi
 
-    untagged=0
-    refused=0
+    # Build the eviction plan before removing anything. A membership lookup that
+    # fails for a reason other than "not present" must not authorise deletion:
+    # grep exits 1 for no match and 2 for a read error, and only 1 may continue.
+    if ! : >"$retention_work/plan"; then
+        retention_failed 'cannot write the eviction plan, removing nothing'
+        rm -rf "$retention_work"
+        exit 0
+    fi
     while IFS='|' read -r created tag; do
         [ -n "$tag" ] || continue
-        if grep -Fqx "$tag" "$retention_work/kept" 2>/dev/null; then
+        protected=0
+        for list in kept window; do
+            if grep -Fqx -- "$tag" "$retention_work/$list" 2>/dev/null; then
+                protected=1
+                break
+            else
+                grep_status=$?
+            fi
+            if [ "$grep_status" -ne 1 ]; then
+                retention_failed "cannot read the $list set, removing nothing"
+                rm -rf "$retention_work"
+                exit 0
+            fi
+        done
+        if [ "$protected" -eq 1 ]; then
             continue
         fi
-        if grep -Fqx "$tag" "$retention_work/window" 2>/dev/null; then
-            continue
+        if ! printf '%s\n' "$tag" >>"$retention_work/plan"; then
+            retention_failed 'cannot write the eviction plan, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
         fi
+    done <"$retention_work/ranked"
+
+    untagged=0
+    refused=0
+    while IFS= read -r tag; do
+        [ -n "$tag" ] || continue
         # `podman untag` takes an image selector and then the names to remove;
         # with no name it removes every name on the image. Pass the full
         # reference twice - selector and name - so only this build's tag goes
@@ -328,7 +356,7 @@ reconcile_image_tags() (
             log "retention_kept: $tag could not be removed"
             refused=$((refused + 1))
         fi
-    done <"$retention_work/ranked"
+    done <"$retention_work/plan"
 
     # Prune on every run, not only when this run removed a name: a prune that was
     # refused must be retried on the next run, or the dangling images stay. The

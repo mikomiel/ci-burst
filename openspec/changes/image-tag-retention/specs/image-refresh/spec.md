@@ -61,6 +61,13 @@ The prune MUST filter on this deployment's own build label and MUST run on every
 - **WHEN** another product's dangling image carries the standard OCI revision label
 - **THEN** it is not a prune candidate
 
+### Requirement: The eviction plan is complete before any removal
+Retention MUST compute every name it intends to remove before removing the first one, so a failure while classifying a tag leaves nothing partly applied.
+
+#### Scenario: A membership lookup fails
+- **WHEN** reading the retained or window set fails for a reason other than "no match"
+- **THEN** the run removes nothing, prunes nothing and logs a retention failure
+
 ### Requirement: A retention failure does not misreport the deployment
 A refused untag or prune MUST be logged with its reason and the number of tags still on the host, at warning level in the refresh unit's journal, and MUST NOT change the exit status, because the promotion has already succeeded and the serving image is correct. It MUST NOT be treated as an alert condition in this change.
 

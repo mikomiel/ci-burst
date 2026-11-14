@@ -486,6 +486,32 @@ What a promotion does and does not do:
   `localhost/ci-burst:previous`. That is the rollback handle for the first
   refresh too, when the serving image is a hand-built one with no `sha-<12>` tag
   of its own;
+- after the serving tag has moved, it removes the build tags it no longer owes.
+  Every merged commit used to leave one `sha-<12>` tag at about 150 MB forever,
+  which filled a 7.8 GB host. The retained set is `latest`, `previous`, the tag
+  of the deployed commit recorded on the host, the tag of every 40-hex ref the
+  deployment-state document names, and the newest `CI_BURST_RETAIN_BUILDS`
+  builds overall (default 3, by image creation time): the window is computed
+  independently and then united with the named refs. Only `sha-<12>` tags this deployment created
+  are candidates. The whole eviction plan is computed first, and each removal
+  names its image and that one full `IMAGE:TAG` name: an image that another tag
+  still names keeps that tag. A tag whose image cannot be inspected is kept and
+  reported, and a retained ref that cannot be read fails closed — a present but
+  unparsable state document, or a corrupted `deployed-sha`, removes nothing. The
+  step runs only where a run has proven the serving image is the promoted one:
+  the promote path, or the already-current path so a refused cleanup is retried.
+  The prune is scoped by the deployment's own `org.ci-burst.build=refresh` label,
+  not by the standard OCI revision label, and it runs on every such pass so a
+  refused prune is retried rather than waiting for the next eviction. The step
+  logs `retention: removed <n> build tags, pruned owned dangling images`,
+  `retention_kept: <tag> cannot be inspected` or `retention: kept <n> tags
+  unverified`. A refusal logs `retention_failed: <reason>; <n> tags left` on
+  stderr and, when `logger` is present, at `user.warning` priority so it is
+  visible at warning level in the refresh unit's journal; a refusal changes
+  neither the exit status nor the promotion, because the serving image is
+  already correct. Nothing alerts on that line yet: an alert would read the
+  journal or the `job=ci-burst-worker` stream, and that stream is still unproven
+  (HB-3339);
 - it records the deployed commit in `/var/lib/ci-burst-image/deployed-sha`, and
   writes an authoritative build record after the smoke passes and before
   `latest` moves, at
@@ -640,8 +666,9 @@ systemctl enable --now ci-burst-refresh.timer   # honors the hold; no promotion
 ```
 
 `previous` is whatever `latest` pointed at before the last promotion, including
-the hand-built image a fresh install starts with. Any promoted commit is also
-available as `localhost/ci-burst:sha-<12>`:
+the hand-built image a fresh install starts with. A recent promoted commit is
+also available as `localhost/ci-burst:sha-<12>`, within the retained window
+described above; an older one has to be rebuilt from its commit:
 
 ```sh
 flock /var/lib/ci-burst-image/refresh.lock \

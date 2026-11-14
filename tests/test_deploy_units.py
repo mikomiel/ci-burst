@@ -695,7 +695,14 @@ class RefreshBehaviourTests(unittest.TestCase):
         (self.state / "deployed-sha").write_text(self.want + "\n", encoding="utf-8")
         completed = self.run_script()
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertNotIn("build", self.calls.read_text(encoding="utf-8"))
+        calls = self.calls.read_text(encoding="utf-8")
+        # No build command runs. Retention still reconciles this host's tags on
+        # the already-current path, so a "build" substring in its own label is
+        # not a build: the assertion names the command, not the word.
+        self.assertFalse(
+            [line for line in calls.splitlines() if line.startswith("build ")], calls
+        )
+        self.assertIn("image prune -f --filter label=org.ci-burst.build=refresh", calls)
 
 
 class ImageTests(unittest.TestCase):

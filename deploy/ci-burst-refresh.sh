@@ -1,11 +1,16 @@
 #!/bin/sh
 # Deploy the current ci-burst main to this host as the ci-burst image.
 #
-# One run compares the deployed commit with origin/main and does nothing when
-# they match. Otherwise it builds the image from a tar archive of exactly that
-# commit (never from the working tree, so an edited checkout cannot be deployed
-# under a clean commit's name), smoke-tests the candidate, and only then moves
-# the tag the scheduled units resolve.
+# One run compares the deployed commit with origin/main and promotes nothing
+# when they match. Otherwise it builds the image from a tar archive of exactly
+# that commit (never from the working tree, so an edited checkout cannot be
+# deployed under a clean commit's name), smoke-tests the candidate, and only
+# then moves the tag the scheduled units resolve.
+#
+# A run that has proven the serving image is the promoted one also reconciles
+# this host's build tags: one sha-<12> tag per merged commit accumulates at about
+# 150 MB each, which is how a 7.8 GB host ran out of disk. The retained set and
+# the deletion order are documented at the retention step below.
 #
 # The smoke run is one execution from the candidate against this host's own
 # configuration and its own credentials, and it must complete with a decision
@@ -56,6 +61,35 @@ UNIT_DIR=${CI_BURST_UNIT_DIR:-/etc/systemd/system}
 UNITS=${CI_BURST_UNITS:-"ci-burst-apply.service ci-burst-apply.timer ci-burst-refresh.service ci-burst-refresh.timer ci-burst-export.service ci-burst-export.timer"}
 
 log() { printf 'ci-burst-refresh: %s\n' "$*"; }
+# A retention refusal is worth flagging in the unit's journal: stdout lands at
+# info level, so a warning-priority entry is written as well when logger exists.
+# Nothing in this script alerts on it; that stays a separate decision because
+# the worker-event stream is still unproven (HB-3339).
+warn() {
+    printf 'ci-burst-refresh: %s\n' "$*" >&2
+    if command -v logger >/dev/null 2>&1; then
+        logger -t ci-burst-refresh -p user.warning -- "$*" 2>/dev/null || true
+    fi
+}
+
+# The standard revision label every build carries, and a label of this
+# deployment's own. Retention prunes on the second: the first is a convention
+# many products follow, so it cannot establish that an image is ours.
+REVISION_LABEL=org.opencontainers.image.revision
+OWNERSHIP_LABEL=org.ci-burst.build
+# How many of the most recent sha-<12> builds to keep, in addition to every tag a
+# rollback or the deployment-state document can still name. The number is a host
+# property, so it is an explicit variable rather than a tuned constant: 0 keeps
+# only the named tags, and a value outside 0-99 is a configuration error that
+# refuses before anything is built, not one that silently keeps everything.
+RETAIN_BUILDS=${CI_BURST_RETAIN_BUILDS:-3}
+case "$RETAIN_BUILDS" in
+    0|[1-9]|[1-9][0-9]) ;;
+    *)
+        log "retained_builds_invalid: ${RETAIN_BUILDS}"
+        exit 2
+        ;;
+esac
 
 # podman renders `.Id` with and without the `sha256:` prefix depending on the
 # engine build, so normalise it once, before it becomes a path component, a
@@ -98,6 +132,253 @@ case "$SMOKE_COMMAND" in
 esac
 
 
+# --- image tag retention -----------------------------------------------------
+# Every merged commit leaves one more localhost/ci-burst:sha-<12> tag, at about
+# 150 MB. Nothing removed them until this step existed, and a host with a 7.8 GB
+# root disk filled after about forty-five builds. Deleting a build is the only
+# irreversible act in this script, so the step is deliberately narrow:
+#
+#   * it runs only when this run has proven the serving image is the promoted
+#     one - the promote path, or the already-current path - never before the
+#     serving tag has moved;
+#   * the retained set is latest, previous (the only rollback handle), the
+#     sha-<12> of the deployed ref recorded on this host, the sha-<12> of every
+#     40-hex ref the deployment-state document names, and the newest
+#     RETAIN_BUILDS builds overall;
+#   * it removes one name at a time, and only names this deployment created. A
+#     build that shares its image with another tag keeps that other tag: an
+#     untag removes the named tag, never the image;
+#   * a tag whose image cannot be inspected is kept and reported;
+#   * a retained ref that cannot be read fails closed: a present document that
+#     does not parse, or a corrupted deployed ref, removes nothing;
+#   * a refusal changes neither the exit status nor the promotion, because the
+#     serving image is already correct. The log line is the durable signal.
+
+retained_tag_suffixes() {
+    printf '%s\n' latest previous
+    if [ -e "$STATE/deployed-sha" ]; then
+        deployed=$(cat "$STATE/deployed-sha" 2>/dev/null || true)
+        case "$deployed" in
+            *[!0-9a-f]*|"") return 1 ;;
+        esac
+        [ "${#deployed}" -eq 40 ] || return 1
+        printf 'sha-%s\n' "$(printf '%s' "$deployed" | cut -c1-12)"
+    fi
+    state_document=$STATE/deployment-state.json
+    # Only a genuinely absent path is an absent protection list. A directory, a
+    # device or a dangling symlink at that path exists and cannot be read, so it
+    # fails this function rather than silently authorising deletion.
+    if [ ! -e "$state_document" ] && [ ! -L "$state_document" ]; then
+        return 0
+    fi
+    [ -f "$state_document" ] || return 1
+    # The document names commits, never tags, and its shape is owned elsewhere.
+    # Only a full 40-hex string is read as a ref. A document that exists but
+    # cannot be read fails here rather than returning an empty set: an unreadable
+    # protection list must not authorise deletions.
+    python3 - "$state_document" <<'PY'
+import json
+import re
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        document = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit(1)
+
+
+def strings(value):
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from strings(item)
+    elif isinstance(value, str):
+        yield value
+
+
+for value in strings(document):
+    if re.fullmatch(r"[0-9a-f]{40}", value):
+        print(f"sha-{value[:12]}")
+PY
+}
+
+
+# The refusal line names the reason and the number of tags still on the host,
+# so an operator reading the journal sees the size of the backlog and not just
+# that something failed.
+retention_failed() {
+    remaining=unknown
+    if [ -n "${retention_work:-}" ] \
+        && podman images --format '{{.Tag}}' "$IMAGE" >"$retention_work/current" 2>/dev/null; then
+        # Counted now, not from the listing taken before the removals: a warning
+        # that overstates the backlog is worse than one with no number.
+        remaining=$(wc -l <"$retention_work/current" 2>/dev/null || printf 'unknown')
+    fi
+    warn "retention_failed: $1; ${remaining} tags left"
+}
+
+reconcile_image_tags() (
+    # A subshell: this function must not write to any variable the caller still
+    # uses, in particular $work, which the EXIT trap removes after the run.
+    retention_work=""
+    if ! retention_work=$(mktemp -d 2>/dev/null) || [ -z "$retention_work" ]; then
+        retention_work=""
+        retention_failed 'cannot create a work directory'
+        exit 0
+    fi
+    # List the tags first: a refusal below reports how many are still on the
+    # host, and a retention failure is only useful with the size of the backlog.
+    : >"$retention_work/tags"
+    if ! : >"$retention_work/tags" \
+        || ! podman images --format '{{.Tag}}' "$IMAGE" >"$retention_work/tags" 2>/dev/null; then
+        retention_failed 'cannot list the image tags, removing nothing'
+        rm -rf "$retention_work"
+        exit 0
+    fi
+    if ! retained_tag_suffixes >"$retention_work/kept" 2>/dev/null; then
+        retention_failed 'cannot read the retained refs, removing nothing'
+        rm -rf "$retention_work"
+        exit 0
+    fi
+    if ! : >"$retention_work/ranked"; then
+        retention_failed 'cannot write a scratch file, removing nothing'
+        rm -rf "$retention_work"
+        exit 0
+    fi
+
+    # Rank every inspectable build, named or not, by creation time. The window is
+    # computed independently as the newest RETAIN_BUILDS of that whole set, then
+    # united with the named refs.
+    unverified=0
+    : >"$retention_work/ranked"
+    while IFS= read -r tag; do
+        # Only this deployment's immutable build tags are candidates. The shape
+        # check also keeps a malformed tag out of a podman argument.
+        case "$tag" in
+            sha-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) continue ;;
+        esac
+        created=$(podman image inspect --format '{{.Created}}' "$IMAGE:$tag" 2>/dev/null) || created=
+        if [ -z "$created" ]; then
+            log "retention_kept: $tag cannot be inspected"
+            unverified=$((unverified + 1))
+            continue
+        fi
+        if ! printf '%s|%s\n' "$created" "$tag" >>"$retention_work/ranked"; then
+            retention_failed 'cannot write a scratch file, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
+        fi
+    done <"$retention_work/tags"
+
+    if ! : >"$retention_work/window"; then
+        retention_failed 'cannot write a scratch file, removing nothing'
+        rm -rf "$retention_work"
+        exit 0
+    fi
+    if [ "$RETAIN_BUILDS" -gt 0 ] && [ -s "$retention_work/ranked" ]; then
+        # Each stage is checked on its own. A pipeline reports only its last
+        # command's status, so a failed `sort` would leave an empty window and
+        # the deletion step would remove the newest builds the window protects.
+        if ! sort -r "$retention_work/ranked" >"$retention_work/ranked.sorted"; then
+            retention_failed 'cannot order the builds, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
+        fi
+        if ! head -n "$RETAIN_BUILDS" "$retention_work/ranked.sorted" \
+            >"$retention_work/window.rows"; then
+            retention_failed 'cannot select the newest builds, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
+        fi
+        if ! cut -d'|' -f2 "$retention_work/window.rows" >"$retention_work/window"; then
+            retention_failed 'cannot write the retained window, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
+        fi
+        if [ ! -s "$retention_work/window" ]; then
+            retention_failed 'the retained window is empty, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
+        fi
+    fi
+
+    # Build the eviction plan before removing anything. A membership lookup that
+    # fails for a reason other than "not present" must not authorise deletion:
+    # grep exits 1 for no match and 2 for a read error, and only 1 may continue.
+    if ! : >"$retention_work/plan"; then
+        retention_failed 'cannot write the eviction plan, removing nothing'
+        rm -rf "$retention_work"
+        exit 0
+    fi
+    while IFS='|' read -r created tag; do
+        [ -n "$tag" ] || continue
+        protected=0
+        for list in kept window; do
+            if grep -Fqx -- "$tag" "$retention_work/$list" 2>/dev/null; then
+                protected=1
+                break
+            else
+                grep_status=$?
+            fi
+            if [ "$grep_status" -ne 1 ]; then
+                retention_failed "cannot read the $list set, removing nothing"
+                rm -rf "$retention_work"
+                exit 0
+            fi
+        done
+        if [ "$protected" -eq 1 ]; then
+            continue
+        fi
+        if ! printf '%s\n' "$tag" >>"$retention_work/plan"; then
+            retention_failed 'cannot write the eviction plan, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
+        fi
+    done <"$retention_work/ranked"
+
+    untagged=0
+    refused=0
+    while IFS= read -r tag; do
+        [ -n "$tag" ] || continue
+        # `podman untag` takes an image selector and then the names to remove;
+        # with no name it removes every name on the image. Pass the full
+        # reference twice - selector and name - so only this build's tag goes
+        # and an image shared with latest or previous keeps those names. Short
+        # names are expanded with localhost/ and :latest, so the name operand is
+        # always the full reference.
+        if podman untag "$IMAGE:$tag" "$IMAGE:$tag" >/dev/null 2>&1; then
+            untagged=$((untagged + 1))
+        else
+            log "retention_kept: $tag could not be removed"
+            refused=$((refused + 1))
+        fi
+    done <"$retention_work/plan"
+
+    # Prune on every run, not only when this run removed a name: a prune that was
+    # refused must be retried on the next run, or the dangling images stay. The
+    # filter is this deployment's own build label, so an image another product
+    # built - even one carrying the standard OCI revision label - is never a
+    # candidate, and images built before the label existed are left alone.
+    if podman image prune -f --filter "label=$OWNERSHIP_LABEL=refresh" >/dev/null 2>&1; then
+        log "retention: removed $untagged build tags, pruned owned dangling images"
+    else
+        retention_failed "prune refused after $untagged build tags were removed"
+    fi
+    if [ "$refused" -gt 0 ]; then
+        retention_failed "$refused build tags could not be removed"
+    fi
+    if [ "$unverified" -gt 0 ]; then
+        log "retention: kept $unverified tags unverified"
+    fi
+    rm -rf "$retention_work"
+)
+# --- end image tag retention -------------------------------------------------
+
+
 install -d -m 0700 "$STATE"
 exec 9>"$STATE/refresh.lock"
 if ! flock -n 9; then
@@ -131,6 +412,9 @@ if [ "$want" = "$recorded" ]; then
     serving=$(podman image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE:latest" 2>/dev/null || true)
     if [ "$serving" = "$want" ]; then
         log "current: $want"
+        if ! reconcile_image_tags; then
+            warn 'retention_failed: unexpected failure, removing nothing further'
+        fi
         exit 0
     fi
     # A rollback retags an older image without rewriting deployed-sha. The
@@ -161,7 +445,8 @@ fi
 # exercises exactly the networking they use.
 version=$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$work/src/ci_burst/__init__.py" 2>/dev/null | head -n 1)
 set -- build --quiet --network=host --tag "$IMAGE:candidate" \
-    --label "org.opencontainers.image.revision=$want"
+    --label "org.opencontainers.image.revision=$want" \
+    --label "$OWNERSHIP_LABEL=refresh"
 if [ -n "$version" ]; then
     set -- "$@" --label "org.opencontainers.image.version=$version"
 fi
@@ -598,3 +883,6 @@ podman rmi "$IMAGE:candidate" >/dev/null 2>&1 || true
 printf '%s\n' "$want" >"$STATE/deployed-sha.tmp"
 mv "$STATE/deployed-sha.tmp" "$STATE/deployed-sha"
 log "promoted: $want"
+if ! reconcile_image_tags; then
+    warn 'retention_failed: unexpected failure, removing nothing further'
+fi

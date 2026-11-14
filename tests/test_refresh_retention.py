@@ -39,6 +39,14 @@ BUILDS = [
 ]
 
 
+def warn_block():
+    """The shipped warning helper, so the journal route is the real one."""
+    lines = SCRIPT.read_text(encoding="utf-8").splitlines()
+    start = next(index for index, line in enumerate(lines) if line.startswith("warn() {"))
+    end = next(index for index, line in enumerate(lines) if index > start and line == "}")
+    return "\n".join(lines[start : end + 1])
+
+
 def retention_block():
     lines = SCRIPT.read_text(encoding="utf-8").splitlines()
     start = next(
@@ -82,6 +90,14 @@ class EngineHarness(unittest.TestCase):
         self.engine = self.bin / "podman"
         self.engine.write_text(self.engine_source())
         self.engine.chmod(0o755)
+        self.logger_calls = self.root / "logger"
+        logger = self.bin / "logger"
+        logger.write_text(
+            "#!/bin/bash\n"
+            f'printf "%s\\n" "$*" >> {self.logger_calls}\n'
+            "exit 0\n"
+        )
+        logger.chmod(0o755)
         (self.state / "deployed-sha").write_text(f"{OLD}\n")
 
     def engine_source(self):
@@ -203,9 +219,9 @@ class EngineHarness(unittest.TestCase):
     def dangling_ids(self):
         return {line.split("|")[0] for line in self.dangling.read_text().splitlines() if line}
 
-    def run_block(self, retained=1):
+    def run_block(self, retained=1, environment=None):
         runner = self.root / "run.sh"
-        (self.root / "retention.sh").write_text(retention_block())
+        (self.root / "retention.sh").write_text(warn_block() + "\n" + retention_block())
         runner.write_text(
             "#!/bin/bash\n"
             "set -eu\n"
@@ -220,7 +236,13 @@ class EngineHarness(unittest.TestCase):
             "reconcile_image_tags\n"
         )
         runner.chmod(0o755)
-        return subprocess.run(["bash", str(runner)], capture_output=True, text=True, timeout=60)
+        return subprocess.run(
+            ["bash", str(runner)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=dict(os.environ, **environment) if environment else None,
+        )
 
 
 class RetentionFunctionTests(EngineHarness):
@@ -354,10 +376,24 @@ class RetentionFunctionTests(EngineHarness):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn(f"sha-{MID[:12]}", self.host_tags())
         self.assertIn(
-            f"retention_kept: sha-{MID[:12]} could not be removed",
-            done.stdout + done.stderr,
+            f"retention_kept: sha-{MID[:12]} could not be removed", done.stdout
         )
+        # One tag was removed, so four of the five remain: the warning counts
+        # what is left now, not the listing taken before the removals.
+        expected = "retention_failed: 1 build tags could not be removed; 4 tags left"
+        self.assertIn(expected, done.stderr)
+        self.assertIn(f"-t ci-burst-refresh -p user.warning -- {expected}", self.logger_calls.read_text())
         self.assertIn("retention: removed", done.stdout)
+
+    def test_a_scratch_allocation_failure_removes_nothing_and_still_succeeds(self):
+        done = self.run_block(
+            retained=0, environment={"TMPDIR": str(self.root / "does-not-exist")}
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("retention_failed: cannot create a work directory", done.stderr)
+        self.assertIn("tags left", done.stderr)
+        self.assertEqual(self.untag_calls(), [])
+        self.assertIn(f"sha-{OLD[:12]}", self.host_tags())
 
     def test_the_prune_is_scoped_to_this_products_label(self):
         self.run_block(retained=0)
@@ -385,7 +421,7 @@ class RefreshOrderTests(unittest.TestCase):
         calls = [
             index
             for index, line in enumerate(self.lines)
-            if line.strip() == "reconcile_image_tags"
+            if line.strip() in ("reconcile_image_tags", "if ! reconcile_image_tags; then")
         ]
         self.assertEqual(len(calls), 2, calls)
         current, promote = calls
@@ -544,7 +580,7 @@ class RefreshPromoteTests(EngineHarness):
         work = self.root / "promote-work"
         work.mkdir()
         (work / "marker").write_text("keep")
-        (self.root / "retention.sh").write_text(retention_block())
+        (self.root / "retention.sh").write_text(warn_block() + "\n" + retention_block())
         runner = self.root / "run-work.sh"
         runner.write_text(
             "#!/bin/bash\n"

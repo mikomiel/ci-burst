@@ -61,6 +61,16 @@ UNIT_DIR=${CI_BURST_UNIT_DIR:-/etc/systemd/system}
 UNITS=${CI_BURST_UNITS:-"ci-burst-apply.service ci-burst-apply.timer ci-burst-refresh.service ci-burst-refresh.timer ci-burst-export.service ci-burst-export.timer"}
 
 log() { printf 'ci-burst-refresh: %s\n' "$*"; }
+# A retention refusal is worth flagging in the unit's journal: stdout lands at
+# info level, so a warning-priority entry is written as well when logger exists.
+# Nothing in this script alerts on it; that stays a separate decision because
+# the worker-event stream is still unproven (HB-3339).
+warn() {
+    printf 'ci-burst-refresh: %s\n' "$*" >&2
+    if command -v logger >/dev/null 2>&1; then
+        logger -t ci-burst-refresh -p user.warning -- "$*" 2>/dev/null || true
+    fi
+}
 
 # The standard revision label every build carries, and a label of this
 # deployment's own. Retention prunes on the second: the first is a convention
@@ -195,24 +205,17 @@ for value in strings(document):
 PY
 }
 
-# A retention refusal is worth flagging in the unit's journal: stdout lands at
-# info level, so a warning-priority entry is written as well when logger exists.
-# Nothing in this script alerts on it; that stays a separate decision because
-# the worker-event stream is still unproven (HB-3339).
-warn() {
-    printf 'ci-burst-refresh: %s\n' "$*" >&2
-    if command -v logger >/dev/null 2>&1; then
-        logger -t ci-burst-refresh -p user.warning -- "$*" 2>/dev/null || true
-    fi
-}
 
 # The refusal line names the reason and the number of tags still on the host,
 # so an operator reading the journal sees the size of the backlog and not just
 # that something failed.
 retention_failed() {
     remaining=unknown
-    if [ -n "${retention_work:-}" ] && [ -f "$retention_work/tags" ]; then
-        remaining=$(wc -l <"$retention_work/tags" 2>/dev/null || printf 'unknown')
+    if [ -n "${retention_work:-}" ] \
+        && podman images --format '{{.Tag}}' "$IMAGE" >"$retention_work/current" 2>/dev/null; then
+        # Counted now, not from the listing taken before the removals: a warning
+        # that overstates the backlog is worse than one with no number.
+        remaining=$(wc -l <"$retention_work/current" 2>/dev/null || printf 'unknown')
     fi
     warn "retention_failed: $1; ${remaining} tags left"
 }
@@ -220,21 +223,28 @@ retention_failed() {
 reconcile_image_tags() (
     # A subshell: this function must not write to any variable the caller still
     # uses, in particular $work, which the EXIT trap removes after the run.
-    retention_work=$(mktemp -d 2>/dev/null) || {
+    retention_work=""
+    if ! retention_work=$(mktemp -d 2>/dev/null) || [ -z "$retention_work" ]; then
         retention_work=""
         retention_failed 'cannot create a work directory'
         exit 0
-    }
+    fi
     # List the tags first: a refusal below reports how many are still on the
     # host, and a retention failure is only useful with the size of the backlog.
     : >"$retention_work/tags"
-    if ! podman images --format '{{.Tag}}' "$IMAGE" >"$retention_work/tags" 2>/dev/null; then
+    if ! : >"$retention_work/tags" \
+        || ! podman images --format '{{.Tag}}' "$IMAGE" >"$retention_work/tags" 2>/dev/null; then
         retention_failed 'cannot list the image tags, removing nothing'
         rm -rf "$retention_work"
         exit 0
     fi
     if ! retained_tag_suffixes >"$retention_work/kept" 2>/dev/null; then
         retention_failed 'cannot read the retained refs, removing nothing'
+        rm -rf "$retention_work"
+        exit 0
+    fi
+    if ! : >"$retention_work/ranked"; then
+        retention_failed 'cannot write a scratch file, removing nothing'
         rm -rf "$retention_work"
         exit 0
     fi
@@ -257,15 +267,27 @@ reconcile_image_tags() (
             unverified=$((unverified + 1))
             continue
         fi
-        printf '%s|%s\n' "$created" "$tag" >>"$retention_work/ranked"
+        if ! printf '%s|%s\n' "$created" "$tag" >>"$retention_work/ranked"; then
+            retention_failed 'cannot write a scratch file, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
+        fi
     done <"$retention_work/tags"
 
-    : >"$retention_work/window"
+    if ! : >"$retention_work/window"; then
+        retention_failed 'cannot write a scratch file, removing nothing'
+        rm -rf "$retention_work"
+        exit 0
+    fi
     if [ "$RETAIN_BUILDS" -gt 0 ] && [ -s "$retention_work/ranked" ]; then
-        sort -r "$retention_work/ranked" | head -n "$RETAIN_BUILDS" |
+        if ! sort -r "$retention_work/ranked" | head -n "$RETAIN_BUILDS" |
             while IFS='|' read -r created tag; do
                 printf '%s\n' "$tag"
-            done >"$retention_work/window"
+            done >"$retention_work/window"; then
+            retention_failed 'cannot write a scratch file, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
+        fi
     fi
 
     untagged=0
@@ -346,7 +368,9 @@ if [ "$want" = "$recorded" ]; then
     serving=$(podman image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE:latest" 2>/dev/null || true)
     if [ "$serving" = "$want" ]; then
         log "current: $want"
-        reconcile_image_tags
+        if ! reconcile_image_tags; then
+            warn 'retention_failed: unexpected failure, removing nothing further'
+        fi
         exit 0
     fi
     # A rollback retags an older image without rewriting deployed-sha. The
@@ -815,4 +839,6 @@ podman rmi "$IMAGE:candidate" >/dev/null 2>&1 || true
 printf '%s\n' "$want" >"$STATE/deployed-sha.tmp"
 mv "$STATE/deployed-sha.tmp" "$STATE/deployed-sha"
 log "promoted: $want"
-reconcile_image_tags
+if ! reconcile_image_tags; then
+    warn 'retention_failed: unexpected failure, removing nothing further'
+fi

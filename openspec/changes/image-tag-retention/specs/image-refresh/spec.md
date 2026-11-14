@@ -67,3 +67,7 @@ A refused untag or prune MUST be logged with its reason and the number of tags s
 #### Scenario: The engine refuses an untag
 - **WHEN** an untag or the prune returns a failure
 - **THEN** the run logs a retention failure and still completes successfully
+
+#### Scenario: A scratch file cannot be allocated or written
+- **WHEN** the retention step cannot create or write its temporary files
+- **THEN** the run removes nothing, logs a retention failure and still completes successfully

@@ -280,11 +280,27 @@ reconcile_image_tags() (
         exit 0
     fi
     if [ "$RETAIN_BUILDS" -gt 0 ] && [ -s "$retention_work/ranked" ]; then
-        if ! sort -r "$retention_work/ranked" | head -n "$RETAIN_BUILDS" |
-            while IFS='|' read -r created tag; do
-                printf '%s\n' "$tag"
-            done >"$retention_work/window"; then
-            retention_failed 'cannot write a scratch file, removing nothing'
+        # Each stage is checked on its own. A pipeline reports only its last
+        # command's status, so a failed `sort` would leave an empty window and
+        # the deletion step would remove the newest builds the window protects.
+        if ! sort -r "$retention_work/ranked" >"$retention_work/ranked.sorted"; then
+            retention_failed 'cannot order the builds, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
+        fi
+        if ! head -n "$RETAIN_BUILDS" "$retention_work/ranked.sorted" \
+            >"$retention_work/window.rows"; then
+            retention_failed 'cannot select the newest builds, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
+        fi
+        if ! cut -d'|' -f2 "$retention_work/window.rows" >"$retention_work/window"; then
+            retention_failed 'cannot write the retained window, removing nothing'
+            rm -rf "$retention_work"
+            exit 0
+        fi
+        if [ ! -s "$retention_work/window" ]; then
+            retention_failed 'the retained window is empty, removing nothing'
             rm -rf "$retention_work"
             exit 0
         fi

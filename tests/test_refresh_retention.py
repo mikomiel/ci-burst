@@ -385,14 +385,30 @@ class RetentionFunctionTests(EngineHarness):
         self.assertIn(f"-t ci-burst-refresh -p user.warning -- {expected}", self.logger_calls.read_text())
         self.assertIn("retention: removed", done.stdout)
 
+    def test_a_failed_ranking_stage_removes_nothing(self):
+        # A pipeline would report only its last command's status: a failed sort
+        # used to leave an empty window and delete the newest builds.
+        sort = self.bin / "sort"
+        sort.write_text("#!/bin/bash\nexit 1\n")
+        sort.chmod(0o755)
+        done = self.run_block(retained=1)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("retention_failed: cannot order the builds, removing nothing", done.stderr)
+        self.assertIn("tags left", done.stderr)
+        self.assertEqual(self.untag_calls(), [])
+        self.assertEqual(self.prunes(), [])
+        self.assertIn(f"sha-{NEW[:12]}", self.host_tags())
+
     def test_a_scratch_allocation_failure_removes_nothing_and_still_succeeds(self):
         done = self.run_block(
             retained=0, environment={"TMPDIR": str(self.root / "does-not-exist")}
         )
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("retention_failed: cannot create a work directory", done.stderr)
-        self.assertIn("tags left", done.stderr)
+        expected = "retention_failed: cannot create a work directory; unknown tags left"
+        self.assertIn(expected, done.stderr)
+        self.assertIn(f"-t ci-burst-refresh -p user.warning -- {expected}", self.logger_calls.read_text())
         self.assertEqual(self.untag_calls(), [])
+        self.assertEqual(self.prunes(), [])
         self.assertIn(f"sha-{OLD[:12]}", self.host_tags())
 
     def test_the_prune_is_scoped_to_this_products_label(self):

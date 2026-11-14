@@ -18,6 +18,7 @@ launch-template version and a configuration change, never an in-place edit.
 import hashlib
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -43,10 +44,46 @@ PUBLISHED_TEMPLATE_SHA256 = (
 #: version, update the deployment TOML's ``launch_template_version``, then flip
 #: these constants in a follow-up change (published becomes the pending pair and
 #: both PENDING values become ``None``).
+#:
+#: Version 5 is still owed: #110 prepared it for the one-job process status, and
+#: that version was never published. This change joins it, because only one
+#: publication may be outstanding at a time, so the operator publishes one
+#: version 5 that carries both changes. If version 5 is published from the bytes
+#: without this change first, the next version is 6 and these constants move with
+#: it instead.
 PENDING_TEMPLATE_VERSION = 5
 PENDING_TEMPLATE_SHA256 = (
-    "645a16d8c9576549039cc22667d79368622a411486676b5efcf553ad49eb4852"
+    "f8606af5ef6942b1b46bb9f64ef5dcf1b6f18ecb10ab8f07eb7c8a45390dbc6d"
 )
+
+
+def _end_one_job_snippet():
+    """The shipped signal helper, for an execution test."""
+    lines = BOOTSTRAP.read_text(encoding="utf-8").splitlines()
+    start = next(
+        index for index, line in enumerate(lines) if line.startswith("end_one_job() {")
+    )
+    end = next(index for index, line in enumerate(lines) if index > start and line == "}")
+    return "\n".join(lines[start : end + 1])
+
+
+def _capture_snippet():
+    """The shipped registration-id block, for an execution test."""
+    lines = BOOTSTRAP.read_text(encoding="utf-8").splitlines()
+    start = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("RUNNER_FILE=/var/lib/forgejo-runner/.runner")
+    )
+    fallback = next(
+        index
+        for index, line in enumerate(lines)
+        if index > start and line.strip() == "RUNNER_UUID=unknown"
+    )
+    end = next(
+        index for index, line in enumerate(lines) if index > fallback and line.strip() == "fi"
+    )
+    return "\n".join(lines[start : end + 1])
 
 
 class RunnerBootstrapTests(unittest.TestCase):
@@ -240,6 +277,99 @@ class RunnerBootstrapTests(unittest.TestCase):
             with self.subTest(address=address):
                 self.assertIn(f"--uid-owner runner -d {address} -j REJECT", self.script)
 
+    def test_watches_the_spot_notice_as_root_before_the_job_starts(self):
+        # The job account is denied the metadata service above, so the watcher
+        # runs as root and must be running before the one job it can end.
+        self.assertIn("/latest/api/token", self.script)
+        self.assertIn("/latest/meta-data/spot/instance-action", self.script)
+        self.assertIn("spot_watch &", self.script)
+        self.assertIn("SPOT_WATCH_PID=$!", self.script)
+        self.assertLess(
+            self._line_index("-d 169.254.169.254 -j REJECT"),
+            self._line_index("spot_watch &"),
+        )
+        self.assertLess(self._line_index("spot_watch &"), self._line_index("one-job --wait"))
+
+    def test_publishes_one_fixed_marker_with_closed_values_only(self):
+        # The controller turns this exact line into the worker-event, so the
+        # marker is one string of validated values, never free console text.
+        # `unknown` is the shipped fallback for a notice without a documented
+        # action and for a registration id that was not captured.
+        self.assertEqual(self.script.count("bootstrap spot-interruption"), 1)
+        self.assertIn(
+            'echo "bootstrap spot-interruption action=$action host=$host runner=$RUNNER_UUID"',
+            self.script,
+        )
+        self.assertIn("terminate|stop|hibernate)", self.script)
+        self.assertIn("*) action=unknown ;;", self.script)
+        self.assertIn('host=$(hostname)', self.script)
+
+    def test_captures_the_registration_id_before_the_job_account_owns_the_file(self):
+        # The registration file also holds the token, and the job account can
+        # replace anything in its directory. Reading the id at notice time would
+        # let job code block the watcher with a FIFO, so the id is captured while
+        # the file is still root-owned, bounded, and shape-checked as a whole
+        # value rather than line by line.
+        capture = self._line_index("RUNNER_FILE=/var/lib/forgejo-runner/.runner")
+        self.assertLess(capture, self._line_index("chown -R runner:runner"))
+        self.assertIn("jq -ser", self.script)
+        # One JSON document, its raw string checked inside jq before command
+        # substitution can strip a trailing newline or fold a second document,
+        # and a file over the bound rejected rather than truncated.
+        self.assertIn("if length == 1", self.script)
+        self.assertIn('.[0].uuid | type) == "string"', self.script)
+        self.assertIn('test("[\\n\\r]") | not', self.script)
+        self.assertIn("stat -c '%s'", self.script)
+        self.assertIn('-le 4096', self.script)
+        self.assertIn('[[ ! "$RUNNER_UUID" =~ ', self.script)
+        self.assertNotIn("grep -Eq", self.script)
+        # The watcher never opens the file: the captured value is all it uses.
+        watcher = self.script[self.script.index("spot_watch()") :]
+        watcher = watcher[: watcher.index("\n}\n") + 3]
+        self.assertNotIn("/var/lib/forgejo-runner/.runner", watcher)
+        self.assertNotIn(".uuid", watcher)
+        for forbidden in ("cat /var/lib/forgejo-runner/.runner", "TOKEN_FILE", "shred"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, watcher)
+
+    def test_keeps_trying_to_end_the_job_after_the_marker(self):
+        # The watcher starts before the job, so a notice can arrive while nothing
+        # is running. The marker is printed once, then the signal is retried
+        # within the notice window instead of being dropped.
+        self.assertIn("for _ in $(seq 1 120); do", self.script)
+        self.assertIn("if end_one_job; then", self.script)
+        marker = self._line_index('echo "bootstrap spot-interruption')
+        retry = self._line_index("for _ in $(seq 1 120); do")
+        self.assertLess(marker, retry)
+        # end_one_job reports whether it signalled anything, so the retry loop
+        # can tell "no runner yet" from "signalled".
+        self.assertIn("signalled=1", self.script)
+        self.assertIn("signalled=0", self.script)
+        self.assertIn('return "$signalled"', self.script)
+
+    def test_ends_only_the_job_accounts_runner_process(self):
+        # The watcher signals the one process it can prove belongs to the job
+        # account; it never kills by name alone and never touches Forgejo.
+        watcher = self.script[self.script.index("end_one_job()") :]
+        self.assertIn("stat -c '%U'", watcher)
+        self.assertIn("= runner ]", watcher)
+        self.assertIn("grep -qa 'forgejo-runner'", watcher)
+        self.assertIn('kill -TERM "$pid"', watcher)
+        self.assertNotIn("kill -9", self.script)
+        self.assertNotIn("forgejo-runner daemon", self.script)
+
+    def test_a_metadata_failure_is_not_fatal_and_the_watcher_is_removed(self):
+        # A worker that cannot read the notice keeps the old lifetime and job
+        # timeout bounds, and the watcher must not outlive the bootstrap.
+        self.assertIn('|| token=""', self.script)
+        self.assertIn('|| action=""', self.script)
+        self.assertIn("sleep 5", self.script)
+        self.assertIn('kill "$SPOT_WATCH_PID"', self.script)
+        self.assertLess(
+            self._line_index('kill "$SPOT_WATCH_PID"'),
+            self._line_index("bootstrap exiting rc="),
+        )
+
     def test_installs_and_downloads_nothing(self):
         # The worker boots a baked image. An apt call or a download would make
         # the launch depend on network availability and re-open the placeholder
@@ -260,6 +390,126 @@ class RunnerBootstrapTests(unittest.TestCase):
         guide = SETUP_GUIDE.read_text(encoding="utf-8")
         self.assertIn("[`deploy/runner/bootstrap.sh`](../deploy/runner/bootstrap.sh)", guide)
         self.assertNotIn("#!/bin/bash", guide)
+
+
+@unittest.skipUnless(
+    shutil.which("bash") and shutil.which("jq"),
+    "the shipped image provides bash and jq; the capture is exercised with them",
+)
+class RegistrationIdCaptureTests(unittest.TestCase):
+    """Run the shipped capture block against fixture registration files.
+
+    The source-contract checks above pin the shape; these cases pin the
+    behaviour a malformed or hostile registration file must not change.
+    """
+
+    UUID = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
+
+    def capture(self, content):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runner.json"
+            if content is not None:
+                path.write_bytes(content)
+            snippet = _capture_snippet().replace(
+                "/var/lib/forgejo-runner/.runner", str(path)
+            )
+            script = "set -euo pipefail\n" + snippet + '\nprintf "%s" "$RUNNER_UUID"\n'
+            done = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return done.stdout
+
+    def test_one_valid_document_yields_the_registration_id(self):
+        document = '{"uuid":"%s","token":"SECRET-TOKEN"}' % self.UUID
+        captured = self.capture(document.encode())
+        self.assertEqual(captured, self.UUID)
+        self.assertNotIn("SECRET-TOKEN", captured)
+
+    def test_malformed_registration_input_fails_closed(self):
+        uuid = self.UUID
+        cases = {
+            "missing file": None,
+            "empty file": b"",
+            "uuid is null": b'{"uuid":null}',
+            "uuid is not a string": b'{"uuid":42}',
+            "trailing newline inside the string": (
+                '{"uuid":"%s\\n"}' % uuid
+            ).encode(),
+            "second document": (
+                '{"uuid":"%s"}\n{"uuid":null}' % uuid
+            ).encode(),
+            "junk trailing line": (
+                '{"uuid":"%s"}\njunk' % uuid
+            ).encode(),
+            "truncated json": b'{"uuid":"0f1e2d3c-4b5a',
+            # A valid document followed by padding past the 4096-byte bound and
+            # then a second value: rejecting the file, not truncating it, is the
+            # point.
+            "oversized file": (
+                '{"uuid":"%s"}\n' % uuid
+            ).encode()
+            + b" " * 5000
+            + b'\n{"uuid":null}',
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.capture(content), "unknown")
+
+    def test_a_padded_but_bounded_document_still_yields_the_id(self):
+        document = '{"uuid":"%s"}' % self.UUID
+        captured = self.capture((document + " " * 100).encode())
+        self.assertEqual(captured, self.UUID)
+
+    def test_the_size_bound_is_exact(self):
+        # A document padded to the bound is accepted; one byte more is rejected
+        # rather than truncated.
+        document = ('{"uuid":"%s"}' % self.UUID).encode()
+        at_bound = document + b" " * (4096 - len(document))
+        over_bound = document + b" " * (4097 - len(document))
+        self.assertEqual(len(at_bound), 4096)
+        self.assertEqual(len(over_bound), 4097)
+        self.assertEqual(self.capture(at_bound), self.UUID)
+        self.assertEqual(self.capture(over_bound), "unknown")
+
+
+@unittest.skipUnless(shutil.which("bash"), "the watcher runs under bash")
+class EndOneJobTests(unittest.TestCase):
+    """Run the signal helper against a stubbed process table.
+
+    A delivered signal is the only thing that may end the retry window; a
+    process found but not signalled must keep it open.
+    """
+
+    def run_helper(self, kill_status):
+        with tempfile.TemporaryDirectory() as directory:
+            process = Path(directory) / "proc" / "4242"
+            process.mkdir(parents=True)
+            (process / "cmdline").write_bytes(
+                b"/usr/local/bin/forgejo-runner\0one-job\0"
+            )
+            snippet = _end_one_job_snippet().replace(
+                "/proc/", str(Path(directory) / "proc") + "/"
+            )
+            script = (
+                "set -uo pipefail\n"
+                "stat() { printf runner; }\n"
+                "grep() { return 0; }\n"
+                f"kill() {{ return {kill_status}; }}\n" + snippet + "\nend_one_job\necho rc=$?\n"
+            )
+            done = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return done.stdout.strip()
+
+    def test_a_delivered_signal_reports_success(self):
+        self.assertEqual(self.run_helper(0), "rc=0")
+
+    def test_a_failed_signal_reports_failure(self):
+        # The retry loop depends on this: a process that vanished before the
+        # signal must not end the window.
+        self.assertEqual(self.run_helper(1), "rc=1")
 
 
 class BootstrapTailTests(unittest.TestCase):

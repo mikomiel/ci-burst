@@ -196,19 +196,50 @@ One JSON object per line:
 {"id":"i-0123456789abcdef0:step:register","ts":"2026-11-11T16:55:17Z","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"step","step":"register"}
 {"id":"i-0123456789abcdef0:exit:0","ts":"...","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"exit","rc":0}
 {"id":"i-0123456789abcdef0:job-process:failed:42","ts":"...","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"job-process","outcome":"failed","rc":42}
+{"id":"i-0123456789abcdef0:spot-interruption:terminate:ip-10-0-0-1:0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b","ts":"...","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"spot-interruption","reason":"spot_interruption","action":"terminate","host":"ip-10-0-0-1","runner":"0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"}
 ```
 
 `event` is `step` (a step name from the shipped script's fixed set), `exit`
 (`bootstrap exiting rc=N`), `job-process` (`bootstrap one-job <outcome> rc=N`,
-where `outcome` is one of `completed`, `failed` or `timeout`) or `error`, where
-`kind` is one of `forgejo_ping`, `ssm_timeout`, `apt_failed`, `register_failed`
-or `runner_error`. The `job-process` event and the `exit` marker describe the
-worker process lifecycle and never the Forgejo job result: a runner can exit 0
-after a job that failed, so no success metric or job verdict is derived from
-them and the job result stays with Forgejo. No console text is published: a
-failure line contributes its kind only. The console is not a trusted channel,
-and truncation is not redaction — read the raw line with the provider CLI when
-you need it.
+where `outcome` is one of `completed`, `failed` or `timeout`), `spot-interruption`
+or `error`, where `kind` is one of `forgejo_ping`, `ssm_timeout`, `apt_failed`,
+`register_failed` or `runner_error`. The `job-process` event and the `exit` marker
+describe the worker process lifecycle and never the Forgejo job result: a runner
+can exit 0 after a job that failed, so no success metric or job verdict is derived
+from them and the job result stays with Forgejo. No console text is published: a
+failure line contributes its kind only. The console is not a trusted channel, and
+truncation is not redaction — read the raw line with the provider CLI when you
+need it.
+
+### The Spot interruption marker
+
+The worker's bootstrap reads the two-minute Spot interruption notice and, on the
+notice, prints one fixed marker to its console and then tries to end its one
+job within a bounded window; the `spot-interruption` event above is that
+marker. It carries four validated values:
+`reason`, the constant `spot_interruption` that a consumer filters on; `action`,
+the notice's own value (`terminate`, `stop`, `hibernate`, or `unknown` when the
+notice body has no documented action); `host`, the worker's hostname; and
+`runner`, the registration id captured at registration (`null` when the worker
+could not capture it). Nothing else from the line is copied.
+
+`host` is the value the job's own `forgejo-ci-attribution` line records as
+`host=`, so a consumer that has that line can join the marker to a run and a job
+without a provider call. `runner` is the registration id, so the same join can be
+made from a runner registration when attribution is missing; it is not a job
+identity, because a Forgejo job record carries no runner field. The marker is
+evidence that the notice was observed and that a signal delivery was attempted;
+it is not proof that the worker or the job ended, and it is never a job
+result. Like
+every line in this file it comes from the console, which no party is trusted to
+write, so treat a marker as one input among the job's, not as proof on its own.
+
+The notice is read by the bootstrap as root because the job account is denied the
+metadata service, and the watcher starts after registration, so a notice during
+registration is not observed. A worker that cannot read the notice behaves as
+before: the instance lifetime and the job timeout still bound it, and no marker
+is written. The watcher prints the marker once and then keeps trying to signal
+the runner for up to two minutes, because it starts before the job does.
 
 The file is replaced atomically on each run rather than appended to in place, so
 a collector must open it by path and must not hold a descriptor across runs; that

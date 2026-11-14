@@ -148,26 +148,24 @@ class EngineHarness(unittest.TestCase):
             "    exit 0 ;;\n"
             f"  images) cut -d'|' -f1 {self.tags} ;;\n"
             "  untag)\n"
-            '    shift\n'
+            '    selector=$2\n'
+            '    shift 2\n'
+            '    if [ "$#" -eq 0 ]; then\n'
+            f'      # No name operand: every name on the selected image is removed.\n'
+            f'      printf "%s\\n" "$selector" >> {self.root}/untag-bulk\n'
+            f'      : > {self.tags}\n'
+            "      exit 0\n"
+            "    fi\n"
             '    for name in "$@"; do\n'
             f'      if [ -f {self.root / "untag-fail"} ] && '
             f'grep -Fqx "${{name##*:}}" {self.root / "untag-fail"}; then exit 1; fi\n'
-            '      case "$name" in\n'
-            '        *:*)\n'
-            f'          removed=${{name##*:}}\n'
-            f'          id=$(awk -F"|" -v t="$removed" \'$1==t {{print $2}}\' {self.tags})\n'
-            f'          grep -v "^$removed|" {self.tags} > {self.tags}.new || true\n'
-            f'          mv {self.tags}.new {self.tags}\n'
-            f'          if [ -n "$id" ] && ! grep -q "|$id$" {self.tags}; then\n'
-            f'            printf "%s|org.ci-burst.build=refresh\\n" "$id" >> {self.dangling}\n'
-            "          fi\n"
-            "          ;;\n"
-            "        *)\n"
-            f'          # A bare repository name removes every name on that image.\n'
-            f'          cat {self.tags} >> {self.root}/untag-bulk\n'
-            f'          : > {self.tags}\n'
-            "          ;;\n"
-            "      esac\n"
+            f'      removed=${{name##*:}}\n'
+            f'      id=$(awk -F"|" -v t="$removed" \'$1==t {{print $2}}\' {self.tags})\n'
+            f'      grep -v "^$removed|" {self.tags} > {self.tags}.new || true\n'
+            f'      mv {self.tags}.new {self.tags}\n'
+            f'      if [ -n "$id" ] && ! grep -q "|$id$" {self.tags}; then\n'
+            f'        printf "%s|org.ci-burst.build=refresh\\n" "$id" >> {self.dangling}\n'
+            "      fi\n"
             "    done\n"
             "    exit 0 ;;\n"
             "esac\n"
@@ -320,9 +318,11 @@ class RetentionFunctionTests(EngineHarness):
         self.assertGreaterEqual(len(calls), 1, calls)
         for call in calls:
             with self.subTest(call=call):
-                # Exactly one operand, and it is a full repository:tag name.
-                self.assertEqual(len(call), 2, call)
+                # An image selector and one explicit name, both the same full
+                # reference: a name-less call would remove every name.
+                self.assertEqual(len(call), 3, call)
                 self.assertRegex(call[1], r"^localhost/ci-burst:sha-[0-9a-f]{12}$")
+                self.assertEqual(call[1], call[2])
         self.assertFalse((self.root / "untag-bulk").exists())
 
     def test_an_evicted_image_is_pruned_and_an_unrelated_one_survives(self):

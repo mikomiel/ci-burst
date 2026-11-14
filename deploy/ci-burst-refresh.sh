@@ -251,10 +251,13 @@ reconcile_image_tags() (
         if grep -Fqx "$tag" "$retention_work/window" 2>/dev/null; then
             continue
         fi
-        # One full name at a time. `podman untag` takes image names, so the
-        # argument must be IMAGE:TAG: a bare repository name would remove every
-        # name from that image, including latest and previous.
-        if podman untag "$IMAGE:$tag" >/dev/null 2>&1; then
+        # `podman untag` takes an image selector and then the names to remove;
+        # with no name it removes every name on the image. Pass the full
+        # reference twice - selector and name - so only this build's tag goes
+        # and an image shared with latest or previous keeps those names. Short
+        # names are expanded with localhost/ and :latest, so the name operand is
+        # always the full reference.
+        if podman untag "$IMAGE:$tag" "$IMAGE:$tag" >/dev/null 2>&1; then
             untagged=$((untagged + 1))
         else
             log "retention_failed: cannot remove the tag $tag"

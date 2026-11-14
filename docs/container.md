@@ -493,8 +493,8 @@ What a promotion does and does not do:
   deployment-state document names, and the newest `CI_BURST_RETAIN_BUILDS`
   builds overall (default 3, by image creation time): the window is computed
   independently and then united with the named refs. Only `sha-<12>` tags this deployment created
-  are candidates, and each is removed as one name: an image that another tag
-  still names keeps that tag. A tag whose image cannot be inspected is kept and
+  are candidates, and each removal names its image and that one full
+  `IMAGE:TAG` name: an image that another tag still names keeps that tag. A tag whose image cannot be inspected is kept and
   reported, and a retained ref that cannot be read fails closed — a present but
   unparsable state document, or a corrupted `deployed-sha`, removes nothing. The
   step runs only where a run has proven the serving image is the promoted one:

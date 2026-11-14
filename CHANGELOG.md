@@ -9,6 +9,18 @@ The version, this file and the release tag are maintained by
 conventional commits on `main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases)
 owns the release boundary. Do not edit a released section by hand.
 
+## [0.7.0](https://github.com/mikomiel/ci-burst/compare/v0.6.0...v0.7.0) (2026-11-14)
+
+
+### Added
+
+* **worker:** publish a marker when the Spot interruption notice arrives ([#133](https://github.com/mikomiel/ci-burst/issues/133)) ([3f2a1e3](https://github.com/mikomiel/ci-burst/commit/3f2a1e39ddede6e149dae65aa9622d8ddd037e35))
+
+
+### Fixed
+
+* **refresh:** retain a bounded set of image tags ([#134](https://github.com/mikomiel/ci-burst/issues/134)) ([802b96c](https://github.com/mikomiel/ci-burst/commit/802b96cfc790e879104e014689c2424e2de62353))
+
 ## [0.6.0](https://github.com/mikomiel/ci-burst/compare/v0.5.1...v0.6.0) (2026-11-13)
 
 

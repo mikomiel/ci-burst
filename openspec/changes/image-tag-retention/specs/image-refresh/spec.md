@@ -62,7 +62,7 @@ The prune MUST filter on this deployment's own build label and MUST run on every
 - **THEN** it is not a prune candidate
 
 ### Requirement: A retention failure does not misreport the deployment
-A refused untag or prune MUST be logged and MUST NOT change the exit status, because the promotion has already succeeded and the serving image is correct.
+A refused untag or prune MUST be logged with its reason and the number of tags still on the host, at warning level in the refresh unit's journal, and MUST NOT change the exit status, because the promotion has already succeeded and the serving image is correct. It MUST NOT be treated as an alert condition in this change.
 
 #### Scenario: The engine refuses an untag
 - **WHEN** an untag or the prune returns a failure

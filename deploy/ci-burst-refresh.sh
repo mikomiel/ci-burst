@@ -195,20 +195,46 @@ for value in strings(document):
 PY
 }
 
+# A retention refusal is worth flagging in the unit's journal: stdout lands at
+# info level, so a warning-priority entry is written as well when logger exists.
+# Nothing in this script alerts on it; that stays a separate decision because
+# the worker-event stream is still unproven (HB-3339).
+warn() {
+    printf 'ci-burst-refresh: %s\n' "$*" >&2
+    if command -v logger >/dev/null 2>&1; then
+        logger -t ci-burst-refresh -p user.warning -- "$*" 2>/dev/null || true
+    fi
+}
+
+# The refusal line names the reason and the number of tags still on the host,
+# so an operator reading the journal sees the size of the backlog and not just
+# that something failed.
+retention_failed() {
+    remaining=unknown
+    if [ -n "${retention_work:-}" ] && [ -f "$retention_work/tags" ]; then
+        remaining=$(wc -l <"$retention_work/tags" 2>/dev/null || printf 'unknown')
+    fi
+    warn "retention_failed: $1; ${remaining} tags left"
+}
+
 reconcile_image_tags() (
     # A subshell: this function must not write to any variable the caller still
     # uses, in particular $work, which the EXIT trap removes after the run.
     retention_work=$(mktemp -d 2>/dev/null) || {
-        log 'retention_failed: cannot create a work directory'
+        retention_work=""
+        retention_failed 'cannot create a work directory'
         exit 0
     }
-    if ! retained_tag_suffixes >"$retention_work/kept" 2>/dev/null; then
-        log 'retention_failed: cannot read the retained refs; removing nothing'
+    # List the tags first: a refusal below reports how many are still on the
+    # host, and a retention failure is only useful with the size of the backlog.
+    : >"$retention_work/tags"
+    if ! podman images --format '{{.Tag}}' "$IMAGE" >"$retention_work/tags" 2>/dev/null; then
+        retention_failed 'cannot list the image tags, removing nothing'
         rm -rf "$retention_work"
         exit 0
     fi
-    if ! podman images --format '{{.Tag}}' "$IMAGE" >"$retention_work/tags" 2>/dev/null; then
-        log 'retention_failed: cannot list the image tags'
+    if ! retained_tag_suffixes >"$retention_work/kept" 2>/dev/null; then
+        retention_failed 'cannot read the retained refs, removing nothing'
         rm -rf "$retention_work"
         exit 0
     fi
@@ -243,6 +269,7 @@ reconcile_image_tags() (
     fi
 
     untagged=0
+    refused=0
     while IFS='|' read -r created tag; do
         [ -n "$tag" ] || continue
         if grep -Fqx "$tag" "$retention_work/kept" 2>/dev/null; then
@@ -260,8 +287,8 @@ reconcile_image_tags() (
         if podman untag "$IMAGE:$tag" "$IMAGE:$tag" >/dev/null 2>&1; then
             untagged=$((untagged + 1))
         else
-            log "retention_failed: cannot remove the tag $tag"
-            unverified=$((unverified + 1))
+            log "retention_kept: $tag could not be removed"
+            refused=$((refused + 1))
         fi
     done <"$retention_work/ranked"
 
@@ -273,7 +300,10 @@ reconcile_image_tags() (
     if podman image prune -f --filter "label=$OWNERSHIP_LABEL=refresh" >/dev/null 2>&1; then
         log "retention: removed $untagged build tags, pruned owned dangling images"
     else
-        log "retention_failed: removed $untagged build tags, prune refused"
+        retention_failed "prune refused after $untagged build tags were removed"
+    fi
+    if [ "$refused" -gt 0 ]; then
+        retention_failed "$refused build tags could not be removed"
     fi
     if [ "$unverified" -gt 0 ]; then
         log "retention: kept $unverified tags unverified"

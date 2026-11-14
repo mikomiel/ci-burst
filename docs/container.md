@@ -503,10 +503,14 @@ What a promotion does and does not do:
   not by the standard OCI revision label, and it runs on every such pass so a
   refused prune is retried rather than waiting for the next eviction. The step
   logs `retention: removed <n> build tags, pruned owned dangling images`,
-  `retention_kept: <tag> cannot be inspected`, `retention: kept <n> tags
-  unverified` or `retention_failed: …`. A refusal changes neither the exit status
-  nor the promotion: the serving image is already correct, and the log line is
-  the durable signal;
+  `retention_kept: <tag> cannot be inspected` or `retention: kept <n> tags
+  unverified`. A refusal logs `retention_failed: <reason>; <n> tags left` on
+  stderr and, when `logger` is present, at `user.warning` priority so it is
+  visible at warning level in the refresh unit's journal; a refusal changes
+  neither the exit status nor the promotion, because the serving image is
+  already correct. Nothing alerts on that line yet: an alert would read the
+  journal or the `job=ci-burst-worker` stream, and that stream is still unproven
+  (HB-3339);
 - it records the deployed commit in `/var/lib/ci-burst-image/deployed-sha`, and
   writes an authoritative build record after the smoke passes and before
   `latest` moves, at

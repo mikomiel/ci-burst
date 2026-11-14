@@ -15,6 +15,9 @@ no cleanup on any host.
   deployment's own `org.ci-burst.build=refresh` label, which the build sets.
 - [x] 1.4 Keep and report a tag whose image cannot be inspected, and make a
   refusal change neither the promotion nor the exit status.
+- [x] 1.5 Log every refusal as `retention_failed: <reason>; <n> tags left` on
+  stderr and at `user.warning` priority, so it reaches the unit's journal at
+  warning level, and name alerting as out of scope (it depends on HB-3339).
 
 ## 2. Placement
 

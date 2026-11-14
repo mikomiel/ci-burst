@@ -274,7 +274,10 @@ class RetentionFunctionTests(EngineHarness):
         (self.state / "deployment-state.json").write_text("{ this is not json")
         done = self.run_block(retained=0)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("retention_failed: cannot read the retained refs", done.stdout)
+        self.assertIn(
+            "retention_failed: cannot read the retained refs, removing nothing",
+            done.stdout + done.stderr,
+        )
         self.assertEqual(self.untagged(), [])
         self.assertIn(f"sha-{OLD[:12]}", self.host_tags())
 
@@ -282,7 +285,10 @@ class RetentionFunctionTests(EngineHarness):
         (self.state / "deployment-state.json").mkdir()
         done = self.run_block(retained=0)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("retention_failed: cannot read the retained refs", done.stdout)
+        self.assertIn(
+            "retention_failed: cannot read the retained refs, removing nothing",
+            done.stdout + done.stderr,
+        )
         self.assertEqual(self.untag_calls(), [])
         self.assertEqual(self.prunes(), [])
 
@@ -290,7 +296,10 @@ class RetentionFunctionTests(EngineHarness):
         (self.state / "deployment-state.json").symlink_to(self.state / "missing.json")
         done = self.run_block(retained=0)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("retention_failed: cannot read the retained refs", done.stdout)
+        self.assertIn(
+            "retention_failed: cannot read the retained refs, removing nothing",
+            done.stdout + done.stderr,
+        )
         self.assertEqual(self.untag_calls(), [])
         self.assertEqual(self.prunes(), [])
 
@@ -298,7 +307,10 @@ class RetentionFunctionTests(EngineHarness):
         (self.state / "deployed-sha").write_text("not-a-commit\n")
         done = self.run_block(retained=0)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("retention_failed: cannot read the retained refs", done.stdout)
+        self.assertIn(
+            "retention_failed: cannot read the retained refs, removing nothing",
+            done.stdout + done.stderr,
+        )
         self.assertEqual(self.untagged(), [])
 
     def test_nothing_to_remove_is_reported_and_removes_nothing(self):
@@ -342,7 +354,8 @@ class RetentionFunctionTests(EngineHarness):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn(f"sha-{MID[:12]}", self.host_tags())
         self.assertIn(
-            f"retention_failed: cannot remove the tag sha-{MID[:12]}", done.stdout
+            f"retention_kept: sha-{MID[:12]} could not be removed",
+            done.stdout + done.stderr,
         )
         self.assertIn("retention: removed", done.stdout)
 
@@ -511,7 +524,7 @@ class RefreshPromoteTests(EngineHarness):
         self.prune_status.write_text("1")
         first = self.run_script()
         self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
-        self.assertIn("prune refused", first.stdout)
+        self.assertIn("prune refused", first.stdout + first.stderr)
         # The evicted build (the middle one: `previous` keeps the oldest name)
         # is dangling and still on disk after the refusal.
         self.assertIn("b" * 64, self.dangling_ids())

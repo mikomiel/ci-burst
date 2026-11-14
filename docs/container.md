@@ -491,8 +491,8 @@ What a promotion does and does not do:
   which filled a 7.8 GB host. The retained set is `latest`, `previous`, the tag
   of the deployed commit recorded on the host, the tag of every 40-hex ref the
   deployment-state document names, and the newest `CI_BURST_RETAIN_BUILDS`
-  builds overall (default 3, by image creation time; a named build does not
-  consume a place in that window). Only `sha-<12>` tags this deployment created
+  builds overall (default 3, by image creation time): the window is computed
+  independently and then united with the named refs. Only `sha-<12>` tags this deployment created
   are candidates, and each is removed as one name: an image that another tag
   still names keeps that tag. A tag whose image cannot be inspected is kept and
   reported, and a retained ref that cannot be read fails closed — a present but

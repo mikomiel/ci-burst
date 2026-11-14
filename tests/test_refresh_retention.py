@@ -238,6 +238,9 @@ class RetentionFunctionTests(EngineHarness):
         )
 
     def test_a_named_ref_outside_the_window_survives(self):
+        # The deployed ref is NEW, so OLD survives only because the state
+        # document names it; MID is inside neither the window nor the named set.
+        (self.state / "deployed-sha").write_text(f"{NEW}\n")
         (self.state / "deployment-state.json").write_text(
             json.dumps({"schema": "deployment-state.v1", "deployed_ref": OLD})
         )

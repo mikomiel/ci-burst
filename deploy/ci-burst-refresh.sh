@@ -214,8 +214,8 @@ reconcile_image_tags() (
     fi
 
     # Rank every inspectable build, named or not, by creation time. The window is
-    # the newest RETAIN_BUILDS of that whole set, then united with the named
-    # refs: a named build does not consume a place in the window.
+    # computed independently as the newest RETAIN_BUILDS of that whole set, then
+    # united with the named refs.
     unverified=0
     : >"$retention_work/ranked"
     while IFS= read -r tag; do

@@ -10,8 +10,12 @@ cleanup_token() {
     shred -u "$TOKEN_FILE" 2>/dev/null || rm -f "$TOKEN_FILE"
   fi
 }
+SPOT_WATCH_PID=""
 on_exit() {
   rc=$?
+  if [ -n "${SPOT_WATCH_PID}" ]; then
+    kill "$SPOT_WATCH_PID" 2>/dev/null || true
+  fi
   echo "bootstrap exiting rc=$rc"
   cleanup_token
   sync
@@ -40,11 +44,97 @@ aws ssm get-parameter --region eu-central-1 --name "$PARAM" \
   --labels cloud-ci:host,strong-ci:host,linux-arm64:host \
   --ephemeral
 cleanup_token
+# The registration id is read now, while the file is still root-owned and before
+# the job account can touch it. Reading it at notice time would let job code
+# replace the file with a FIFO and block the watcher forever. A file over 4096
+# bytes is rejected rather than truncated, so a malformed suffix cannot hide
+# behind the bound. The id is published in the marker; the file also holds the
+# registration token, which is never read or printed.
+RUNNER_FILE=/var/lib/forgejo-runner/.runner
+RUNNER_SIZE=$(stat -c '%s' "$RUNNER_FILE" 2>/dev/null) || RUNNER_SIZE=""
+RUNNER_UUID=""
+if [ -n "$RUNNER_SIZE" ] && [ "$RUNNER_SIZE" -le 4096 ]; then
+  RUNNER_UUID=$(jq -ser 'if length == 1
+               and (.[0] | type) == "object"
+               and (.[0].uuid | type) == "string"
+               and (.[0].uuid | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+               and (.[0].uuid | test("[\n\r]") | not)
+             then .[0].uuid
+             else empty
+             end' "$RUNNER_FILE" 2>/dev/null) || RUNNER_UUID=""
+fi
+RUNNER_UUID=${RUNNER_UUID:-}
+if [[ ! "$RUNNER_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+  RUNNER_UUID=unknown
+fi
 chown -R runner:runner /var/lib/forgejo-runner
 echo "STEP register"
 
 iptables -A OUTPUT -m owner --uid-owner runner -d 169.254.169.254 -j REJECT
 iptables -A OUTPUT -m owner --uid-owner runner -d 169.254.170.2 -j REJECT
+
+# AWS sends a two-minute notice before it reclaims a Spot instance. The job
+# account cannot reach the metadata service (the REJECT rules above), so root
+# reads the notice here. On a notice the worker publishes one fixed marker on
+# this console and then tries to end the one job within a bounded window; the
+# controller turns that marker into a worker-event. The marker says the notice
+# was observed, not that the job ended: a successful signal does not prove
+# termination, and the marker is printed before the first attempt. It is
+# deliberately not a job step: the head controls its own steps, so the evidence
+# has to come from the worker.
+#
+# A worker that cannot read the notice behaves exactly as before - the instance
+# lifetime and the job timeout still bound it - so a failed metadata read is not
+# fatal.
+end_one_job() {
+  local cmdline pid signalled=1
+  for cmdline in /proc/[0-9]*/cmdline; do
+    [ -r "$cmdline" ] || continue
+    pid=${cmdline#/proc/}
+    pid=${pid%/cmdline}
+    [ "$(stat -c '%U' "/proc/$pid" 2>/dev/null)" = runner ] || continue
+    grep -qa 'forgejo-runner' "$cmdline" 2>/dev/null || continue
+    if kill -TERM "$pid" 2>/dev/null; then
+      signalled=0
+    fi
+  done
+  return "$signalled"
+}
+spot_watch() {
+  local token body action host
+  host=$(hostname)
+  while :; do
+    token=$(curl -fsS --max-time 2 -X PUT \
+      -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+      http://169.254.169.254/latest/api/token) || token=""
+    if [ -n "$token" ]; then
+      if body=$(curl -fsS --max-time 2 -H "X-aws-ec2-metadata-token: $token" \
+        http://169.254.169.254/latest/meta-data/spot/instance-action); then
+        action=$(printf '%s' "$body" | jq -r '.action // empty' 2>/dev/null) || action=""
+        case "$action" in
+          terminate|stop|hibernate) ;;
+          *) action=unknown ;;
+        esac
+        echo "bootstrap spot-interruption action=$action host=$host runner=$RUNNER_UUID"
+        # The job may not be running yet: the watcher starts before it. Keep
+        # trying until the runner exists, so a notice that arrives during setup
+        # still attempts to end the job instead of attempting nothing. The bound
+        # is the notice window, and a runner that never starts ends with the
+        # instance.
+        for _ in $(seq 1 120); do
+          if end_one_job; then
+            return 0
+          fi
+          sleep 1
+        done
+        return 0
+      fi
+    fi
+    sleep 5
+  done
+}
+spot_watch &
+SPOT_WATCH_PID=$!
 
 install -d -o runner -g runner -m 0700 /var/lib/forgejo-runner/work
 cd /var/lib/forgejo-runner

@@ -208,7 +208,7 @@ These steps need operator approval, a bounded scope and a cleanup plan. Listing
 them authorizes nothing. Record the evidence in the operator's own deployment
 records, not in this repository.
 
-- [ ] 7.1 Publish the next launch-template version that carries the new user
+- [x] 7.1 Publish the next launch-template version that carries the new user
   data. Do not set it in the deployment configuration yet. The setup guide owns
   the procedure. That version also carries every other unpublished bootstrap
   change, and enabling it for one of them enables all of them, so decide the order

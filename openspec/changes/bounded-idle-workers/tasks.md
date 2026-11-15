@@ -7,21 +7,21 @@ them.
 
 ## 1. Worker claim window
 
-- [ ] 1.1 Read the pinned runner's exit status and exact output for a `one-job`
+- [x] 1.1 Read the pinned runner's exit status and exact output for a `one-job`
   poll that finds no task, from the runner's own source or release notes. Record
   both in `docs/runner-setup.md`, which today documents only the message
   `Error: no task received`. If neither source states the status, stop and report
   the gap. If the status is outside 2 to 123, stop and report it, because the spec
   allows only 2 to 123 and the runner of a claimed job can end with the other
   statuses. Do not guess a number.
-- [ ] 1.2 In `deploy/runner/bootstrap.sh`, define the claim window (300 seconds),
+- [x] 1.2 In `deploy/runner/bootstrap.sh`, define the claim window (300 seconds),
   the poll interval (10 seconds), the documented no-task status and the documented
   no-task message as single literals beside the lifetime literal, and start the
   window when `register` returns.
-- [ ] 1.3 Replace the blocking `one-job --wait` call with a loop that runs
+- [x] 1.3 Replace the blocking `one-job --wait` call with a loop that runs
   `one-job` without `--wait` under the existing job timeout and pauses the poll
   interval between polls.
-- [ ] 1.4 Capture a bounded copy of each poll's output in a file that root creates
+- [x] 1.4 Capture a bounded copy of each poll's output in a file that root creates
   with mode 0600 outside the runner-owned work directory, and remove it with the
   other cleanup. The property to keep is that the job account cannot open the
   capture by its path. The bound limits what the bootstrap reads, so keep draining
@@ -32,15 +32,15 @@ them.
   must meet those rules and the capture rules of the spec, and task 3.2 tests them
   with a stub child process that writes the documented message to every
   descriptor it inherits.
-- [ ] 1.5 Keep the loop open only when the poll exited with the documented
+- [x] 1.5 Keep the loop open only when the poll exited with the documented
   no-task status and the capture holds the documented message as a complete line,
   that is the message followed by one line feed with no other byte on the line.
   End the loop on every other outcome and report it through the existing one-job
   marker.
-- [ ] 1.6 Check the claim deadline after each empty poll and again after each
+- [x] 1.6 Check the claim deadline after each empty poll and again after each
   pause, so that no poll starts at or after the deadline. Do not stop a running
   poll at the deadline.
-- [ ] 1.7 At the deadline, print exactly one `STEP claim-timeout` marker. Print
+- [x] 1.7 At the deadline, print exactly one `STEP claim-timeout` marker. Print
   neither `STEP job` nor a `bootstrap one-job` marker, and do not fall through
   into the code after the poll, which prints both. The EXIT trap (`on_exit`)
   prints the exit marker, runs `cleanup_token`, syncs and shuts down, but it does
@@ -48,16 +48,16 @@ them.
   with the same guarded `rm -f ... || echo "WARNING: ..."` form that the job path
   uses, so that a failed removal cannot change the exit status. Then leave through
   the EXIT trap with status 0.
-- [ ] 1.8 Exit 0 after a claim timeout and state it in `docs/runner-setup.md`.
-- [ ] 1.9 Keep the job timeout and the lifetime shutdown literals unchanged.
-- [ ] 1.10 Keep sending the output of each poll to the console while it runs. Omit
+- [x] 1.8 Exit 0 after a claim timeout and state it in `docs/runner-setup.md`.
+- [x] 1.9 Keep the job timeout and the lifetime shutdown literals unchanged.
+- [x] 1.10 Keep sending the output of each poll to the console while it runs. Omit
   only the documented no-task line of an empty poll.
 
 ## 2. Reader
 
-- [ ] 2.1 Add `claim-timeout` to `STEP_NAMES` in `ci_burst/export.py`. Leave
+- [x] 2.1 Add `claim-timeout` to `STEP_NAMES` in `ci_burst/export.py`. Leave
   `EVENT_SCHEMA`, the event identity form and the metrics unchanged.
-- [ ] 2.2 In `tests/test_export.py`, copy the pattern of the existing step and
+- [x] 2.2 In `tests/test_export.py`, copy the pattern of the existing step and
   record-validation tests. Cover: the marker becomes one `step` event, a worker
   that registered and then timed out is counted as registered once, a lookalike
   name such as `claim-timeouts` is still ignored, a persisted record that holds
@@ -65,7 +65,7 @@ them.
 
 ## 3. Bootstrap tests
 
-- [ ] 3.1 In `tests/test_runner_bootstrap.py`, replace
+- [x] 3.1 In `tests/test_runner_bootstrap.py`, replace
   `test_runs_exactly_one_job_and_waits_for_it`, which pins `one-job --wait`, with
   tests of the claim loop. Re-point the status-preservation, umask and
   watcher-order tests at the new poll invocation. The metadata-block test never
@@ -78,7 +78,7 @@ them.
   job cases. Keep both existing cases (the status reaches the marker and the exit
   status, and a failed registration removal cannot replace the job result). Do not
   weaken any of these tests.
-- [ ] 3.2 Run the loop in a test with stubbed `forgejo-runner`, `timeout`, `sleep`
+- [x] 3.2 Run the loop in a test with stubbed `forgejo-runner`, `timeout`, `sleep`
   and clock. Cover: empty polls then a claim timeout, empty polls then a job,
   each outcome that is not the documented empty result ending the loop (status
   alone, message alone, a signal, an oversized capture, a missing capture), no
@@ -91,25 +91,25 @@ them.
   exits with a status other than the documented one (the loop ends), and a stub
   child process that outlives the one-job process while the status and the message
   match (the loop ends).
-- [ ] 3.3 Test that the capture is created by root with mode 0600 outside the
+- [x] 3.3 Test that the capture is created by root with mode 0600 outside the
   runner-owned directory and is removed during cleanup. Test that the
   claim-timeout path removes the registration file. Test that a failed removal (a
   non-empty directory at the path) prints no `bootstrap one-job` marker and does
   not change the exit status.
-- [ ] 3.4 Feed the stubbed console of an idle worker to `parse_console` and assert
+- [x] 3.4 Feed the stubbed console of an idle worker to `parse_console` and assert
   that it yields the `claim-timeout` step, an `exit` event with `rc` 0 and no
   failure kind.
-- [ ] 3.5 Update the pending publication pair (`PENDING_TEMPLATE_VERSION` and
+- [x] 3.5 Update the pending publication pair (`PENDING_TEMPLATE_VERSION` and
   `PENDING_TEMPLATE_SHA256`) so the repository bytes equal the declared state.
   Do not flip the published pair. That is the operator's step in section 7. The
   pending version is shared with any other bootstrap change that is not published
   yet, so check what is unpublished before this edit merges, and follow the
   activation note in the design.
-- [ ] 3.6 Test the status band. Assert that the documented no-task status literal
+- [x] 3.6 Test the status band. Assert that the documented no-task status literal
   in `deploy/runner/bootstrap.sh` is from 2 to 123. Assert that a poll whose
   capture holds the documented message ends the loop as a finished attempt for
   each of the statuses 0, 1, 124, 125, 128 and 137.
-- [ ] 3.7 Test that runner output reaches the console while a poll runs. Use a stub
+- [x] 3.7 Test that runner output reaches the console while a poll runs. Use a stub
   that writes a line and then waits, and assert that the line reaches the console
   before the stub exits. Assert that every line other than the documented no-task
   line of an empty poll reaches the console.
@@ -153,7 +153,7 @@ them.
 
 ## 5. Documentation
 
-- [ ] 5.1 `docs/runner-setup.md`: replace the paragraph that says `one-job` polls
+- [x] 5.1 `docs/runner-setup.md`: replace the paragraph that says `one-job` polls
   once and that `--wait` blocks. State the claim window and the poll interval, the
   no-task status and message, the `claim-timeout` marker, the exit status of a
   claim timeout and the live-qualification requirement. Update the bootstrap
@@ -177,7 +177,7 @@ them.
   a job.
 - [ ] 5.3 `docs/deployment.md`: add the optional `claim_grace_seconds` key to the
   controller block with its range and default.
-- [ ] 5.4 `docs/pilot-checklist.md`: reword the bootstrap item that says the worker
+- [x] 5.4 `docs/pilot-checklist.md`: reword the bootstrap item that says the worker
   exits on no job so it names the claim window. Reword the item "Maximum lifetime
   covers boot, queue wait and a failed bootstrap" so that it names the claim window
   and the job, not queue wait. Add an unticked item for the qualification in
@@ -186,7 +186,7 @@ them.
 
 ## 6. Verification
 
-- [ ] 6.1 `npm run check:policy` and `npm run check:spec` pass on the change.
+- [x] 6.1 `npm run check:policy` and `npm run check:spec` pass on the change.
 - [ ] 6.2 Run the Gitleaks scan described in `CONTRIBUTING.md` on the change
   before any push. The change adds no host name, address, account value or
   deployment name.

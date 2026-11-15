@@ -30,6 +30,18 @@ CLEAN_BOOT = """\
 [   24.0] cloud-init[400]: bootstrap exiting rc=0
 """
 
+#: A worker whose claim window passed with no job: the claim-timeout marker,
+#: then the exit marker with status 0. No `STEP job` and no one-job marker,
+#: because no job attempt happened.
+IDLE_WORKER = """\
+[    9.7] cloud-init[400]: STEP mount-options
+[   10.7] cloud-init[400]: STEP register
+[   10.8] cloud-init[400]: runner: burst-ip-10-0-0-1, with version: v1, ephemeral: true, declared successfully
+[  311.0] cloud-init[400]: Error: no task received
+[  311.1] cloud-init[400]: STEP claim-timeout
+[  311.2] cloud-init[400]: bootstrap exiting rc=0
+"""
+
 FAILED_PING = """\
 [   12.1] cloud-init[477]: level=error msg="Cannot ping the Forgejo instance server" error="deadline_exceeded: Post \\"https://forgejo.example/api\\": context deadline exceeded"
 [   12.2] cloud-init[477]: bootstrap exiting rc=1
@@ -174,6 +186,21 @@ class ParseConsoleTests(unittest.TestCase):
         facts = parse_console("cloud-init: STEP credential=synthetic-value\n")
         self.assertEqual(facts.steps, ())
         self.assertFalse(facts.registered)
+
+    def test_a_claim_timeout_is_a_known_step_and_not_a_failure(self):
+        facts = parse_console(IDLE_WORKER)
+        self.assertEqual(facts.steps, ("mount-options", "register", "claim-timeout"))
+        self.assertTrue(facts.registered)
+        self.assertEqual(facts.exit_code, 0)
+        # The runner's no-task line is not a failure kind, and no job ran.
+        self.assertEqual(facts.errors, ())
+        self.assertIsNone(facts.job_process)
+
+    def test_a_lookalike_of_the_claim_timeout_step_is_not_a_marker(self):
+        facts = parse_console(
+            "cloud-init: STEP claim-timeouts\ncloud-init: STEP claim-timeout-x\n"
+        )
+        self.assertEqual(facts.steps, ())
 
     def test_error_kinds_are_bounded_and_deduplicated(self):
         text = "\n".join(
@@ -514,6 +541,144 @@ class ExporterTests(ExportCase):
             {"i-0123456789abcdef0": FAILED_PING},
         )
         self.assertEqual(self.run_export(final)["console_reads"], 1)
+
+    def test_a_claim_timeout_marker_does_not_finish_the_record(self):
+        running = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": IDLE_WORKER})
+        self.assertEqual(self.run_export(running)["console_reads"], 1)
+        # The marker is what the worker printed, not the end of the instance: the
+        # provider still reports it live, so the record stays a candidate.
+        still_running = self.build(
+            [instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": IDLE_WORKER}
+        )
+        self.assertEqual(self.run_export(still_running)["console_reads"], 1)
+        final = self.build(
+            [instance("i-0123456789abcdef0", state="terminated")],
+            {"i-0123456789abcdef0": IDLE_WORKER},
+        )
+        self.assertEqual(self.run_export(final)["console_reads"], 1)
+        settled = self.build(
+            [instance("i-0123456789abcdef0", state="terminated")],
+            {"i-0123456789abcdef0": IDLE_WORKER},
+        )
+        self.assertEqual(self.run_export(settled)["console_reads"], 0)
+
+    def test_a_claim_timeout_is_one_step_event_with_no_console_text(self):
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": IDLE_WORKER})
+        self.run_export(exporter)
+        events = self.events_read()
+        timeouts = [event for event in events if event.get("step") == "claim-timeout"]
+        self.assertEqual(len(timeouts), 1)
+        self.assertEqual(timeouts[0]["id"], "i-0123456789abcdef0:step:claim-timeout")
+        self.assertEqual(timeouts[0]["event"], "step")
+        self.assertEqual(
+            set(timeouts[0]),
+            {"id", "ts", "deployment", "instance", "zone", "operation", "event", "step"},
+        )
+        # The worker exited with status 0, and nothing in the stream reads as a
+        # failure or as a job result.
+        self.assertEqual([event["rc"] for event in events if event["event"] == "exit"], [0])
+        self.assertEqual([event for event in events if event["event"] in ("error", "job-process")], [])
+        for text in ("no task received", "declared successfully", "burst-ip"):
+            self.assertNotIn(text, self.events.read_text())
+        self.assertEqual(self.run_export(exporter)["events_emitted"], 0)
+
+    def test_a_worker_that_registered_and_timed_out_is_registered_once(self):
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": IDLE_WORKER})
+        expected = {"launches": 1, "registered": 1, "unregistered": 0}
+        self.assertEqual(self.run_export(exporter)["totals"], expected)
+        self.assertEqual(self.run_export(exporter)["totals"], expected)
+        ended = self.build(
+            [instance("i-0123456789abcdef0", state="terminated")],
+            {"i-0123456789abcdef0": IDLE_WORKER},
+        )
+        self.assertEqual(self.run_export(ended)["totals"], expected)
+
+    def test_a_persisted_record_holding_claim_timeout_survives_sanitising(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": 1,
+                    "totals": {"launches": 1, "registered": 1, "unregistered": 0},
+                    "instances": {
+                        "i-0123456789abcdef0": {
+                            "first_seen": NOW,
+                            "seen": NOW,
+                            "state": "running",
+                            "zone": None,
+                            "operation": None,
+                            "steps": ["register", "claim-timeout"],
+                            "errors": [],
+                            "exit_code": 0,
+                            "job_process": None,
+                            "spot_interruption": None,
+                            "registered": True,
+                            "emitted": ["step:register", "step:claim-timeout", "exit:0"],
+                            "counted_registered": True,
+                            "counted_unregistered": False,
+                        }
+                    },
+                }
+            )
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": NOISE})
+        result = self.run_export(exporter)
+        self.assertNotIn("state_rebuilt", result["notes"])
+        record = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]
+        self.assertEqual(record["steps"], ["register", "claim-timeout"])
+        self.assertIn("step:claim-timeout", record["emitted"])
+        # The marker was already published, so nothing is published twice.
+        self.assertEqual(result["events_emitted"], 0)
+
+    def test_a_persisted_lookalike_of_claim_timeout_is_dropped(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": 1,
+                    "totals": {"launches": 1, "registered": 1, "unregistered": 0},
+                    "instances": {
+                        "i-0123456789abcdef0": {
+                            "seen": NOW,
+                            "steps": ["register", "claim-timeouts"],
+                            "errors": [],
+                            "exit_code": None,
+                            "registered": True,
+                            "emitted": ["step:register", "step:claim-timeouts"],
+                        }
+                    },
+                }
+            )
+        )
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": NOISE})
+        result = self.run_export(exporter)
+        self.assertIn("state_rebuilt", result["notes"])
+        self.assertNotIn("claim-timeouts", self.state_file.read_text())
+        if self.events.exists():
+            self.assertNotIn("claim-timeouts", self.events.read_text())
+
+    def test_a_retained_claim_timeout_line_validates_and_a_lookalike_is_dropped(self):
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        common = {
+            "ts": "2026-11-11T00:00:00Z",
+            "deployment": "test-deployment",
+            "instance": "i-0123456789abcdef1",
+            "zone": None,
+            "operation": None,
+            "event": "step",
+        }
+        valid = dict(common, id="i-0123456789abcdef1:step:claim-timeout", step="claim-timeout")
+        lookalike = dict(common, id="i-0123456789abcdef1:step:claim-timeouts", step="claim-timeouts")
+        self.events.write_text(
+            json.dumps(valid, sort_keys=True) + "\n" + json.dumps(lookalike, sort_keys=True) + "\n"
+        )
+        result = self.run_export(self.build([], {}))
+        self.assertIn("events_pruned", result["notes"])
+        body = self.events.read_text()
+        self.assertIn("i-0123456789abcdef1:step:claim-timeout\"", body)
+        self.assertNotIn("claim-timeouts", body)
 
     def test_a_shutting_down_worker_counts_toward_the_configured_limit(self):
         owned = [

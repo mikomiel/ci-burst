@@ -373,17 +373,20 @@ enables that version. The tasks name this in 3.5 and 7.1.
   13.2.1, is unverified. If an empty poll invalidated the registration, the worker
   would end after its second poll and the controller could launch again. The
   operator must qualify this live before the template version is enabled.
-- The no-task exit status is not recorded in the repository. Whether the pinned
-  runner prints the no-task message to standard output or standard error, and
-  whether it prints other lines for an empty poll that the reader's failure rules
-  could classify, is also unverified. Whether that status can equal a status that
-  the runner of a claimed job also ends with is unverified too. The spec allows
-  only 2 to 123 for that reason.
+- Task 1.1 recorded the no-task result from the pinned runner's source: status 2
+  and the message on standard error, as described in the worker setup guide. A
+  failed request for a task ends the same way after an error-level line, so it
+  counts as an empty poll; the worker still ends at the claim deadline. Status 2
+  is also the Go runtime's status for a panic or a fatal signal such as
+  `SIGQUIT`, which a job step running as the runner's account can send. The
+  status half and the survival rule therefore do not stop a hostile job; the
+  message half is the guard that holds. None of this has been observed on a live
+  runner yet.
 - Whether the runner's child processes inherit its standard output or standard
   error is unverified. If they do, a job step can write the documented message
-  into the capture through that descriptor. The status half of the signature and
-  the survival rule still apply. Task 7.3 tests the route, and open question 2
-  records the decision that the result feeds.
+  into the capture through that descriptor, and with the point above the
+  signature would not hold against that job. Task 7.3 tests the route, and open
+  question 2 records the decision that the result feeds.
 - The values 300 seconds and 10 seconds are unmeasured. The repository holds no
   boot-to-claim timing.
 - Hypothesis, not a claim: a known Forgejo behaviour may leave a long-polling

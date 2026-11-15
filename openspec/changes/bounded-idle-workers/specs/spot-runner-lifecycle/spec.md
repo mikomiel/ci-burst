@@ -151,8 +151,14 @@ Every poll outcome that is not an empty poll MUST end the claim loop as a finish
 - **THEN** the poll is a finished attempt
 - **AND** the bootstrap starts no further poll
 
+#### Scenario: A request for a task fails
+- **WHEN** the runner's request for a task fails, for example by a network error or a timeout, and the pinned runner therefore ends with the documented no-task status and message after an error-level log line
+- **THEN** the poll matches the empty-poll signature and the bootstrap treats it as empty
+- **AND** the worker still ends no later than the claim deadline
+- **AND** the error-level line may reach the console, so the claim timeout can carry that runner error
+
 #### Scenario: A poll fails for another reason
-- **WHEN** a poll fails with an unrecognised status, for example because the server cannot be reached or does not accept the registration
+- **WHEN** a poll fails with an unrecognised status, for example because the server does not accept the registration
 - **THEN** the bootstrap ends the claim loop and emits one failed marker with that status
 - **AND** token cleanup, registration-file removal, sync and shutdown still run
 - **AND** the bootstrap does not poll again
@@ -176,5 +182,5 @@ When the claim window passes without a task, the bootstrap MUST print exactly on
 - **THEN** the bootstrap prints no `STEP claim-timeout` marker
 
 #### Scenario: A claim timeout does not read as a failure
-- **WHEN** the claim window passes after only empty polls
+- **WHEN** the claim window passes after only empty polls in which the runner logged no error-level line
 - **THEN** the claim loop writes no console line that the exporter's failure rules classify as a failure kind

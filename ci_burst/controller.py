@@ -78,6 +78,10 @@ CLIENT_TOKEN_MAX_AGE_SECONDS = 24 * 60 * 60
 #: stays outstanding until the record could have disappeared.
 INSTANCE_RETENTION_SECONDS = 60 * 60
 
+#: Only a worker that is booting or running can still claim a waiting job. An
+#: operation in any other state covers none, although it can still hold a slot.
+COVERING_STATES = ("starting", "running")
+
 COST_SCOPE_NOTE = (
     "Tracked cost estimates compute at the Spot price taken when the launch was accepted, plus the "
     "hourly incidental rate recorded when the operation was admitted; the forward commitment prices "
@@ -628,6 +632,22 @@ class Controller:
                 plans.append(CandidatePlan(candidate, instance_type, template, quote, None))
         return plans
 
+    def _recent_launches(self, slot):
+        """Count the launches that each still cover one waiting job.
+
+        A launch is recent while its operation is booting or running and was
+        created less than the claim grace ago. The age is the ledger's own
+        creation time against the controller clock, so a restart neither
+        forgets a launch nor extends its grace.
+        """
+        now = self.clock()
+        grace = self.config.controller.claim_grace_seconds
+        return sum(
+            1
+            for operation in slot["operations"]
+            if operation["state"] in COVERING_STATES and now - operation["created_at"] < grace
+        )
+
     def _decide(self, observation, slot, *, deadline=None):
         """Return the decision block and the ordered candidate plans behind it."""
         self._check_deadline(deadline, PHASE_ADMISSION)
@@ -635,10 +655,12 @@ class Controller:
         limit = slot["limit"]
         instances = slot["instances"]
         free = limit - instances
+        recent = self._recent_launches(slot)
         decision = {
             "reasons": reasons,
             "notes": notes,
             "demand": observation.demand,
+            "recent_launches": recent,
             "free_instances": free,
             "launch_count": 0,
         }
@@ -658,7 +680,15 @@ class Controller:
             decision["decision"] = "wait"
             reasons.append("no_runnable_demand")
             return decision, ()
-        requested = min(observation.demand, free)
+        # Each recent launch covers one waiting job, so only the rest is
+        # requested. The slot limit, the allowance and the price checks below
+        # still bound that rest.
+        uncovered = max(0, observation.demand - recent)
+        if uncovered == 0:
+            decision["decision"] = "wait"
+            reasons.append("awaiting_claim")
+            return decision, ()
+        requested = min(uncovered, free)
         templates = self._templates(decision, deadline=deadline)
         if templates is None:
             decision["decision"] = "refused"

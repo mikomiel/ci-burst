@@ -59,13 +59,15 @@ Optional keys: `forgejo.timeout_seconds` (10), `forgejo.max_response_bytes`
 (2,000,000), `aws.price_max_age_seconds` (900), `aws.profile`,
 `aws.availability_zones`, `aws.instance_types` (an ordered list of at most four
 type names), `controller.max_instances` (an integer in `1..12`, default `1`),
-`controller.pass_deadline_seconds` (an integer in `30..290`, default `240`).
+`controller.pass_deadline_seconds` (an integer in `30..290`, default `240`),
+`controller.claim_grace_seconds` (an integer in `60..1800`, default `300`).
 Relative state paths resolve against the configuration file directory. Unknown
 keys, floating-point money, a template-version alias, a non-`https` Forgejo URL,
 a `controller.max_instances` outside `1..12`, a
-`controller.pass_deadline_seconds` outside `30..290`, a malformed
-zone-candidate list (`ZONE_CANDIDATES_INVALID`) and a malformed instance-type
-list (`INSTANCE_TYPES_INVALID`) are refused.
+`controller.pass_deadline_seconds` outside `30..290`, a
+`controller.claim_grace_seconds` outside `60..1800` or not an integer, a
+malformed zone-candidate list (`ZONE_CANDIDATES_INVALID`) and a malformed
+instance-type list (`INSTANCE_TYPES_INVALID`) are refused.
 
 ### Availability-zone candidates
 
@@ -787,10 +789,14 @@ far more than 28 launches while `spend` stays under `5.00`.
 Admission is demand-driven. One tick computes a batch size from three bounds:
 
 ```
-launches = min(waiting jobs, free slots, affordable workers)
+launches = min(max(0, waiting jobs - recent launches), free slots, affordable workers)
 ```
 
 - **Waiting jobs** is the eligible demand in the qualified queue observation.
+- **Recent launches** is the number of owned operations in the state `starting`
+  or `running` that were created less than `controller.claim_grace_seconds` ago.
+  Each one covers one waiting job, so only the demand it does not cover is
+  requested (§ Claim grace below).
 - **Free slots** is `controller.max_instances` minus the non-terminal owned
   operations in the ledger. An intent, starting, running, terminating or
   uncertain worker occupies a slot; a terminal or failed one does not.
@@ -799,11 +805,13 @@ launches = min(waiting jobs, free slots, affordable workers)
   § Cost tracking and the allowance.
 
 A zero bound is not an error. No free slot waits with `slot_busy`, no demand waits
-with `no_runnable_demand`, and no affordable worker refuses with
+with `no_runnable_demand`, demand that recent launches already cover waits with
+`awaiting_claim`, and no affordable worker refuses with
 `budget_allowance_exhausted`. When the allowance allows fewer launches than both
-demand and free slots, the batch is capped and the decision carries the
-`budget_capped_batch` note. `plan` reports the same `demand`, `free_instances`
-and `launch_count` that an `apply` would use.
+the uncovered demand and the free slots, the batch is capped and the decision
+carries the `budget_capped_batch` note. `plan` reports the same `demand`,
+`recent_launches`, `free_instances` and `launch_count` that an `apply` would use,
+when the ledger matches the provider inventory.
 
 Each worker in a batch has its own launch intent, ledger operation, frozen
 request, client token and reservation. A batch is not one admission with several
@@ -844,6 +852,51 @@ lifetime; expiry cleanup remains the only owner of termination. Observation
 reports the same condition and keeps reading the draining workers' consoles, so
 the drain stays visible while it lasts.
 
+### Claim grace
+
+A job stays `waiting` until a worker claims it, and a worker needs time to boot,
+register and poll. Without a bound, every tick would launch another worker for the
+same job, up to the free slots. Forgejo reports no link between a worker and a
+job, so the controller uses time: each recent launch covers one waiting job for
+`controller.claim_grace_seconds` (default `300`, the claim window of the worker
+bootstrap; range `60..1800`; there is no off value).
+
+- Only an owned operation in the state `starting` or `running` covers a job. A
+  `terminating` operation is shutting down and will not claim one, but it still
+  occupies a slot until it is terminal; an `intent`, `uncertain`, `terminal` or
+  `failed` operation covers nothing.
+- The age is the controller clock minus the `created_at` in the ledger, and the
+  launch covers a job only while that age is less than the grace. A restart
+  neither forgets a launch nor extends its grace.
+- When no demand is left uncovered the decision is `wait` with `awaiting_claim`
+  and a `launch_count` of `0`, and no launch intent, reservation or instance is
+  created. `slot_busy` and `no_runnable_demand` keep precedence and still report
+  `recent_launches`.
+- Every decision that admission computes reports `recent_launches`, the number it
+  counted. A result that ends before admission computes a decision (an owned-state
+  discrepancy, an invalid state, a changed scope or a refused observation), and a
+  deadline deferral that holds no decision, need not carry one.
+- After the grace, a job that is still waiting can get a new worker. That is the
+  recovery path for a worker that failed its bootstrap or never registered; the
+  replacement stays inside the slot limit and the allowance.
+
+The grace does not change the slot limit, the allowance or the price checks, and it
+matters only when `controller.max_instances` is above `1`: one slot already stops a
+second launch while a worker is outstanding. It is an estimate, not proof that a
+worker is healthy. A launch that has already taken its own job still covers one
+waiting job until the grace ends, so a job that becomes runnable in that time can
+wait up to the grace for its own worker. The grace starts when the ledger row is
+created and the worker's claim window starts at registration, so the grace ends
+earlier by the boot time, and a job that a slow-booting worker was about to claim
+can get a second worker, which ends at its own claim deadline. That costs one
+extra short-lived worker per lost race, bounded by the slot limit and the
+allowance.
+
+`plan` reads durable state only and does not resume or reconcile. It can show a
+launch for a job that `apply` holds back while an operation has no instance, and
+it counts a stored `starting` or `running` operation that reconciliation would
+turn into `terminating`, until the next `apply` reconciles the row.
+
 ## Launch decision and capacity fallback
 
 `plan` reports every configured candidate in order, each with the zone, subnet,
@@ -860,8 +913,8 @@ cannot be read or is unusable refuses the plan with `template_unusable` and
 `template_error` rather than dropping that candidate.
 
 `apply` admits a batch of at most `controller.max_instances` workers, sized by
-waiting demand, free slots and affordable workers (§ Fleet size and
-fan-out). Each worker in the batch is its own admission, with its own frozen
+the waiting demand that no recent launch covers, free slots and affordable
+workers (§ Fleet size and fan-out). Each worker in the batch is its own admission, with its own frozen
 request, ledger operation, client token and reservation; the batch stops as soon
 as one worker is not accepted. Within one worker, if the provider definitely
 rejects the selected pool for insufficient capacity

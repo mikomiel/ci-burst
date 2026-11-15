@@ -9,6 +9,14 @@ The version, this file and the release tag are maintained by
 conventional commits on `main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases)
 owns the release boundary. Do not edit a released section by hand.
 
+## [0.8.0](https://github.com/mikomiel/ci-burst/compare/v0.7.0...v0.8.0) (2026-11-15)
+
+
+### Added
+
+* **controller:** subtract recent launches from waiting demand ([#147](https://github.com/mikomiel/ci-burst/issues/147)) ([1dbeb23](https://github.com/mikomiel/ci-burst/commit/1dbeb236265b31f3676fd7c6e9e10f566ca1e515)), closes [#137](https://github.com/mikomiel/ci-burst/issues/137)
+* **runner:** end an idle worker after a bounded claim window ([#146](https://github.com/mikomiel/ci-burst/issues/146)) ([da59b51](https://github.com/mikomiel/ci-burst/commit/da59b517036d7bf6f586f79fbffbe243a1cb4407))
+
 ## [0.7.0](https://github.com/mikomiel/ci-burst/compare/v0.6.0...v0.7.0) (2026-11-14)
 
 

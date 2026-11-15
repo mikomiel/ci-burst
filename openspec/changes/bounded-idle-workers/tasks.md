@@ -208,7 +208,7 @@ These steps need operator approval, a bounded scope and a cleanup plan. Listing
 them authorizes nothing. Record the evidence in the operator's own deployment
 records, not in this repository.
 
-- [ ] 7.1 Publish the next launch-template version that carries the new user
+- [x] 7.1 Publish the next launch-template version that carries the new user
   data. Do not set it in the deployment configuration yet. The setup guide owns
   the procedure. That version also carries every other unpublished bootstrap
   change, and enabling it for one of them enables all of them, so decide the order
@@ -250,7 +250,7 @@ records, not in this repository.
   other than the documented no-task line matches one of the exporter's failure
   rules, stop and report, because the spec requires that a claim timeout writes no
   such line.
-- [ ] 7.6 Only after 7.2 to 7.4 and 7.8 hold on a version whose bytes carry the
+- [x] 7.6 Only after 7.2 to 7.4 and 7.8 hold on a version whose bytes carry the
   ptrace limit (task 1.11), 7.2 has recorded that no second task reaches a used
   registration, and 7.3 has recorded that a job step cannot place the documented
   message in the capture, set the new version in the deployment configuration

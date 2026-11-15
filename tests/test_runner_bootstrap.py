@@ -34,39 +34,27 @@ BOOTSTRAP = ROOT / "deploy" / "runner" / "bootstrap.sh"
 SETUP_GUIDE = ROOT / "docs" / "runner-setup.md"
 DEPLOYMENT_DOC = ROOT / "docs" / "deployment.md"
 
-#: sha256 of the user data that ``ci-burst-runner-multiaz`` version 6 carries.
-#: Production launches version 6. Versions 4, 5 and 6 carry the same user-data
-#: bytes: versions 5 and 6 changed only the image id. Update only together with a
-#: published template version and the deployment TOML's
-#: ``launch_template_version``.
-PUBLISHED_TEMPLATE_VERSION = 6
+#: sha256 of the user data that ``ci-burst-runner-multiaz`` version 8 carries.
+#: Version 8 carries the bounded claim window and the ptrace limit, and the
+#: deployment TOML's ``launch_template_version`` sets it. Update only together
+#: with a published template version and that setting.
+PUBLISHED_TEMPLATE_VERSION = 8
 PUBLISHED_TEMPLATE_SHA256 = (
-    "79435dab3f02405a54957aa60cbe8b3d635fc30e93dbf3ca19ca9ab53d23d219"
+    "1e14208cc254a5c06915bb6ad9775dd2525a62ad7d70971355c42709a562b324"
 )
 
-#: The publication this change prepares but does not perform. While a pending
+#: The publication a change prepares but does not perform. While a pending
 #: publication exists the repository bytes must equal it, so the pin is not
 #: weakened. Publication is the operator step: publish the bytes as a new
 #: launch-template version, update the deployment TOML's
 #: ``launch_template_version``, then flip these constants in a follow-up change
 #: (published becomes the pending pair and both PENDING values become ``None``).
-#:
-#: Version 7 was published with the 0.8.0 bootstrap bytes (sha256
-#: 3474b96723841ebb31ef46b600fa67f44b7db941d7676857cca520b305d28769) and was never
-#: set in the deployment. The bytes in this branch differ from those only by the
-#: ptrace limit, and they will be published as version 8. The pending version only
-#: has to be greater than the published one: a version that changes only the image
-#: and a version that a later one supersedes each consume a number.
-#:
-#: Only one publication may be outstanding at a time, so each later bootstrap
-#: change joins the pending one. The pending bytes carry the bounded claim window
-#: and the ptrace limit, so qualify them live (runner-setup.md, "The claim window")
-#: before a deployment sets version 8. If a version is published from earlier
-#: bytes first, the pending version moves past it instead.
-PENDING_TEMPLATE_VERSION = 8
-PENDING_TEMPLATE_SHA256 = (
-    "1e14208cc254a5c06915bb6ad9775dd2525a62ad7d70971355c42709a562b324"
-)
+#: The pending version only has to be greater than the published one: a version
+#: that changes only the image and a version that a later one supersedes each
+#: consume a number. Only one publication may be outstanding at a time, so each
+#: later bootstrap change joins the pending one.
+PENDING_TEMPLATE_VERSION = None
+PENDING_TEMPLATE_SHA256 = None
 
 
 def _end_one_job_snippet():
@@ -208,15 +196,26 @@ class RunnerBootstrapTests(unittest.TestCase):
         )
 
     def test_publication_state_refuses_absent_and_contradictory_states(self):
+        # Each state is complete, so the cases do not depend on whether a
+        # publication is pending today.
+        stand_in = "0" * 64
         states = {
-            "half a pending pair": {"PENDING_TEMPLATE_VERSION": None},
+            "half a pending pair": {
+                "PENDING_TEMPLATE_VERSION": None,
+                "PENDING_TEMPLATE_SHA256": stand_in,
+            },
             "pending version equals the published one": {
-                "PENDING_TEMPLATE_VERSION": PUBLISHED_TEMPLATE_VERSION
+                "PENDING_TEMPLATE_VERSION": PUBLISHED_TEMPLATE_VERSION,
+                "PENDING_TEMPLATE_SHA256": stand_in,
             },
             "pending version is earlier than the published one": {
-                "PENDING_TEMPLATE_VERSION": PUBLISHED_TEMPLATE_VERSION - 1
+                "PENDING_TEMPLATE_VERSION": PUBLISHED_TEMPLATE_VERSION - 1,
+                "PENDING_TEMPLATE_SHA256": stand_in,
             },
-            "pending digest equals published": {"PENDING_TEMPLATE_SHA256": PUBLISHED_TEMPLATE_SHA256},
+            "pending digest equals published": {
+                "PENDING_TEMPLATE_VERSION": PUBLISHED_TEMPLATE_VERSION + 1,
+                "PENDING_TEMPLATE_SHA256": PUBLISHED_TEMPLATE_SHA256,
+            },
             "no publication state": {
                 "PENDING_TEMPLATE_VERSION": None,
                 "PENDING_TEMPLATE_SHA256": None,

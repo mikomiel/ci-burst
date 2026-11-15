@@ -148,7 +148,7 @@ them.
   it as well. Give such a row an age beyond the grace unless the test is about
   coverage, and do not change an expectation without naming the reason in the
   test.
-- [ ] 4.6 Add a test that the controller's default grace equals the claim-window
+- [x] 4.6 Add a test that the controller's default grace equals the claim-window
   literal in `deploy/runner/bootstrap.sh`.
 
 ## 5. Documentation
@@ -160,7 +160,7 @@ them.
   summary that says the worker runs exactly one job. In section 5 (Verify), change
   step 1 so that it also describes a launch with no queued job, and change step 2
   so that it names `STEP claim-timeout` as the expected record of that launch.
-- [ ] 5.2 `docs/operations.md`: document the new controller key in the
+- [x] 5.2 `docs/operations.md`: document the new controller key in the
   configuration section, the `claim-timeout` step in the event stream section, and
   the new bound in the "Fleet size and fan-out" section (formula, the
   `awaiting_claim` reason, `recent_launches`, the grace and its limits). Rewrite

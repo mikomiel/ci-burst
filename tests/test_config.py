@@ -1,3 +1,4 @@
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -67,6 +68,16 @@ class ConfigTests(unittest.TestCase):
 
     def test_claim_grace_defaults_to_300_seconds(self):
         self.assertEqual(load(write_config(self.root)).controller.claim_grace_seconds, 300)
+
+    def test_claim_grace_default_equals_the_worker_claim_window(self):
+        # The grace covers a launch until its worker's claim window ends, so the
+        # default must follow the single literal in the shipped bootstrap.
+        bootstrap = Path(__file__).resolve().parent.parent / "deploy" / "runner" / "bootstrap.sh"
+        windows = re.findall(r"^CLAIM_WINDOW_SECONDS=(\d+)$", bootstrap.read_text(), re.MULTILINE)
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(
+            load(write_config(self.root)).controller.claim_grace_seconds, int(windows[0])
+        )
 
     def test_accepts_the_claim_grace_range(self):
         for value in (60, 300, 1800):

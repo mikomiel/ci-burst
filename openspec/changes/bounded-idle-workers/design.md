@@ -108,8 +108,10 @@ gives it, so closing the path does not close every route. Whether the runner's
 child processes inherit that descriptor is unverified, and no source in this
 repository says. A job step that could write to it would forge the message half
 only, and the status half would still have to match. A forgery then needs the
-runner of a claimed job to end with the documented status. The status range, task
-7.2 and the adversarial check in task 7.3 test that. Open question 2 records the
+runner of a claimed job to end with the documented status. The status range and task
+7.2 bound that, and task 7.3 tests it with no process of the job account left
+running, so the survival rule cannot mask a status that matches. Task 7.8 tests
+the survival rule on its own. Open question 2 records the
 decision that the check feeds.
 
 The bound limits what the bootstrap reads. It must not limit what the runner
@@ -413,9 +415,9 @@ enables that version. The tasks name this in 3.5 and 7.1.
    only after the one-job process has exited, and ends the loop when a process of
    the job account survives. It does not claim that an inherited descriptor is
    closed, because the runner's behaviour is unverified. Recommendation: keep the
-   signature as specified and let task 7.3 decide. If the check shows both that a
-   job step can write the capture through an inherited descriptor and that the
-   runner of a claimed job can end with the documented status, treat the
-   empty-poll signature as forgeable and reopen this change before the template
-   version is enabled. The cost is a design change to the signature, not a
+   signature as specified and let task 7.3 decide. Activation requires evidence
+   from task 7.3 that the runner of a claimed job cannot end with the documented
+   status; a status range alone is not that evidence. If the check shows that it
+   can, treat the empty-poll signature as forgeable and reopen this change before
+   the template version is enabled, whatever the inherited-descriptor result. The cost is a design change to the signature, not a
    rollback, because no version is enabled before the check.

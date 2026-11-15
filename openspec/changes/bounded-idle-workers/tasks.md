@@ -208,13 +208,18 @@ records, not in this repository.
   that the ephemeral registration stays valid across repeated empty polls and is
   consumed by the first claimed task. Confirm that a poll after a claimed task is
   refused and does not read as an empty poll.
-- [ ] 7.3 Run one adversarial check. From a job step, as the job account, try to
-  write the documented no-task message to the capture path, to the runner's own
+- [ ] 7.3 Run one adversarial check with no process of the job account left
+  running when the step ends. From a job step, as the job account, try to write
+  the documented no-task message to the capture path, to the runner's own
   descriptors (including through `/proc`) and to a descriptor that a child process
-  inherits. Leave a background process of the job account running after the step
-  ends. Confirm that the worker does not poll again after that job. Record whether
-  a child of the runner inherits its standard output or error, because that result
-  decides design open question 2.
+  inherits. In the same job, try to make the runner end with the documented no-task
+  status: end the step with that status, and end the runner's child processes with
+  it. Record the runner's exit status for each attempt, and record whether it can
+  equal the documented no-task status. Confirm that the worker does not poll again
+  after that job. Record whether a child of the runner inherits its standard output
+  or error. Both records decide design open question 2: the status and the
+  inherited-descriptor results must show that a claimed runner cannot end with the
+  documented status, or the signature is redesigned before activation.
 - [ ] 7.4 Observe one claim timeout (launch with no job queued) and one claimed
   job in the event stream. For the claim timeout, expect the registration step,
   the `claim-timeout` step, the exit marker with `rc=0` and then provider
@@ -226,8 +231,14 @@ records, not in this repository.
   other than the documented no-task line matches one of the exporter's failure
   rules, stop and report, because the spec requires that a claim timeout writes no
   such line.
-- [ ] 7.6 Only after 7.2 to 7.4 hold, set the new version in the deployment
+- [ ] 7.6 Only after 7.2 to 7.4 and 7.8 hold, and 7.3 has recorded that a
+  claimed runner cannot end with the documented no-task status, set the new version in the deployment
   configuration and run the prerequisite check.
 - [ ] 7.7 With the controller half deployed, observe that one waiting job does not
   launch a second worker while the first worker is still booting, and that a
   replacement is launched after the grace when the first worker never claims.
+- [ ] 7.8 Run the surviving-process case separately from 7.3. From a job step,
+  leave a background process of the job account running after the step ends, and
+  write nothing to the capture or the runner's descriptors. Confirm that the worker
+  does not poll again after that job and that the result reads as a finished
+  attempt, not as an empty poll.

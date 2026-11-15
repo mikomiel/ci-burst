@@ -135,6 +135,19 @@ The capture MUST be bounded to a fixed number of bytes. The job account MUST NOT
 - **THEN** the poll is a finished attempt
 - **AND** the bootstrap starts no further poll
 
+### Requirement: A job step cannot trace the runner of its poll
+Before the first poll, the bootstrap MUST limit ptrace to a process's descendants, and it MUST keep a stricter limit that is already set. When the bootstrap cannot confirm the limit, it MUST print a warning and MUST NOT start a second poll.
+
+#### Scenario: The image allows tracing any process of the same account
+- **WHEN** the kernel's ptrace scope is 0 when the bootstrap starts
+- **THEN** the bootstrap raises it to 1 before the first poll
+- **AND** a job step cannot attach to the runner or open its memory for writing
+
+#### Scenario: The limit cannot be confirmed
+- **WHEN** the bootstrap cannot set or read a ptrace scope from 1 to 3
+- **THEN** it prints a warning that matches no exporter error rule
+- **AND** an empty first poll ends the worker as a claim timeout
+
 ### Requirement: Runner output reaches the console while a poll runs
 The capture MUST NOT replace the console. The bootstrap MUST keep sending the output of the one-job process to the console while the process runs. The bootstrap MAY omit the documented no-task line of an empty poll from the console.
 

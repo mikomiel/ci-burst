@@ -52,6 +52,10 @@ them.
 - [x] 1.9 Keep the job timeout and the lifetime shutdown literals unchanged.
 - [x] 1.10 Keep sending the output of each poll to the console while it runs. Omit
   only the documented no-task line of an empty poll.
+- [x] 1.11 Before the first poll, limit ptrace to descendants
+  (`kernel.yama.ptrace_scope` 1) and keep a stricter value. When the limit cannot
+  be confirmed, print a warning and poll once: an empty first poll is a claim
+  timeout.
 
 ## 2. Reader
 
@@ -113,6 +117,13 @@ them.
   that writes a line and then waits, and assert that the line reaches the console
   before the stub exits. Assert that every line other than the documented no-task
   line of an empty poll reaches the console.
+- [x] 3.8 Run the shipped ptrace block against a stub scope file and `sysctl`:
+  scope 0 is raised to 1, a refused raise and an unreadable or unknown scope poll
+  once with a warning, and 1 to 3 are kept. Run the claim loop without a
+  confirmed limit: one empty poll ends the worker, and a job is still a finished
+  attempt. Test that the block comes after registration and before the watcher
+  and the claim loop, and that neither warning matches an exporter error rule.
+  Move the publication state to the version that carries the limit.
 
 ## 4. Controller claim grace
 
@@ -206,9 +217,12 @@ records, not in this repository.
   from that version, as the setup guide's verify section describes, before the
   version is enabled. Confirm the no-task exit status and the message. Confirm
   that the ephemeral registration stays valid across repeated empty polls and is
-  consumed by the first claimed task. Confirm that a poll after a claimed task is
-  refused and does not read as an empty poll, both after a job that ends normally
-  and after a claimed runner that a job step ends with `SIGQUIT`.
+  consumed by the first claimed task. After a job that ends normally, confirm that
+  a poll with the same registration is refused with another status. After a
+  claimed runner that a job step ends with `SIGQUIT`, confirm that no second task
+  reaches the registration: while the server still counts the claimed task as
+  running a poll gets the no-task result, and after the server ends that task the
+  poll is refused.
 - [ ] 7.3 Run one adversarial check with no process of the job account left
   running when the step ends. From a job step, as the job account, try to write
   the documented no-task message to the capture path, to the runner's own
@@ -216,7 +230,8 @@ records, not in this repository.
   inherits. In the same job, try to make the runner end with the documented no-task
   status: end the step with that status, and end the runner's child processes with
   it, send the runner `SIGQUIT` directly, and try to attach to it with `ptrace`
-  or write through `/proc/<pid>/mem`. Record the runner's exit status for each
+  or write through `/proc/<pid>/mem`. Confirm that the bootstrap printed no
+  `ptrace not limited` warning. Record the runner's exit status for each
   attempt, and record whether it can equal the documented no-task status. Confirm that the worker does not poll again
   after that job. Record whether a child of the runner inherits its standard output
   or error. Both records feed design open question 2: the message results must
@@ -235,10 +250,11 @@ records, not in this repository.
   other than the documented no-task line matches one of the exporter's failure
   rules, stop and report, because the spec requires that a claim timeout writes no
   such line.
-- [ ] 7.6 Only after 7.2 to 7.4 and 7.8 hold, 7.2 has recorded that a poll
-  after a claimed task is refused with another status, and 7.3 has recorded that
-  a job step cannot place the documented message in the capture, set the new
-  version in the deployment configuration and run the prerequisite check.
+- [ ] 7.6 Only after 7.2 to 7.4 and 7.8 hold on a version whose bytes carry the
+  ptrace limit (task 1.11), 7.2 has recorded that no second task reaches a used
+  registration, and 7.3 has recorded that a job step cannot place the documented
+  message in the capture, set the new version in the deployment configuration
+  and run the prerequisite check.
 - [ ] 7.7 With the controller half deployed, observe that one waiting job does not
   launch a second worker while the first worker is still booting, and that a
   replacement is launched after the grace when the first worker never claims.

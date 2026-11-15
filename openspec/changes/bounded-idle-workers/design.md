@@ -123,12 +123,12 @@ implementation keeps draining the output after the bound is reached, and a test
 with a stub that writes more than the bound proves that the process is not
 stopped. An oversized capture is a finished attempt.
 
-The repository documents the message `Error: no task received` for the pinned
-runner. It does not record the exit status. The implementation task reads the
-status from the pinned runner's contract and stops and reports if no source states
-it, or if it lies outside 2 to 123. This change does not write a number. A runner
-version bump reopens the signature, because the tests pin the status and the
-message.
+Task 1.1 read the no-task result from the pinned runner's source: status 2 and
+the message `Error: no task received` on standard error. The worker setup guide
+records both with their sources. Status 2 is not unique to an empty poll: a
+failed request for a task ends the same way, and so does a runner that a job
+step stops with `SIGQUIT`. A runner version bump reopens the signature, because
+the tests pin the status and the message.
 
 ## The console copy
 
@@ -419,9 +419,14 @@ enables that version. The tasks name this in 3.5 and 7.1.
    only after the one-job process has exited, and ends the loop when a process of
    the job account survives. It does not claim that an inherited descriptor is
    closed, because the runner's behaviour is unverified. Recommendation: keep the
-   signature as specified and let task 7.3 decide. Activation requires evidence
-   from task 7.3 that the runner of a claimed job cannot end with the documented
-   status; a status range alone is not that evidence. If the check shows that it
-   can, treat the empty-poll signature as forgeable and reopen this change before
-   the template version is enabled, whatever the inherited-descriptor result. The cost is a design change to the signature, not a
-   rollback, because no version is enabled before the check.
+   signature as specified and let task 7.3 decide. The runner's source
+   already shows that a job step can end a claimed runner with the documented
+   status (`SIGQUIT`), so the status half is forgeable and does not count as a
+   guard. Two guards remain. The message half holds only if task 7.3 shows that a
+   job step cannot place the documented message in the capture. The ephemeral
+   registration holds only if task 7.2 shows that a poll after a claimed task is
+   refused with another status: then a forged empty poll leads to one refused
+   poll and a finished attempt, not to a second job. Activation requires both
+   records. If either fails, reopen this change before the template version is
+   enabled. The cost is a design change to the signature, not a rollback, because
+   no version is enabled before the checks.

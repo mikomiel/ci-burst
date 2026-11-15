@@ -217,9 +217,11 @@ records, not in this repository.
   it. Record the runner's exit status for each attempt, and record whether it can
   equal the documented no-task status. Confirm that the worker does not poll again
   after that job. Record whether a child of the runner inherits its standard output
-  or error. Both records decide design open question 2: the status and the
-  inherited-descriptor results must show that a claimed runner cannot end with the
-  documented status, or the signature is redesigned before activation.
+  or error. Both records feed design open question 2: the message results must
+  show that a job step cannot place the documented message in the capture, or the
+  signature is redesigned before activation. The status results are recorded but
+  are not a guard, because the runner's source already shows that a job step can
+  end the runner with the documented status.
 - [ ] 7.4 Observe one claim timeout (launch with no job queued) and one claimed
   job in the event stream. For the claim timeout, expect the registration step,
   the `claim-timeout` step, the exit marker with `rc=0` and then provider
@@ -231,9 +233,10 @@ records, not in this repository.
   other than the documented no-task line matches one of the exporter's failure
   rules, stop and report, because the spec requires that a claim timeout writes no
   such line.
-- [ ] 7.6 Only after 7.2 to 7.4 and 7.8 hold, and 7.3 has recorded that a
-  claimed runner cannot end with the documented no-task status, set the new version in the deployment
-  configuration and run the prerequisite check.
+- [ ] 7.6 Only after 7.2 to 7.4 and 7.8 hold, 7.2 has recorded that a poll
+  after a claimed task is refused with another status, and 7.3 has recorded that
+  a job step cannot place the documented message in the capture, set the new
+  version in the deployment configuration and run the prerequisite check.
 - [ ] 7.7 With the controller half deployed, observe that one waiting job does not
   launch a second worker while the first worker is still booting, and that a
   replacement is launched after the grace when the first worker never claims.

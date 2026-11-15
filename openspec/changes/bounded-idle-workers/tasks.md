@@ -250,7 +250,7 @@ records, not in this repository.
   other than the documented no-task line matches one of the exporter's failure
   rules, stop and report, because the spec requires that a claim timeout writes no
   such line.
-- [x] 7.6 Only after 7.2 to 7.4 and 7.8 hold on a version whose bytes carry the
+- [ ] 7.6 Only after 7.2 to 7.4 and 7.8 hold on a version whose bytes carry the
   ptrace limit (task 1.11), 7.2 has recorded that no second task reaches a used
   registration, and 7.3 has recorded that a job step cannot place the documented
   message in the capture, set the new version in the deployment configuration

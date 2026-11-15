@@ -65,6 +65,56 @@ class ConfigTests(unittest.TestCase):
             load(path)
         self.assertIn("controller.pass_deadline_seconds", raised.exception.detail)
 
+    def test_claim_grace_defaults_to_300_seconds(self):
+        self.assertEqual(load(write_config(self.root)).controller.claim_grace_seconds, 300)
+
+    def test_accepts_the_claim_grace_range(self):
+        for value in (60, 300, 1800):
+            with self.subTest(value=value):
+                config = load(
+                    write_config(self.root, config={"controller": {"claim_grace_seconds": value}})
+                )
+                self.assertEqual(config.controller.claim_grace_seconds, value)
+
+    def test_refuses_a_claim_grace_outside_the_range(self):
+        for value in (59, 1801):
+            with self.subTest(value=value):
+                path = write_config(
+                    self.root, config={"controller": {"claim_grace_seconds": value}}
+                )
+                with self.assertRaises(ConfigRefusal) as raised:
+                    load(path)
+                self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
+                self.assertEqual(
+                    raised.exception.detail,
+                    "controller.claim_grace_seconds: must be between 60 and 1800",
+                )
+
+    def test_refuses_a_non_integer_claim_grace(self):
+        # A float, a quoted string and a boolean are all not integers; a boolean
+        # is an int subtype in Python but not an integer in the configuration.
+        for value in (300.0, "300", True):
+            with self.subTest(value=value):
+                path = write_config(
+                    self.root, config={"controller": {"claim_grace_seconds": value}}
+                )
+                with self.assertRaises(ConfigRefusal) as raised:
+                    load(path)
+                self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
+                self.assertEqual(
+                    raised.exception.detail,
+                    "controller.claim_grace_seconds: must be an integer",
+                )
+
+    def test_the_controller_table_still_refuses_an_unknown_key(self):
+        # The new key joins the allowed list without turning the check off: a
+        # near miss of its name is refused and named.
+        path = write_config(self.root, config={"controller": {"claim_grace": 300}})
+        with self.assertRaises(ConfigRefusal) as raised:
+            load(path)
+        self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
+        self.assertEqual(raised.exception.detail, "controller: unknown key(s) claim_grace")
+
     def test_refuses_zero_instances(self):
         path = write_config(self.root, config={"controller": {"max_instances": 0}})
         with self.assertRaises(ConfigRefusal) as raised:

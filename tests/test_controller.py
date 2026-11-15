@@ -64,6 +64,12 @@ _V2_SCHEMA = """
 
 
 class ControllerCase(unittest.TestCase):
+    #: An age beyond the default claim grace of 300 seconds. A seeded worker of
+    #: this age covers no waiting job, so a test that is not about coverage gives
+    #: its seeded workers this age and keeps testing the slot limit, the
+    #: allowance or the cost instead.
+    PAST_THE_GRACE = 600
+
     def setUp(self):
         self._directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._directory.cleanup)
@@ -102,17 +108,26 @@ class ControllerCase(unittest.TestCase):
         reservation=1_000_000,
         instance_id="i-seed",
         request=None,
+        age=0,
     ):
-        ledger = Ledger(self.config.state.database, clock=self.clock).connect()
+        """Seed one operation that was created ``age`` seconds ago.
+
+        The whole timeline of the row moves back with its creation, so it has
+        the lifetime and the cost of a worker created at that time. A row with
+        no age is created at the clock's current time and so, in the state
+        ``starting`` or ``running``, is inside the claim grace.
+        """
+        created = self.clock.now - age
+        ledger = Ledger(self.config.state.database, clock=lambda: created).connect()
         with ledger.transaction():
             ledger.new_operation(
                 operation_id=operation_id,
                 client_token="ci-burst-" + operation_id,
                 request={"seed": True} if request is None else request,
                 request_sha256="0" * 64,
-                expires_at=expires_at if expires_at is not None else self.clock.now + 3600,
+                expires_at=expires_at if expires_at is not None else created + 3600,
                 reservation_micros=reservation,
-                window_start=current_window(self.clock.now, self.config.budget.window_seconds),
+                window_start=current_window(created, self.config.budget.window_seconds),
                 region=self.config.aws.region,
                 account="111122223333",
             )
@@ -197,7 +212,14 @@ class PlanTests(ControllerCase):
                 self.root, config={"budget": {"allowance": "0.50"}, "controller": {"max_instances": 4}}
             )
         )
-        self.seed(state="running", operation_id="live", reservation=540_000)
+        # The worker is past the claim grace, so it covers no waiting job and
+        # this test stays about the allowance, not about coverage.
+        self.seed(
+            state="running",
+            operation_id="live",
+            reservation=540_000,
+            age=self.PAST_THE_GRACE,
+        )
         result = self.build(observation=observation_demand(), config=config).plan()
         self.assertEqual(result["decision"], "refused")
         self.assertIn("budget_allowance_exhausted", result["reasons"])
@@ -1699,8 +1721,20 @@ class FleetTests(ControllerCase):
         self.assertEqual(controller.status()["budget"]["hourly_ceiling"], "0.480000")
 
     def test_existing_workers_leave_only_the_free_slots(self):
-        self.seed(state="running", operation_id="busy-a", instance_id="i-busy-a")
-        self.seed(state="running", operation_id="busy-b", instance_id="i-busy-b")
+        # Both workers are past the claim grace, so the free slots are the bound
+        # that this test is about, not the coverage of the waiting jobs.
+        self.seed(
+            state="running",
+            operation_id="busy-a",
+            instance_id="i-busy-a",
+            age=self.PAST_THE_GRACE,
+        )
+        self.seed(
+            state="running",
+            operation_id="busy-b",
+            instance_id="i-busy-b",
+            age=self.PAST_THE_GRACE,
+        )
         controller = self.build(observation=observation_demand(4), config=self.fleet_config(4))
         result = controller.apply()
         self.assertEqual(result["launch_count"], 2)
@@ -2174,6 +2208,400 @@ class FleetTests(ControllerCase):
         self.assertEqual(result["budget"]["hourly_ceiling"], "0.160000")
 
 
+class ClaimGraceTests(ControllerCase):
+    """A recent launch covers one waiting job until the claim grace ends.
+
+    The default limit of 1 ends in ``slot_busy`` before the grace matters, so
+    every case that expects ``awaiting_claim`` or a launch raises the limit
+    above the number of seeded operations.
+    """
+
+    GRACE = 300
+
+    def fleet(self, max_instances=4, **controller):
+        values = {"max_instances": max_instances, **controller}
+        return load(write_config(self.root, config={"controller": values}))
+
+    def seed_worker(self, name, state="running"):
+        """Seed one owned operation, created at the clock's current time."""
+        return self.seed(state=state, operation_id=name, instance_id="i-" + name)
+
+    def report(self, *workers):
+        """List each ``(name, provider state)`` so that the ledger matches the provider."""
+        self.aws.instances_result = [
+            instance(instance_id="i-" + name, operation=name, state=state)
+            for name, state in workers
+        ]
+
+    def launches(self):
+        return [call for call in self.aws.calls if call[0] == "run_spot"]
+
+    def operation_ids(self):
+        return [operation.id for operation in self.reopened().operations()]
+
+    # -- a recent launch covers a job ------------------------------------
+    def assert_a_worker_covers_its_job(self, state, provider_state):
+        self.seed_worker("booting", state)
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        self.report(("booting", provider_state))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("awaiting_claim", result["reasons"])
+        self.assertNotIn("slot_busy", result["reasons"])
+        self.assertEqual(result["demand"], 1)
+        self.assertEqual(result["recent_launches"], 1)
+        self.assertEqual(result["launch_count"], 0)
+        # No launch intent, reservation or instance is created.
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(self.operation_ids(), ["booting"])
+
+    def test_a_starting_worker_covers_its_job(self):
+        self.assert_a_worker_covers_its_job("starting", "pending")
+
+    def test_a_running_worker_covers_its_job(self):
+        self.assert_a_worker_covers_its_job("running", "running")
+
+    def test_demand_above_the_recent_launches_requests_the_rest(self):
+        self.seed_worker("first", "starting")
+        self.seed_worker("second", "running")
+        controller = self.build(observation=observation_demand(3), config=self.fleet())
+        self.report(("first", "pending"), ("second", "running"))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["demand"], 3)
+        self.assertEqual(result["recent_launches"], 2)
+        self.assertEqual(result["free_instances"], 2)
+        self.assertEqual(result["launch_count"], 1)
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertEqual(len(self.launches()), 1)
+        self.assertEqual(len(self.operation_ids()), 3)
+
+    def test_waiting_jobs_fewer_than_the_recent_launches_wait(self):
+        self.seed_worker("first", "starting")
+        self.seed_worker("second", "running")
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        self.report(("first", "pending"), ("second", "running"))
+        result = controller.apply()
+        # The demand left uncovered is zero, never negative: nothing is requested.
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("awaiting_claim", result["reasons"])
+        self.assertEqual(result["demand"], 1)
+        self.assertEqual(result["recent_launches"], 2)
+        self.assertEqual(result["free_instances"], 2)
+        self.assertEqual(result["launch_count"], 0)
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(len(self.operation_ids()), 2)
+
+    def test_a_repeat_tick_does_not_launch_a_second_worker_for_the_same_job(self):
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        first = controller.apply()
+        self.assertEqual(first["decision"], "launched")
+        self.aws.instances_result = [instance(operation=first["operation"], state="running")]
+        self.clock.advance(60)
+        repeat = controller.apply()
+        self.assertEqual(repeat["decision"], "wait")
+        self.assertIn("awaiting_claim", repeat["reasons"])
+        self.assertEqual(repeat["recent_launches"], 1)
+        self.assertEqual(len(self.launches()), 1)
+        # The worker never claims the job: once the grace has ended from the
+        # launch, the job that is still waiting gets a replacement.
+        self.clock.advance(self.GRACE - 60)
+        replacement = controller.apply()
+        self.assertEqual(replacement["decision"], "launched")
+        self.assertEqual(replacement["recent_launches"], 0)
+        self.assertEqual(len(self.launches()), 2)
+
+    # -- what covers nothing ----------------------------------------------
+    def test_a_terminating_worker_covers_no_job_but_keeps_its_slot(self):
+        operation_id = self.seed_worker("ending", "running")
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        self.report(("ending", "shutting-down"))
+        result = controller.apply()
+        # Reconciliation moves the row to terminating before admission counts.
+        self.assertEqual(self.reopened().operation(operation_id).state, "terminating")
+        self.assertEqual(result["decision"], "launched")
+        self.assertNotIn("awaiting_claim", result["reasons"])
+        self.assertEqual(result["recent_launches"], 0)
+        self.assertEqual(result["free_instances"], 3)
+        self.assertEqual(result["launch_count"], 1)
+        self.assertEqual(len(self.launches()), 1)
+
+    def test_a_terminating_worker_still_fills_the_last_slot(self):
+        self.seed_worker("ending", "terminating")
+        controller = self.build(observation=observation_demand(1), config=self.fleet(max_instances=1))
+        result = controller.plan()
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("slot_busy", result["reasons"])
+        self.assertEqual(result["recent_launches"], 0)
+
+    def test_a_recent_worker_that_reaches_a_terminal_state_covers_no_job(self):
+        operation_id = self.seed_worker("failed-boot", "starting")
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        self.report(("failed-boot", "terminated"))
+        result = controller.apply()
+        self.assertEqual(self.reopened().operation(operation_id).state, "terminal")
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["recent_launches"], 0)
+        self.assertEqual(result["free_instances"], 4)
+        self.assertEqual(result["launch_count"], 1)
+
+    def test_only_a_starting_or_running_worker_covers_a_job(self):
+        # plan reads the ledger as stored, so every state is counted unreconciled.
+        for name, state in (
+            ("booting", "starting"),
+            ("busy", "running"),
+            ("ending", "terminating"),
+            ("pending", "intent"),
+            ("unknown", "uncertain"),
+            ("finished", "terminal"),
+            ("rejected", "failed"),
+        ):
+            self.seed(
+                state=state,
+                operation_id=name,
+                instance_id=None if state in ("intent", "uncertain") else "i-" + name,
+            )
+        # Five operations are not terminal or failed, so seven slots stay free.
+        controller = self.build(observation=observation_demand(7), config=self.fleet(max_instances=12))
+        result = controller.plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(result["free_instances"], 7)
+        self.assertEqual(result["recent_launches"], 2)
+        self.assertEqual(result["launch_count"], 5)
+
+    # -- the grace ends ---------------------------------------------------
+    def apply_for_a_worker_of_age(self, age, **controller):
+        """Apply for one waiting job when the only owned worker is ``age`` seconds old."""
+        self.seed_worker("aged", "running")
+        self.clock.advance(age)
+        built = self.build(observation=observation_demand(1), config=self.fleet(**controller))
+        self.report(("aged", "running"))
+        return built.apply()
+
+    def test_a_worker_just_inside_the_default_grace_still_covers_its_job(self):
+        result = self.apply_for_a_worker_of_age(self.GRACE - 1)
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("awaiting_claim", result["reasons"])
+        self.assertEqual(result["recent_launches"], 1)
+
+    def test_a_worker_at_the_default_grace_covers_nothing(self):
+        # The age must be less than the grace, so equal is no longer recent.
+        result = self.apply_for_a_worker_of_age(self.GRACE)
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["recent_launches"], 0)
+        self.assertEqual(result["free_instances"], 3)
+        self.assertEqual(result["launch_count"], 1)
+        self.assertEqual(len(self.operation_ids()), 2)
+
+    def test_a_shorter_configured_grace_ends_sooner(self):
+        result = self.apply_for_a_worker_of_age(60, claim_grace_seconds=60)
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["recent_launches"], 0)
+
+    def test_a_worker_just_inside_a_shorter_configured_grace_still_covers(self):
+        result = self.apply_for_a_worker_of_age(59, claim_grace_seconds=60)
+        self.assertEqual(result["decision"], "wait")
+        self.assertEqual(result["recent_launches"], 1)
+
+    def test_a_longer_configured_grace_outlasts_the_default(self):
+        result = self.apply_for_a_worker_of_age(self.GRACE * 2, claim_grace_seconds=1800)
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("awaiting_claim", result["reasons"])
+        self.assertEqual(result["recent_launches"], 1)
+
+    def test_the_age_is_the_recorded_creation_time_not_the_provider_launch_time(self):
+        operation_id = self.seed_worker("booting", "running")
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        # The provider reports a launch an hour ago: reconciliation records it,
+        # and the grace still ages from the ledger's own creation time.
+        self.aws.instances_result = [
+            replace(
+                instance(instance_id="i-booting", operation="booting", state="running"),
+                launch_time=self.clock.now - 3600,
+            )
+        ]
+        result = controller.apply()
+        self.assertEqual(self.reopened().operation(operation_id).launch_time, self.clock.now - 3600)
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("awaiting_claim", result["reasons"])
+        self.assertEqual(result["recent_launches"], 1)
+
+    def test_a_restart_inside_the_grace_neither_forgets_nor_extends_the_launch(self):
+        config = self.fleet()
+        first = self.build(observation=observation_demand(1), config=config).apply()
+        self.assertEqual(first["decision"], "launched")
+        created_at = self.reopened().operation(first["operation"]).created_at
+        self.aws.instances_result = [instance(operation=first["operation"], state="running")]
+        # A fresh controller and ledger model a restarted process.
+        self.clock.advance(200)
+        restarted = self.build(observation=observation_demand(1), aws=self.aws, config=config)
+        held = restarted.apply()
+        self.assertEqual(held["decision"], "wait")
+        self.assertIn("awaiting_claim", held["reasons"])
+        self.assertEqual(held["recent_launches"], 1)
+        self.assertEqual(self.reopened().operation(first["operation"]).created_at, created_at)
+        # The second restart starts only 100 seconds after the first, but the
+        # launch is 300 seconds old: the grace ran from its creation.
+        self.clock.advance(100)
+        again = self.build(observation=observation_demand(1), aws=self.aws, config=config)
+        replaced = again.apply()
+        self.assertEqual(replaced["decision"], "launched")
+        self.assertEqual(replaced["recent_launches"], 0)
+        self.assertEqual(len(self.launches()), 2)
+
+    # -- the existing reasons keep precedence ------------------------------
+    def test_an_owned_state_discrepancy_keeps_precedence(self):
+        self.seed_worker("booting", "running")
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        self.aws.instances_result = [
+            instance(instance_id="i-booting", operation="booting", state="running"),
+            instance(instance_id="i-stray", operation="unknown-operation", state="running"),
+        ]
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertNotIn("awaiting_claim", result["reasons"])
+        # The pass ends before admission computes a decision, so it adds no count.
+        self.assertNotIn("recent_launches", result)
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_a_busy_slot_keeps_precedence_and_reports_the_recent_launches(self):
+        self.seed_worker("first", "running")
+        self.seed_worker("second", "starting")
+        controller = self.build(
+            observation=observation_demand(1), config=self.fleet(max_instances=2)
+        )
+        self.report(("first", "running"), ("second", "pending"))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("slot_busy", result["reasons"])
+        self.assertNotIn("awaiting_claim", result["reasons"])
+        self.assertEqual(result["free_instances"], 0)
+        self.assertEqual(result["recent_launches"], 2)
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_the_default_limit_of_one_ends_in_a_busy_slot_first(self):
+        self.seed_worker("booting", "running")
+        controller = self.build(observation=observation_demand(1))
+        self.assertEqual(self.config.controller.max_instances, 1)
+        self.report(("booting", "running"))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("slot_busy", result["reasons"])
+        self.assertNotIn("awaiting_claim", result["reasons"])
+        self.assertEqual(result["recent_launches"], 1)
+
+    def test_no_runnable_demand_keeps_precedence_and_reports_the_recent_launches(self):
+        self.seed_worker("booting", "running")
+        controller = self.build(observation=observation_empty(), config=self.fleet())
+        self.report(("booting", "running"))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "wait")
+        self.assertIn("no_runnable_demand", result["reasons"])
+        self.assertNotIn("awaiting_claim", result["reasons"])
+        self.assertEqual(result["demand"], 0)
+        self.assertEqual(result["recent_launches"], 1)
+        self.assertEqual(self.aws.mutations(), [])
+
+    # -- the bounds do not change -------------------------------------------
+    def test_a_decision_that_refuses_for_the_price_reports_the_recent_launches(self):
+        self.seed_worker("booting", "running")
+        aws = FakeAws(spot_quote=quote(price_micros=50_000, clock=self.clock))
+        controller = self.build(observation=observation_demand(2), aws=aws, config=self.fleet())
+        self.report(("booting", "running"))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("spot_price_above_cap", result["reasons"])
+        self.assertEqual(result["recent_launches"], 1)
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_a_decision_that_refuses_for_the_template_reports_the_recent_launches(self):
+        self.seed_worker("booting", "running")
+        aws = FakeAws(
+            template_facts=ProviderRefusal("TEMPLATE_NOT_FOUND"),
+            spot_quote=quote(clock=self.clock),
+        )
+        controller = self.build(observation=observation_demand(2), aws=aws, config=self.fleet())
+        self.report(("booting", "running"))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("template_unusable", result["reasons"])
+        self.assertEqual(result["recent_launches"], 1)
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_the_allowance_still_bounds_the_demand_that_no_launch_covers(self):
+        config = load(
+            write_config(
+                self.root,
+                config={"budget": {"allowance": "0.50"}, "controller": {"max_instances": 4}},
+            )
+        )
+        self.seed(state="running", operation_id="live", reservation=540_000)
+        result = self.build(observation=observation_demand(2), config=config).plan()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("budget_allowance_exhausted", result["reasons"])
+        self.assertEqual(result["recent_launches"], 1)
+        self.assertEqual(result["launch_count"], 0)
+
+    def test_the_slot_limit_still_bounds_the_demand_that_no_launch_covers(self):
+        # The allowance affords four more workers, so only the two free slots
+        # bind, and the batch is not reported as capped by the budget.
+        config = load(
+            write_config(
+                self.root,
+                config={"controller": {"max_instances": 3}, "budget": {"allowance": "3.00"}},
+            )
+        )
+        self.seed(
+            state="running", operation_id="booting", instance_id="i-booting", reservation=540_000
+        )
+        controller = self.build(observation=observation_demand(10), config=config)
+        self.report(("booting", "running"))
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["recent_launches"], 1)
+        self.assertEqual(result["free_instances"], 2)
+        self.assertEqual(result["launch_count"], 2)
+        self.assertNotIn("budget_capped_batch", result["notes"])
+        self.assertEqual(len(self.operation_ids()), 3)
+
+    # -- plan reports what apply uses -----------------------------------------
+    def plan_then_apply(self, demand, *workers):
+        """Plan, then apply from a fresh controller, over a ledger that matches the provider.
+
+        Each worker is ``(name, ledger state, provider state)``.
+        """
+        for name, state, _ in workers:
+            self.seed_worker(name, state)
+        before = [operation.as_dict() for operation in self.reopened().operations()]
+        planner = self.build(observation=observation_demand(demand), config=self.fleet())
+        self.report(*[(name, provider) for name, _, provider in workers])
+        planned = planner.plan()
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual([operation.as_dict() for operation in self.reopened().operations()], before)
+        applier = self.build(observation=observation_demand(demand), aws=self.aws, config=self.config)
+        return planned, applier.apply()
+
+    def test_plan_reports_a_held_launch_as_apply_uses_it(self):
+        planned, applied = self.plan_then_apply(1, ("booting", "running", "running"))
+        self.assertEqual(planned["decision"], "wait")
+        self.assertEqual(applied["decision"], "wait")
+        for result in (planned, applied):
+            self.assertIn("awaiting_claim", result["reasons"])
+            self.assertEqual(result["recent_launches"], 1)
+            self.assertEqual(result["launch_count"], 0)
+
+    def test_plan_reports_the_batch_after_coverage_as_apply_uses_it(self):
+        planned, applied = self.plan_then_apply(
+            3, ("first", "starting", "pending"), ("second", "running", "running")
+        )
+        self.assertEqual(planned["decision"], "would_launch")
+        self.assertEqual(applied["decision"], "launched")
+        for result in (planned, applied):
+            self.assertEqual(result["demand"], 3)
+            self.assertEqual(result["recent_launches"], 2)
+            self.assertEqual(result["launch_count"], 1)
+
 
 class BudgetHeadroomTests(ControllerCase):
     def headroom_config(self, *, max_instances, allowance):
@@ -2384,14 +2812,18 @@ class CostTrackingTests(ControllerCase):
             )
         )
         config = load(path)
-        ledger = Ledger(config.state.database, clock=self.clock).connect()
+        # The worker was created and launched ten minutes ago with its full
+        # lifetime, which is past the claim grace: it covers no waiting job, so
+        # this test stays about the commitment, not about coverage.
+        launched = self.clock.now - self.PAST_THE_GRACE
+        ledger = Ledger(config.state.database, clock=lambda: launched).connect()
         with ledger.transaction():
             ledger.new_operation(
                 operation_id="a",
                 client_token="ci-burst-a",
                 request={"seed": True},
                 request_sha256="0" * 64,
-                expires_at=self.clock.now + 3600,
+                expires_at=launched + 3600,
                 reservation_micros=200_001,
                 window_start=current_window(self.clock.now, config.budget.window_seconds),
                 region=config.aws.region,
@@ -2399,7 +2831,7 @@ class CostTrackingTests(ControllerCase):
                 price_micros=200_000,
             )
         ledger.set_instance("a", "i-a")
-        ledger.set_launch_time("a", self.clock.now - 600)
+        ledger.set_launch_time("a", launched)
         ledger.set_state("a", "running", instance_id="i-a")
         ledger.close()
         controller = self.build(observation=observation_demand(2), config=config)

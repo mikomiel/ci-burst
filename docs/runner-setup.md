@@ -408,9 +408,8 @@ error kind next to its `claim-timeout` step. And a Go program exits with status 
 after an unrecovered panic or a fatal signal such as `SIGQUIT`. That is Go runtime
 behaviour, not runner code. The runner's own source registers no handler for
 `SIGQUIT`, so the runtime default applies. A job step runs as the runner's account,
-so it can send the runner `SIGQUIT` and make it end with status 2. That is read
-from source and has not been observed on the runner; the live check below records
-it. An invalid or already used registration fails earlier, with status 1. Status 2
+so it can send the runner `SIGQUIT` and make it end with status 2, and a live
+check observed exactly that. An invalid or already used registration fails earlier, with status 1. Status 2
 alone is therefore not proof, and the bootstrap asks for more.
 
 The bootstrap keeps polling only when all three of these hold:
@@ -445,8 +444,8 @@ Three limits to know:
   as the account that runs the runner. It can end the runner with status 2 (see
   above), and it can end its own processes first. The message half is then the
   only guard. Three routes for job code to put the message into the capture are
-  closed. This is read from the runner's source and from a local check of the
-  pipe, not observed on a worker:
+  closed. This is read from the runner's source, and a live check on the worker
+  image confirmed each route:
   - Root creates the capture pipe with mode 0600, so the job account cannot open it
     through `/proc/<pid>/fd`.
   - A host-executor step gets its own output pipes, not the runner's: `cmd.Stdout`
@@ -491,8 +490,9 @@ Three limits to know:
   account that exists in the baked image at that moment would end every worker
   after its first poll, and the live check below shows it.
 
-**Qualify it live before you enable it.** The status, the message and the polling
-behaviour come from source and from stub tests, not from a live run. Before a
+**Qualify it live before you enable it.** The live checks named above ran
+against an earlier version of these bytes. They do not qualify the exact template
+version a deployment will set. Before a
 deployment sets a template version that carries this bootstrap, run bounded
 launches from that version and confirm:
 

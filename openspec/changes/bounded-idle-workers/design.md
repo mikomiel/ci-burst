@@ -99,14 +99,23 @@ Two boundaries carry that weight:
   then makes the poll a finished attempt, so no job process can write into the
   capture after the bootstrap has read it. The runner itself writes into the
   capture through the descriptor the bootstrap gives it, so closing the path does
-  not close every route: whether the runner's children inherit that descriptor,
-  and whether a step can reach the runner's own descriptors, is unverified. Task
-  7.3 tests those routes.
-- A second job after a misclassification is prevented by the ephemeral
-  registration. If a forged empty poll is accepted, the next poll uses a
-  registration that the claimed task has already consumed. The pinned runner then
-  fails with status 1, which is a finished attempt, so the worker ends after one
-  refused poll. Task 7.2 records that refusal live.
+  not close every route. The live check of task 7.3 found that a step's output
+  goes to its own pipe, not the runner's, and that a step cannot open the runner's
+  descriptors through `/proc`, because root created the pipe. It also found one
+  open route: at the worker image's kernel default (`kernel.yama.ptrace_scope`
+  0), a step can trace the runner and open its memory for writing, so it can make
+  the runner itself write the message. The bootstrap therefore limits tracing to
+  descendants before the first poll (scope 1, and a stricter value is kept). The
+  runner is the step's ancestor, so the step can no longer attach to it. A worker
+  that cannot confirm the limit polls once, so a forged empty poll ends it.
+- A second job after a misclassification is prevented by the server, not by the
+  worker. The next poll uses the registration that the claimed task holds. Task
+  7.2 found that Forgejo gives that registration no further task: while it
+  still counts the claimed task as running, a poll gets the no-task result (the
+  documented status and message, so it reads as empty), and once the task has
+  ended, normally or at the server's zombie-task timeout, the poll is refused
+  with status 1. A misclassification therefore costs at most idle polls until the
+  claim deadline. It does not start a second job.
 
 Task 3.2 tests the survival rule with a matching status and message, and task 7.8
 observes a live surviving process. Open question 2 records the decision that the
@@ -298,8 +307,9 @@ rows it already reads, makes no new AWS call and takes no new credential.
 | No task arrives before the deadline | `STEP claim-timeout`, the guarded registration-file removal, exit status 0, cleanup and shutdown. A job that is still waiting stays waiting, and the controller can launch a replacement after the grace. |
 | A poll hangs without a task | The claim deadline does not interrupt it. The job timeout and the instance lifetime end it, as they end a hung wait today. |
 | A Spot interruption notice arrives during the claim window | The watcher's existing retry signals the next `runner`-owned `forgejo-runner` process it finds, and a signalled poll is a finished attempt. A poll that starts after the notice can still receive a task before the signal lands, and the signal then ends that job. This change adds no stop condition for it, because handling Spot interruptions is a non-goal. |
-| Empty polls invalidate the registration (unverified) | The next poll fails with something other than the empty result, so the loop ends as a failed attempt and the worker shuts down. The controller can then launch again, bounded by the slot limit and the allowance. This is why section 7 of the tasks qualifies the behaviour before the template is enabled. |
-| Job output imitates the empty result | Expected to be rejected: the job account cannot open the capture by path, the bootstrap reads the capture only after the one-job process has exited, a surviving job process ends the loop, and the status must match as well. A descriptor that the runner passes on to its children could still be a route (open question 2). The setup guide says ephemeral mode makes Forgejo delete the runner after one job, so a later poll is expected to be refused. Task 7.3 and task 7.2 qualify both. |
+| Empty polls invalidate the registration (not observed: the live check kept one registration valid across repeated empty polls) | The next poll fails with something other than the empty result, so the loop ends as a failed attempt and the worker shuts down. The controller can then launch again, bounded by the slot limit and the allowance. |
+| Job output imitates the empty result | Rejected: the job account cannot open the capture by path or the runner's descriptors through `/proc`, a step's output is not the runner's output, the bootstrap reads the capture only after the one-job process has exited, and a surviving job process ends the loop. Tracing the runner is closed by the ptrace limit; without a confirmed limit the worker polls once. If a forged empty poll is still accepted, Forgejo gives the registration no further task, so the worker polls idle until the deadline (tasks 7.2 and 7.3). |
+| The ptrace limit cannot be set or confirmed | The bootstrap prints a warning and the worker polls once: an empty first poll is a claim timeout. |
 | A claimed job writes more output than the capture bound | The bound limits what the bootstrap reads. The process is not stopped, signalled or blocked, and the oversized capture makes the poll a finished attempt. |
 | The runner's no-task status or message changes | The signature stops matching. The worker ends after its first poll instead of looping. |
 | A recent worker fails bootstrap or never registers | It covers its job until it enters the state `terminating`, reaches a terminal state or the grace ends. Admission can then launch a replacement. |
@@ -366,24 +376,20 @@ enables that version. The tasks name this in 3.5 and 7.1.
 
 ## Evidence gaps
 
-- Whether empty polls keep the ephemeral registration valid on the pinned runner,
-  13.2.1, is unverified. If an empty poll invalidated the registration, the worker
-  would end after its second poll and the controller could launch again. The
-  operator must qualify this live before the template version is enabled.
-- Task 1.1 recorded the no-task result from the pinned runner's source: status 2
-  and the message on standard error, as described in the worker setup guide. A
-  failed request for a task ends the same way after an error-level line, so it
-  counts as an empty poll; the worker still ends at the claim deadline. Status 2
-  is also the Go runtime's status for a panic or a fatal signal such as
-  `SIGQUIT`, which a job step running as the runner's account can send. The
-  status half and the survival rule therefore do not stop a hostile job; the
-  message half is the guard that holds. None of this has been observed on a live
-  runner yet.
-- Whether the runner's child processes inherit its standard output or standard
-  error is unverified. If they do, a job step can write the documented message
-  into the capture through that descriptor, and with the point above the
-  signature would not hold against that job. Task 7.3 tests the route, and open
-  question 2 records the decision that the result feeds.
+- A live check on the pinned runner, 13.2.1, against the production Forgejo
+  version showed that the ephemeral registration stays valid across repeated empty
+  polls, and that an empty poll ends with status 2 and the message on standard
+  error. The operator's deployment records hold the details.
+- Status 2 is also the Go runtime's status for a panic or a fatal signal such as
+  `SIGQUIT`, which a job step running as the runner's account can send; the live
+  check observed it. The status half and the survival rule therefore do not stop
+  a hostile job. The message half holds only with the ptrace limit, and the
+  server's refusal of a second task bounds what a forged empty poll costs.
+- The live check found that a step's output is not the runner's output: a child
+  process does not inherit the runner's standard output or standard error.
+- The ptrace limit was checked on the worker image with the limit set before the
+  runner starts. A runner or kernel change, an executor other than `host`, or a
+  runner log level of `debug` or `trace` needs the check again.
 - The values 300 seconds and 10 seconds are unmeasured. The repository holds no
   boot-to-claim timing.
 - Hypothesis, not a claim: a known Forgejo behaviour may leave a long-polling
@@ -396,10 +402,9 @@ enables that version. The tasks name this in 3.5 and 7.1.
   poll loop may also reduce this idle mode. This is unverified for the pinned
   runner. The live qualification should look for it and record the result, and
   nothing in this change depends on it being true.
-- No live run has exercised either half. The source and the policy tests prove the
-  shape, not the behaviour. Runtime verification needs one claim timeout and one
-  claimed job in the event stream, and one held launch in a `plan` or `apply`
-  result.
+- Runtime verification still needs one claim timeout and one claimed job in the
+  event stream from the published template version, and one held launch in a
+  `plan` or `apply` result.
 
 ## Open questions
 
@@ -411,19 +416,15 @@ enables that version. The tasks name this in 3.5 and 7.1.
    remove the protection against a repeat launch. A second question is whether the
    default should exceed the worker's window by a boot margin. This change sets the
    default equal to the window and keeps it there.
-2. Whether a descriptor that the runner passes on to its children can reach the
-   capture. The spec closes the capture's path, requires the capture to be read
-   only after the one-job process has exited, and ends the loop when a process of
-   the job account survives. It does not claim that an inherited descriptor is
-   closed, because the runner's behaviour is unverified. Recommendation: keep the
-   signature as specified and let task 7.3 decide. The runner's source
-   already shows that a job step can end a claimed runner with the documented
-   status (`SIGQUIT`), so the status half is forgeable and does not count as a
-   guard. Two guards remain. The message half holds only if task 7.3 shows that a
-   job step cannot place the documented message in the capture. The ephemeral
-   registration holds only if task 7.2 shows that a poll after a claimed task is
-   refused with another status: then a forged empty poll leads to one refused
-   poll and a finished attempt, not to a second job. Activation requires both
-   records. If either fails, reopen this change before the template version is
-   enabled. The cost is a design change to the signature, not a rollback, because
-   no version is enabled before the checks.
+2. Whether job code can make an empty poll. Decided by the live checks of tasks
+   7.2 and 7.3. The status half is forgeable (`SIGQUIT`) and does not count as a
+   guard. The message half holds against the step's own output, the capture path
+   and the runner's descriptors, and against tracing the runner once the
+   bootstrap has limited ptrace to descendants; at the image's kernel default it
+   did not hold. The ephemeral registration does not refuse a poll while the
+   claimed task still runs: the poll reads as empty. Forgejo still gives that
+   registration no second task, and refuses it once the task has ended.
+   Decision: keep the signature, add the ptrace limit with a one-poll fallback,
+   and treat the server's one-task rule as the bound on a misclassification, not
+   the refusal. Activation requires a template version whose bytes carry the
+   limit, and the live checks of section 7 on that version.

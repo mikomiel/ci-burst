@@ -408,9 +408,8 @@ error kind next to its `claim-timeout` step. And a Go program exits with status 
 after an unrecovered panic or a fatal signal such as `SIGQUIT`. That is Go runtime
 behaviour, not runner code. The runner's own source registers no handler for
 `SIGQUIT`, so the runtime default applies. A job step runs as the runner's account,
-so it can send the runner `SIGQUIT` and make it end with status 2. That is read
-from source and has not been observed on the runner; the live check below records
-it. An invalid or already used registration fails earlier, with status 1. Status 2
+so it can send the runner `SIGQUIT` and make it end with status 2, and a live
+check observed exactly that. An invalid or already used registration fails earlier, with status 1. Status 2
 alone is therefore not proof, and the bootstrap asks for more.
 
 The bootstrap keeps polling only when all three of these hold:
@@ -445,8 +444,8 @@ Three limits to know:
   as the account that runs the runner. It can end the runner with status 2 (see
   above), and it can end its own processes first. The message half is then the
   only guard. Three routes for job code to put the message into the capture are
-  closed. This is read from the runner's source and from a local check of the
-  pipe, not observed on a worker:
+  closed. This is read from the runner's source, and a live check on the worker
+  image confirmed each route:
   - Root creates the capture pipe with mode 0600, so the job account cannot open it
     through `/proc/<pid>/fd`.
   - A host-executor step gets its own output pipes, not the runner's: `cmd.Stdout`
@@ -458,11 +457,28 @@ Three limits to know:
     default is `info`.
 
   A runner upgrade, an executor other than `host` and a log level of `debug` or
-  `trace` each need the live check again. One route is not examined: job code that
-  controls the runner process itself, for example with `ptrace` or
-  `/proc/<pid>/mem` on a process of the same account, could make the runner write
-  the message. The image recipe sets no `ptrace` policy, and this repository has
-  not checked the kernel default.
+  `trace` each need the live check again.
+
+  One more route needs a kernel setting. Job code that controls the runner
+  process itself, with `ptrace` or a write to `/proc/<pid>/mem` on a process of
+  the same account, can make the runner write the message and end with status 2.
+  The worker image's kernel default (`kernel.yama.ptrace_scope` 0) lets a process
+  trace any process of its own account, and a live check showed that a job step
+  could attach to the runner and open its memory for writing. The bootstrap
+  therefore sets the scope to 1 before the first poll, which limits tracing to a
+  process's own descendants. The runner is the step's ancestor, so the step can
+  no longer attach to it, and the same live check showed the attach and the memory
+  write refused. A stricter value that is already set is kept. A worker that
+  cannot confirm the limit prints `WARNING: ptrace not limited, polling once` and
+  ends after an empty first poll, so a forged empty poll ends that worker instead
+  of starting another poll.
+
+  If an empty poll is forged anyway, Forgejo bounds the damage: it gives a used
+  ephemeral registration no second task. While it still counts the claimed task
+  as running, a poll with that registration gets the no-task result and reads as
+  empty, so the worker polls idle until the deadline. Once the task has ended,
+  normally or at the server's zombie-task timeout, the poll is refused with
+  status 1.
 - A process that keeps the runner's output open after the runner exits keeps the
   poll from ending, because the copy waits for the end of the stream. The worker
   then waits for it. The job timeout does not end that wait, because `timeout`
@@ -474,8 +490,9 @@ Three limits to know:
   account that exists in the baked image at that moment would end every worker
   after its first poll, and the live check below shows it.
 
-**Qualify it live before you enable it.** The status, the message and the polling
-behaviour come from source and from stub tests, not from a live run. Before a
+**Qualify it live before you enable it.** The live checks named above ran
+against an earlier version of these bytes. They do not qualify the exact template
+version a deployment will set. Before a
 deployment sets a template version that carries this bootstrap, run bounded
 launches from that version and confirm:
 
@@ -483,12 +500,15 @@ launches from that version and confirm:
   no other line of that poll matches an error rule of the exporter;
 - the ephemeral registration stays valid across repeated empty polls, and the
   first claimed task consumes it;
-- a poll after a claimed task is refused and does not read as an empty poll;
+- after a job that ends normally, a poll with the same registration is refused
+  and does not read as an empty poll; after a job step ends the runner with
+  `SIGQUIT`, no second task reaches that registration;
 - an adversarial job step does not make the poll empty, and the worker does not
   poll again after that job. The step writes the documented message to its own
   standard output and standard error, to the capture path, to the runner's own
   descriptors through `/proc` and to a descriptor that a child process inherits,
-  and it tries to attach to the runner with `ptrace`. Then it sends the runner
+  and it tries to attach to the runner with `ptrace` and to open its
+  `/proc/<pid>/mem` for writing. Then it sends the runner
   `SIGQUIT`, ends and leaves no process of the job account running. Record each
   result and the runner's exit status (expect 2);
 - a background process of the job account that is left running after a job step

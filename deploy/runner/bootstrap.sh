@@ -94,6 +94,24 @@ echo "STEP register"
 iptables -A OUTPUT -m owner --uid-owner runner -d 169.254.169.254 -j REJECT
 iptables -A OUTPUT -m owner --uid-owner runner -d 169.254.170.2 -j REJECT
 
+# A job step runs as the job account, and so does the runner whose status and
+# output decide whether a poll was empty. Limit ptrace to descendants before the
+# first poll, so a step cannot attach to its parent runner, write its memory and
+# make it print the no-task message. The image's kernel default allows that. A
+# limit that is already stricter is kept. A worker that cannot confirm the limit
+# polls once, as before the claim window: a forged empty poll then ends the
+# worker instead of starting another poll.
+PTRACE_LIMITED=no
+PTRACE_SCOPE=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null) || PTRACE_SCOPE=""
+if [ "$PTRACE_SCOPE" = 0 ]; then
+  sysctl -q -w kernel.yama.ptrace_scope=1 || echo "WARNING: ptrace limit refused"
+  PTRACE_SCOPE=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null) || PTRACE_SCOPE=""
+fi
+case "$PTRACE_SCOPE" in
+  1|2|3) PTRACE_LIMITED=yes ;;
+  *) echo "WARNING: ptrace not limited, polling once" ;;
+esac
+
 # AWS sends a two-minute notice before it reclaims a Spot instance. The job
 # account cannot reach the metadata service (the REJECT rules above), so root
 # reads the notice here. On a notice the worker publishes one fixed marker on
@@ -264,6 +282,7 @@ while :; do
     || POLL_STATUSES=("${PIPESTATUS[@]}")
   JOB_RC=${POLL_STATUSES[0]:-1}
   poll_is_empty "$JOB_RC" || break
+  [ "$PTRACE_LIMITED" = yes ] || claim_timeout
   claim_deadline_passed && claim_timeout
   sleep "$POLL_INTERVAL_SECONDS"
   claim_deadline_passed && claim_timeout

@@ -34,32 +34,38 @@ BOOTSTRAP = ROOT / "deploy" / "runner" / "bootstrap.sh"
 SETUP_GUIDE = ROOT / "docs" / "runner-setup.md"
 DEPLOYMENT_DOC = ROOT / "docs" / "deployment.md"
 
-#: sha256 of the bytes published as ``ci-burst-runner-multiaz`` version 4.
-#: Update only together with a published template version and the deployment
-#: TOML's ``launch_template_version``.
-PUBLISHED_TEMPLATE_VERSION = 4
+#: sha256 of the user data that ``ci-burst-runner-multiaz`` version 6 carries.
+#: Production launches version 6. Versions 4, 5 and 6 carry the same user-data
+#: bytes: versions 5 and 6 changed only the image id. Update only together with a
+#: published template version and the deployment TOML's
+#: ``launch_template_version``.
+PUBLISHED_TEMPLATE_VERSION = 6
 PUBLISHED_TEMPLATE_SHA256 = (
     "79435dab3f02405a54957aa60cbe8b3d635fc30e93dbf3ca19ca9ab53d23d219"
 )
 
 #: The publication this change prepares but does not perform. While a pending
 #: publication exists the repository bytes must equal it, so the pin is not
-#: weakened. Publication is the operator step: publish the next launch-template
-#: version, update the deployment TOML's ``launch_template_version``, then flip
-#: these constants in a follow-up change (published becomes the pending pair and
-#: both PENDING values become ``None``).
+#: weakened. Publication is the operator step: publish the bytes as a new
+#: launch-template version, update the deployment TOML's
+#: ``launch_template_version``, then flip these constants in a follow-up change
+#: (published becomes the pending pair and both PENDING values become ``None``).
 #:
-#: Version 5 is still owed: #110 prepared it for the one-job process status, and
-#: that version was never published. Each later bootstrap change joins it,
-#: because only one publication may be outstanding at a time, so the operator
-#: publishes one version 5 that carries all of them. The bounded claim window is
-#: one of them. Enabling version 5 for any of them enables the claim window too,
-#: so qualify it live (runner-setup.md, "The claim window") before a deployment
-#: sets version 5. If version 5 is published from earlier bytes first, the next
-#: version is 6 and these constants move with it instead.
-PENDING_TEMPLATE_VERSION = 5
+#: Version 7 was published with the 0.8.0 bootstrap bytes (sha256
+#: 3474b96723841ebb31ef46b600fa67f44b7db941d7676857cca520b305d28769) and was never
+#: set in the deployment. The bytes in this branch differ from those only by the
+#: ptrace limit, and they will be published as version 8. The pending version only
+#: has to be greater than the published one: a version that changes only the image
+#: and a version that a later one supersedes each consume a number.
+#:
+#: Only one publication may be outstanding at a time, so each later bootstrap
+#: change joins the pending one. The pending bytes carry the bounded claim window
+#: and the ptrace limit, so qualify them live (runner-setup.md, "The claim window")
+#: before a deployment sets version 8. If a version is published from earlier
+#: bytes first, the pending version moves past it instead.
+PENDING_TEMPLATE_VERSION = 8
 PENDING_TEMPLATE_SHA256 = (
-    "3474b96723841ebb31ef46b600fa67f44b7db941d7676857cca520b305d28769"
+    "1e14208cc254a5c06915bb6ad9775dd2525a62ad7d70971355c42709a562b324"
 )
 
 
@@ -89,6 +95,14 @@ def _capture_snippet():
     end = next(
         index for index, line in enumerate(lines) if index > fallback and line.strip() == "fi"
     )
+    return "\n".join(lines[start : end + 1])
+
+
+def _ptrace_snippet():
+    """The shipped ptrace-limit block, for an execution test."""
+    lines = BOOTSTRAP.read_text(encoding="utf-8").splitlines()
+    start = next(index for index, line in enumerate(lines) if line == "PTRACE_LIMITED=no")
+    end = next(index for index, line in enumerate(lines) if index > start and line == "esac")
     return "\n".join(lines[start : end + 1])
 
 
@@ -145,8 +159,11 @@ class RunnerBootstrapTests(unittest.TestCase):
 
         Exactly one publication is authoritative: the pending pair while a
         pending publication exists, and the published pair otherwise. Half a
-        state, a pending version that is not the next one, or two equal digests
-        are contradictory and fail rather than silently widen acceptance.
+        state, a pending version that is not later than the published one, or
+        two equal digests are contradictory and fail rather than silently widen
+        acceptance. The pending version need not be the next number: a version
+        that changes only the image and a version that a later one supersedes
+        each consume a number too.
         """
         pending_version = PENDING_TEMPLATE_VERSION
         pending_sha256 = PENDING_TEMPLATE_SHA256
@@ -158,10 +175,10 @@ class RunnerBootstrapTests(unittest.TestCase):
         if pending_version is not None:
             if not isinstance(PUBLISHED_TEMPLATE_VERSION, int) or PUBLISHED_TEMPLATE_SHA256 is None:
                 self.fail("a pending publication requires the published version it follows")
-            if pending_version != PUBLISHED_TEMPLATE_VERSION + 1:
+            if not isinstance(pending_version, int) or pending_version <= PUBLISHED_TEMPLATE_VERSION:
                 self.fail(
-                    "the pending publication must be the next version after "
-                    f"{PUBLISHED_TEMPLATE_VERSION}, not {pending_version}"
+                    "the pending publication must be a later version than "
+                    f"{PUBLISHED_TEMPLATE_VERSION}, not {pending_version!r}"
                 )
             if pending_sha256 == PUBLISHED_TEMPLATE_SHA256:
                 self.fail(
@@ -193,7 +210,12 @@ class RunnerBootstrapTests(unittest.TestCase):
     def test_publication_state_refuses_absent_and_contradictory_states(self):
         states = {
             "half a pending pair": {"PENDING_TEMPLATE_VERSION": None},
-            "pending version is not next": {"PENDING_TEMPLATE_VERSION": 6},
+            "pending version equals the published one": {
+                "PENDING_TEMPLATE_VERSION": PUBLISHED_TEMPLATE_VERSION
+            },
+            "pending version is earlier than the published one": {
+                "PENDING_TEMPLATE_VERSION": PUBLISHED_TEMPLATE_VERSION - 1
+            },
             "pending digest equals published": {"PENDING_TEMPLATE_SHA256": PUBLISHED_TEMPLATE_SHA256},
             "no publication state": {
                 "PENDING_TEMPLATE_VERSION": None,
@@ -206,6 +228,24 @@ class RunnerBootstrapTests(unittest.TestCase):
                 with mock.patch.multiple(__name__, **values):
                     with self.assertRaises(AssertionError):
                         self._expected_publication()
+
+    def test_the_pending_version_may_skip_numbers_that_other_versions_consumed(self):
+        # A version that changes only the image and a version that a later one
+        # supersedes each take a number, so the pending version only has to be
+        # later than the published one. The digest is a stand-in, so the case does
+        # not depend on which publication is pending today.
+        stand_in = "0" * 64
+        for gap in (1, 2, 5):
+            with self.subTest(gap=gap):
+                pending = {
+                    "PENDING_TEMPLATE_VERSION": PUBLISHED_TEMPLATE_VERSION + gap,
+                    "PENDING_TEMPLATE_SHA256": stand_in,
+                }
+                with mock.patch.multiple(__name__, **pending):
+                    self.assertEqual(
+                        self._expected_publication(),
+                        (PUBLISHED_TEMPLATE_VERSION + gap, stand_in),
+                    )
 
     def test_advertises_the_routing_label_the_pool_label_and_the_arch_label(self):
         labels = self._label_argument()
@@ -440,6 +480,52 @@ class RunnerBootstrapTests(unittest.TestCase):
         for address in ("169.254.169.254", "169.254.170.2"):
             with self.subTest(address=address):
                 self.assertIn(f"--uid-owner runner -d {address} -j REJECT", self.script)
+
+    def test_the_ptrace_limit_is_decided_once_before_the_first_poll(self):
+        # Job code runs as the account that runs the runner. It can forge an empty
+        # poll only while it can attach to the runner, so the limit has to stand
+        # before the first poll, and one block must be the only place that says
+        # whether it does.
+        start = self.lines.index("PTRACE_LIMITED=no")
+        self.assertEqual(self.lines.count("PTRACE_LIMITED=no"), 1)
+        self.assertLess(self._line_index('echo "STEP register"'), start)
+        self.assertLess(start, self._line_index("exec 9>&1"))
+        self.assertLess(start, self._line_index("spot_watch &"))
+        # The flag is assigned twice: its default, and the one confirmation that
+        # sits in the block. Whole lines, so an edit cannot hide a third assignment.
+        assigned = [index for index, line in enumerate(self.lines) if "PTRACE_LIMITED=" in line]
+        self.assertEqual(
+            [self.lines[index] for index in assigned],
+            ["PTRACE_LIMITED=no", "  1|2|3) PTRACE_LIMITED=yes ;;"],
+        )
+        block_end = start + len(_ptrace_snippet().splitlines())
+        self.assertTrue(all(start <= index < block_end for index in assigned), assigned)
+        # The claim loop reads the flag in one place: right after an empty poll,
+        # before anything that starts another poll.
+        guard = '  [ "$PTRACE_LIMITED" = yes ] || claim_timeout'
+        self.assertEqual(self.lines.count(guard), 1)
+        self.assertEqual(
+            self.lines[self.lines.index(guard) - 1], '  poll_is_empty "$JOB_RC" || break'
+        )
+
+    def test_the_ptrace_warnings_are_not_exporter_error_rules(self):
+        # The exporter publishes an error kind for any console line that matches
+        # one of its rules, by a lower-case substring. A warning that this block
+        # prints must not read as a failure of the worker.
+        from ci_burst.export import ERROR_RULES, ConsoleFacts, parse_console
+
+        warnings = re.findall(r'echo "(WARNING: [^"]*)"', _ptrace_snippet())
+        self.assertEqual(
+            warnings,
+            ["WARNING: ptrace limit refused", "WARNING: ptrace not limited, polling once"],
+        )
+        for warning in warnings:
+            for kind, needles in ERROR_RULES:
+                for needle in needles:
+                    with self.subTest(warning=warning, kind=kind, needle=needle):
+                        self.assertNotIn(needle, warning.lower())
+        # The same through the parser: no error kind and no marker of any other sort.
+        self.assertEqual(parse_console("\n".join(warnings)), ConsoleFacts((), None, ()))
 
     def test_watches_the_spot_notice_as_root_before_the_job_starts(self):
         # The job account is denied the metadata service above, so the watcher
@@ -752,7 +838,8 @@ class TailHarness:
     read a virtual clock, and ``id`` names the job account's uid. The pipeline,
     the capture, the classification and the endings are the shipped code. A
     synthetic EXIT trap stands in for ``on_exit`` and proves the tail's exit still
-    reaches it.
+    reaches it. The head of the bootstrap sets the deadline and the ptrace flag
+    before the tail runs, so the harness writes both as literals.
 
     The job account cannot be a real user here, so a surviving job process is a
     fake ``/proc/<pid>/status`` entry that carries the stub uid.
@@ -845,6 +932,7 @@ class TailHarness:
         registration_file=True,
         capture_available=True,
         clock_offset=0,
+        ptrace_limited=True,
         env=None,
     ):
         """Launch the extracted tail and return the process.
@@ -854,8 +942,10 @@ class TailHarness:
         optional output instead. ``clock_offset`` moves the virtual clock from the
         moment the claim window started. ``registration_file=False`` puts a
         non-empty directory where the registration file lives, which makes the
-        shipped ``rm -f`` fail; no command is stubbed for that. ``env`` adds
-        variables to the environment of the bootstrap shell.
+        shipped ``rm -f`` fail; no command is stubbed for that.
+        ``ptrace_limited=False`` starts the tail as a worker that could not confirm
+        the ptrace limit. ``env`` adds variables to the environment of the
+        bootstrap shell.
         """
         self._reset()
         registration = self.work / ".runner"
@@ -893,6 +983,7 @@ class TailHarness:
                     f" CAPTURE_DIR={shlex.quote(str(self.capture_dir))}",
                     *(_literal_line(name) for name in PUBLISHED_LITERALS),
                     f"CLAIM_DEADLINE={self.CLOCK_START + window}",
+                    f"PTRACE_LIMITED={'yes' if ptrace_limited else 'no'}",
                     'CAPTURE=""',
                     _function_snippet("cleanup_capture"),
                     COMMON_STUBS,
@@ -1089,6 +1180,90 @@ class BootstrapTailTests(TailHarness, unittest.TestCase):
         self.assertTrue((self.work / ".runner").is_dir())
 
 
+@unittest.skipUnless(shutil.which("bash"), "the ptrace block runs under bash")
+class PtraceLimitTests(unittest.TestCase):
+    """Run the shipped ptrace-limit block against a stub scope file and ``sysctl``.
+
+    The real block reads and writes the kernel setting. Here the scope file is a
+    temporary file, and ``sysctl`` either writes the requested value into it or
+    fails without writing, so each starting value and each failure is covered.
+    """
+
+    def run_block(self, scope, *, sysctl_works=True):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope_file = root / "ptrace_scope"
+            if scope is not None:
+                scope_file.write_text(f"{scope}\n", encoding="utf-8")
+            calls = root / "sysctl-calls"
+            snippet = _ptrace_snippet().replace(
+                "/proc/sys/kernel/yama/ptrace_scope", str(scope_file)
+            )
+            self.assertNotIn("/proc/", snippet)
+            if sysctl_works == "silent":
+                effect = "  return 0\n"  # reports success but changes nothing
+            elif sysctl_works:
+                effect = (
+                    f"  printf '%s\\n' \"${{3#kernel.yama.ptrace_scope=}}\" > {shlex.quote(str(scope_file))}\n"
+                    "  return 0\n"
+                )
+            else:
+                effect = "  return 1\n"
+            stub = (
+                "sysctl() {\n"
+                f'  printf "%s\\n" "$*" >> {shlex.quote(str(calls))}\n'
+                + effect
+                + "}\n"
+            )
+            script = "set -euo pipefail\n" + stub + snippet + '\necho "result=$PTRACE_LIMITED"\n'
+            completed = subprocess.run(
+                ["/bin/bash", "-c", script], capture_output=True, text=True, check=True
+            )
+            sysctl_calls = (
+                calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+            )
+            return completed.stdout.splitlines(), sysctl_calls
+
+    def test_scope_0_is_raised_to_1(self):
+        lines, calls = self.run_block(0)
+        self.assertEqual(calls, ["-q -w kernel.yama.ptrace_scope=1"])
+        self.assertEqual(lines, ["result=yes"])
+
+    def test_a_refused_raise_polls_once(self):
+        lines, calls = self.run_block(0, sysctl_works=False)
+        self.assertEqual(calls, ["-q -w kernel.yama.ptrace_scope=1"])
+        self.assertEqual(
+            lines,
+            [
+                "WARNING: ptrace limit refused",
+                "WARNING: ptrace not limited, polling once",
+                "result=no",
+            ],
+        )
+
+    def test_a_raise_that_does_not_take_effect_polls_once(self):
+        # The re-read decides, not the sysctl status.
+        lines, calls = self.run_block(0, sysctl_works="silent")
+        self.assertEqual(calls, ["-q -w kernel.yama.ptrace_scope=1"])
+        self.assertEqual(lines, ["WARNING: ptrace not limited, polling once", "result=no"])
+
+    def test_a_stricter_limit_is_kept(self):
+        for scope in (1, 2, 3):
+            with self.subTest(scope=scope):
+                lines, calls = self.run_block(scope)
+                self.assertEqual(calls, [])
+                self.assertEqual(lines, ["result=yes"])
+
+    def test_an_unreadable_or_unknown_scope_polls_once(self):
+        for scope in (None, "garbage", 4):
+            with self.subTest(scope=scope):
+                lines, calls = self.run_block(scope)
+                self.assertEqual(calls, [])
+                self.assertEqual(
+                    lines, ["WARNING: ptrace not limited, polling once", "result=no"]
+                )
+
+
 @unittest.skipUnless(shutil.which("bash"), "the claim loop runs under bash")
 class ClaimLoopTests(TailHarness, unittest.TestCase):
     """Run the shipped claim loop with a stub runner, a virtual clock and no pause.
@@ -1098,6 +1273,20 @@ class ClaimLoopTests(TailHarness, unittest.TestCase):
     child process behind the real pipeline, so the capture, the console copy and
     the status handling are exercised, not simulated.
     """
+
+    def test_without_a_confirmed_ptrace_limit_one_empty_poll_ends_the_worker(self):
+        # A job step that can trace the runner can forge an empty poll, so a worker
+        # that could not confirm the limit never starts a second poll.
+        completed = self.run_tail(
+            polls=[self.empty_poll()] * 3, ptrace_limited=False
+        )
+        self.assert_claim_timeout(completed, polls=1, pauses=0)
+
+    def test_without_a_confirmed_ptrace_limit_a_job_is_still_a_finished_attempt(self):
+        completed = self.run_tail(polls=[self.job_poll(), self.empty_poll()], ptrace_limited=False)
+        self.assert_finished_attempt(
+            completed, marker="bootstrap one-job completed rc=0", status=0, polls=1
+        )
 
     def test_each_poll_runs_the_one_job_mode_without_wait_under_the_job_timeout(self):
         completed = self.run_tail(polls=[self.empty_poll(), self.empty_poll(), self.job_poll()])

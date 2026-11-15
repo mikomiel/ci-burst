@@ -93,10 +93,17 @@ class ControllerConfig:
     needs a longer pass must raise the unit timeout; a larger value is not
     offered here. ``reap``, ``status`` and ``export`` keep their own behaviour
     and do not take it.
+
+    ``claim_grace_seconds`` is how long a launch that is still booting or
+    running covers one waiting job, so that the next pass does not launch
+    another worker for the same job. Its default equals the claim window of the
+    published bootstrap; there is no off value, because a grace of zero would
+    remove the protection against a repeat launch.
     """
 
     max_instances: int
     pass_deadline_seconds: int
+    claim_grace_seconds: int
 
 
 @dataclass(frozen=True)
@@ -369,7 +376,9 @@ def load(path):
     deployment = _string(raw, "deployment", "config", pattern=_DEPLOYMENT, pattern_name="a tag-safe name")
 
     controller_table = _table(
-        raw.get("controller", {}), "controller", ("max_instances", "pass_deadline_seconds")
+        raw.get("controller", {}),
+        "controller",
+        ("max_instances", "pass_deadline_seconds", "claim_grace_seconds"),
     )
     max_instances = _integer(
         controller_table, "max_instances", "controller", minimum=1, maximum=12, required=False
@@ -382,9 +391,18 @@ def load(path):
         maximum=290,
         required=False,
     )
+    claim_grace_seconds = _integer(
+        controller_table,
+        "claim_grace_seconds",
+        "controller",
+        minimum=60,
+        maximum=1800,
+        required=False,
+    )
     controller = ControllerConfig(
         max_instances=1 if max_instances is None else max_instances,
         pass_deadline_seconds=240 if pass_deadline_seconds is None else pass_deadline_seconds,
+        claim_grace_seconds=300 if claim_grace_seconds is None else claim_grace_seconds,
     )
 
     forgejo_table = _table(

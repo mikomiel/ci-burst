@@ -116,11 +116,11 @@ them.
 
 ## 4. Controller claim grace
 
-- [ ] 4.1 In `ci_burst/config.py`, add `claim_grace_seconds` to `ControllerConfig`
+- [x] 4.1 In `ci_burst/config.py`, add `claim_grace_seconds` to `ControllerConfig`
   and to the controller table's allowed-keys tuple, with the range and default
   from the spec (design open question 1 can change them). Keep the refusal of
   unknown keys.
-- [ ] 4.2 In `ci_burst/controller.py` `_decide`, count the recent launches from
+- [x] 4.2 In `ci_burst/controller.py` `_decide`, count the recent launches from
   `slot["operations"]`. Count only operations in the state `starting` or
   `running`, and skip every other state before the age test. Use each operation's
   `created_at` and the controller clock. Compute the count before the `slot_busy`
@@ -129,9 +129,9 @@ them.
   `requested = min(max(0, demand - recent_launches), free)`. Report
   `recent_launches` in every decision that `_decide` returns. Add no field to a
   result that ends before `_decide` runs.
-- [ ] 4.3 In `tests/test_config.py`, test the default, both bounds, a value just
+- [x] 4.3 In `tests/test_config.py`, test the default, both bounds, a value just
   outside each bound, a non-integer value and the refusal of an unknown key.
-- [ ] 4.4 In `tests/test_controller.py`, test each scenario in the delta: a booting
+- [x] 4.4 In `tests/test_controller.py`, test each scenario in the delta: a booting
   worker covers its job, demand above the recent launches, demand below them, a
   terminating worker that covers no job, a replacement after the grace, a
   replacement when the recent worker reaches a terminal state first, the
@@ -142,7 +142,7 @@ them.
   `controller.max_instances` above the number of seeded operations in every case
   that expects `awaiting_claim` or a launch, because the default limit of 1 ends in
   `slot_busy` first.
-- [ ] 4.5 Audit the existing controller tests. `seed(...)` creates a row at the
+- [x] 4.5 Audit the existing controller tests. `seed(...)` creates a row at the
   test clock's current time, so a seeded operation in the state `starting` or
   `running` is inside the grace, and a test that runs `apply` twice can be inside
   it as well. Give such a row an age beyond the grace unless the test is about
@@ -175,7 +175,7 @@ them.
   "Only an isolated operator canary", replace "an idle worker expires without
   taking a job" with an idle worker that ends at its claim deadline without taking
   a job.
-- [ ] 5.3 `docs/deployment.md`: add the optional `claim_grace_seconds` key to the
+- [x] 5.3 `docs/deployment.md`: add the optional `claim_grace_seconds` key to the
   controller block with its range and default.
 - [ ] 5.4 `docs/pilot-checklist.md`: reword the bootstrap item that says the worker
   exits on no job so it names the claim window. Reword the item "Maximum lifetime

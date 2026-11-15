@@ -228,6 +228,10 @@ max_instances = 4
 # Optional pass budget in seconds, integer 30..290, default 240. It ends one
 # apply pass with headroom below the shipped unit's TimeoutStartSec=300.
 pass_deadline_seconds = 240
+# Optional, integer 60..1800, default 300. A launch that is still booting or
+# running covers one waiting job for this long, so the next pass does not launch
+# another worker for the same job.
+claim_grace_seconds = 300
 
 [aws]
 region = "eu-central-1"
@@ -279,6 +283,18 @@ the instance itself, and with the shipped defaults the order is
 § Scheduler, cleanup and rollback in
 [operations.md](operations.md#scheduler-cleanup-and-rollback) owns the full
 relation to the systemd unit and the transport timeouts.
+
+`controller.claim_grace_seconds` is optional: it is how long a launch covers one
+waiting job, an integer from `60` to `1800` that defaults to `300`, the claim
+window of the worker bootstrap. A recent launch is an owned operation in the
+state `starting` or `running` that was created less than the grace ago, and the
+age counts from the creation time in the ledger, so a restart does not reset it. A
+value outside the range is refused as `CONFIG_INVALID`; there is no off value.
+The grace changes neither the slot limit, the allowance nor the price checks,
+and it matters only when `controller.max_instances` is above `1`, because one
+slot already stops a second launch while a worker is outstanding. § Fleet size
+and fan-out in [operations.md](operations.md#fleet-size-and-fan-out) owns the
+rule.
 
 `budget.allowance` caps tracked spend in the anchored window.
 `budget.incidental_per_hour` is the estimated non-compute cost of one

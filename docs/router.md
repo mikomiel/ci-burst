@@ -201,9 +201,9 @@ cost:
 
 - **The instance.** A `t4g.nano` runs all the time, so it is billed every
   hour, also when no worker runs.
-- **The public IPv4 address.** AWS bills every public IPv4 address per hour,
-  also the address that the instance receives at launch. For a `t4g.nano`,
-  this charge can be higher than the instance charge.
+- **The public IPv4 address.** AWS bills each AWS-provided public IPv4
+  address per hour, also the address that the instance receives at launch.
+  For a `t4g.nano`, this charge can be higher than the instance charge.
 - **The forwarded traffic.** When a worker and the router are in different
   Availability Zones, AWS bills the traffic between them as regional data
   transfer. AWS bills it on both sides: once where the traffic leaves a zone
@@ -211,10 +211,14 @@ cost:
   through the router. With many short jobs, this charge can be larger than the
   router's own charges.
 
-To keep the forwarded traffic in one zone, put the router in the zone where
-most workers start. Alternatively, run one router in each candidate zone, as
-the section on the single point of failure describes. Each router adds one
-instance and one public IPv4 address. Reduce the bytes first: a worker image
+To reduce the cross-zone traffic, put the router in the zone where most
+workers start. This does not remove the charge: the controller spreads a batch
+across the candidate zones, so the workers in the other zones still send their
+traffic across zones. To avoid this charge, keep every candidate in the
+router's zone, or run one router in each candidate zone and route each
+candidate subnet to the router in its own zone, as the section on the single
+point of failure describes. Each router adds one instance and one public IPv4
+address. Reduce the bytes first: a worker image
 with warm package caches downloads less for each job, and that removes the
 charge for those bytes in every design.
 

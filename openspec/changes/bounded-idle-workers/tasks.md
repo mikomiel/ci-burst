@@ -239,6 +239,9 @@ records, not in this repository.
   replacement is launched after the grace when the first worker never claims.
 - [ ] 7.8 Run the surviving-process case separately from 7.3. From a job step,
   leave a background process of the job account running after the step ends, and
-  write nothing to the capture or the runner's descriptors. Confirm that the worker
-  does not poll again after that job and that the result reads as a finished
-  attempt, not as an empty poll.
+  write nothing to the capture or the runner's descriptors. Record that the
+  background process still exists when the bootstrap classifies the poll, and
+  confirm that the worker does not poll again after that job. This live check does
+  not prove the survival rule on its own, because an ordinary job status and no
+  forged message already fail the other signature checks; task 3.2 tests the rule
+  with a matching status and message.

@@ -110,8 +110,9 @@ repository says. A job step that could write to it would forge the message half
 only, and the status half would still have to match. A forgery then needs the
 runner of a claimed job to end with the documented status. The status range and task
 7.2 bound that, and task 7.3 tests it with no process of the job account left
-running, so the survival rule cannot mask a status that matches. Task 7.8 tests
-the survival rule on its own. Open question 2 records the
+running, so the survival rule cannot mask a status that matches. Task 3.2 tests the
+survival rule with a matching status and message, and task 7.8 observes a live
+surviving process. Open question 2 records the
 decision that the check feeds.
 
 The bound limits what the bootstrap reads. It must not limit what the runner

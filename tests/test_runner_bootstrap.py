@@ -843,9 +843,6 @@ class TailHarness:
 
     The job account cannot be a real user here, so a surviving job process is a
     fake ``/proc/<pid>/status`` entry that carries the stub uid.
-
-    The head of the script sets the claim deadline and the ptrace flag before the
-    tail starts, so the harness writes both ahead of it as literals.
     """
 
     CLOCK_START = 1_000_000
@@ -1202,16 +1199,20 @@ class PtraceLimitTests(unittest.TestCase):
             snippet = _ptrace_snippet().replace(
                 "/proc/sys/kernel/yama/ptrace_scope", str(scope_file)
             )
-            self.assertNotEqual(snippet, _ptrace_snippet())
+            self.assertNotIn("/proc/", snippet)
+            if sysctl_works == "silent":
+                effect = "  return 0\n"  # reports success but changes nothing
+            elif sysctl_works:
+                effect = (
+                    f"  printf '%s\\n' \"${{3#kernel.yama.ptrace_scope=}}\" > {shlex.quote(str(scope_file))}\n"
+                    "  return 0\n"
+                )
+            else:
+                effect = "  return 1\n"
             stub = (
                 "sysctl() {\n"
                 f'  printf "%s\\n" "$*" >> {shlex.quote(str(calls))}\n'
-                + (
-                    f"  printf '%s\\n' \"${{3#kernel.yama.ptrace_scope=}}\" > {shlex.quote(str(scope_file))}\n"
-                    "  return 0\n"
-                    if sysctl_works
-                    else "  return 1\n"
-                )
+                + effect
                 + "}\n"
             )
             script = "set -euo pipefail\n" + stub + snippet + '\necho "result=$PTRACE_LIMITED"\n'
@@ -1239,6 +1240,12 @@ class PtraceLimitTests(unittest.TestCase):
                 "result=no",
             ],
         )
+
+    def test_a_raise_that_does_not_take_effect_polls_once(self):
+        # The re-read decides, not the sysctl status.
+        lines, calls = self.run_block(0, sysctl_works="silent")
+        self.assertEqual(calls, ["-q -w kernel.yama.ptrace_scope=1"])
+        self.assertEqual(lines, ["WARNING: ptrace not limited, polling once", "result=no"])
 
     def test_a_stricter_limit_is_kept(self):
         for scope in (1, 2, 3):

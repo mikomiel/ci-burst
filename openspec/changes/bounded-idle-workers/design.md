@@ -82,38 +82,35 @@ recognise. The rule fails toward ending. A runner that changes its message or it
 status makes the worker stop after one attempt. It never makes the worker poll
 without a bound, and the existing one-job marker still reports the real status.
 
-Why both halves. The message is only text, and the job account is the same
-account that runs the runner, so code under test may be able to write that text
-by some route. A check that trusts such text is forgeable by the code under test,
-which is also why the console markers carry no free text. The bootstrap therefore
-closes the routes it controls and does not rely on the message alone:
+Why the halves are not equal. The message is only text, and the job account is
+the same account that runs the runner, so code under test may be able to write
+that text by some route. A check that trusts such text is forgeable by the code
+under test, which is also why the console markers carry no free text. The status
+is no better: the runner's source shows that a job step can end the runner with
+the documented status by sending it `SIGQUIT`, and then leave no process of its
+account behind. The status band and the survival rule still turn every ordinary
+job outcome into a finished attempt, but they do not stop hostile job code.
+Two boundaries carry that weight:
 
-- The capture is created by root, bounded in size and kept out of the
-  runner-owned directory, so the job account cannot open it by its path.
-- The bootstrap reads the capture only after the one-job process has exited. A
-  process of the job account that still exists at that time makes the poll a
-  finished attempt, so no job process can write into the capture after the
-  bootstrap has read it.
-- The exit status is the half that job code cannot write, provided that the
-  runner does not end a claimed job with the documented status. The spec
-  therefore allows only a documented status from 2 to 123. The runner process of a
-  claimed job can end with 0 after a failed job (the reader already says so), with
-  124 or 137 when the job timeout ends it, with a status of 128 or more after a
-  signal and with 1 as the usual failure status. If the pinned runner documents an
-  empty poll with a status outside that range, the message half would be the only
-  guard, so task 1.1 stops and reports instead.
+- Misclassification is prevented by the message boundary. The capture is created
+  by root, bounded in size and kept out of the runner-owned directory, so the job
+  account cannot open it by its path. The bootstrap reads it only after the
+  one-job process has exited, and a process of the job account that still exists
+  then makes the poll a finished attempt, so no job process can write into the
+  capture after the bootstrap has read it. The runner itself writes into the
+  capture through the descriptor the bootstrap gives it, so closing the path does
+  not close every route: whether the runner's children inherit that descriptor,
+  and whether a step can reach the runner's own descriptors, is unverified. Task
+  7.3 tests those routes.
+- A second job after a misclassification is prevented by the ephemeral
+  registration. If a forged empty poll is accepted, the next poll uses a
+  registration that the claimed task has already consumed. The pinned runner then
+  fails with status 1, which is a finished attempt, so the worker ends after one
+  refused poll. Task 7.2 records that refusal live.
 
-The runner itself writes into the capture through the descriptor the bootstrap
-gives it, so closing the path does not close every route. Whether the runner's
-child processes inherit that descriptor is unverified, and no source in this
-repository says. A job step that could write to it would forge the message half
-only, and the status half would still have to match. A forgery then needs the
-runner of a claimed job to end with the documented status. The status range and task
-7.2 bound that, and task 7.3 tests it with no process of the job account left
-running, so the survival rule cannot mask a status that matches. Task 3.2 tests the
-survival rule with a matching status and message, and task 7.8 observes a live
-surviving process. Open question 2 records the
-decision that the check feeds.
+Task 3.2 tests the survival rule with a matching status and message, and task 7.8
+observes a live surviving process. Open question 2 records the decision that the
+checks feed.
 
 The bound limits what the bootstrap reads. It must not limit what the runner
 writes. A poll that receives a task is one process for the whole job, so its

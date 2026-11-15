@@ -1351,8 +1351,10 @@ class ClaimLoopTests(TailHarness, unittest.TestCase):
         self.assertGreater(len(self.read_lines("calls")), 1)
 
     def test_the_documented_message_with_another_status_is_a_finished_attempt(self):
-        # The status half must hold on its own for every status a claimed job's
-        # runner can end with, and 3 stands for any other status in the band.
+        # Every ordinary outcome of a claimed job's runner must be a finished
+        # attempt even when it prints the message; 3 stands for any other status
+        # in the band. This is not a guard against hostile job code, which can end
+        # the runner with the no-task status (see docs/runner-setup.md).
         _, message = self.no_task()
         cases = {
             0: "completed rc=0",

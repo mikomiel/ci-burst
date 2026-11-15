@@ -207,15 +207,17 @@ records, not in this repository.
   version is enabled. Confirm the no-task exit status and the message. Confirm
   that the ephemeral registration stays valid across repeated empty polls and is
   consumed by the first claimed task. Confirm that a poll after a claimed task is
-  refused and does not read as an empty poll.
+  refused and does not read as an empty poll, both after a job that ends normally
+  and after a claimed runner that a job step ends with `SIGQUIT`.
 - [ ] 7.3 Run one adversarial check with no process of the job account left
   running when the step ends. From a job step, as the job account, try to write
   the documented no-task message to the capture path, to the runner's own
   descriptors (including through `/proc`) and to a descriptor that a child process
   inherits. In the same job, try to make the runner end with the documented no-task
   status: end the step with that status, and end the runner's child processes with
-  it. Record the runner's exit status for each attempt, and record whether it can
-  equal the documented no-task status. Confirm that the worker does not poll again
+  it, send the runner `SIGQUIT` directly, and try to attach to it with `ptrace`
+  or write through `/proc/<pid>/mem`. Record the runner's exit status for each
+  attempt, and record whether it can equal the documented no-task status. Confirm that the worker does not poll again
   after that job. Record whether a child of the runner inherits its standard output
   or error. Both records feed design open question 2: the message results must
   show that a job step cannot place the documented message in the capture, or the

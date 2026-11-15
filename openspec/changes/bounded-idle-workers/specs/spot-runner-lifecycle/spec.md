@@ -154,7 +154,7 @@ Every poll outcome that is not an empty poll MUST end the claim loop as a finish
 #### Scenario: A request for a task fails
 - **WHEN** the runner's request for a task fails, for example by a network error or a timeout, and the pinned runner therefore ends with the documented no-task status and message after an error-level log line
 - **THEN** the poll matches the empty-poll signature and the bootstrap treats it as empty
-- **AND** the worker still ends no later than the claim deadline
+- **AND** the worker still ends at the first deadline check after a poll or a pause that ends past the claim deadline
 - **AND** the error-level line may reach the console, so the claim timeout can carry that runner error
 
 #### Scenario: A poll fails for another reason

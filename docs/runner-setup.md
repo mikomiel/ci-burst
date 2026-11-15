@@ -6,8 +6,9 @@ This tutorial builds the operator-owned prerequisites ci-burst expects:
   parameter;
 - a SecureString parameter holding a repository-scoped Forgejo runner
   registration token;
-- a pinned launch template whose bootstrap registers an ephemeral runner, runs
-  exactly one job and terminates the instance;
+- a pinned launch template whose bootstrap registers an ephemeral runner, polls
+  for a job during a bounded claim window, runs at most one job and terminates
+  the instance;
 - a worker network placement that can reach both Forgejo and the SSM endpoint.
 
 ci-burst never creates IAM resources, reads SSM or distributes the token. It
@@ -281,8 +282,9 @@ or an example. The byte hash pinned in
 that captured artifact only; it does not describe or validate a version you
 publish. It runs as root, reads the registration token from the SSM SecureString
 parameter, registers one ephemeral runner named `burst-<hostname>`, blocks the
-metadata service for the job account, runs exactly one job and always terminates
-the instance.
+metadata service for the job account, polls for a task during a bounded claim
+window ([The claim window](#the-claim-window)), runs at most one job and always
+terminates the instance.
 
 The labels, the Forgejo URL and the parameter name are literal in the file. That
 is deliberate: a deployment that needs different values edits the file, publishes
@@ -310,8 +312,9 @@ The bootstrap reports the one-job runner process with exactly one bounded marker
 status, so the `bootstrap exiting rc=<n>` line is truthful. These markers
 describe the worker process lifecycle and never the Forgejo job result: a runner
 can exit 0 after a job that failed, and the job's verdict stays with Forgejo.
-[operations.md § Worker evidence](operations.md#worker-evidence) owns how the
-exporter reads them.
+A poll that finds no task while the claim window is open is not a job attempt and
+prints no marker. [operations.md § Worker evidence](operations.md#worker-evidence)
+owns how the exporter reads them.
 
 The bootstrap also watches the Spot interruption notice, as root, because the job
 account is denied the metadata service. It polls IMDSv2 every five seconds; on a
@@ -329,12 +332,6 @@ it records that the notice was observed and that a signal delivery was
 attempted - not that the worker or the job ended - and it is never a substitute
 for a job result.
 
-`one-job` polls the queue once. When nothing is queued it exits with
-`Error: no task received`; that is the expected empty-queue result, not a broken
-runner. `one-job -w` (`--wait`) blocks until Forgejo assigns a task. Trigger the
-worker only after you observe queue demand, or pass `--wait`; an idle launch
-otherwise pays for a boot that does no work.
-
 The bootstrap runs with `umask 077` while it handles the registration token, then
 lowers to `umask 0022` before starting the job, because that is what a
 systemd-managed runner produces under its default `UMask=0022`. Without the
@@ -342,6 +339,164 @@ second umask the job would create `0600`/`0700` files where that runner creates
 `0644`/`0755`. That difference is invisible until a job asserts a mode, and then
 it fails only on burst capacity — a false red that looks like a defect in the
 change under test.
+
+### The claim window
+
+After `register` returns, the bootstrap does not block in the runner while it
+waits for a task. It polls the queue for a bounded claim window, so a worker that
+no job needs ends itself instead of idling until its maximum lifetime.
+
+- A poll is one run of `one-job` without its wait option (`-w`, `--wait`, which
+  blocks until Forgejo assigns a task). It asks Forgejo once and returns at once
+  when nothing is queued.
+- The claim window is 300 seconds and the pause between polls is 10 seconds. The
+  window starts when `register` returns. Both numbers are starting points, not
+  measurements. They are single literals beside the lifetime literal in the
+  bootstrap (`CLAIM_WINDOW_SECONDS` and `POLL_INTERVAL_SECONDS`), not
+  configuration, tags or controller input.
+- The bootstrap checks the claim deadline before the first poll, after each empty
+  poll and again after each pause, and it starts no poll at or after the deadline.
+  A worker can end up to one pause after the deadline, and boot comes before the
+  window, so the window is not a maximum idle time of 300 seconds.
+- The deadline never interrupts a running poll, because a running poll may
+  already hold a job. A job that a poll receives keeps the job timeout and the
+  instance lifetime exactly as before, and the lifetime shutdown stays the outer
+  bound on every path.
+- When the window passes with no task, the worker prints one `STEP claim-timeout`
+  marker, removes the registration file and exits with status 0 through the same
+  exit trap as every other ending, so the console shows `bootstrap exiting rc=0`.
+  It prints neither the `job` step marker nor a `bootstrap one-job` marker,
+  because no job attempt happened. A window that ends on schedule is the designed
+  outcome, so the status is 0, and 124 and 137 stay the job-timeout statuses. A
+  completed job also exits 0: the exporter tells the two endings apart by the
+  `claim-timeout` step and the missing one-job marker.
+
+**The empty poll of the pinned runner.** In 13.2.1, a poll that finds no task
+exits with status 2 and prints `Error: no task received`, followed by one line
+feed, on standard error. These values are literals in the bootstrap
+(`NO_TASK_STATUS` and `NO_TASK_MESSAGE`), and a runner version change needs new
+values. The runner's source at the tag `v13.2.1` states them:
+
+- [`internal/app/cmd/cmd.go`](https://code.forgejo.org/forgejo/runner/raw/tag/v13.2.1/internal/app/cmd/cmd.go):
+  `Execute` calls `os.Exit(2)` when the error is `poll.ErrNoTaskReceived` and
+  `os.Exit(1)` for any other error.
+- [`internal/app/poll/single.go`](https://code.forgejo.org/forgejo/runner/raw/tag/v13.2.1/internal/app/poll/single.go):
+  `ErrNoTaskReceived` is `errors.New("no task received")`, and a poll without the
+  wait option returns it when it received no task.
+- cobra v1.10.2
+  [`command.go`](https://raw.githubusercontent.com/spf13/cobra/v1.10.2/command.go):
+  `ExecuteC` prints the returned error to standard error with
+  `PrintErrln(cmd.ErrPrefix(), err.Error())`, and the prefix is `Error:`. The
+  runner's root command sets `SilenceUsage`, so no usage text follows.
+- [`main.go`](https://code.forgejo.org/forgejo/runner/raw/tag/v13.2.1/main.go):
+  the runner registers `SIGINT` and `SIGTERM` with `signal.NotifyContext`. No file
+  of the runner's own source registers `SIGQUIT`. The runner's dependencies were
+  not read.
+- Go [`runtime/signal_unix.go`](https://raw.githubusercontent.com/golang/go/go1.26.8/src/runtime/signal_unix.go)
+  at the tag go1.26.8, the toolchain that the runner's `go.mod` names: a signal
+  that the program has not registered and that is marked `_SigThrow` ends the
+  process with `exit(2)`. [`sigtab_linux_generic.go`](https://raw.githubusercontent.com/golang/go/go1.26.8/src/runtime/sigtab_linux_generic.go)
+  marks `SIGQUIT` that way.
+
+Status 2 is inside the band from 2 to 123 that the bootstrap requires, because the
+runner of a claimed job can also end with 0, 1, 124 or a status of 128 or more.
+That source has two limits. A poll whose request for a task failed (a network
+error or a timeout) also ends with status 2 and the same message, after an
+error-level log line, so it looks like an empty poll. The exporter reads that line
+as a `runner_error`, so a claim timeout that follows such a poll can carry that
+error kind next to its `claim-timeout` step. And a Go program exits with status 2
+after an unrecovered panic or a fatal signal such as `SIGQUIT`. That is Go runtime
+behaviour, not runner code. The runner's own source registers no handler for
+`SIGQUIT`, so the runtime default applies. A job step runs as the runner's account,
+so it can send the runner `SIGQUIT` and make it end with status 2. That is read
+from source and has not been observed on the runner; the live check below records
+it. An invalid or already used registration fails earlier, with status 1. Status 2
+alone is therefore not proof, and the bootstrap asks for more.
+
+The bootstrap keeps polling only when all three of these hold:
+
+1. the runner exited with the documented status, which must be from 2 to 123;
+2. the poll's captured output contains the documented message as a complete line,
+   that is the message followed by one line feed, with no other byte on that line;
+3. no process of the job account still exists when the capture is read.
+
+Every other outcome ends the loop as a finished attempt, and the one-job marker
+reports it: a completed or failed job, the status without the message or the
+message without the status, a signal, a timeout, a capture that is missing, larger
+than its bound or unreadable, a process of the job account that is still running,
+and anything the bootstrap does not recognise. A doubt ends the worker and never
+extends the window, so a runner version that changes its status or message makes
+the worker stop after its first poll instead of looping.
+
+The capture is a second, bounded copy of each poll's output. Root creates it with
+mode 0600 under `/run`, outside the runner's directory, so the job account cannot
+open it by its path. Each poll truncates it, `head` keeps at most
+`CAPTURE_LIMIT_BYTES` plus one byte of it, the bootstrap reads it only after the
+poll has ended, and the exit trap removes it. The bound limits what the bootstrap
+reads, never what the runner writes: `tee` keeps draining the runner's output
+after the bound, so the runner is never stopped, signalled or blocked by it, and a
+claimed job's output can exceed the bound. The runner's output also keeps reaching
+the console while the poll runs, and the bootstrap does not hide the no-task
+line. A capture over the bound is not an empty poll.
+
+Three limits to know:
+
+- The status half and the survival check do not stop a hostile job. Job code runs
+  as the account that runs the runner. It can end the runner with status 2 (see
+  above), and it can end its own processes first. The message half is then the
+  only guard. Three routes for job code to put the message into the capture are
+  closed. This is read from the runner's source and from a local check of the
+  pipe, not observed on a worker:
+  - Root creates the capture pipe with mode 0600, so the job account cannot open it
+    through `/proc/<pid>/fd`.
+  - A host-executor step gets its own output pipes, not the runner's: `cmd.Stdout`
+    and `cmd.Stderr` in `act/container/host_environment.go` are the step's own line
+    writer.
+  - The runner does not echo step output to its own output unless its log level is
+    `debug` or `trace`: `internal/app/run/runner.go` installs a null job logger
+    below that level, the image's runner configuration sets no level, and the
+    default is `info`.
+
+  A runner upgrade, an executor other than `host` and a log level of `debug` or
+  `trace` each need the live check again. One route is not examined: job code that
+  controls the runner process itself, for example with `ptrace` or
+  `/proc/<pid>/mem` on a process of the same account, could make the runner write
+  the message. The image recipe sets no `ptrace` policy, and this repository has
+  not checked the kernel default.
+- A process that keeps the runner's output open after the runner exits keeps the
+  poll from ending, because the copy waits for the end of the stream. The worker
+  then waits for it. The job timeout does not end that wait, because `timeout`
+  watches only its direct child and has already returned with the runner's
+  status, so only the instance lifetime does.
+- The survival check reads the real, effective, saved and filesystem uid of each
+  process from `/proc/<pid>/status`. A uid or a process table that it cannot read
+  counts as a surviving process, so the loop ends. A process of the `runner`
+  account that exists in the baked image at that moment would end every worker
+  after its first poll, and the live check below shows it.
+
+**Qualify it live before you enable it.** The status, the message and the polling
+behaviour come from source and from stub tests, not from a live run. Before a
+deployment sets a template version that carries this bootstrap, run bounded
+launches from that version and confirm:
+
+- an empty poll exits with status 2 and prints the message on standard error, and
+  no other line of that poll matches an error rule of the exporter;
+- the ephemeral registration stays valid across repeated empty polls, and the
+  first claimed task consumes it;
+- a poll after a claimed task is refused and does not read as an empty poll;
+- an adversarial job step does not make the poll empty, and the worker does not
+  poll again after that job. The step writes the documented message to its own
+  standard output and standard error, to the capture path, to the runner's own
+  descriptors through `/proc` and to a descriptor that a child process inherits,
+  and it tries to attach to the runner with `ptrace`. Then it sends the runner
+  `SIGQUIT`, ends and leaves no process of the job account running. Record each
+  result and the runner's exit status (expect 2);
+- a background process of the job account that is left running after a job step
+  ends is still there when the bootstrap classifies the poll, and the worker does
+  not poll again after that job;
+- a launch with nothing queued ends with `STEP claim-timeout` and then
+  `bootstrap exiting rc=0`, and a launch that claims a job ends with the
+  `completed` one-job marker.
 
 ### Runner pin and the deprecated `register` command
 
@@ -405,8 +560,12 @@ the matching semantics; this guide does not repeat them.
 
 1. Add a trivial workflow or job with a matching `runs-on` label, then launch
    one instance from the template version with a distinct tag such as
-   `Name=runner-smoke-test`. Queue the job first: a plain `one-job` exits with
-   `Error: no task received` when the queue is empty (see section 4).
+   `Name=runner-smoke-test`. Queue the job first to watch a claimed job. Launch
+   once more with nothing queued to watch a worker with no job: it polls for its
+   claim window, finds nothing and ends by itself (see
+   [The claim window](#the-claim-window)). In that launch there is no job to
+   watch in steps 3 and 4: the runner stays idle, and the instance terminates
+   when the claim window passes.
 2. Read the bootstrap output. It is still available after the instance is gone:
 
    ```sh
@@ -417,10 +576,12 @@ the matching semantics; this guide does not repeat them.
    The record can lag several minutes after termination, and
    `tee: /dev/ttyS0: Input/output error` lines are noise from the serial
    console, not evidence that the record is missing. Look for the SSM read,
-   `Runner registered successfully.`, one job running, and the power-off.
+   `Runner registered successfully.`, then one job running, or `STEP claim-timeout`
+   and `bootstrap exiting rc=0` when nothing was queued (no `bootstrap one-job`
+   marker appears in that case), and the power-off.
    A healthy reference run moves through boot, the SSM token read,
-   registration, one job and power-off; use that order as a sanity check when a
-   run stops early.
+   registration, one job (or the claim timeout) and power-off; use that order as a
+   sanity check when a run stops early.
 3. In Forgejo, the repository's Actions → Runners page shows the new runner in
    `idle`, then `active` when the job starts.
 4. Confirm the job ran on the worker and that the instance terminated

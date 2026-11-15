@@ -164,9 +164,10 @@ checking still enabled, a security group or network ACL that does not admit the
 subnet, or a router with no internet path of its own all look the same from the
 worker.
 
-Terminate the canary when the test is done. It self-terminates after its
-lifetime, and the reaper does not manage it because it carries no
-`ci-burst:managed` tag.
+Terminate the canary when the test is done. The reaper does not manage it
+because it carries no `ci-burst:managed` tag. It ends itself after its
+lifetime, or, with a template version whose bootstrap has the claim window,
+when that window passes without a job, about five minutes after it registers.
 
 ## 7. Prove it survives a reboot
 

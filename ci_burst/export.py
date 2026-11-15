@@ -132,7 +132,7 @@ DEPLOYMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 #: The step markers the shipped first-boot script emits. A name outside this set
 #: is not a marker: an image could print any `STEP ...` line, and the command
 #: publishes names, so the set has to be closed rather than pattern-matched.
-STEP_NAMES = frozenset({"mount-options", "register", "job"})
+STEP_NAMES = frozenset({"mount-options", "register", "claim-timeout", "job"})
 
 #: Ordered classification rules for console lines that are not a marker. The
 #: first matching rule wins, so a specific failure is named before a generic one.

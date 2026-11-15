@@ -20,9 +20,19 @@ cleanup bounds.
 - [ ] `InstanceType`, architecture and memory suit the intended job class.
 - [ ] `InstanceInitiatedShutdownBehavior = terminate`; disposable volumes
       delete on termination.
-- [ ] Bootstrap registers a repository-scoped ephemeral runner, runs one job,
-      exits after it, and also exits on bootstrap failure and on no job.
-- [ ] Maximum lifetime covers boot, queue wait and a failed bootstrap.
+- [ ] Bootstrap registers a repository-scoped ephemeral runner, polls for a task
+      in a bounded claim window, runs at most one job, exits after it, and also
+      exits on bootstrap failure and when the claim window passes without a job.
+- [ ] Maximum lifetime covers image boot, the claim window, one job and a failed
+      bootstrap.
+- [ ] The claim window is qualified live before the template version that
+      carries it is set in the deployment, with every check in
+      [runner-setup.md § The claim window](runner-setup.md#the-claim-window)
+      ("Qualify it live before you enable it"): a bounded launch with no job
+      queued ends with `STEP claim-timeout` and then `bootstrap exiting rc=0`, a
+      launch that claims a job ends with the `completed` one-job marker, and the
+      empty-poll, registration, forged-message and surviving-process checks pass
+      on the pinned runner.
 - [ ] The worker holds no controller, provisioning or AWS credential.
 - [ ] Registration credentials arrive through an operator-owned secure channel —
       not user data, image layers or logs. The pinned runner CLI accepts its

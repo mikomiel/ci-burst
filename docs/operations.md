@@ -213,6 +213,21 @@ failure line contributes its kind only. The console is not a trusted channel, an
 truncation is not redaction — read the raw line with the provider CLI when you
 need it.
 
+The shipped step names are `mount-options`, `register`, `claim-timeout` and `job`.
+`claim-timeout` is the expected end of a worker that took no job. The bootstrap
+prints it once, when its claim window passes without a task (see
+[runner-setup.md § The claim window](runner-setup.md#the-claim-window)). It is
+published as one `step` event with the same identity form as every other step
+(`<instance>:step:claim-timeout`), and it carries no console text. No `job` step
+and no `job-process` event follow it, because no job attempt happened, and the
+`exit` event for that worker carries `rc=0`. The marker is not an `error` kind,
+not a registration failure and not a job result. A worker that printed
+`register` and then `claim-timeout` counts as registered once and never as
+unregistered. The marker does not finish the record: the instance stays a
+candidate until the provider reports it `terminated` or `stopped`. A runner can
+also exit 0 after a job that failed, so tell an idle worker from a finished one
+by this step and the missing `job-process` event, never by `rc=0` alone.
+
 ### The Spot interruption marker
 
 The worker's bootstrap reads the two-minute Spot interruption notice and, on the
@@ -461,10 +476,10 @@ parameter. It proves nothing about a running server.
 
 Only an isolated operator canary can establish live compatibility: a
 repository-scoped ephemeral runner registers, takes exactly one job to
-completion and exits, and an idle worker expires without taking a job. The
-canary must record the exact Forgejo server version and the exact runner version
-it ran. This change ran no server and no runner, and the matrix does not set
-`qualification = "live-verified"`.
+completion and exits, and an idle worker ends at its claim deadline without
+taking a job. The canary must record the exact Forgejo server version and the
+exact runner version it ran. This change ran no server and no runner, and the
+matrix does not set `qualification = "live-verified"`.
 
 Requalification is required when either recorded version changes, or when a
 server returns a response shape no fixture pins. A changed shape or a different
@@ -500,7 +515,9 @@ The worker contract the template must implement:
 - a repository-scoped ephemeral runner that executes at most one job
   (`forgejo-runner one-job` or equivalent);
 - process exit after the assigned job, and exit on bootstrap failure or when
-  no job arrives, followed by instance shutdown and termination;
+  no job arrives within the bounded claim window
+  ([runner-setup.md § The claim window](runner-setup.md#the-claim-window)),
+  followed by instance shutdown and termination;
 - disposable volumes with delete-on-termination;
 - no controller, provisioning or AWS credential on the worker;
 - registration credentials acquired through an operator-owned secure channel.
@@ -510,8 +527,8 @@ The worker contract the template must implement:
   from a `0600` file and shreds that file before the job starts; the exposure
   this leaves to host root and exec auditing, and its bounds, are in
   [runner-setup.md § Threat model](runner-setup.md#threat-model);
-- a maximum lifetime that covers image boot, a delayed job and a failed
-  bootstrap. Ephemeral registration is not an expiry mechanism;
+- a maximum lifetime that covers image boot, the claim window, one job and a
+  failed bootstrap. Ephemeral registration is not an expiry mechanism;
 - the job toolchain the deployment's queue needs, not only the runner binary.
   Runner classes differ by architecture and by cost tier, never by which
   packages are installed: a job may be batched onto any runner of its
@@ -827,13 +844,19 @@ batch spread. Each worker starts at the first pool in its rotation whose quote i
 still fresh, records the earlier pools as `skipped` (`spot_price_stale`), and
 walks its own pool order only on a definite capacity rejection.
 
-The worker contract stays one job per worker. An idle worker waits for one job
-until its own maximum lifetime, then shuts down and terminates. Its forward
-commitment is released only when it settles, so an idle worker keeps its worst
-case committed for as long as it lives, and money already spent is never
+The worker contract stays one job per worker. An idle worker polls for a task
+during its claim window, then prints `STEP claim-timeout`, shuts down and
+terminates. The claim window is the expected end of an idle worker, not a bound:
+a poll that hangs is ended only by the job timeout and the instance lifetime, and
+a failed shutdown or a provider fault only by the instance lifetime and by
+expiry cleanup. A worker that boots from an earlier template version has no
+claim window and waits for one job until the job timeout or its maximum
+lifetime. A reservation prices the full configured lifetime, and its forward
+commitment is released only when the worker settles, so an idle worker keeps its
+worst case committed for as long as it lives, and money already spent is never
 refunded. Fan-out therefore trades committed allowance for readiness: N workers
-can take N jobs at once, and a worker that never gets a job still costs up to its
-configured lifetime.
+can take N jobs at once, and a worker that never gets a job is expected to end
+soon after its claim window but can still cost up to its configured lifetime.
 
 If any worker in the batch ends in anything other than an accepted launch, the
 controller stops the batch and leaves the workers already launched in place. It

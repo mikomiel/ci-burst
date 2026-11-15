@@ -82,38 +82,35 @@ recognise. The rule fails toward ending. A runner that changes its message or it
 status makes the worker stop after one attempt. It never makes the worker poll
 without a bound, and the existing one-job marker still reports the real status.
 
-Why both halves. The message is only text, and the job account is the same
-account that runs the runner, so code under test may be able to write that text
-by some route. A check that trusts such text is forgeable by the code under test,
-which is also why the console markers carry no free text. The bootstrap therefore
-closes the routes it controls and does not rely on the message alone:
+Why the halves are not equal. The message is only text, and the job account is
+the same account that runs the runner, so code under test may be able to write
+that text by some route. A check that trusts such text is forgeable by the code
+under test, which is also why the console markers carry no free text. The status
+is no better: the runner's source shows that a job step can end the runner with
+the documented status by sending it `SIGQUIT`, and then leave no process of its
+account behind. The status band and the survival rule still turn every ordinary
+job outcome into a finished attempt, but they do not stop hostile job code.
+Two boundaries carry that weight:
 
-- The capture is created by root, bounded in size and kept out of the
-  runner-owned directory, so the job account cannot open it by its path.
-- The bootstrap reads the capture only after the one-job process has exited. A
-  process of the job account that still exists at that time makes the poll a
-  finished attempt, so no job process can write into the capture after the
-  bootstrap has read it.
-- The exit status is the half that job code cannot write, provided that the
-  runner does not end a claimed job with the documented status. The spec
-  therefore allows only a documented status from 2 to 123. The runner process of a
-  claimed job can end with 0 after a failed job (the reader already says so), with
-  124 or 137 when the job timeout ends it, with a status of 128 or more after a
-  signal and with 1 as the usual failure status. If the pinned runner documents an
-  empty poll with a status outside that range, the message half would be the only
-  guard, so task 1.1 stops and reports instead.
+- Misclassification is prevented by the message boundary. The capture is created
+  by root, bounded in size and kept out of the runner-owned directory, so the job
+  account cannot open it by its path. The bootstrap reads it only after the
+  one-job process has exited, and a process of the job account that still exists
+  then makes the poll a finished attempt, so no job process can write into the
+  capture after the bootstrap has read it. The runner itself writes into the
+  capture through the descriptor the bootstrap gives it, so closing the path does
+  not close every route: whether the runner's children inherit that descriptor,
+  and whether a step can reach the runner's own descriptors, is unverified. Task
+  7.3 tests those routes.
+- A second job after a misclassification is prevented by the ephemeral
+  registration. If a forged empty poll is accepted, the next poll uses a
+  registration that the claimed task has already consumed. The pinned runner then
+  fails with status 1, which is a finished attempt, so the worker ends after one
+  refused poll. Task 7.2 records that refusal live.
 
-The runner itself writes into the capture through the descriptor the bootstrap
-gives it, so closing the path does not close every route. Whether the runner's
-child processes inherit that descriptor is unverified, and no source in this
-repository says. A job step that could write to it would forge the message half
-only, and the status half would still have to match. A forgery then needs the
-runner of a claimed job to end with the documented status. The status range and task
-7.2 bound that, and task 7.3 tests it with no process of the job account left
-running, so the survival rule cannot mask a status that matches. Task 3.2 tests the
-survival rule with a matching status and message, and task 7.8 observes a live
-surviving process. Open question 2 records the
-decision that the check feeds.
+Task 3.2 tests the survival rule with a matching status and message, and task 7.8
+observes a live surviving process. Open question 2 records the decision that the
+checks feed.
 
 The bound limits what the bootstrap reads. It must not limit what the runner
 writes. A poll that receives a task is one process for the whole job, so its
@@ -123,12 +120,12 @@ implementation keeps draining the output after the bound is reached, and a test
 with a stub that writes more than the bound proves that the process is not
 stopped. An oversized capture is a finished attempt.
 
-The repository documents the message `Error: no task received` for the pinned
-runner. It does not record the exit status. The implementation task reads the
-status from the pinned runner's contract and stops and reports if no source states
-it, or if it lies outside 2 to 123. This change does not write a number. A runner
-version bump reopens the signature, because the tests pin the status and the
-message.
+Task 1.1 read the no-task result from the pinned runner's source: status 2 and
+the message `Error: no task received` on standard error. The worker setup guide
+records both with their sources. Status 2 is not unique to an empty poll: a
+failed request for a task ends the same way, and so does a runner that a job
+step stops with `SIGQUIT`. A runner version bump reopens the signature, because
+the tests pin the status and the message.
 
 ## The console copy
 
@@ -373,17 +370,20 @@ enables that version. The tasks name this in 3.5 and 7.1.
   13.2.1, is unverified. If an empty poll invalidated the registration, the worker
   would end after its second poll and the controller could launch again. The
   operator must qualify this live before the template version is enabled.
-- The no-task exit status is not recorded in the repository. Whether the pinned
-  runner prints the no-task message to standard output or standard error, and
-  whether it prints other lines for an empty poll that the reader's failure rules
-  could classify, is also unverified. Whether that status can equal a status that
-  the runner of a claimed job also ends with is unverified too. The spec allows
-  only 2 to 123 for that reason.
+- Task 1.1 recorded the no-task result from the pinned runner's source: status 2
+  and the message on standard error, as described in the worker setup guide. A
+  failed request for a task ends the same way after an error-level line, so it
+  counts as an empty poll; the worker still ends at the claim deadline. Status 2
+  is also the Go runtime's status for a panic or a fatal signal such as
+  `SIGQUIT`, which a job step running as the runner's account can send. The
+  status half and the survival rule therefore do not stop a hostile job; the
+  message half is the guard that holds. None of this has been observed on a live
+  runner yet.
 - Whether the runner's child processes inherit its standard output or standard
   error is unverified. If they do, a job step can write the documented message
-  into the capture through that descriptor. The status half of the signature and
-  the survival rule still apply. Task 7.3 tests the route, and open question 2
-  records the decision that the result feeds.
+  into the capture through that descriptor, and with the point above the
+  signature would not hold against that job. Task 7.3 tests the route, and open
+  question 2 records the decision that the result feeds.
 - The values 300 seconds and 10 seconds are unmeasured. The repository holds no
   boot-to-claim timing.
 - Hypothesis, not a claim: a known Forgejo behaviour may leave a long-polling
@@ -416,9 +416,14 @@ enables that version. The tasks name this in 3.5 and 7.1.
    only after the one-job process has exited, and ends the loop when a process of
    the job account survives. It does not claim that an inherited descriptor is
    closed, because the runner's behaviour is unverified. Recommendation: keep the
-   signature as specified and let task 7.3 decide. Activation requires evidence
-   from task 7.3 that the runner of a claimed job cannot end with the documented
-   status; a status range alone is not that evidence. If the check shows that it
-   can, treat the empty-poll signature as forgeable and reopen this change before
-   the template version is enabled, whatever the inherited-descriptor result. The cost is a design change to the signature, not a
-   rollback, because no version is enabled before the check.
+   signature as specified and let task 7.3 decide. The runner's source
+   already shows that a job step can end a claimed runner with the documented
+   status (`SIGQUIT`), so the status half is forgeable and does not count as a
+   guard. Two guards remain. The message half holds only if task 7.3 shows that a
+   job step cannot place the documented message in the capture. The ephemeral
+   registration holds only if task 7.2 shows that a poll after a claimed task is
+   refused with another status: then a forged empty poll leads to one refused
+   poll and a finished attempt, not to a second job. Activation requires both
+   records. If either fails, reopen this change before the template version is
+   enabled. The cost is a design change to the signature, not a rollback, because
+   no version is enabled before the checks.

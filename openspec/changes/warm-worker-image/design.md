@@ -43,11 +43,16 @@ not match it, or when the warm commands are empty.
    It is armed first so that no later step can leave a builder running.
 2. Fetch the archive, verify the sha256 and extract it into a fresh directory
    outside the runner home.
-3. Run the warm commands as the job account:
-   `runuser -u runner -- env -i HOME=... PATH=... LC_ALL=C.UTF-8 <cache
-   environment> bash -c 'umask 0022; cd SRC && CMD'`. `env -i` keeps the root
-   environment, and any credential in it, out of consumer commands. The umask
-   matches the job's.
+3. Run the warm commands as the job account, each in its own transient unit:
+   `systemd-run --wait --pipe --collect --uid=runner --gid=runner
+   --property=KillMode=control-group env -i HOME=... PATH=... LC_ALL=C.UTF-8
+   <cache environment> bash -c 'umask 0022; cd SRC && CMD'`. `env -i` keeps the
+   root environment, and any credential in it, out of consumer commands. The umask
+   matches the job's. The unit's control group ends with its command, so a
+   background process dies with it. The archive is extracted the same way, by the
+   job account and never by root, with the archive on standard input. Before the
+   clean-up and again before the marker the script fails unless no process of the
+   job account remains.
 4. If an offline gate command is supplied, run it the same way with downloads
    forbidden. The mechanism that forbids downloads is the consumer's command to
    choose (see open questions).

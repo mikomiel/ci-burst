@@ -70,16 +70,21 @@ front of the script ([step 3](#3-render-the-user-data)).
 | `WARM_LIFETIME_SECONDS` | no | Builder lifetime bound, 600 to 14400, default 5400. |
 | `WARM_SNAPSHOT_SECONDS` | no | How long the builder stays up after the marker, 60 to 3600, default 1800. |
 
-Each command runs from the extracted source root as
+Each command runs from the extracted source root, as the `runner` account, in its
+own transient systemd unit:
 
 ```sh
-runuser -u runner -- env -i HOME=... PATH=... LC_ALL=C.UTF-8 <cache environment> \
+systemd-run --wait --pipe --collect --uid=runner --gid=runner \
+  --property=KillMode=control-group \
+  env -i HOME=... PATH=... LC_ALL=C.UTF-8 <cache environment> \
   bash -c 'umask 0022; cd SRC && COMMAND'
 ```
 
 `env -i` keeps root's environment, and any credential in it, out of consumer
-commands, and the umask matches a job's. A command sees only those variables.
-Its stdout and stderr go to a log, never to the script's output.
+commands, and drops the variables systemd adds for a user service. The umask
+matches a job's. A command sees only those variables. Its stdout and stderr go
+to a log, never to the script's output. When a command ends, its unit's control
+group ends with it, so a background process it started dies too.
 
 ## What the script does
 
@@ -87,13 +92,20 @@ Its stdout and stderr go to a log, never to the script's output.
    off. It is armed first, so no later step can leave a builder running.
 2. Refuses before any fetch or consumer command when the sha256 or the warm
    commands are missing or malformed.
-3. Fetches the archive, compares its sha256 with `WARM_SRC_SHA256` and only then
-   extracts it into a fresh directory outside the runner home.
+3. Fetches the archive and compares its sha256 with `WARM_SRC_SHA256`. Only then
+   does the `runner` account, never root, extract it into a fresh directory
+   outside the runner home. Root feeds the archive on standard input and the
+   account unpacks it with `--no-same-owner --no-same-permissions`, so an archive
+   cannot create a device node or a root-owned file: such an archive fails the
+   extraction and the build.
 4. Runs the warm commands in order, then the gate if one is set.
-5. Removes the extracted source, the runner registration file and every entry of
-   the runner home except `cache`, and runs `cloud-init clean --logs`. The last
-   step also removes the saved user data, which holds the archive URL. Every
-   clean-up step is fatal.
+5. Fails unless no process of the `runner` account remains (it looks again after a
+   short settle, then kills the units and looks once more). Then removes the
+   extracted source, the runner registration file and every entry of the runner
+   home except `cache`, and runs `cloud-init clean --logs`. The last step also
+   removes the saved user data, which holds the archive URL. Every clean-up step
+   is fatal, and the process check repeats right before the marker, so a late
+   background writer cannot change the image after the clean-up.
 6. Prints `CACHE size=...`, then `WARM_SOURCE_SHA256 <digest>`, then
    `IMAGE_READY` as its last line, and stays up for the snapshot window.
 
@@ -220,13 +232,16 @@ if a command hangs.
 
 ```sh
 # Poll the serial console for up to about an hour. The console lags the builder by
-# a few minutes. Stop at the first marker or failure line: every failure,
-# including a refusal, prints "warm exiting rc=".
+# a few minutes. Stop only on the whole IMAGE_READY line or on a failure line:
+# every failure, including a refusal, prints "warm exiting rc=".
 for _ in $(seq 1 120); do
   aws ec2 get-console-output --instance-id <builder-instance-id> --latest --output text \
-    | grep -E '^(warm exiting rc=|WARM FAIL|WARM_SOURCE_SHA256 |IMAGE_READY$)' && break
+    | grep -E '^(warm exiting rc=|WARM FAIL|IMAGE_READY$)' && break
   sleep 30
 done
+# After IMAGE_READY, read the digest line the script prints just above it.
+aws ec2 get-console-output --instance-id <builder-instance-id> --latest --output text \
+  | grep -E '^WARM_SOURCE_SHA256 '
 ```
 
 - `IMAGE_READY` is the only signal to create an image. The line above it,

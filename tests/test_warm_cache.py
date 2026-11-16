@@ -20,12 +20,14 @@ powers off, the exact environment of consumer commands, and a clean-up that
 keeps only ``cache``.
 """
 
+import os
 import re
 import shutil
 import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import tomllib
 import unittest
 from hashlib import sha256
@@ -43,7 +45,10 @@ SECRET_URL_TOKEN = "-".join(("not", "a", "real", "signature", "value"))
 SOURCE_URL = f"https://builder-source.invalid/archive.tar.gz?token={SECRET_URL_TOKEN}"
 
 #: Commands the script runs that act on the host. Each must resolve to a stub.
-STUBBED = ("shutdown", "systemd-run", "runuser", "cloud-init", "curl", "sleep", "sync", "chown", "aws")
+STUBBED = (
+    "shutdown", "systemd-run", "systemctl", "runuser", "cloud-init", "curl", "sleep", "sync",
+    "chown", "aws", "tar", "id",
+)
 
 #: What bash itself adds to an empty environment.
 BASH_INTERNAL = {"PWD", "SHLVL", "_", "OLDPWD"}
@@ -80,7 +85,14 @@ STUB_BODIES = {
     "sync": "",
     "chown": "",
     "aws": "exit 99",
-    "cloud-init": 'exit "${STUB_CLOUD_INIT_RC:-0}"',
+    "cloud-init": """
+if [ -n "${STUB_LATE_PROCESS_PID:-}" ]; then
+  mkdir -p "$STUB_PROC/$STUB_LATE_PROCESS_PID"
+  printf 'Uid:\\t%s\\t%s\\t%s\\t%s\\n' "$STUB_RUNNER_UID" "$STUB_RUNNER_UID" "$STUB_RUNNER_UID" "$STUB_RUNNER_UID" \\
+    > "$STUB_PROC/$STUB_LATE_PROCESS_PID/status"
+fi
+exit "${STUB_CLOUD_INIT_RC:-0}"
+""",
     "curl": """
 out=
 while [ "$#" -gt 0 ]; do
@@ -92,13 +104,65 @@ done
 [ "${STUB_CURL_RC:-0}" = 0 ] || exit "$STUB_CURL_RC"
 cp "$STUB_ARCHIVE" "$out"
 """,
-    "runuser": """
-[ "$1" = -u ] && [ "$2" = runner ] && [ "$3" = -- ] || exit 97
-echo CONSUMER >> "$STUB_DIR/events"
-shift 3
-exec "$@"
-""",
+    # The script no longer uses runuser or a root tar: either call is a defect.
+    "runuser": "echo RUNUSER >> \"$STUB_DIR/events\"\nexit 97",
+    "tar": "echo ROOT_TAR >> \"$STUB_DIR/events\"\nexit 97",
+    "id": 'echo "$STUB_RUNNER_UID"',
+    "systemctl": "",
 }
+
+#: Stands in for the unit manager. The lifetime timer is only recorded. A
+#: transient unit runs its command in a session of its own and, when the main
+#: process ends, kills the whole group, which is what KillMode=control-group does
+#: to the unit's control group. The command after the options starts with
+#: ``env -i NAME=value ...``: the stub finds the program that env would run.
+SYSTEMD_RUN_STUB = """#!/bin/bash
+case "$*" in
+  *--on-active=*) echo "systemd-run $*" >> "$STUB_DIR/events"; exit 0 ;;
+esac
+unit=
+options=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --unit=*) unit=${1#--unit=}; shift ;;
+    --*) options="$options $1"; shift ;;
+    *) break ;;
+  esac
+done
+echo "UNIT $unit" >> "$STUB_DIR/events"
+echo "UNIT_OPTIONS$options" >> "$STUB_DIR/events"
+[ "$1" = env ] && [ "$2" = -i ] || exit 98
+program=
+program_arguments=()
+for argument in "${@:3}"; do
+  if [ -n "$program" ]; then
+    program_arguments+=("$argument")
+    continue
+  fi
+  case "$argument" in
+    *=*) ;;
+    *) program=$argument ;;
+  esac
+done
+case "$program" in
+  bash) echo CONSUMER >> "$STUB_DIR/events" ;;
+  tar)
+    echo "EXTRACT $program ${program_arguments[*]}" >> "$STUB_DIR/events"
+    if [ -n "${STUB_TAR_NOISE:-}" ]; then
+      printf '%b' "$STUB_TAR_NOISE" >&2
+      [ "${STUB_TAR_FAIL:-0}" = 0 ] || exit "$STUB_TAR_FAIL"
+    fi
+    ;;
+  *) exit 99 ;;
+esac
+exec 3<&0
+setsid "$@" <&3 &
+pid=$!
+wait "$pid"
+rc=$?
+kill -KILL -- "-$pid" 2>/dev/null || true
+exit "$rc"
+"""
 
 
 class WarmHarness:
@@ -114,14 +178,29 @@ class WarmHarness:
         self.run_dir = self.root / "tmpfs"  # stands in for /run
         self.stub = self.root / "stub"
         self.console = self.root / "console"  # stands in for /dev/ttyS0
-        for path in (self.home, self.vartmp, self.run_dir, self.stub):
+        self.proc = self.root / "procfs"  # stands in for /proc
+        for path in (self.home, self.vartmp, self.run_dir, self.stub, self.proc):
             path.mkdir()
+        # A baseline process table: a root process and one of another account.
+        self.add_process(1, 0)
+        self.add_process(500, self.RUNNER_UID + 1)
         self.console.write_text("", encoding="utf-8")
         self.events = self.stub / "events"
         self.events.write_text("", encoding="utf-8")
         for name, body in STUB_BODIES.items():
             self.write_stub(name, body)
+        unit_manager = self.stub / "systemd-run"
+        unit_manager.write_text(SYSTEMD_RUN_STUB, encoding="utf-8")
+        unit_manager.chmod(unit_manager.stat().st_mode | stat.S_IXUSR)
         self.archive, self.digest = make_archive(self.root)
+
+    RUNNER_UID = 4242
+
+    def add_process(self, pid, uid):
+        (self.proc / str(pid)).mkdir(exist_ok=True)
+        (self.proc / str(pid) / "status").write_text(
+            f"Name:\tstub\nPid:\t{pid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n", encoding="utf-8"
+        )
 
     def write_stub(self, name, body):
         path = self.stub / name
@@ -138,12 +217,13 @@ class WarmHarness:
             text.replace("/var/lib/forgejo-runner", str(self.home))
             .replace("/var/tmp/", f"{self.vartmp}/")
             .replace("/run/", f"{self.run_dir}/")
+            .replace("/proc/", f"{self.proc}/")
             .replace("/dev/ttyS0", str(self.console))
         )
         # Fail closed: no real host path may survive, so a missed replacement
         # cannot reach the builder's, or this host's, filesystem.
         stripped = text.replace(str(self.root), "")
-        leftovers = re.findall(r"/(?:var|run|tmp|etc|root|home)/\S*|/dev/tty\S*", stripped)
+        leftovers = re.findall(r"/(?:var|run|tmp|etc|root|home|proc)/\S*|/dev/tty\S*", stripped)
         self.assertEqual(leftovers, [], "an unreplaced host path would reach this host")
         for line in text.splitlines():
             if "/sbin/shutdown" in line:
@@ -162,6 +242,8 @@ class WarmHarness:
             "PATH": f"{self.stub}:/usr/local/bin:/usr/bin:/bin",
             "STUB_DIR": str(self.stub),
             "STUB_ARCHIVE": str(self.archive),
+            "STUB_RUNNER_UID": str(self.RUNNER_UID),
+            "STUB_PROC": str(self.proc),
             "SECRET_CANARY": "root-credential-canary",
             "LANG": "C.UTF-8",
         }
@@ -541,6 +623,185 @@ class CleanupTests(WarmHarness, unittest.TestCase):
     def test_a_failure_removes_the_extracted_source(self):
         self.start(WARM_COMMANDS="exit 1")
         self.assertFalse((self.vartmp / "warm-src").exists())
+
+
+def make_device_archive(directory):
+    """An archive whose only member is a character device node."""
+    archive = Path(directory) / "device.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        member = tarfile.TarInfo("device-node")
+        member.type = tarfile.CHRTYPE
+        member.devmajor, member.devminor = 1, 3
+        tar.addfile(member)
+    return archive, sha256(archive.read_bytes()).hexdigest()
+
+
+class ExtractionTests(WarmHarness, unittest.TestCase):
+    """The archive is untrusted data: only the job account unpacks it."""
+
+    def test_the_archive_is_extracted_by_the_job_account_in_a_unit_never_by_root(self):
+        completed = self.start()
+        self.assertEqual(completed.returncode, 0, self.output)
+        events = self.event_list()
+        self.assertNotIn("ROOT_TAR", events, "root never runs tar")
+        self.assertNotIn("RUNUSER", events)
+        extract = [e for e in events if e.startswith("EXTRACT ")]
+        self.assertEqual(
+            extract,
+            [f"EXTRACT tar -xzf - -C {self.vartmp / 'warm-src'} --no-same-owner --no-same-permissions"],
+        )
+        # The unit that ran it is the first one, and it ran before any warm command.
+        self.assertLess(events.index("UNIT warm-job-1"), events.index("CONSUMER"))
+        self.assertEqual(events[events.index("UNIT warm-job-1") + 2].split()[0], "EXTRACT")
+
+    def test_no_executable_line_of_the_script_runs_tar_or_a_recursive_chown_as_root(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        executable = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+        self.assertEqual([l.strip() for l in executable if re.search(r"(?<![\w./=-])tar\s", l)],
+                         ["run_in_unit extract \"$ARCHIVE\" tar -xzf - -C \"$SRC_DIR\" --no-same-owner --no-same-permissions"])
+        self.assertFalse([l for l in executable if re.search(r"\bchown\s+-\w*R", l)])
+        self.assertFalse([l for l in executable if re.search(r"\brunuser\b", l)])
+
+    def test_a_device_node_in_the_archive_creates_no_device_and_no_marker(self):
+        if os.geteuid() == 0:
+            self.skipTest("root could make the node; the structural tests above cover this case")
+        self.archive, self.digest = make_device_archive(self.root)
+        completed = self.start()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(self.unframed_markers(), [])
+        node = self.vartmp / "warm-src" / "device-node"
+        self.assertFalse(node.exists() or node.is_symlink())
+
+    def test_every_unit_is_a_waited_collected_job_account_unit_with_a_control_group_kill(self):
+        self.start(WARM_COMMANDS="cat lock.txt\ncat lock.txt", WARM_GATE_COMMAND="cat lock.txt")
+        events = self.event_list()
+        units = [e for e in events if e.startswith("UNIT ")]
+        self.assertEqual(units, [f"UNIT warm-job-{n}" for n in range(1, 5)])
+        for line in (e for e in events if e.startswith("UNIT_OPTIONS")):
+            for option in (
+                "--wait", "--pipe", "--collect", "--quiet", "--uid=runner", "--gid=runner",
+                "--property=KillMode=control-group",
+            ):
+                self.assertIn(option, line.split())
+
+    def test_extraction_output_goes_to_the_log_and_a_failure_is_framed(self):
+        self.extra_env = {"STUB_TAR_NOISE": f"\n{MARKER}\n", "STUB_TAR_FAIL": "2"}
+        completed = self.start()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("WARM FAIL extract rc=2", self.output)
+        self.assertEqual(self.unframed_markers(), [])
+        self.assertIn(f"{FRAME}{MARKER}", self.lines)
+        for line in self.lines + self.console_lines() + self.output.split("\n"):
+            self.assertFalse(line.startswith(MARKER), repr(line))
+        self.assertNotIn("CONSUMER", self.event_list())
+
+    def test_noisy_extraction_followed_by_a_failing_command_prints_no_unframed_marker(self):
+        self.extra_env = {"STUB_TAR_NOISE": f"\n{MARKER}\n"}
+        completed = self.start(WARM_COMMANDS="exit 1")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(self.unframed_markers(), [])
+        for line in self.lines + self.console_lines() + self.output.split("\n"):
+            self.assertFalse(line.startswith(MARKER), repr(line))
+
+    def test_noisy_extraction_followed_by_success_keeps_the_marker_unique(self):
+        self.extra_env = {"STUB_TAR_NOISE": f"\n{MARKER}\n"}
+        completed = self.start()
+        self.assertEqual(completed.returncode, 0, self.output)
+        self.assertEqual(self.output.count(MARKER), 1)
+        self.assertEqual(self.lines[-1], MARKER)
+
+    def test_a_failing_cleanup_prints_a_framed_log_tail_and_no_unframed_marker(self):
+        self.write_stub("find", f"printf '\\n{MARKER}\\n' >&2\nexit 1")
+        completed = self.start()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("WARM FAIL clean-up", self.output)
+        self.assertEqual(self.unframed_markers(), [])
+        self.assertIn(f"{FRAME}{MARKER}", self.lines)
+
+
+class ContainmentTests(WarmHarness, unittest.TestCase):
+    """A command's leftovers die with its unit, or the build fails without a marker."""
+
+    def test_a_delayed_background_writer_is_killed_with_its_unit(self):
+        completed = self.start(
+            WARM_COMMANDS='(sleep 1; touch "$HOME/.runner"; mkdir "$HOME/late") >/dev/null 2>&1 &'
+        )
+        self.assertEqual(completed.returncode, 0, self.output)
+        time.sleep(2.5)
+        self.assertFalse((self.home / ".runner").exists())
+        self.assertFalse((self.home / "late").exists())
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["cache"])
+
+    def test_a_delayed_writer_into_the_source_directory_is_killed_too(self):
+        completed = self.start(
+            WARM_COMMANDS='(sleep 1; mkdir -p "$PWD/late-source") >/dev/null 2>&1 &'
+        )
+        self.assertEqual(completed.returncode, 0, self.output)
+        time.sleep(2.5)
+        self.assertFalse((self.vartmp / "warm-src").exists())
+
+    def test_a_surviving_process_of_the_job_account_ends_the_build_without_a_marker(self):
+        self.add_process(777, self.RUNNER_UID)
+        completed = self.start()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(self.unframed_markers(), [])
+        self.assertIn("a process of the job account is still running", self.output)
+        events = self.event_list()
+        self.assertTrue([e for e in events if e.startswith("systemctl kill")], "the units are killed first")
+        self.assertTrue([e for e in events if e.startswith("systemctl stop")])
+        self.assertNotIn("cloud-init clean --logs", events, "nothing is cleaned while a process runs")
+        self.assertEqual(events[-1], "shutdown -h now")
+
+    def test_any_of_the_four_uids_counts_as_the_job_account(self):
+        for position in range(4):
+            with self.subTest(position=position):
+                self.events.write_text("", encoding="utf-8")
+                uids = [self.RUNNER_UID + 1] * 4
+                uids[position] = self.RUNNER_UID
+                (self.proc / "778").mkdir(exist_ok=True)
+                (self.proc / "778" / "status").write_text(
+                    "Uid:\t" + "\t".join(map(str, uids)) + "\n", encoding="utf-8"
+                )
+                completed = self.start()
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(self.unframed_markers(), [])
+
+    def test_a_process_that_starts_after_the_cleanup_still_prevents_the_marker(self):
+        self.extra_env = {"STUB_LATE_PROCESS_PID": "779"}
+        completed = self.start()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(self.unframed_markers(), [])
+        events = self.event_list()
+        self.assertIn("cloud-init clean --logs", events)
+        self.assertLess(
+            events.index("sleep 300"), events.index("sync "), "the only sync is the failure trap's, after the hold"
+        )
+        self.assertEqual(events[-1], "shutdown -h now")
+
+    def test_the_account_is_checked_before_the_cleanup_and_again_before_the_marker(self):
+        completed = self.start()
+        self.assertEqual(completed.returncode, 0, self.output)
+        events = self.event_list()
+        clean = events.index("cloud-init clean --logs")
+        sync = events.index("sync ")
+        before = [i for i, e in enumerate(events) if e == "id -u runner" and i < clean]
+        after = [i for i, e in enumerate(events) if e == "id -u runner" and clean < i < sync]
+        self.assertTrue(before, "checked before the clean-up")
+        self.assertTrue(after, "checked again before the marker")
+        self.assertIn("sleep 2", events[: events.index("cloud-init clean --logs")], "a short settle first")
+
+    def test_an_unreadable_process_table_fails_closed(self):
+        shutil.rmtree(self.proc)
+        self.proc.mkdir()
+        completed = self.start()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(self.unframed_markers(), [])
+
+    def test_an_account_that_cannot_be_looked_up_fails_closed(self):
+        self.write_stub("id", "exit 1")
+        completed = self.start()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(self.unframed_markers(), [])
 
 
 def _gitleaks_findings(text):

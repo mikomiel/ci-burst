@@ -38,8 +38,10 @@ them. No task changes controller behaviour, IAM or the router.
 - [x] 2.3 Fetch the archive, verify the sha256 before extracting, and extract it to a
   directory outside the runner home.
 - [x] 2.4 Run the warm commands and the optional gate as the job account with
-  `runuser -u runner -- env -i HOME=... PATH=... LC_ALL=C.UTF-8 <shared cache
-  environment> bash -c 'umask 0022; cd SRC && CMD'`.
+  `systemd-run --wait --pipe --collect --uid=runner --gid=runner
+  --property=KillMode=control-group env -i HOME=... PATH=... LC_ALL=C.UTF-8
+  <shared cache environment> bash -c 'umask 0022; cd SRC && CMD'`, in a transient
+  unit per command, and extract the archive the same way as the job account.
 - [x] 2.5 Remove the source, `/var/lib/forgejo-runner/.runner` and every runner-home
   entry other than `cache`; run `cloud-init clean --logs`. Print `IMAGE_READY` and
   the source digest only after every step has passed. Any failure exits non-zero
@@ -49,7 +51,7 @@ them. No task changes controller behaviour, IAM or the router.
 ## 3. Tests for the script
 
 - [x] 3.1 Add tests in `tests/` in the style of `tests/test_runner_bootstrap.py`:
-  read the committed script and run it against stubs (`runuser`, `systemd-run`,
+  read the committed script and run it against stubs (`systemd-run`, `systemctl`,
   `cloud-init`, `curl`, `shutdown`) so no builder, account or network is needed.
 - [x] 3.2 Cover: missing sha256 and empty commands refuse before any consumer
   command; a digest mismatch stops before extraction; a failing warm command and a

@@ -3,8 +3,10 @@
 import contextlib
 import copy
 import io
+import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -388,6 +390,50 @@ class TransportTests(unittest.TestCase):
                 with self.assertRaises(driver.ApiError):
                     api.merge(1, HEAD)
                 self.assertEqual(request.call_count, 1)
+
+
+class MergedReportTest(unittest.TestCase):
+    def test_only_an_applied_merge_that_landed_reports_true(self):
+        self.assertIs(driver.merged_report("merge", True, [{"merged": True}]), True)
+        self.assertIs(driver.merged_report("merge", True, [{"merged": False}]), False)
+        self.assertIs(driver.merged_report("merge", True, []), False)
+        self.assertIs(driver.merged_report("merge", False, [{"merged": True}]), False)
+        self.assertIs(driver.merged_report("review", True, [{"merged": True}]), False)
+        # Literal booleans and well-formed decisions only: a truthy int, a string,
+        # a missing key or a non-dictionary decision must not authorize a release.
+        self.assertIs(driver.merged_report("merge", True, [{"merged": "true"}]), False)
+        self.assertIs(driver.merged_report("merge", 1, [{"merged": True}]), False)
+        self.assertIs(driver.merged_report("merge", True, [{"merged": 1}]), False)
+        self.assertIs(driver.merged_report("merge", True, [{}]), False)
+        self.assertIs(driver.merged_report("merge", True, ["merged"]), False)
+
+    def test_the_output_file_receives_merged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "output"
+            target.write_text("", encoding="utf-8")
+            driver.append_github_output(target, "merge", True, [{"merged": True}])
+            driver.append_github_output(target, "merge", True, [{"merged": False}])
+            self.assertEqual(target.read_text(encoding="utf-8"), "merged=true\nmerged=false\n")
+
+    def test_main_writes_the_output_file_after_an_applied_merge(self):
+        sink = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "output"
+            target.write_text("", encoding="utf-8")
+            with contextlib.redirect_stdout(sink), \
+                    mock.patch.object(driver, "trusted_context", return_value=True), \
+                    mock.patch.object(driver, "GitHub", lambda apply: object()), \
+                    mock.patch.object(driver, "run_merge", return_value=[{"merged": True}]):
+                self.assertEqual(driver.main(["merge", "--apply", "--github-output", str(target)]), 0)
+            self.assertEqual(target.read_text(encoding="utf-8"), "merged=true\n")
+        self.assertEqual(json.loads(sink.getvalue())["decisions"], [{"merged": True}])
+
+    def test_main_writes_nothing_when_the_flag_is_absent(self):
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(driver, "trusted_context", return_value=True), \
+                mock.patch.object(driver, "GitHub", lambda apply: object()), \
+                mock.patch.object(driver, "run_merge", return_value=[{"merged": True}]):
+            self.assertEqual(driver.main(["merge", "--apply"]), 0)
 
 
 if __name__ == "__main__":

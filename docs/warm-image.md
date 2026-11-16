@@ -184,6 +184,13 @@ umask 077
   tail -n +2 deploy/runner/image/warm-cache.sh
 } > user-data.sh
 bash -n user-data.sh
+# EC2 refuses user data over 16384 bytes. An oversized file is removed, so the
+# launch below fails instead of sending it; the check itself returns nonzero.
+if [ "$(wc -c < user-data.sh)" -gt 16384 ]; then
+  echo "user data too large: move commands into the archive" >&2
+  rm -f user-data.sh
+  false
+fi
 ```
 
 The rendered file begins like this, with your own values in place of the
@@ -198,8 +205,14 @@ export WARM_GATE_COMMAND=<gate-command>
 ```
 
 EC2 user data is limited to 16 KB before base64 encoding. The script is about
-9 KB, which leaves about 7 KB for the inputs, so keep the commands short and put
-long logic in a script inside the source archive.
+13.5 KB and a presigned URL is often 1.5 to 2 KB, which leaves well under 1 KB for
+the commands. Put the command lists in scripts inside the source archive, where
+the digest covers them, and keep the inputs to one line each:
+
+```sh
+WARM_COMMANDS='bash warm.sh'
+WARM_GATE_COMMAND='bash warm-gate.sh'
+```
 
 ### 4. Launch the builder from the base image
 
@@ -236,15 +249,17 @@ if a command hangs.
 ```sh
 # Poll the serial console for up to about an hour. The console lags the builder by
 # a few minutes. Stop only on the whole IMAGE_READY line or on a failure line:
-# every failure, including a refusal, prints "warm exiting rc=".
+# every failure, including a refusal, prints "warm exiting rc=". A line can carry
+# the cloud-init prefix, for example "[  279.87] cloud-init[671]: IMAGE_READY".
+P='^(\[ *[0-9.]+\] )?(cloud-init\[[0-9]+\]: )?'
 for _ in $(seq 1 120); do
   aws ec2 get-console-output --instance-id <builder-instance-id> --latest --output text \
-    | grep -E '^(warm exiting rc=|WARM FAIL|IMAGE_READY$)' && break
+    | grep -E "${P}(warm exiting rc=|WARM FAIL|IMAGE_READY\$)" && break
   sleep 30
 done
 # After IMAGE_READY, read the digest line the script prints just above it.
 aws ec2 get-console-output --instance-id <builder-instance-id> --latest --output text \
-  | grep -E '^WARM_SOURCE_SHA256 '
+  | grep -E "${P}WARM_SOURCE_SHA256 "
 ```
 
 - `IMAGE_READY` is the only signal to create an image. The line above it,
@@ -254,6 +269,11 @@ aws ec2 get-console-output --instance-id <builder-instance-id> --latest --output
   source, and start again from step 1. The builder holds for 300 seconds and
   powers itself off.
 - The console keeps a bounded tail, so read the framed tail soon after a failure.
+- The script copies its output to the serial port, and cloud-init copies it to
+  the console with its own prefix. When the serial login prompt starts, the
+  copy to the port can fail with `tee: /dev/ttyS0: Input/output error`. From
+  then on every line appears only with the cloud-init prefix, which the pattern
+  above accepts. The build is not affected.
 
 ### 6. Create the image, tagged with the source digest
 
@@ -279,6 +299,11 @@ aws ec2 terminate-instances --instance-ids <builder-instance-id>
 The `warm-source-sha256` tag is the traceability record: it names the archive, and
 so the lockfiles, that the layer was built from. Record the base image id beside
 it in your own deployment notes.
+
+If your tagging policy limits the tag keys allowed on create (for example with
+`aws:TagKeys`), AWS refuses the whole `create-image` call when this key is not on
+the list. Add the key to the policy, or put the digest in `--description` and keep
+only the allowed tags.
 
 ### 7. Publish a launch-template version
 

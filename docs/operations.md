@@ -118,7 +118,7 @@ so the Region can offer more Spot capacity than one type has across its zones:
 region = "eu-central-1"
 launch_template_name = "example-ci-burst-runner"
 launch_template_version = 6
-instance_types = ["m7g.xlarge", "m8g.xlarge"]
+instance_types = ["m8g.xlarge", "m7g.xlarge"]
 max_spot_price = "0.0400"
 max_lifetime_seconds = 3600
 
@@ -127,8 +127,11 @@ zone = "eu-central-1a"
 subnet_id = "subnet-0123456789abcdef0"
 ```
 
-The order is type-major and it is the priority: every zone of `m7g.xlarge`
-first, then every zone of `m8g.xlarge`. A definite capacity rejection walks to
+The order is type-major and it is the priority: every zone of `m8g.xlarge`
+first, then every zone of `m7g.xlarge`. The example lists the newer generation
+first and the older one as the capacity fallback;
+[deployment.md](deployment.md#5-write-the-deployment-toml) gives the rule and the
+measurement that checks it. A definite capacity rejection walks to
 the next pool in that order within the same admission and operation, and a
 rotation that starts inside the first type stays there until that type's pools
 are exhausted. A worker always starts on the first type: a batch spreads across

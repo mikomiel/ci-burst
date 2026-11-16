@@ -43,11 +43,16 @@ not match it, or when the warm commands are empty.
    It is armed first so that no later step can leave a builder running.
 2. Fetch the archive, verify the sha256 and extract it into a fresh directory
    outside the runner home.
-3. Run the warm commands as the job account:
-   `runuser -u runner -- env -i HOME=... PATH=... LC_ALL=C.UTF-8 <cache
-   environment> bash -c 'umask 0022; cd SRC && CMD'`. `env -i` keeps the root
-   environment, and any credential in it, out of consumer commands. The umask
-   matches the job's.
+3. Run the warm commands as the job account, each in its own transient unit:
+   `systemd-run --wait --pipe --collect --uid=runner --gid=runner
+   --property=KillMode=control-group env -i HOME=... PATH=... LC_ALL=C.UTF-8
+   <cache environment> bash -c 'umask 0022; cd SRC && CMD'`. `env -i` keeps the
+   root environment, and any credential in it, out of consumer commands. The umask
+   matches the job's. The unit's control group ends with its command, so a
+   background process dies with it. The archive is extracted the same way, by the
+   job account and never by root, with the archive on standard input. Before the
+   clean-up and again before the marker the script fails unless no process of the
+   job account remains.
 4. If an offline gate command is supplied, run it the same way with downloads
    forbidden. The mechanism that forbids downloads is the consumer's command to
    choose (see open questions).
@@ -94,12 +99,18 @@ version, with a hash pinned in `tests/test_runner_bootstrap.py`. It cannot read 
 repository file at boot, and sourcing a file from the image would change those
 bytes and break an older image that lacks the file. So:
 
-- `provision.sh` installs the shared file into the image, and its probe and the
-  warm layer source it. Those two copies disappear.
+- `provision.sh` embeds a byte-identical copy of the shared file and installs it
+  at `/etc/ci-burst/cache-env.sh`; its probe reads the cache variables from that
+  installed file.
+- `warm-cache.sh` keeps an inline copy of the assignments. It runs as lone user
+  data on a builder whose image may predate the installed file, so it cannot
+  source it.
 - `bootstrap.sh` keeps its inline assignments, because it is self-contained user
-  data. A test parses the assignments out of `bootstrap.sh`, and out of
-  `provision.sh` if any remain, and fails when a name or a value differs from the
-  shared file or when a name is missing.
+  data.
+- `tests/test_cache_environment.py` parses the assignments out of every copy
+  (`bootstrap.sh`, the `provision.sh` heredoc, the `warm-cache.sh` array) and
+  fails, naming the variable, when a name or a value differs from the shared file
+  or when a name is missing. It also asserts that the heredoc is byte-identical.
 
 A later bootstrap edit may source the installed file. That is a new template
 version and its own change.

@@ -272,6 +272,9 @@ file here is the recorded deployment's captured template user data, not a
 parameterised example; if your deployment needs different values, fork it and
 publish your own version (see [Worker bootstrap](#worker-bootstrap)).
 
+An optional warm-cache layer, added on top of this image so jobs do not download
+their packages on every worker, is described in [warm-image.md](warm-image.md).
+
 ### Worker bootstrap
 
 User data (no secret in it). The bootstrap is the repository-owned file

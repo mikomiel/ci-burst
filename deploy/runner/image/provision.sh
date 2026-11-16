@@ -91,6 +91,44 @@ chown root:runner /etc/forgejo-runner/config.yml
 chmod 0640 /etc/forgejo-runner/config.yml
 rm -f /var/lib/forgejo-runner/.runner
 
+# The job-account cache environment, installed so that a later tool on the
+# image (the warm-cache layer's probe, a future bootstrap) can read one
+# definition. The body is a byte-for-byte copy of deploy/runner/cache-env.sh,
+# which owns it; this recipe runs as lone user data and cannot read the file.
+# tests/test_cache_environment.py fails when the copy differs.
+install -d -m 0755 /etc/ci-burst
+cat > /etc/ci-burst/cache-env.sh <<'CACHE_ENV'
+# Job-account cache environment: the one definition.
+#
+# The runtime bootstrap starts every job with these variables, so a cache that a
+# warm step fills at any other path is a cache no job reads. The clean-up of the
+# warm-cache layer keeps only the `cache` directory, so every value must lie
+# under /var/lib/forgejo-runner/cache.
+#
+# One NAME=value assignment per line, no quoting, no expansion and no export.
+# This file is data that three scripts carry a copy of:
+#
+#   - deploy/runner/bootstrap.sh is published launch-template user data with a
+#     pinned hash and cannot read a repository file, so it keeps inline
+#     assignments;
+#   - deploy/runner/image/provision.sh writes this file into the image from an
+#     embedded copy and runs its probe with the installed file;
+#   - deploy/runner/image/warm-cache.sh runs as lone user data on a builder
+#     whose image may predate this file, so it keeps an inline copy.
+#
+# tests/test_cache_environment.py parses every copy and fails, naming the
+# variable, when a name is missing or a value differs from this file. Change a
+# value here and in each copy together; a bootstrap change is a new
+# launch-template version and its own change.
+XDG_CACHE_HOME=/var/lib/forgejo-runner/cache
+UV_CACHE_DIR=/var/lib/forgejo-runner/cache/uv
+NPM_CONFIG_CACHE=/var/lib/forgejo-runner/cache/npm
+npm_config_cache=/var/lib/forgejo-runner/cache/npm
+PIP_CACHE_DIR=/var/lib/forgejo-runner/cache/pip
+CI_PROFILE_CACHE_ROOT=/var/lib/forgejo-runner/cache/validation
+CACHE_ENV
+chmod 0644 /etc/ci-burst/cache-env.sh
+
 # The pinned toolchain. Checksums are the release artifacts this recipe was
 # verified against; update one only with a new image.
 UV_VERSION=0.13.7
@@ -212,17 +250,16 @@ for tool in ruff uv node; do
 done
 
 # The runtime bootstrap starts the runner with HOME and the cache variables
-# set and the job's umask at 0022. Reproduce that shape and check PATH-based
-# discovery, which is what a test's shutil.which("ruff") actually uses; the
-# absolute-path checks above cannot see a PATH that omits /usr/local/bin.
-if runuser -u runner -- env \
+# set and the job's umask at 0022. Reproduce that shape with the installed
+# cache environment and check PATH-based discovery, which is what a test's
+# shutil.which("ruff") actually uses; the absolute-path checks above cannot see
+# a PATH that omits /usr/local/bin.
+mapfile -t cache_env < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' /etc/ci-burst/cache-env.sh)
+if [ "${#cache_env[@]}" -gt 0 ] \
+   && runuser -u runner -- env \
      HOME=/var/lib/forgejo-runner \
      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-     XDG_CACHE_HOME=/var/lib/forgejo-runner/cache \
-     UV_CACHE_DIR=/var/lib/forgejo-runner/cache/uv \
-     NPM_CONFIG_CACHE=/var/lib/forgejo-runner/cache/npm \
-     PIP_CACHE_DIR=/var/lib/forgejo-runner/cache/pip \
-     CI_PROFILE_CACHE_ROOT=/var/lib/forgejo-runner/cache/validation \
+     "${cache_env[@]}" \
      bash -c 'umask 0022; python3 -c "import shutil,sys; sys.exit(0 if shutil.which(\"ruff\") else 1)"' \
      >/dev/null 2>&1; then
   echo "HAVE ruff-on-job-path"

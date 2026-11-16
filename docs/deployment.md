@@ -7,6 +7,7 @@ the order in which everything is installed. The details stay with their owners:
 | Document | Owns |
 | --- | --- |
 | [runner-setup.md](runner-setup.md) | worker IAM role, registration credential, network placement, launch template, user data |
+| [warm-image.md](warm-image.md) | the optional warm-cache layer for the worker image: runbook and per-ecosystem examples |
 | [container.md](container.md) | image build, host paths, container mounts, credential files, systemd units |
 | [operations.md](operations.md) | configuration contract, queue contract, cost scope, identities, rollback, status semantics |
 | [pilot-checklist.md](pilot-checklist.md) | the preparation record you fill in, which is not authorization |
@@ -239,7 +240,7 @@ launch_template_name = "example-ci-burst-runner"
 launch_template_version = 3
 # Optional, ordered, at most four. Each type multiplies every candidate into one
 # pool; all types must share the template type's vCPU count and memory size.
-instance_types = ["m7g.xlarge", "m8g.xlarge"]
+instance_types = ["m8g.xlarge", "m7g.xlarge"]
 max_spot_price = "0.1200"
 max_lifetime_seconds = 3600
 profile = "default"
@@ -311,12 +312,28 @@ in [operations.md](operations.md#cost-tracking-and-the-allowance) owns the
 formulas and the reconciliation with the provider bill.
 
 Start with the one candidate the scaling policy authorizes. An optional
-`aws.instance_types` list multiplies that candidate over same-shape types; keep
-the template's type first so the default landing place does not change. Add a
-`[[aws.availability_zones]]` table per further candidate, in priority order,
-and add that candidate's subnet to the policy's `RunInstances` resources in the
-same change: the policy — not the TOML — is what decides which placements are
-allowed, so a candidate the policy omits is a denied launch rather than a
+`aws.instance_types` list multiplies that candidate over same-shape types, and
+when it is present its order is the priority: workers start on the first listed
+type and a later type is used only after a capacity rejection. The template's
+own type is then the shape reference and the default when the list is absent; it
+does not decide where workers land.
+
+Order the list by one rule: the newest generation of the same shape first, and an
+older generation after it as the capacity fallback. When the template's type is
+already the newest, keep it first. When it is older, list the newest first
+anyway, so the first listed type, not the template's, is the preferred landing
+place; publish the newest type in the template at its next version so the two
+agree, which is tidiness and not a requirement. Verify the order with a
+measurement, and reorder when it does not hold: job duration per instance type
+and cost per job, before and after the change (the instance type in worker
+events is GitHub issue #156). One
+consumer measured the newer same-shape generation 16-23% faster (median, small
+sample) at about 7% lower Spot price. Treat that as one result, not a guarantee.
+
+Add a `[[aws.availability_zones]]` table per further candidate, in priority
+order, and add that candidate's subnet to the policy's `RunInstances` resources
+in the same change: the policy — not the TOML — is what decides which placements
+are allowed, so a candidate the policy omits is a denied launch rather than a
 fallback. A zone without a subnet cannot be used at all.
 
 ### Change the deployment name

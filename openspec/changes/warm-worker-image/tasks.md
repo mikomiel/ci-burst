@@ -38,8 +38,8 @@ them. No task changes controller behaviour, IAM or the router.
 - [x] 2.3 Fetch the archive, verify the sha256 before extracting, and extract it to a
   directory outside the runner home.
 - [x] 2.4 Run the warm commands and the optional gate as the job account with
-  `systemd-run --wait --pipe --collect --uid=runner --gid=runner
-  --property=KillMode=control-group env -i HOME=... PATH=... LC_ALL=C.UTF-8
+  `systemd-run --wait --pipe --collect --expand-environment=no --uid=runner
+  --gid=runner --property=KillMode=control-group env -i HOME=... PATH=... LC_ALL=C.UTF-8
   <shared cache environment> bash -c 'umask 0022; cd SRC && CMD'`, in a transient
   unit per command, and extract the archive the same way as the job account.
 - [x] 2.5 Remove the source, `/var/lib/forgejo-runner/.runner` and every runner-home
@@ -121,22 +121,40 @@ them. No task changes controller behaviour, IAM or the router.
 
 ## 6. Live verification (operator approval required)
 
-- [ ] 6.1 Launch a builder from the current worker image on a test identity, run the
+- [x] 6.1 Launch a builder from the current worker image on a test identity, run the
   script with a test consumer's archive and commands, and record the cache size.
   Include a warm command that writes the literal text `"${UV_CACHE_DIR}"` (for
   example `mkdir -p "${UV_CACHE_DIR}/probe"`) and confirm the directory appears
   under the shared cache path, to prove the service manager did not expand the
   variable before bash ran.
+  Evidence: one xlarge Graviton builder, real consumer archive; digest verified,
+  extraction 1 s, warm commands 229 s, literal-variable probe confirmed by the
+  gate, cache 1.8 GB, `IMAGE_READY` printed.
 - [ ] 6.2 Confirm the offline gate passes, and that a deliberately broken warm
   command and a deliberately failing gate each produce no ready marker.
-- [ ] 6.3 Create the image while the builder is still running, tag it with the
+  Partial: the offline gate passed live in 22 s. The two negative cases are covered
+  by the unit tests only; no builder ran them.
+- [x] 6.3 Create the image while the builder is still running, tag it with the
   source digest, and publish it in a new launch-template version. Do not move the
   configured version yet.
-- [ ] 6.4 Run a canary job on a test repository through the new version and confirm
+  Evidence: image created with `--no-reboot` in the snapshot window. The test
+  identity's tag policy allowed only two tag keys, so the digest went into the
+  image description (the runbook now says so). The operator then approved moving
+  the configured version.
+- [x] 6.4 Run a canary job on a test repository through the new version and confirm
   it finds the warm cache and downloads little. This is an operator obligation; the
   controller does not check for it.
+  Evidence: the controller serves one repository, so a test-repository job was not
+  claimed. Production jobs on the new version found the cache instead: the
+  interpreter came from the image, and uv resolved and installed every package
+  without a download. Download and prepare lines per job fell from 32 to 9 and
+  from 19 to 4.
 - [ ] 6.5 Compare job duration for the same jobs on the cold and the warm version, and
   record the result. Only then should the operator move the configured version.
+  First sample (one run each, same jobs, same instance type): 1% to 11% shorter.
+  The rest of the setup time is a dependency the consumer's own layout keeps
+  outside the shared cache (Ansible collections downloaded from Galaxy, 30 to
+  240 s per job), which a warm layer cannot reach. More samples are needed.
 - [ ] 6.6 With instance type in worker events (issue #156) available, compare per-type
   job duration and cost per job before and after the reorder in the guidance, and
   record the result.

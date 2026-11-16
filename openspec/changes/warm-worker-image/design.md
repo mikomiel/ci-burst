@@ -44,8 +44,8 @@ not match it, or when the warm commands are empty.
 2. Fetch the archive, verify the sha256 and extract it into a fresh directory
    outside the runner home.
 3. Run the warm commands as the job account, each in its own transient unit:
-   `systemd-run --wait --pipe --collect --uid=runner --gid=runner
-   --property=KillMode=control-group env -i HOME=... PATH=... LC_ALL=C.UTF-8
+   `systemd-run --wait --pipe --collect --expand-environment=no --uid=runner
+   --gid=runner --property=KillMode=control-group env -i HOME=... PATH=... LC_ALL=C.UTF-8
    <cache environment> bash -c 'umask 0022; cd SRC && CMD'`. `env -i` keeps the
    root environment, and any credential in it, out of consumer commands. The umask
    matches the job's. The unit's control group ends with its command, so a

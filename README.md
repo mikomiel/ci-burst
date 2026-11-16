@@ -46,7 +46,8 @@ A minimal configuration is in [docs/operations.md](docs/operations.md), which
 also owns the queue contract, the worker image/template contract, labels,
 cost scope, identities, rollback and status semantics. To build the
 operator-owned worker prerequisites, including the IAM role, SSM parameter and
-bootstrap, follow [docs/runner-setup.md](docs/runner-setup.md). Once those exist, the
+bootstrap, follow [docs/runner-setup.md](docs/runner-setup.md); an optional warm-cache
+layer for that image is in [docs/warm-image.md](docs/warm-image.md). Once those exist, the
 [deployment walkthrough](docs/deployment.md) sequences the control-plane
 identities, hosts, configuration, scheduling and live qualification. The
 [pilot checklist](docs/pilot-checklist.md) is a preparation record, not

@@ -7,6 +7,8 @@ old launch-template version.
 | File | Purpose |
 |---|---|
 | [`provision.sh`](provision.sh) | The build recipe: OS packages, the pinned toolchain, the unprivileged runner account and a post-install inventory check. Run it as root on a fresh Debian 13 arm64 builder. |
+| [`warm-cache.sh`](warm-cache.sh) | Optional warm-cache layer, run as the user data of a builder launched from the current worker image. It warms the job account's cache from a consumer's source archive and commands and prints `IMAGE_READY`. [`docs/warm-image.md`](../../../docs/warm-image.md) owns the runbook and the examples. |
+| [`../cache-env.sh`](../cache-env.sh) | The one definition of the job-account cache environment. `provision.sh` installs a byte-identical copy at `/etc/ci-burst/cache-env.sh`, and a test fails when `bootstrap.sh`, `provision.sh` or `warm-cache.sh` differs from it. |
 | [`../bootstrap.sh`](../bootstrap.sh) | The recorded deployment's captured runtime user data, published as its launch-template version. It installs nothing; it reads the registration token, registers one ephemeral runner, runs one job and terminates. |
 
 ## Pins
@@ -143,6 +145,35 @@ and this file records what was installed, not that the check passed.
 The image build is operator-owned. `provision.sh` does not register a runner,
 read a secret, create an image or publish anything; IAM and network changes
 remain operator actions.
+
+## Warm-cache layer
+
+[`warm-cache.sh`](warm-cache.sh) is optional. An operator who never runs it keeps
+the cold image that `provision.sh` builds. It adds the package and tool caches a
+consumer's jobs would download, as one more layer on a finished image;
+[`docs/warm-image.md`](../../../docs/warm-image.md) owns its inputs, runbook and
+examples, and this section only places it in the build flow above.
+
+- **Same builder contract.** Launch the builder with
+  `InstanceInitiatedShutdownBehavior=terminate` and delete-on-termination
+  storage, with no instance profile. The script arms its lifetime timer first and
+  runs `shutdown -h now` after a failed build, as `provision.sh` does, so the
+  default `stop` would again keep a failed builder and its volume.
+- **Same snapshot rule.** On success the script prints `IMAGE_READY` and stays up
+  for a bounded snapshot window (default 1800 s, at most 3600 s) instead of
+  powering off, so [Build](#build) step 3 applies unchanged: create the image
+  while the builder is running. `provision.sh` idles for up to 7200 s but its
+  3600 s watchdog ends the builder sooner; the warm script's window is explicit
+  and its lifetime timer is the outer bound.
+- **Different base.** The builder starts from the current worker image, not a
+  fresh Debian instance, and the script needs no `RUFF_VERSION` or other pin.
+  It runs consumer commands, so it never prints their output unframed; only the
+  script prints `IMAGE_READY`.
+- **Same rollout.** The warm image is published and rolled out as in [Build](#build)
+  steps 3 to 5: a new launch-template version, then the deployment TOML's
+  `launch_template_version`, then the toolchain check on a launched worker. A
+  canary before the move is an operator obligation that the controller does not
+  enforce.
 
 ## Job account permissions
 

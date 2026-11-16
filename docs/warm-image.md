@@ -184,8 +184,13 @@ umask 077
   tail -n +2 deploy/runner/image/warm-cache.sh
 } > user-data.sh
 bash -n user-data.sh
-# EC2 refuses user data over 16384 bytes.
-test "$(wc -c < user-data.sh)" -le 16384 || echo "user data too large" >&2
+# EC2 refuses user data over 16384 bytes. An oversized file is removed, so the
+# launch below fails instead of sending it; the check itself returns nonzero.
+if [ "$(wc -c < user-data.sh)" -gt 16384 ]; then
+  echo "user data too large: move commands into the archive" >&2
+  rm -f user-data.sh
+  false
+fi
 ```
 
 The rendered file begins like this, with your own values in place of the

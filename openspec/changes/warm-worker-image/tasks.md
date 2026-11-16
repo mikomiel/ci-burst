@@ -141,11 +141,12 @@ them. No task changes controller behaviour, IAM or the router.
   identity's tag policy allowed only two tag keys, so the digest went into the
   image description (the runbook now says so). The operator then approved moving
   the configured version.
-- [x] 6.4 Run a canary job on a test repository through the new version and confirm
+- [ ] 6.4 Run a canary job on a test repository through the new version and confirm
   it finds the warm cache and downloads little. This is an operator obligation; the
   controller does not check for it.
-  Evidence: the controller serves one repository, so a test-repository job was not
-  claimed. Production jobs on the new version found the cache instead: the
+  Not done as written: the controller serves one repository, so a
+  test-repository job was not claimed, and the operator moved the configured
+  version without it. Production jobs on the new version show the cache works: the
   interpreter came from the image, and uv resolved and installed every package
   without a download. Download and prepare lines per job fell from 32 to 9 and
   from 19 to 4.

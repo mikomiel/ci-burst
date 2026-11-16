@@ -19,7 +19,7 @@ for (const [file, mode, permission] of [
     assert.equal(w.env, undefined);
     assert.equal(w.defaults, undefined);
     assert.equal(w.concurrency['cancel-in-progress'], false);
-    for (const job of Object.values(w.jobs)) {
+    for (const job of Object.values(w.jobs).filter((job) => job.uses === undefined)) {
       assert.equal(job.permissions, undefined);
       assert.equal(job.env, undefined);
       assert.equal(job.defaults, undefined);
@@ -32,8 +32,20 @@ for (const [file, mode, permission] of [
       assert.deepEqual(unexpected, []); // A write-token job has this explicit execution allowlist.
       assert.match(checkout.uses, /^actions\/checkout@[a-f0-9]{40}$/);
       assert.deepEqual(checkout.with, { ref: defaultBranch, 'persist-credentials': false });
-      assert.equal(execute.run, `python3 scripts/github_pr_automation.py ${mode} --apply`);
+      assert.equal(
+        execute.run,
+        `python3 scripts/github_pr_automation.py ${mode} --apply`
+          + (mode === 'merge' ? ' --github-output "$GITHUB_OUTPUT"' : ''),
+      );
       assert.equal(execute.env.GH_TOKEN, '${{ github.token }}');
+    }
+    for (const job of Object.values(w.jobs).filter((job) => job.uses !== undefined)) {
+      // A reusable-workflow call is its own allowlist entry, not a step job.
+      assert.equal(job.uses, './.github/workflows/release-please.yml');
+      assert.equal(job.secrets, 'inherit');
+      assert.deepEqual(job.permissions, { contents: 'write', 'pull-requests': 'write' });
+      assert.equal(job.needs, 'merge');
+      assert.equal(job.if, "needs.merge.outputs.merged == 'true'");
     }
   });
 
@@ -64,6 +76,17 @@ test('merger only wakes from trusted workflow completion or its sweep', () => {
   assert.ok(w.on.workflow_run.workflows.includes('review-gate'));
 });
 
+test('the release workflow is called only when the merge landed', () => {
+  const w = workflow('automerge.yml');
+  assert.equal(w.jobs.merge.outputs.merged, '${{ steps.merge.outputs.merged }}');
+  const execute = w.jobs.merge.steps.find((step) => step.id === 'merge');
+  assert.ok(execute, 'the job output reads this step id');
+  assert.ok(execute.run.endsWith('--github-output "$GITHUB_OUTPUT"'));
+  assert.equal(w.jobs.release.needs, 'merge');
+  assert.equal(w.jobs.release.if, "needs.merge.outputs.merged == 'true'");
+  assert.equal(w.jobs.release.uses, './.github/workflows/release-please.yml');
+});
+
 test('validation CI stays read-only and checks policy alongside OpenSpec', () => {
   const w = workflow('ci.yml');
   assert.deepEqual(w.permissions, { contents: 'read' });
@@ -78,9 +101,9 @@ test('validation CI stays read-only and checks policy alongside OpenSpec', () =>
 
 test('release-please observes automated merges and requires its token', () => {
   const w = workflow('release-please.yml');
-  assert.deepEqual(Object.keys(w.on).sort(), ['push', 'workflow_dispatch', 'workflow_run']);
+  assert.deepEqual(Object.keys(w.on).sort(), ['push', 'workflow_call', 'workflow_dispatch']);
   assert.deepEqual(w.on.push.branches, ['main']);
-  assert.deepEqual(w.on.workflow_run, { workflows: ['automerge'], types: ['completed'] });
+  assert.equal(w.on.workflow_call, null);
   assert.deepEqual(w.permissions, { contents: 'read' });
   assert.deepEqual(w.concurrency, { group: 'release-please', 'cancel-in-progress': false });
   assert.equal(w.env, undefined);
@@ -91,10 +114,7 @@ test('release-please observes automated merges and requires its token', () => {
   assert.ok(job['timeout-minutes'] <= 10);
   assert.equal(
     job.if.replace(/\s+/g, ' ').trim(),
-    "(github.event_name != 'workflow_run' "
-      + "|| github.event.workflow_run.head_branch == 'main') "
-      + "&& (github.event_name != 'workflow_dispatch' "
-      + "|| github.ref == 'refs/heads/main')",
+    "github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'",
   );
   for (const key of ['permissions', 'env', 'defaults', 'container', 'services', 'environment']) {
     assert.equal(job[key], undefined, `the release job must not set ${key}`);

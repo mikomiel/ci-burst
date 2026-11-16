@@ -11,7 +11,7 @@ const defaultBranch = '${{ github.event.repository.default_branch }}';
 
 for (const [file, mode, permission] of [
   ['review-gate.yml', 'review', { contents: 'read', 'pull-requests': 'read', statuses: 'write' }],
-  ['automerge.yml', 'merge', { contents: 'write', 'pull-requests': 'write', checks: 'read', statuses: 'read' }],
+  ['automerge.yml', 'merge', { contents: 'write', 'pull-requests': 'write', issues: 'write', checks: 'read', statuses: 'read' }],
 ]) {
   test(`${file}: write token only runs trusted default-branch code`, () => {
     const w = workflow(file);

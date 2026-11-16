@@ -30,6 +30,7 @@ import tempfile
 import time
 import tomllib
 import unittest
+from unittest import mock
 from hashlib import sha256
 from pathlib import Path
 
@@ -116,7 +117,13 @@ cp "$STUB_ARCHIVE" "$out"
 #: process ends, kills the whole group, which is what KillMode=control-group does
 #: to the unit's control group. The command after the options starts with
 #: ``env -i NAME=value ...``: the stub finds the program that env would run.
-SYSTEMD_RUN_STUB = """#!/bin/bash
+#:
+#: Like the real manager, it expands ``${NAME}`` and ``$NAME`` in the command's
+#: arguments from its own environment (empty when unset) and turns ``$$`` into
+#: ``$``, before anything runs, unless ``--expand-environment=no`` is among the
+#: options. Without the flag a consumer's ``${UV_CACHE_DIR}`` is gone before bash
+#: sees it, so the tests below fail when the script drops the flag.
+SYSTEMD_RUN_STUB = r"""#!/bin/bash
 case "$*" in
   *--on-active=*) echo "systemd-run $*" >> "$STUB_DIR/events"; exit 0 ;;
 esac
@@ -131,6 +138,33 @@ while [ "$#" -gt 0 ]; do
 done
 echo "UNIT $unit" >> "$STUB_DIR/events"
 echo "UNIT_OPTIONS$options" >> "$STUB_DIR/events"
+expand_argument() {
+  local rest=$1 out=
+  local pattern='^(([^$]|\$[^{A-Za-z_$])*)\$(\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*)|(\$))(.*)$'
+  while [[ $rest =~ $pattern ]]; do
+    out+=${BASH_REMATCH[1]}
+    if [ -n "${BASH_REMATCH[4]}" ]; then
+      out+=${!BASH_REMATCH[4]:-}
+    elif [ -n "${BASH_REMATCH[5]}" ]; then
+      out+=${!BASH_REMATCH[5]:-}
+    else
+      out+='$'
+    fi
+    rest=${BASH_REMATCH[7]}
+  done
+  expanded=$out$rest
+}
+case " $options " in
+  *" --expand-environment=no "*) ;;
+  *)
+    arguments=()
+    for argument in "$@"; do
+      expand_argument "$argument"
+      arguments+=("$expanded")
+    done
+    set -- "${arguments[@]}"
+    ;;
+esac
 [ "$1" = env ] && [ "$2" = -i ] || exit 98
 program=
 program_arguments=()
@@ -556,6 +590,47 @@ class EnvironmentTests(WarmHarness, unittest.TestCase):
             self.assertNotIn(secret, text)
         self.assertFalse(re.search(r"^WARM_", text, re.MULTILINE))
 
+    # systemd-run replaces ${NAME} and $NAME in its arguments with the service
+    # manager's own value before env -i runs; the stub does the same unless the
+    # script passes --expand-environment=no.
+    EXPRESSIONS = (
+        'printf "%s\\n" "${UV_CACHE_DIR}" > @cache@\n'
+        'printf "%s\\n" $HOME > @home@\n'
+        'printf "%s|%s\\n" "$$" "$(echo inner)" > @shell@'
+    )
+
+    def run_expressions(self):
+        paths = {name: self.root / f"expr-{name}.txt" for name in ("cache", "home", "shell")}
+        command = self.EXPRESSIONS
+        for name, path in paths.items():
+            command = command.replace(f"@{name}@", str(path))
+        completed = self.start(WARM_COMMANDS=command)
+        return completed, paths
+
+    def test_variable_expressions_in_a_command_reach_bash_unchanged(self):
+        completed, paths = self.run_expressions()
+        self.assertEqual(completed.returncode, 0, self.output)
+        cache = shared_environment()["UV_CACHE_DIR"].replace("/var/lib/forgejo-runner", str(self.home))
+        self.assertEqual(paths["cache"].read_text(encoding="utf-8").strip(), cache)
+        self.assertEqual(paths["home"].read_text(encoding="utf-8").strip(), str(self.home))
+        pid, _, inner = paths["shell"].read_text(encoding="utf-8").strip().partition("|")
+        self.assertTrue(pid.isdigit(), "$$ must be bash's process id, not a literal dollar")
+        self.assertEqual(inner, "inner")
+
+    def test_without_the_flag_the_service_manager_would_empty_the_variables(self):
+        original = WarmHarness.rendered
+
+        def without_flag(harness):
+            text = original(harness)
+            self.assertIn(" --expand-environment=no", text)
+            return text.replace(" --expand-environment=no", "")
+
+        with mock.patch.object(WarmHarness, "rendered", without_flag):
+            completed, paths = self.run_expressions()
+        self.assertEqual(paths["cache"].read_text(encoding="utf-8").strip(), "")
+        self.assertEqual(paths["home"].read_text(encoding="utf-8").strip(), "")
+        self.assertEqual(paths["shell"].read_text(encoding="utf-8").strip(), "$|inner")
+
     def test_the_script_copy_of_the_cache_environment_is_the_shared_one(self):
         text = SCRIPT.read_text(encoding="utf-8")
         for name, value in shared_environment().items():
@@ -680,7 +755,7 @@ class ExtractionTests(WarmHarness, unittest.TestCase):
         for line in (e for e in events if e.startswith("UNIT_OPTIONS")):
             for option in (
                 "--wait", "--pipe", "--collect", "--quiet", "--uid=runner", "--gid=runner",
-                "--property=KillMode=control-group",
+                "--property=KillMode=control-group", "--expand-environment=no",
             ):
                 self.assertIn(option, line.split())
 

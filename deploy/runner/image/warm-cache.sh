@@ -29,13 +29,15 @@
 #
 # The extraction and every command run from the extracted source root as the job
 # account, each in its own transient systemd unit:
-#   systemd-run --wait --pipe --collect --uid=runner --gid=runner \
-#     --property=KillMode=control-group \
+#   systemd-run --wait --pipe --collect --expand-environment=no \
+#     --uid=runner --gid=runner --property=KillMode=control-group \
 #     env -i HOME=... PATH=... LC_ALL=C.UTF-8 <cache env> \
 #     bash -c 'umask 0022; cd SRC && COMMAND'
 # `env -i` inside the unit keeps root's environment, and any credential in it,
 # out of consumer commands, and drops the variables systemd adds for a user
-# service. The unit's control group ends with its main process, so a background
+# service. --expand-environment=no stops the service manager from replacing
+# ${NAME} and $NAME in the arguments before bash sees them (it would use its
+# own, empty value), so a command can write "${UV_CACHE_DIR}" literally. The unit's control group ends with its main process, so a background
 # process a command leaves behind dies with it; the script then fails closed
 # unless no process of the job account remains, before the clean-up and again
 # before the marker. The archive is extracted by the job account, never by root,
@@ -93,7 +95,8 @@ LOG=
 on_exit() {
   rc=$?
   trap - EXIT
-  rm -rf -- "$SRC_DIR" "$ARCHIVE" || true
+  # LOG is empty until the inputs validate; rm diagnostics never reach the console.
+  rm -rf -- "$SRC_DIR" "$ARCHIVE" >>"${LOG:-/dev/null}" 2>&1 || true
   if [ "$rc" -ne 0 ]; then
     echo "warm exiting rc=$rc; no image may be created from this builder"
     echo "warm failed; holding ${FAIL_HOLD_SECONDS} s so the console can be read"
@@ -169,7 +172,7 @@ run_in_unit() {
   shift 2
   unit_count=$((unit_count + 1))
   printf '### %s\n' "$label" >>"$LOG"
-  systemd-run --wait --pipe --collect --quiet \
+  systemd-run --wait --pipe --collect --quiet --expand-environment=no \
     --unit="warm-job-${unit_count}" --uid=runner --gid=runner \
     --property=KillMode=control-group --property=TimeoutStopSec=10 \
     env -i \

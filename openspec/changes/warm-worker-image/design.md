@@ -99,12 +99,18 @@ version, with a hash pinned in `tests/test_runner_bootstrap.py`. It cannot read 
 repository file at boot, and sourcing a file from the image would change those
 bytes and break an older image that lacks the file. So:
 
-- `provision.sh` installs the shared file into the image, and its probe and the
-  warm layer source it. Those two copies disappear.
+- `provision.sh` embeds a byte-identical copy of the shared file and installs it
+  at `/etc/ci-burst/cache-env.sh`; its probe reads the cache variables from that
+  installed file.
+- `warm-cache.sh` keeps an inline copy of the assignments. It runs as lone user
+  data on a builder whose image may predate the installed file, so it cannot
+  source it.
 - `bootstrap.sh` keeps its inline assignments, because it is self-contained user
-  data. A test parses the assignments out of `bootstrap.sh`, and out of
-  `provision.sh` if any remain, and fails when a name or a value differs from the
-  shared file or when a name is missing.
+  data.
+- `tests/test_cache_environment.py` parses the assignments out of every copy
+  (`bootstrap.sh`, the `provision.sh` heredoc, the `warm-cache.sh` array) and
+  fails, naming the variable, when a name or a value differs from the shared file
+  or when a name is missing. It also asserts that the heredoc is byte-identical.
 
 A later bootstrap edit may source the installed file. That is a new template
 version and its own change.

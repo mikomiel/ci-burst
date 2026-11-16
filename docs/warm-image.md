@@ -74,15 +74,18 @@ Each command runs from the extracted source root, as the `runner` account, in it
 own transient systemd unit:
 
 ```sh
-systemd-run --wait --pipe --collect --uid=runner --gid=runner \
-  --property=KillMode=control-group \
+systemd-run --wait --pipe --collect --expand-environment=no \
+  --uid=runner --gid=runner --property=KillMode=control-group \
   env -i HOME=... PATH=... LC_ALL=C.UTF-8 <cache environment> \
   bash -c 'umask 0022; cd SRC && COMMAND'
 ```
 
 `env -i` keeps root's environment, and any credential in it, out of consumer
-commands, and drops the variables systemd adds for a user service. The umask
-matches a job's. A command sees only those variables. Its stdout and stderr go
+commands, and drops the variables systemd adds for a user service.
+`--expand-environment=no` stops systemd from replacing `${NAME}` and `$NAME` in
+the arguments with its own (empty) values first, so a command may write
+`"${UV_CACHE_DIR}"` or `$HOME` and bash resolves it from the variables above. The
+umask matches a job's. A command sees only those variables. Its stdout and stderr go
 to a log, never to the script's output. When a command ends, its unit's control
 group ends with it, so a background process it started dies too.
 

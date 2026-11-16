@@ -123,6 +123,10 @@ them. No task changes controller behaviour, IAM or the router.
 
 - [ ] 6.1 Launch a builder from the current worker image on a test identity, run the
   script with a test consumer's archive and commands, and record the cache size.
+  Include a warm command that writes the literal text `"${UV_CACHE_DIR}"` (for
+  example `mkdir -p "${UV_CACHE_DIR}/probe"`) and confirm the directory appears
+  under the shared cache path, to prove the service manager did not expand the
+  variable before bash ran.
 - [ ] 6.2 Confirm the offline gate passes, and that a deliberately broken warm
   command and a deliberately failing gate each produce no ready marker.
 - [ ] 6.3 Create the image while the builder is still running, tag it with the

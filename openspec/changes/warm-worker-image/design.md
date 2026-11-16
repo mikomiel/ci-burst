@@ -53,12 +53,31 @@ not match it, or when the warm commands are empty.
    choose (see open questions).
 5. Remove the extracted source, `/var/lib/forgejo-runner/.runner` and every entry
    in the runner home other than `cache`. Run `cloud-init clean --logs`.
-6. Print `IMAGE_READY`.
+6. Print `IMAGE_READY`, then keep the builder running for the snapshot window
+   (the lifetime timer still bounds it).
 
-Any failing step exits non-zero before step 6. The ready marker is the only signal
-the operator acts on, so a failed warm or a failed gate never becomes an image. On
-a non-zero exit the script still removes the source and shuts the builder down
-through an exit trap, as `provision.sh` does.
+Warm and gate output goes to a log file, never to the script's own output (see
+"The readiness channel"). Any failing step exits non-zero before step 6. The ready marker is the only signal
+the operator acts on, so a failed warm or a failed gate never becomes an image.
+
+On success the builder must stay up: the operator creates the image from a running
+builder (`provision.sh` prints `IMAGE_READY`, syncs and then sleeps for the same
+reason). The script therefore does not power off after the marker. It waits for a
+bounded snapshot window, and the lifetime timer armed in step 1 is the outer bound.
+On failure the exit trap removes the source, holds briefly so the console output can
+be read, and powers the builder off. The builder is launched with
+terminate-on-shutdown and delete-on-termination storage, as
+`deploy/runner/image/README.md` requires, so a power-off removes it.
+
+## The readiness channel
+
+The operator reads `IMAGE_READY` from the builder's console. Consumer commands must
+not be able to forge it. Their stdout and stderr go to a log file, not to the
+script's output. On failure the script prints the last lines of the log with every
+line prefixed by a fixed frame (`  | `), so no consumer line can start with the
+marker. Only the script prints the marker, and only on success. A consumer command
+that prints the marker and then fails, or prints it and succeeds, leaves no
+unframed marker.
 
 The warm layer is the only thing that survives step 5, and only under `cache`. The
 script does not clear `cache` between the warm commands and the image, so what the
@@ -88,6 +107,28 @@ version and its own change.
 The tests also assert that every path in the cache environment lies under
 `/var/lib/forgejo-runner/cache`, because the clean-up keeps only that directory.
 
+## Runbook and examples
+
+`docs/warm-image.md` is the one owner of the end-to-end runbook and the examples;
+`docs/runner-setup.md` and the image README link to it and carry no second copy. The
+runbook steps: make the source archive and its sha256; host it at a URL the builder
+can fetch without credentials (for example a short-lived presigned URL, which is
+never logged or committed); launch a builder from the base worker image with the
+script as user data, terminate-on-shutdown and the lifetime bound; watch the console
+for the trusted marker; create the image, tagged with the source digest; publish a
+new launch-template version; run a canary; the operator moves the configured version.
+Commands are AWS CLI with comments and placeholders (`<base-image-id>`,
+`<subnet-id>`, `<bucket>`), never real identifiers.
+
+The examples pair each warm command with an offline gate: uv (`uv sync --frozen` per
+project; gate with `UV_OFFLINE=1`), npm (`npm ci`; gate `npm ci --offline`), pip
+(`pip download -r requirements.txt -d <dir under cache>` or an install into a
+throwaway venv; gate `--no-index`), Playwright (install browsers into a path under
+`cache` and set `PLAYWRIGHT_BROWSERS_PATH` for warm and gate; the job environment is
+the bootstrap's, so the consumer's workflow sets it for jobs), and a generic monorepo
+check runner with a prime mode and an offline mode. A test requires that every cache
+variable or path in the examples lies under the shared cache directory.
+
 ## Tag and traceability
 
 The operator tags the created image with the source archive's sha256, so the
@@ -97,12 +138,19 @@ script does not create images.
 
 ## Rebuild and rollout
 
-Rebuild when a lockfile the warm commands read changes. A stale cache is slower,
-never wrong: the job still resolves its own lockfile and downloads only what is
-missing. Rollout is the existing flow and this change does not alter it: register
-the image in a new launch-template version, run a canary, then the operator pins
-that version in the deployment configuration. The controller keeps launching from
-the pinned version.
+Rebuild when a lockfile the warm commands read changes. For content-addressed
+package and download caches (uv, npm, pip, browser downloads) a stale cache costs
+only time: the job resolves its own lockfile and downloads what is missing. That
+claim does not extend to any other cache a consumer places under `cache/`, such as
+a validation or result cache. The consumer must key such a cache on its source,
+lockfiles, toolchain and environment, and ci-burst does not guarantee its validity.
+
+Rollout is the existing operator flow in `deploy/runner/image/README.md` and this
+change does not alter it: create the image, create a new launch-template version
+with the new image, move the deployment TOML's `launch_template_version` to it, and
+run the toolchain check on a launched worker. A canary job before that move is an
+operator obligation. The controller reads the configured version and checks no
+canary evidence, so it enforces nothing here.
 
 ## Instance-type guidance
 
@@ -118,6 +166,13 @@ The guidance:
 - treat the measured speed-up as one consumer's small-sample result, not a
   guarantee.
 
+`docs/deployment.md` currently advises keeping the template's type first so the
+default landing place does not change. The new guidance supersedes that sentence
+for an operator who has measured the newer type: the template's type stays first
+when it is already the newest, and otherwise the operator moves the template to the
+newest type, or accepts that the first listed type becomes the preferred one. The
+text must say which, not leave both statements standing.
+
 The examples in `docs/deployment.md` and `docs/operations.md` list the older type
 first. They are reordered newest-first. The order sentence in `docs/operations.md`
 is checked so it still describes the example.
@@ -130,6 +185,8 @@ is checked so it still describes the example.
 | A warm command fails | Non-zero exit. No marker. No image. |
 | The offline gate fails | Non-zero exit. No marker. No image. |
 | The builder outlives its work | The lifetime timer powers it off. |
+| A failed build | The script holds briefly for the console, then powers the builder off. |
+| A consumer command prints the marker | The text goes to the log; a failure prints it framed only. |
 | A clean-up step fails | Non-zero exit. No marker. The image is not safe to create. |
 
 ## Credential boundary

@@ -60,17 +60,38 @@ The script MUST print its ready marker only after the warm commands, the offline
 - **THEN** the script prints the ready marker once, as its last output
 - **AND** it prints the source digest beside the marker
 
-### Requirement: The builder is time-bounded
-The script MUST arm a lifetime timer that powers the builder off before it runs any consumer command, and it MUST power the builder off when it exits on any path.
+### Requirement: The builder is time-bounded and survives to image creation
+The script MUST arm a lifetime timer that powers the builder off before it runs any consumer command. After a successful build it MUST print the ready marker and keep the builder running for a bounded snapshot window, still bounded by the lifetime timer. After a failed build it MUST hold briefly for the console and then power the builder off. Documentation MUST require terminate-on-shutdown and delete-on-termination storage for the builder.
+
+#### Scenario: The build succeeds
+- **WHEN** every step has passed and the ready marker is printed
+- **THEN** the builder stays running for the snapshot window and is not powered off by the script's own exit path
+- **AND** the lifetime timer still powers it off if the operator never creates the image
+
+#### Scenario: The build fails
+- **WHEN** any step fails
+- **THEN** the script prints no ready marker, holds briefly for the console and then powers the builder off
 
 #### Scenario: The builder outlives its work
 - **WHEN** a step hangs past the builder lifetime
 - **THEN** the timer powers the builder off
 
-#### Scenario: The script fails
-- **WHEN** any step fails
-- **THEN** the exit path powers the builder off
-- **AND** no ready marker has been printed
+### Requirement: Only the script prints the ready marker
+The script MUST send the stdout and stderr of every warm command and of the offline gate to a log file and MUST NOT write them to its own output. On failure the script MAY print a tail of that log, and MUST prefix every printed line with a fixed frame so that no consumer line can begin with the ready marker. Only the script itself MUST print the ready marker, and only on the success path.
+
+#### Scenario: A failing command prints the marker
+- **WHEN** a warm command or the offline gate prints the ready marker text and exits non-zero
+- **THEN** the script exits non-zero
+- **AND** no line of its output begins with the ready marker
+
+#### Scenario: A passing command prints the marker
+- **WHEN** a successful warm command prints the ready marker text
+- **THEN** that text does not appear unframed in the script's output
+- **AND** the script's own marker is the only unframed one
+
+#### Scenario: A failure shows its cause
+- **WHEN** a warm command fails
+- **THEN** the script prints a framed tail of the command's log so the operator can read the cause
 
 ### Requirement: The image carries no consumer source or registration
 Before the ready marker the script MUST remove the extracted source, the runner registration file and every entry in the job account's home other than `cache`, and MUST clean cloud-init state including its logs. A clean-up failure MUST prevent the ready marker.
@@ -98,17 +119,33 @@ The job-account cache environment MUST be defined once in a shared file. The war
 - **WHEN** a shared value resolves outside the job account's `cache` directory
 - **THEN** the repository test fails, because the clean-up would delete it
 
-### Requirement: Warm images are traceable and rolled out through the pinned template
-Documentation MUST state that the image is tagged with the source digest, that a lockfile change is the reason to rebuild, and that a warm cache reduces downloads without changing a job's result. Rollout MUST remain the existing flow: a new launch-template version, a canary, then the operator pins the version. This change MUST NOT alter controller behaviour, IAM or the router.
+### Requirement: Warm images are traceable and documented honestly
+Documentation MUST state that the image is tagged with the source digest and that a lockfile change is the reason to rebuild. It MUST state that a stale content-addressed package or download cache (uv, npm, pip, browser downloads) costs only time, because the job resolves its own lockfile against it.
 
 #### Scenario: A lockfile changes
 - **WHEN** a lockfile that the warm commands read changes
 - **THEN** the documentation directs the operator to rebuild the layer
-- **AND** a job on the older warm image still resolves its own lockfile and produces the same result, only more slowly
+- **AND** a job on the older warm image still resolves its own lockfile through its package cache, only more slowly
+
+### Requirement: Cache validity beyond package caches is the consumer's
+Documentation MUST NOT extend the stale-cache claim to any other cache a consumer places under `cache/`, such as a validation or result cache. The consumer MUST key such a cache on its source, lockfiles, toolchain and environment, and ci-burst does not guarantee its validity.
+
+#### Scenario: A consumer warms a result cache
+- **WHEN** a consumer's warm commands fill a cache that is not content-addressed
+- **THEN** the documentation states that the consumer owns that cache's validity
+- **AND** it makes no claim that a stale entry is harmless
+
+### Requirement: Rollout stays the operator's existing flow
+Rollout of a warm image MUST remain the operator flow that `deploy/runner/image/README.md` describes: create the image, create a new launch-template version, move the deployment configuration's `launch_template_version` to it, and run the toolchain check on a launched worker. A canary before that move MUST be documented as an operator obligation, and the controller MUST NOT be described as enforcing it. This change MUST NOT alter controller behaviour, IAM or the router.
 
 #### Scenario: A warm image is rolled out
 - **WHEN** an operator has created a warm image
-- **THEN** the controller does not use it until the operator publishes a launch-template version, runs a canary and pins that version
+- **THEN** the controller does not use it until the operator publishes a launch-template version and moves the configured version to it
+- **AND** the documentation tells the operator to run a canary before that move
+
+#### Scenario: No canary evidence exists
+- **WHEN** an operator moves the configured version without a canary
+- **THEN** the controller launches from it anyway, because it does not check for canary evidence
 
 ### Requirement: Instance-type selection guidance
 Documentation MUST state that the newest generation of the same shape belongs first in `aws.instance_types` and an older type after it as capacity fallback, and that the choice is verified with per-type job duration and cost per job. The documented examples MUST list the newest generation first.
@@ -116,4 +153,29 @@ Documentation MUST state that the newest generation of the same shape belongs fi
 #### Scenario: An operator orders the types
 - **WHEN** an operator reads the deployment guide
 - **THEN** the guide states the ordering rule and the measurement that checks it
+- **AND** the guide reconciles the rule with its earlier advice to keep the template's type first
 - **AND** its example lists the newest generation first
+
+### Requirement: End-to-end runbook
+One owner document MUST give an end-to-end runbook from source archive and sha256 to a pinned launch-template version, covering hosting the archive at a credential-free URL, launching the builder, watching the console marker, creating the tagged image, publishing the version and the canary. It MUST give copy-paste AWS CLI commands with comments and placeholders only, and MUST state that a presigned URL is short-lived and never logged or committed.
+
+#### Scenario: An operator follows the runbook
+- **WHEN** an operator follows the runbook with their own values
+- **THEN** every step has a command or an instruction and every identifier is a placeholder
+- **AND** the runbook names the console marker as the signal to create the image
+
+#### Scenario: The archive URL is sensitive
+- **WHEN** the runbook hosts the archive behind a presigned URL
+- **THEN** it states that the URL expires soon and is never logged or committed
+
+### Requirement: Generic warm-command examples
+Documentation MUST give generic warm-command examples, each with an offline gate counterpart, for uv or Python projects, npm, pip, Playwright browsers and a monorepo check runner that has a prime mode and an offline mode. Every cache path in an example MUST lie under the shared cache directory. The Playwright example MUST state that the job environment is the bootstrap's, so a consumer sets `PLAYWRIGHT_BROWSERS_PATH` in its own workflow. Examples MUST NOT name a consumer.
+
+#### Scenario: Example paths stay in the shared cache
+- **WHEN** a documented example sets a cache variable or path
+- **THEN** the value lies under the shared cache directory
+- **AND** a repository test fails when it does not
+
+#### Scenario: A browser cache is warmed
+- **WHEN** the Playwright example installs browsers into a cache path
+- **THEN** the documentation states that the job's workflow must set the same browsers path, because the bootstrap does not

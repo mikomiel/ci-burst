@@ -27,8 +27,14 @@ them. No task changes controller behaviour, IAM or the router.
 - [ ] 2.1 Add the script under `deploy/runner/image/`. Inputs: source archive URL,
   sha256, warm commands, optional offline gate command, builder lifetime. Refuse a
   missing sha256 or empty warm commands before any consumer command runs.
-- [ ] 2.2 Arm the lifetime timer (`systemd-run --on-active`) first and power off
-  from an exit trap on every path.
+- [ ] 2.2 Arm the lifetime timer (`systemd-run --on-active`) first. On success,
+  print the marker, sync and wait for a bounded snapshot window; do not power off.
+  On failure, hold briefly for the console and then power off from the exit trap.
+  Match `provision.sh`'s wait after `IMAGE_READY` and the terminate-on-shutdown
+  contract in `deploy/runner/image/README.md`.
+- [ ] 2.2a Send the stdout and stderr of every warm command and the gate to a log
+  file, not the script's output. On failure print a tail of the log with every line
+  prefixed by a fixed frame (`  | `). Only the script prints `IMAGE_READY`.
 - [ ] 2.3 Fetch the archive, verify the sha256 before extracting, and extract it to a
   directory outside the runner home.
 - [ ] 2.4 Run the warm commands and the optional gate as the job account with
@@ -48,8 +54,12 @@ them. No task changes controller behaviour, IAM or the router.
 - [ ] 3.2 Cover: missing sha256 and empty commands refuse before any consumer
   command; a digest mismatch stops before extraction; a failing warm command and a
   failing gate each exit non-zero with no marker; success prints the marker last with
-  the digest; the timer is armed before the first consumer command; the exit trap
-  powers off on failure; the consumer commands receive exactly the shared cache
+  the digest; the timer is armed before the first consumer command; on success the builder
+  stays alive for the snapshot window and the script does not power off; on
+  failure it holds briefly and then shuts down; a warm command or the gate that
+  prints `IMAGE_READY` and exits non-zero produces no unframed marker; a successful
+  command that prints `IMAGE_READY` does not appear unframed either; a failure
+  prints a framed log tail; the consumer commands receive exactly the shared cache
   environment and an empty inherited environment; clean-up removes the source, the
   registration file and non-`cache` runner-home entries and keeps `cache`; a failing
   clean-up step prevents the marker.
@@ -58,20 +68,47 @@ them. No task changes controller behaviour, IAM or the router.
 
 ## 4. Documentation
 
-- [ ] 4.1 `docs/runner-setup.md`: add a warm image section under "The worker image".
-  Cover the inputs, a generic example with placeholder URL and digest, the ready
+- [ ] 4.0 Create `docs/warm-image.md` as the single owner of the runbook and the
+  examples. In `docs/runner-setup.md` ("The worker image") add a short pointer only.
+  Write the runbook: make the archive and sha256; host it at a URL fetchable without
+  credentials (short-lived presigned URL, never logged or committed); launch the
+  builder from the base image with the script as user data, terminate-on-shutdown
+  and the lifetime bound; watch the console for the marker; create the image tagged
+  with the source digest; publish a launch-template version; canary; the operator
+  moves the configured version. Give copy-paste AWS CLI commands with comments and
+  placeholders (`<base-image-id>`, `<subnet-id>`, `<bucket>`) and no real ids.
+- [ ] 4.0a In `docs/warm-image.md` add generic warm and offline-gate examples: uv
+  (`uv sync --frozen`; `UV_OFFLINE=1`), npm (`npm ci`; `npm ci --offline`), pip
+  (`pip download -r requirements.txt -d <path under cache>` or a throwaway venv;
+  `--no-index`), Playwright (browsers under `cache`, `PLAYWRIGHT_BROWSERS_PATH` in
+  warm and gate, and a note that jobs get the bootstrap's environment so the
+  consumer's workflow sets it), and a monorepo check runner with prime and offline
+  modes. Name no consumer.
+- [ ] 4.0b Add a test that parses the cache variables and paths in the documented
+  examples and fails when one lies outside the shared cache directory.
+- [ ] 4.1 In `docs/warm-image.md`: cover the inputs, a generic example with placeholder URL and digest, the ready
   marker, tagging the image with the source digest, when to rebuild (lockfile
   change), the expected size as an order of magnitude, why a warm cache only reduces
-  downloads and a stale cache is slower and never wrong, and the unchanged rollout
-  (new template version, canary, operator pins it).
+  downloads, that a stale content-addressed package or download cache (uv, npm,
+  pip, browser downloads) is slower and never wrong, that any other cache under
+  `cache/` is the consumer's to key on source, lockfiles, toolchain and
+  environment, and the rollout as `deploy/runner/image/README.md` states it (new
+  template version, move `launch_template_version`, toolchain check), with a canary
+  as an operator obligation the controller does not enforce. Reconcile the README's
+  build steps (terminate-on-shutdown builder, snapshot while running) with the new
+  script, and add a task-level note if the README needs a line for the warm layer.
 - [ ] 4.2 `deploy/runner/image/README.md`: add the script and the shared file to the
   file table.
 - [ ] 4.3 `docs/deployment.md`: add the instance-type selection guidance (newest
   same-shape generation first, older as capacity fallback, verify with per-type job
   duration and cost per job, reference to issue #156) and reorder the example
-  `instance_types` list newest-first.
+  `instance_types` list newest-first. Reconcile the existing sentence near line 314
+  ("keep the template's type first so the default landing place does not change")
+  with the newest-first guidance: rewrite it so one rule stands, and say what to do
+  when the template's type is not the newest.
 - [ ] 4.4 `docs/operations.md`: reorder its example the same way and re-read the
-  type-major order sentence beside it so it still matches.
+  type-major order sentence beside it so it still matches, and make sure it does
+  not contradict the reconciled sentence in `docs/deployment.md`.
 - [ ] 4.5 Update any README that lists `deploy/runner/image/` contents, following
   `docs/readme-standard.md` if the repository has one.
 
@@ -86,12 +123,14 @@ them. No task changes controller behaviour, IAM or the router.
   script with a test consumer's archive and commands, and record the cache size.
 - [ ] 6.2 Confirm the offline gate passes, and that a deliberately broken warm
   command and a deliberately failing gate each produce no ready marker.
-- [ ] 6.3 Create the image, tag it with the source digest, and publish it in a new
-  launch-template version. Do not pin it yet.
+- [ ] 6.3 Create the image while the builder is still running, tag it with the
+  source digest, and publish it in a new launch-template version. Do not move the
+  configured version yet.
 - [ ] 6.4 Run a canary job on a test repository through the new version and confirm
-  it finds the warm cache and downloads little.
+  it finds the warm cache and downloads little. This is an operator obligation; the
+  controller does not check for it.
 - [ ] 6.5 Compare job duration for the same jobs on the cold and the warm version, and
-  record the result. Only then may the operator pin the version.
+  record the result. Only then should the operator move the configured version.
 - [ ] 6.6 With instance type in worker events (issue #156) available, compare per-type
   job duration and cost per job before and after the reorder in the guidance, and
   record the result.

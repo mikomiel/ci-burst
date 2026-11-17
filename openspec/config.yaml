@@ -4,7 +4,9 @@ context: |
   ci-burst is a standalone public Forgejo queue-driven AWS Spot runner controller.
   The first release has one repository scope, one controller and a durable local SQLite ledger.
   The controller uses a pre-provisioned, version-pinned runner launch template.
-  It does not create networking, credentials, IAM roles or runner images.
+  It does not create or widen IAM, networking, buckets, launch templates or credentials.
+  When the operator opts in (`[image].enabled = true`), it MAY create, tag and delete worker images, their snapshots, tagged builder instances and non-default launch-template versions, and stage and delete a source archive under an operator-provided private bucket prefix.
+  A timer MUST NEVER move the production launch-template pin.
   Default execution is observation/dry-run; live provisioning is a separate explicit operation.
   Runtime implementation is planned in Python 3.13+ with the official AWS SDK.
   Public examples and tests are synthetic and self-contained.

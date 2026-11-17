@@ -31,7 +31,6 @@ JOURNAL_STATUSES = ("pending", "complete", "aborted")
 _ACTIVE_SQL = ", ".join(repr(state) for state in ACTIVE_STATES)
 
 _SCHEMA_SQL = f"""
-    BEGIN IMMEDIATE;
     CREATE TABLE image_builds (
         id TEXT PRIMARY KEY,
         deployment TEXT NOT NULL,
@@ -89,8 +88,10 @@ _SCHEMA_SQL = f"""
     );
     INSERT INTO control (id) VALUES (1);
     PRAGMA user_version = {SCHEMA_VERSION};
-    COMMIT;
 """
+#: ``executescript`` commits first, so creation runs these inside one open
+#: transaction, one statement at a time. No statement holds a semicolon in a literal.
+_SCHEMA_STATEMENTS = tuple(part.strip() for part in _SCHEMA_SQL.split(";") if part.strip())
 
 #: Columns ``advance_build`` may change. The identity columns stay fixed.
 _BUILD_UPDATABLE = (
@@ -193,14 +194,28 @@ class ImageState:
         try:
             connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
             connection.row_factory = sqlite3.Row
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            version = _user_version(connection)
             if version == 0:
-                connection.execute("PRAGMA journal_mode=DELETE")
-                connection.executescript(_SCHEMA_SQL)
-            elif version != SCHEMA_VERSION:
+                # Two first opens may both read 0. Take the write lock, read the
+                # version again inside it, and create the schema only if it is
+                # still 0, so the loser sees the winner's file as valid.
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    version = _user_version(connection)
+                    if version == 0:
+                        for statement in _SCHEMA_STATEMENTS:
+                            connection.execute(statement)
+                        version = SCHEMA_VERSION
+                    connection.execute("COMMIT")
+                except BaseException:
+                    try:
+                        connection.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+            if version != SCHEMA_VERSION:
                 raise StateRefusal("IMAGE_STATE_VERSION_UNSUPPORTED", f"schema {version}")
-            else:
-                connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("PRAGMA journal_mode=DELETE")
         except sqlite3.DatabaseError as error:
             if connection is not None:
                 connection.close()
@@ -414,6 +429,10 @@ class ImageState:
         if self._connection is None:
             raise StateRefusal("IMAGE_STATE_UNAVAILABLE")
         return self._connection
+
+
+def _user_version(connection):
+    return connection.execute("PRAGMA user_version").fetchone()[0]
 
 
 def _check_columns(fields, allowed):

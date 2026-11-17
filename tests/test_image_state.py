@@ -2,6 +2,7 @@ import hashlib
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -310,6 +311,117 @@ class LifecycleTests(ImageStateCase):
         self.state.acquire_writer()
         self.assertTrue((self.directory / "image-state.sqlite.lock").exists())
         self.assertFalse((self.directory / "state.sqlite3.lock").exists())
+
+
+class FirstOpenRaceTests(unittest.TestCase):
+    """Two first opens that both read version 0 must both succeed."""
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.directory = Path(self._directory.name) / "image"
+
+    def test_a_loser_that_read_version_zero_sees_the_winners_file_as_valid(self):
+        real_connect = sqlite3.connect
+        winner = []
+        calls = []
+
+        class AfterFirstVersionRead:
+            """Run the winner's whole first open right after the loser reads 0."""
+
+            def __init__(self, connection):
+                object.__setattr__(self, "_connection", connection)
+                object.__setattr__(self, "_fired", False)
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+            def __setattr__(self, name, value):
+                setattr(self._connection, name, value)
+
+            def execute(self, sql, *args):
+                result = self._connection.execute(sql, *args)
+                if "user_version" in sql and not self._fired:
+                    object.__setattr__(self, "_fired", True)
+                    self_row = result.fetchone()
+                    self_version = self_row[0]
+                    calls.append(self_version)
+                    winner.append(ImageState(directory).connect())
+                    return mock.Mock(fetchone=lambda: (self_version,))
+                return result
+
+        directory = self.directory
+
+        def connect(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            return connection if calls else AfterFirstVersionRead(connection)
+
+        with mock.patch.object(image_state.sqlite3, "connect", connect):
+            loser = ImageState(directory).connect()
+        self.addCleanup(loser.close)
+        self.addCleanup(winner[0].close)
+        self.assertEqual(calls, [0])
+        self.assertTrue(loser.available)
+        self.assertEqual(loser.control_get().consecutive_failures, 0)
+        raw = real_connect(loser.path)
+        self.addCleanup(raw.close)
+        self.assertEqual(raw.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+
+    def test_a_file_that_turns_newer_before_the_exclusion_is_refused_unwritten(self):
+        real_connect = sqlite3.connect
+        self.directory.mkdir(parents=True)
+        path = self.directory / STATE_FILE
+        directory = self.directory
+
+        class Newer:
+            def __init__(self, connection):
+                object.__setattr__(self, "_connection", connection)
+                object.__setattr__(self, "_seen", 0)
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+            def __setattr__(self, name, value):
+                setattr(self._connection, name, value)
+
+            def execute(self, sql, *args):
+                if "user_version" in sql and sql.startswith("PRAGMA"):
+                    seen = self._seen
+                    object.__setattr__(self, "_seen", seen + 1)
+                    if seen == 0:
+                        return mock.Mock(fetchone=lambda: (0,))
+                    return mock.Mock(fetchone=lambda: (SCHEMA_VERSION + 1,))
+                return self._connection.execute(sql, *args)
+
+        with mock.patch.object(image_state.sqlite3, "connect", lambda *a, **k: Newer(real_connect(*a, **k))):
+            with self.assertRaises(StateRefusal) as raised:
+                ImageState(directory).connect()
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_VERSION_UNSUPPORTED")
+        raw = real_connect(path)
+        self.addCleanup(raw.close)
+        self.assertEqual(raw.execute("SELECT count(*) FROM sqlite_master").fetchone()[0], 0)
+
+    def test_simultaneous_first_opens_all_succeed(self):
+        barrier = threading.Barrier(6)
+        results = []
+
+        def open_state():
+            state = ImageState(self.directory)
+            try:
+                barrier.wait()
+                state.connect()
+                results.append(state.control_get().consecutive_failures)
+            except BaseException as error:  # reported by the assertion below
+                results.append(error)
+            finally:
+                state.close()
+
+        threads = [threading.Thread(target=open_state) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(results, [0] * 6)
 
 
 class ScalingLedgerSeparationTests(unittest.TestCase):

@@ -9,6 +9,13 @@ The version, this file and the release tag are maintained by
 conventional commits on `main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases)
 owns the release boundary. Do not edit a released section by hand.
 
+## [0.10.0](https://github.com/mikomiel/ci-burst/compare/v0.9.0...v0.10.0) (2026-11-17)
+
+
+### Added
+
+* **export:** publish the instance type in worker events ([#165](https://github.com/mikomiel/ci-burst/issues/165)) ([9847730](https://github.com/mikomiel/ci-burst/commit/9847730d6082ac133e0afa9d1b94600fa1b449af))
+
 ## [0.9.0](https://github.com/mikomiel/ci-burst/compare/v0.8.0...v0.9.0) (2026-11-16)
 
 

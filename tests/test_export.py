@@ -11,6 +11,7 @@ from ci_burst.aws import MAX_CONSOLE_BYTES, Aws
 from ci_burst.config import load
 from ci_burst.errors import ProviderRefusal
 from ci_burst.export import (
+    EVENT_SCHEMA,
     MAX_CONSOLE_READS,
     MAX_EVENTS_BYTES,
     Exporter,
@@ -284,14 +285,35 @@ class ExporterTests(ExportCase):
             instance("i-0123456789abcdef0", state="terminated", zone="eu-central-1a"),
             instance_type="m8g.xlarge",
         )
-        exporter = self.build([typed], {"i-0123456789abcdef0": SPOT_NOTICE})
+        failed = dataclasses.replace(
+            instance("i-0123456789abcdef1", state="terminated", zone="eu-central-1b"),
+            instance_type="m8g.xlarge",
+        )
+        exporter = self.build(
+            [typed, failed],
+            {"i-0123456789abcdef0": SPOT_NOTICE, "i-0123456789abcdef1": FAILED_PING},
+        )
         self.run_export(exporter)
         events = self.events_read()
-        self.assertGreater(len({event["event"] for event in events}), 1)
+        self.assertEqual({event["event"] for event in events}, set(EVENT_SCHEMA))
         for event in events:
             with self.subTest(event=event["id"]):
                 self.assertEqual(event["instance_type"], "m8g.xlarge")
         record = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]
+        self.assertEqual(record["instance_type"], "m8g.xlarge")
+
+    def test_a_type_reported_after_the_events_were_emitted_adds_no_event(self):
+        untyped = instance("i-0123456789abcdef0", zone="eu-central-1a")
+        consoles = {"i-0123456789abcdef0": CLEAN_BOOT}
+        self.run_export(self.build([untyped], consoles))
+        before = self.events_read()
+        emitted = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]["emitted"]
+        typed = dataclasses.replace(untyped, instance_type="m8g.xlarge")
+        result = self.run_export(self.build([typed], consoles))
+        self.assertEqual(result["events_emitted"], 0)
+        self.assertEqual([event["id"] for event in self.events_read()], [event["id"] for event in before])
+        record = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]
+        self.assertEqual(record["emitted"], emitted)
         self.assertEqual(record["instance_type"], "m8g.xlarge")
 
     def test_an_instance_without_a_type_publishes_no_instance_type_key(self):

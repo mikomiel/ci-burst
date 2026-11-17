@@ -157,6 +157,7 @@ class Instance:
     tags: dict
     launch_time: float | None
     availability_zone: str | None = None
+    instance_type: str | None = None
 
     def as_dict(self):
         return {
@@ -165,6 +166,7 @@ class Instance:
             "operation": self.tags.get(OPERATION_TAG),
             "expires_at": self.tags.get(EXPIRES_TAG),
             "availability_zone": self.availability_zone,
+            "instance_type": self.instance_type,
         }
 
 
@@ -552,6 +554,7 @@ def _instances(response):
             launch_time = item.get("LaunchTime")
             placement = item.get("Placement") or {}
             zone = placement.get("AvailabilityZone")
+            instance_type = item.get("InstanceType")
             result.append(
                 Instance(
                     instance_id=instance_id,
@@ -559,6 +562,7 @@ def _instances(response):
                     tags=tags,
                     launch_time=_timestamp(launch_time),
                     availability_zone=zone if isinstance(zone, str) and zone else None,
+                    instance_type=instance_type if isinstance(instance_type, str) and instance_type else None,
                 )
             )
     return result

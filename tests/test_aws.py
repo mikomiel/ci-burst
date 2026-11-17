@@ -161,6 +161,18 @@ class InstanceParsingTests(unittest.TestCase):
         self.assertEqual(parsed[0].tags["ci-burst:managed"], "true")
         self.assertIsNotNone(parsed[0].launch_time)
 
+    def test_instance_type_is_kept_only_when_it_is_a_non_empty_string(self):
+        def parsed(**extra):
+            entry = {"InstanceId": "i-1", "State": {"Name": "running"}, **extra}
+            return _instances({"Reservations": [{"Instances": [entry]}]})[0]
+
+        self.assertEqual(parsed(InstanceType="m8g.xlarge").instance_type, "m8g.xlarge")
+        self.assertEqual(parsed(InstanceType="m8g.xlarge").as_dict()["instance_type"], "m8g.xlarge")
+        for value in ("", None, 7, ["m8g.xlarge"]):
+            with self.subTest(value=value):
+                self.assertIsNone(parsed(InstanceType=value).instance_type)
+        self.assertIsNone(parsed().instance_type)
+
     def test_a_valid_multi_reservation_response_is_parsed_unchanged(self):
         response = {
             "Reservations": [

@@ -19,9 +19,9 @@ and only then the timer (8).
 
 ## 2. Configuration
 
-- [ ] 2.1 In `ci_burst/config.py`, add the optional strict `[image]`, `[image.source]`, `[image.warm]`, `[image.build]` and `[image.storage]` tables with the keys, ranges and defaults from the design. Reuse the existing allowed-keys and range helpers. Keep the refusal of unknown keys and out-of-range values with `CONFIG_INVALID`. Omit `check_interval_seconds` until section 8.
-- [ ] 2.2 Refuse an `[image].profile` equal to `[aws].profile`. Refuse a basis path with `..` or a leading `/`, more than 32 basis paths, a warm command or gate command with a control character, and `source.strip_components` other than 0 or 1.
-- [ ] 2.3 In `tests/test_config.py`, test the absent table, `enabled = false`, each default, both bounds and a value just outside each, a non-integer, an unknown key and each refusal in 2.2. Use synthetic names only.
+- [x] 2.1 In `ci_burst/config.py`, add the optional strict `[image]`, `[image.source]`, `[image.warm]`, `[image.build]` and `[image.storage]` tables with the keys, ranges and defaults from the design. Reuse the existing allowed-keys and range helpers. Keep the refusal of unknown keys and out-of-range values with `CONFIG_INVALID`. Omit `check_interval_seconds` until section 8.
+- [x] 2.2 Refuse an `[image].profile` equal to `[aws].profile`. Refuse a basis path with `..` or a leading `/`, more than 32 basis paths, a warm command or gate command with a control character, and `source.strip_components` other than 0 or 1.
+- [x] 2.3 In `tests/test_config.py`, test the absent table, `enabled = false`, each default, both bounds and a value just outside each, a non-integer, an unknown key and each refusal in 2.2. Use synthetic names only.
 
 ## 3. Image state
 

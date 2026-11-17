@@ -10,8 +10,9 @@ ci-burst builds the warm worker image itself, in two phases, and never moves the
 production pin on its own.
 
 - Phase 1: the operator runs `ci-burst image plan|run|status|promote` by hand.
-  `run --apply` does the whole build. `promote --write` is the only code path that
-  edits the deployment TOML, and only the operator starts it.
+  `run --apply --until-done` supervises repeated bounded passes until the build
+  reaches `candidate` or `failed`, with no timer. `promote --write` is the only
+  code path that edits the deployment TOML, and only the operator starts it.
 - Phase 2: a systemd timer runs `image run --apply` on a short period. A basis
   digest, not a clock, decides whether a build starts. The timer never promotes.
   It is enabled only after the first manual build succeeded and about three clean
@@ -71,7 +72,7 @@ product boundary.
 
 ## Triggers and the basis digest
 
-1. Manual (phase 1): `image run --apply [--force]`.
+1. Manual (phase 1): `image run --apply --until-done [--force]`. A bare `image run --apply` is one pass.
 2. Digest-driven (phase 2): the timer runs `image run --apply` about every five minutes. The command makes the source check at most every `check_interval_seconds`. A stale image is not an incident, because a stale image costs time, never correctness (see `warm-worker-image`). There is no urgency trigger.
 
 The command resolves the head sha of `source.branch` and computes:
@@ -133,10 +134,10 @@ The operator applies the IAM that makes this safe:
 - The source identity's policy allows `sts:AssumeRole` on that one role ARN and no other action.
 - The role's trust policy names that one source principal and requires the external ID. A source-identity condition is stronger, but whether a profile alone can supply one is not established (gate G9). Do not assert it.
 - The role's maximum session duration is 1 hour (the IAM minimum is 1 hour).
-- The role has the build permissions and no `iam:*`, no `ec2:ModifyLaunchTemplate`, no `ec2:DeleteLaunchTemplateVersions`, no `ec2:ModifyImageAttribute` and no `ssm:*`.
+- The role has the build permissions and no `iam:*` wildcard and no IAM action except the one optional, condition-scoped `iam:PassRole` statement (gate G5). It has no `ec2:ModifyLaunchTemplate`, no `ec2:DeleteLaunchTemplateVersions`, no `ec2:ModifyImageAttribute` and no `ssm:*`.
 
-The controller code has no IAM client and no shipped policy contains an `iam:*`
-action. The repository adds `deploy/iam/image-build-policy.json` (placeholders
+The controller code has no IAM client, and no shipped policy contains an `iam:*`
+wildcard or any IAM action other than the one optional `iam:PassRole` statement. The repository adds `deploy/iam/image-build-policy.json` (placeholders
 only) and a test for these properties.
 
 The long-lived part is now the source key only. The operator rotates it on a
@@ -215,6 +216,10 @@ manual pin are the controls.
 
 When a pass first sees the marker it calls `CreateImage` in that pass, before it does anything else. `NoReboot` is true: a reboot would rerun user data after `cloud-init clean`, and the manual path used no-reboot. The builder-side snapshot window (`WARM_SNAPSHOT_SECONDS`, default 1800 in the script) is longer than the timer period, so a slow tick leaves a good build with an image. The pass polls the console every 30 seconds inside a pass deadline of 240 seconds. Waiting for the image to become `available` and every later step continue in later passes.
 
+### Supervising a manual build
+
+A pass is bounded to 240 seconds, and a build takes 10 to 15 minutes, so one pass cannot finish a build. In phase 1 the operator runs `image run --apply --until-done`. The supervisor repeats bounded passes with a fixed 30-second sleep between them until the build is `candidate` or `failed`, or the build deadline passes. Each pass reconciles first and resumes from the state file, so killing the supervisor loses nothing: rerunning the same command resumes the same build, and the single-flight rules refuse a second builder. Without `--until-done`, `run --apply` is one pass, which is what the phase 2 timer runs. The supervisor is a loop in the CLI, not a daemon, and does not outlive the command.
+
 The builder is terminated when the image is `available`, or when the snapshot window or the lifetime timer ends it. Whether it may be terminated while the image is still `pending` is gate G11. Until the gate is met the code waits for `available`.
 
 ## State
@@ -224,7 +229,8 @@ The build state lives in `<state dir>/image-state.sqlite`, with its own lock and
 Tables:
 
 - `image_builds`: id, deployment, client_token, basis_digest, source_sha, archive_key, archive_sha256, builder_id, image_id, template_version, state, reason_code, created_at, updated_at, deadline_at, and the verification record (gate seen, drift result, `verified_at`, `source_pin`).
-- `pin_log`: one row per observed or written pin: pin version, image id, observed_at, and for promotions the previous pin, the backup file name and the sha256 of the written file.
+- `pin_log`: one row per observed pin: pin version, image id, observed_at.
+- `promotion_journal`: one row per promotion or rollback: previous pin, new pin, previous and new file sha256, candidate id, backup file name, status (`pending`, `complete` or `aborted`) and timestamps.
 - `control`: one row with the consecutive failure count, the failure cooldown end, the `blocked` flag and the last check time.
 
 States: `building`, `imaging`, `candidate`, `failed`, `promoted`. No more.
@@ -238,7 +244,8 @@ Reconcile runs first in every pass, before any transition:
 
 - terminate builder-tagged instances that are not the active build's builder, or are past the deadline;
 - delete objects under the prefix that are not the active archive and are older than 1 hour;
-- deregister tagged images that belong to a failed build id, and delete their snapshots;
+- clean the images and snapshots of failed builds, but only under the image deletion rule (see Retention);
+- resolve a pending promotion journal row from the file hash (see `image promote`);
 - record a tagged image with no state row as a `candidate` that is not verified, and never pin it.
 
 ## Launch-template version and promotion
@@ -253,7 +260,7 @@ The verified record holds the version, the image id, the archive sha, the script
 
 ### `image promote`
 
-`promote` runs as an operator-invoked one-off. It needs no AWS credentials and makes no AWS call: its verification comes from the image state record. `image run` and `image status --refresh` (a read-only describe pass with the image role) stamp `verified_at` and the pin observation. The promote container does not mount the role's credential directory, the forge token file or any scaling credential.
+`promote` runs as an operator-invoked one-off. It needs no AWS credentials and makes no AWS call: its verification comes from the image state record. `image run --apply` and `image status --refresh` (a describe-only pass with the image role) stamp `verified_at` and the pin observation. The promote container does not mount the role's credential directory, the forge token file or any scaling credential.
 
 Without `--write`, `promote` prints the evidence block (build id, source sha, basis digest, script sha, gate configured and passed, build duration, verified_at), the diff of the one pin line, the previous pin and the rollback target. It exits 0.
 
@@ -274,9 +281,21 @@ It then edits only the `launch_template_version` key of the `[aws]` table:
 3. Build the new text with that one value replaced. Re-parse it with the controller's own strict loader. The parsed result MUST equal the original parse except that one key. A failed parse leaves the file unchanged.
 4. Write a temporary file in the same directory with the same mode, flush it and copy the original to `<file>.bak.<UTC timestamp>`.
 5. Re-read the target and compare its sha256 with step 1. A difference refuses with `PROMOTE_FILE_CHANGED`. A narrow race between this check and the rename remains. The file has one human editor, so it is accepted.
-6. Rename atomically and flush the directory. Record the `promoted` row: previous pin, new pin, backup name, new file sha256.
+6. Commit a `pending` row to `promotion_journal` (previous pin, new pin, previous and new file sha256, candidate id, backup name). The row is durable before the rename.
+7. Rename atomically and flush the directory.
+8. Mark the row `complete` and commit.
 
-`--rollback` writes the recorded previous pin with the same procedure. It refuses with `PIN_RECORD_DIVERGED` unless the newest `promoted` row's new pin equals the TOML's pin and the newest `.bak` file holds the recorded previous pin, and unless the previous version and its image are recorded as existing at a fresh `verified_at`. Retention protects the previous pin's image, so a rollback needs no rebuild. The TOML owns the current pin and the `pin_log` owns the previous pin. Rollback verifies both against the `.bak`, so they cannot diverge silently.
+The order is journal, rename, complete, so a crash never leaves a new pin without a record. The next `promote`, `promote --rollback` or `image run --apply` resolves any `pending` row from the sha256 of the file:
+
+| File hash | Resolution |
+|---|---|
+| the recorded old hash | the rename did not happen: mark the row `aborted` |
+| the recorded new hash | the rename happened: mark the row `complete` |
+| any other hash | refuse with `PROMOTION_JOURNAL_DIVERGED`, write nothing, and leave the row `pending` |
+
+`image status` reports a pending row and the resolution that the hash implies, but writes nothing (plain status writes only the check timestamp). While a row is `pending`, both of its pins are in the protected set, so no deletion path can remove either image. A diverged row stays until an operator resolves it by hand, for example by restoring the file from the backup, and then reruns a resolving command.
+
+`--rollback` writes the recorded previous pin with the same journaled procedure, after it resolves a pending row. It refuses with `PIN_RECORD_DIVERGED` unless the newest completed promotion's new pin equals the TOML's pin and the newest `.bak` file holds the recorded previous pin, and unless the previous version and its image are recorded as existing at a fresh `verified_at`. Retention protects the previous pin's image, so a rollback needs no rebuild. The TOML owns the current pin and the journal owns the previous pin. Rollback verifies both against the `.bak`, so they cannot diverge silently.
 
 Promotion needs no restart: the apply unit reads the TOML on each pass, and a worker keeps its image until it expires. The shipped apply unit mounts the file read-only, once per run.
 
@@ -298,11 +317,14 @@ Out of scope. A later change would need explicit gates (the marker, a clean cana
 
 ## Retention
 
-- The protected set is the image behind the configured pin, the image behind any `[[aws.availability_zones]]` version pin, the image of the recorded previous pin, the newest unpromoted candidate's image and the image of an active build. With the defaults that is three images, and `retain` (default 3, range 2..6) never goes below that.
-- ci-burst never deregisters an image that any launch-template version in the protected set references.
-- Everything else tagged for this deployment and older than `retain_min_age_seconds` is eligible, down to `retain` images.
-- Deregister first. Delete only snapshots that carry the same build id, and only after the deregister succeeded.
-- Fail closed: if the pin, a zone pin or the version contents cannot be read, delete nothing.
+One deletion rule covers every path that deregisters an image or deletes a snapshot: retention, failed-build cleanup in reconcile, orphan cleanup and the pending-image timeout. No path has its own rule.
+
+- Resolve the protected set first: the images of every launch-template version that the TOML references (the `[aws]` pin and every `[[aws.availability_zones]]` pin), the recorded previous pin, the pins of any pending or diverged promotion journal row, the current candidate and an active build. With the defaults that is three images, and `retain` (default 3, range 2..6) never goes below that. A failed build's image that an operator has pinned by hand is protected like any other.
+- Never deregister a protected image.
+- Verify the ownership tags (image-build, deployment and the build id) before deleting. An image or snapshot without them is left alone.
+- Fail closed: if the TOML or any launch-template version cannot be read, delete nothing.
+- Deregister first. Delete a snapshot only after the deregistration is confirmed, and only if it carries the same build id.
+- Retention adds one more condition: only images older than `retain_min_age_seconds` are eligible, down to `retain` images.
 - Older launch-template versions that reference deregistered images become unlaunchable. They are never deleted here. The previous pin stays valid because it is protected.
 - Retention runs inside `image run`. It only reports what it would remove unless `--apply` is given.
 - Orphans (tagged images or snapshots with no state row, older than 24 hours) are handled after that grace period.
@@ -356,8 +378,8 @@ The `[aws]` and `[forgejo]` tables are unchanged. Region, deployment identity an
 JSON on stdout with stable reason codes and no secrets. Exit codes follow the existing contract: 0 completed decision, 2 refusal, 1 provider failure.
 
 - `image plan --config C`: read-only. Resolves the sha, computes the digest, tests source access, reads the build template, shows the script sha and says whether a build would start and why not.
-- `image run --config C [--apply] [--force]`: without `--apply` it is `plan`.
-- `image status --config C [--refresh]`: the active or last build, the candidate, the pin, the rollback target, the retention set, the counters and the `blocked` flag with how to clear it. `--refresh` makes a read-only describe pass with the image role and stamps `verified_at`.
+- `image run --config C [--apply] [--until-done] [--force]`: without `--apply` it is `plan`. With `--apply` it runs one bounded pass. With `--until-done` (which needs `--apply`) it supervises repeated passes to `candidate`, `failed` or the build deadline.
+- `image status --config C [--refresh]`: the active or last build, the candidate, the pin, the rollback target, the retention set, the counters, a pending promotion journal row and the `blocked` flag with how to clear it. Plain `status` makes no provider call that mutates and writes only the check timestamp. `--refresh` makes describe-only provider reads with the image role and persists only `verified_at`, the image state, whether the template version exists, the drift result and the observed pins. Neither form mutates a provider resource.
 - `image promote --config C [--version N | --rollback] [--write]`: as above.
 
 The `blocked` state clears only with a basis digest change or `image run --apply --force`. `status` prints that.
@@ -373,6 +395,7 @@ Events carry ids, 12-character digests, counts and reason codes. The presigned U
 - The image unit mounts the image role's profile directory, the image token env file, the config read-only and its own state directory. It does not mount the scaling credentials, the scaling state directory or the token that `apply` uses.
 - The apply, reap and export units gain no new mount. They never hold image credentials.
 - The promote container holds no AWS credential, no forge token and no network.
+- Residual risk: a leaked image-role session can call `DeregisterImage` or `DeleteSnapshot` on any image tagged for this deployment, including the pinned one, and so bypass the application's deletion rule. A Deny for pinned images is not possible, because the pin moves and an IAM condition cannot follow it. The mitigations are 1-hour sessions, the external ID, a source identity that exists only on the controller host and that can only assume the role, source-key rotation and CloudTrail records of the calls. Recovery is to rebuild from the protected branch or to roll the pin back to an image that still exists.
 - Builders hold no credential. The presigned URL is bearer access to one archive for at most `presign_seconds`.
 - Logs, events and the state file hold no URL, token, user data or raw provider payload.
 
@@ -404,7 +427,7 @@ Events carry ids, 12-character digests, counts and reason codes. The presigned U
 | Console blind, or no marker | `CONSOLE_BLIND` or `MARKER_TIMEOUT`, builder terminated, no image |
 | Marker digest differs from the staged archive | `IMAGE_MARKER_DIGEST_MISMATCH`, no image |
 | Builder gone before `CreateImage` | `IMAGE_BUILDER_GONE`, cooldown |
-| Image fails or stays pending | Poll to the deadline, then deregister and delete snapshots |
+| Image fails or stays pending | Poll to the deadline, then clean up only under the deletion rule |
 | New version differs beyond `ImageId` | `TEMPLATE_DRIFT`, version unusable, image kept 24 hours |
 | Version creation fails | Retry with the same client token, no rebuild |
 | Crash after a state write | Idempotent retry. Reconcile terminates an unmatched builder. |
@@ -415,6 +438,12 @@ Events carry ids, 12-character digests, counts and reason codes. The presigned U
 | Promote: file changed since read | `PROMOTE_FILE_CHANGED`. File unchanged. |
 | Promote: strict re-parse fails | Refusal. File and backup unchanged. |
 | Promote: directory not dedicated | `PROMOTE_DIRECTORY_NOT_DEDICATED`. File unchanged. |
+| Promote: crash before the rename | The journal row is `pending` with the old file hash. The next resolving command marks it `aborted`. |
+| Promote: crash after the rename | The journal row is `pending` and the file has the new hash. The next resolving command marks it `complete`. |
+| Promote: file edited by hand while a row is pending | `PROMOTION_JOURNAL_DIVERGED`. Nothing is written, both pins stay protected. |
+| Deletion path cannot read the TOML or a version | Delete nothing, report the refusal. |
+| Failed build's image is pinned by hand | Skipped as protected. |
+| Supervisor interrupted | Rerun the same command to resume. |
 | Promoted image bad | `promote --rollback`. No rebuild. |
 | Image pass fails repeatedly | `blocked` after `max_consecutive_failures`. Clears with a digest change or `--force`. |
 

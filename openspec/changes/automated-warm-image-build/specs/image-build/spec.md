@@ -2,7 +2,6 @@
 
 ## ADDED Requirements
 
-
 ### Requirement: Image build is opt-in and inert by default
 ci-burst MUST create, tag or delete a worker image, a snapshot, a builder instance, a launch-template version or a staged archive only when `[image].enabled = true`. When the `[image]` table is absent or `enabled` is false, every `image` command MUST exit 0 with the decision `disabled` and MUST make no AWS, S3 or Forgejo call.
 
@@ -21,16 +20,33 @@ ci-burst MUST create, tag or delete a worker image, a snapshot, a builder instan
 - **AND** the scaling behavior of `apply`, `reap` and `export` is unchanged
 
 ### Requirement: Image commands default to observation
-`image plan`, `image status` and `image run` without `--apply` MUST NOT write to AWS or S3, MUST NOT create a builder, an image, a snapshot or a launch-template version, and MUST NOT change the image state file except for the check timestamp. An AWS dry-run flag MUST NOT replace this isolation.
+`image plan`, plain `image status` and `image run` without `--apply` MUST make no provider mutation: no S3 write, no builder, no image, no snapshot, no launch-template version and no deletion. They MUST NOT change the image state file except for the check timestamp. An AWS dry-run flag MUST NOT replace this isolation. No command makes a provider mutation unless `--apply` is given.
 
 #### Scenario: Run without apply
 - **WHEN** an operator runs `image run` without `--apply`
 - **THEN** the output is the plan
 - **AND** no S3 object, instance, image or launch-template version is created
 
+#### Scenario: Plain status
+- **WHEN** an operator runs `image status` without `--refresh`
+- **THEN** the command makes no provider call that mutates and writes only the check timestamp
+
 #### Scenario: Apply is explicit
 - **WHEN** an operator runs `image run --apply` and every precondition holds
 - **THEN** the pass MAY stage the archive and launch one builder
+
+### Requirement: Status refresh persists only verification evidence
+`image status --refresh` MUST perform describe-only provider reads and MUST persist only these fields: `verified_at`, the image state, whether the template version exists, the drift result and the observed pins. It MUST make no provider mutation and MUST persist no other field. The pass that records the evidence MUST be the only source of `verified_at` for `promote`.
+
+#### Scenario: Refresh persists the listed fields
+- **WHEN** an operator runs `image status --refresh`
+- **THEN** only the listed fields change in the state file
+- **AND** no provider mutation is made
+
+#### Scenario: Stale evidence, refresh, then promote
+- **WHEN** `verified_at` is older than `promote_max_age_seconds` and `promote --write` refuses with `IMAGE_VERIFICATION_STALE`
+- **AND** the operator runs `image status --refresh` in the build container
+- **THEN** the later `promote --write` in the container without AWS credentials succeeds when every other check holds
 
 ### Requirement: Image build state is separate from the scaling ledger
 Image build state MUST live in its own SQLite file with its own lock and its own schema version, in a state directory that the scaling units do not mount and that the image unit does not share with the scaling ledger. The image code MUST NOT read or write the scaling ledger and MUST NOT change its schema version. A lost or restored image state file MUST NOT permit a second builder or a deletion of an image that a pin references.
@@ -68,10 +84,10 @@ Image builds MUST use a separate AWS role that the SDK assumes through a shared-
 - **THEN** configuration loading refuses with `CONFIG_INVALID`
 
 ### Requirement: The image path has no IAM authority
-The controller code MUST contain no IAM client. No shipped policy MUST contain an `iam:*` action, `ec2:ModifyLaunchTemplate` or `ec2:DeleteLaunchTemplateVersions`. The operator, not ci-burst, MUST create and change all IAM. The documented source identity MUST be allowed `sts:AssumeRole` on the one image role and no other action.
+The controller code MUST contain no IAM client. No shipped policy MUST contain an `iam:*` wildcard or any IAM action other than the one optional, condition-scoped `iam:PassRole` statement, `ec2:ModifyLaunchTemplate` or `ec2:DeleteLaunchTemplateVersions`. The operator, not ci-burst, MUST create and change all IAM. The documented source identity MUST be allowed `sts:AssumeRole` on the one image role and no other action.
 
 #### Scenario: The code or policy gains an IAM action
-- **WHEN** the controller source constructs an IAM client or a shipped policy contains an `iam:*` action, `ec2:ModifyLaunchTemplate` or `ec2:DeleteLaunchTemplateVersions`
+- **WHEN** the controller source constructs an IAM client or a shipped policy contains an `iam:*` wildcard, an IAM action other than the one condition-scoped `iam:PassRole` statement, `ec2:ModifyLaunchTemplate` or `ec2:DeleteLaunchTemplateVersions`
 - **THEN** a repository test fails and names the file
 
 #### Scenario: The source identity is documented
@@ -262,6 +278,25 @@ At most one builder MUST exist for a deployment. A unique index keyed on the dep
 - **WHEN** a tagged builder exists and the state file has no active row
 - **THEN** the AWS precheck refuses the launch
 
+### Requirement: A run can supervise a build to completion
+Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run --apply --until-done` MUST repeat bounded passes with a fixed sleep between them until the build reaches `candidate` or `failed`, or the build deadline passes. Without `--until-done`, `run --apply` MUST run one pass. Rerunning the same command MUST resume an interrupted supervisor from the state file. `--until-done` MUST be refused without `--apply`.
+
+#### Scenario: The marker arrives after the first pass
+- **WHEN** the first pass ends at its deadline before the marker and the marker appears later
+- **THEN** a later pass of the same `--until-done` run sees the marker, calls `CreateImage` in that pass and completes the build to `candidate` without a timer
+
+#### Scenario: The supervisor is interrupted
+- **WHEN** the supervising process is stopped during a build
+- **THEN** rerunning `image run --apply --until-done` resumes the same build and starts no second builder
+
+#### Scenario: The build deadline passes
+- **WHEN** the build deadline passes with no marker
+- **THEN** the supervisor ends the build with `MARKER_TIMEOUT` or `CONSOLE_BLIND`
+
+#### Scenario: Until-done without apply
+- **WHEN** an operator passes `--until-done` without `--apply`
+- **THEN** the command refuses with exit 2 and does nothing
+
 ### Requirement: Success requires the framed marker and the staged digest
 A build MUST succeed only when the console shows `WARM_SOURCE_SHA256` with a digest equal to the archive sha256 held in the state file, followed by the whole line `IMAGE_READY`, read through the existing framed-line discipline. A `WARM FAIL` line or a `warm exiting rc=` line MUST fail the build. The command MUST NOT guess success.
 
@@ -321,10 +356,11 @@ The pass that first sees the marker MUST call `CreateImage` before it does any o
 
 #### Scenario: The image stays pending
 - **WHEN** the image is not `available` by the deadline
-- **THEN** the image is deregistered, its snapshots are deleted and the build is `failed`
+- **THEN** the build is `failed`
+- **AND** the image and its snapshots are removed only under the image deletion rule
 
 ### Requirement: Reconcile runs first and cleans leaks
-Every pass MUST reconcile before any transition. Reconcile MUST terminate builder-tagged instances that are not the active build's builder or are past the deadline, MUST delete objects under the prefix that are not the active archive and are older than one hour, and MUST deregister the images of failed builds and delete their snapshots.
+Every pass MUST reconcile before any transition. Reconcile MUST terminate builder-tagged instances that are not the active build's builder or are past the deadline, MUST delete objects under the prefix that are not the active archive and are older than one hour, and MUST clean the images of failed builds only under the image deletion rule.
 
 #### Scenario: A leaked builder
 - **WHEN** a builder is tagged for the deployment and the state file has no matching active build
@@ -448,12 +484,42 @@ No timer and no process that holds AWS credentials MUST write the deployment TOM
 - **WHEN** the `[aws]` table has no assignment or more than one
 - **THEN** the command refuses with `PROMOTE_PIN_LINE_AMBIGUOUS`
 
-### Requirement: Promotion keeps a backup and a record
-Before the rename, `promote --write` MUST write a timestamped backup and MUST refuse with `PROMOTE_FILE_CHANGED` when the file differs from the bytes it read. After the rename it MUST record the previous pin, the new pin, the backup name and the new file hash in the image state file.
+### Requirement: Promotion is journaled before the rename
+Before the rename, `promote --write` MUST commit a pending-promotion journal row to the image state file with the previous pin, the new pin, the previous and new file sha256, the candidate id and the backup name. After the rename it MUST mark the row complete. `image status` MUST report a pending row and what the file hash implies.
 
-#### Scenario: A backup and a record
+#### Scenario: The order of a write
+- **WHEN** `promote --write` succeeds
+- **THEN** the pending row was committed before the rename and is marked complete after it
+
+#### Scenario: Status shows a pending row
+- **WHEN** an operator runs `image status` while a row is pending
+- **THEN** the output names the pending row and the resolution that the file hash implies
+- **AND** the state file is not changed except for the check timestamp
+
+### Requirement: A pending promotion is resolved from the file hash
+The next `promote`, `promote --rollback` or `image run --apply` MUST resolve a pending row from the file hash: the old hash marks it aborted, the new hash completes it, and any other hash refuses with `PROMOTION_JOURNAL_DIVERGED`. While a row is pending or diverged, both of its pins MUST be protected from deletion.
+
+#### Scenario: A crash before the rename
+- **WHEN** the process stops after the journal commit and before the rename
+- **THEN** the file still has the old hash and the next resolving command marks the row aborted
+- **AND** the pin is unchanged
+
+#### Scenario: A crash after the rename
+- **WHEN** the process stops after the rename and before the completion commit
+- **THEN** the file has the new hash and the next resolving command completes the row
+- **AND** a later rollback finds the recorded previous pin
+
+#### Scenario: The file is edited by hand in between
+- **WHEN** the file has neither the old nor the new hash while a row is pending
+- **THEN** the command refuses with `PROMOTION_JOURNAL_DIVERGED` and writes nothing
+- **AND** retention protects both pins until an operator resolves the divergence
+
+### Requirement: Promotion keeps a backup and refuses a changed file
+Before the rename, `promote --write` MUST write a timestamped backup and MUST refuse with `PROMOTE_FILE_CHANGED` when the file differs from the bytes it read.
+
+#### Scenario: A backup exists
 - **WHEN** a write succeeds
-- **THEN** a backup `<file>.bak.<UTC timestamp>` exists and a `promoted` row holds the previous pin
+- **THEN** a backup `<file>.bak.<UTC timestamp>` exists and holds the previous bytes
 
 #### Scenario: The file changed since it was read
 - **WHEN** another editor changes the file after the read
@@ -475,49 +541,72 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **THEN** the command succeeds
 
 ### Requirement: Rollback restores the recorded previous pin
-`promote --rollback --write` MUST write the recorded previous pin with the same procedure as a promotion. It MUST refuse with `PIN_RECORD_DIVERGED` unless the newest `promoted` row's new pin equals the TOML's pin and the newest backup file holds the recorded previous pin, and MUST refuse unless the previous version and its image are recorded as existing with a fresh `verified_at`. The previous pin's image MUST be in the retention protected set, so a rollback needs no rebuild.
+`promote --rollback --write` MUST write the recorded previous pin with the same journaled procedure as a promotion, after it resolves a pending journal row. The previous pin's image MUST be protected from deletion, so a rollback needs no rebuild.
 
 #### Scenario: A bad promotion is rolled back
 - **WHEN** the record and the newest backup agree on the previous pin
-- **THEN** the pin returns to that number and a `rolled_back` row is recorded
+- **THEN** the pin returns to that number and a completed rollback row is recorded
+
+### Requirement: Rollback verifies the records first
+`promote --rollback --write` MUST refuse with `PIN_RECORD_DIVERGED` unless the newest completed promotion's new pin equals the TOML's pin and the newest backup file holds the recorded previous pin. It MUST refuse unless the previous version and its image are recorded as existing with a fresh `verified_at`.
 
 #### Scenario: The records diverge
-- **WHEN** the TOML pin, the newest backup and the `promoted` row disagree
+- **WHEN** the TOML pin, the newest backup and the completed row disagree
 - **THEN** the command refuses with `PIN_RECORD_DIVERGED` and writes nothing
 
 #### Scenario: The previous image is missing
 - **WHEN** the previous pin's image is not recorded as existing
 - **THEN** the command refuses and does not write
 
-### Requirement: Retention protects the pins and a minimum set
-Retention MUST protect the image behind the configured pin, the image behind every per-zone version pin, the image of the recorded previous pin, the newest unpromoted candidate's image and the image of an active build. It MUST NOT deregister an image that a launch-template version in the protected set references. It MUST keep at least `retain` images for the deployment (default 3, range 2 to 6).
+### Requirement: Every image deletion resolves the protected set
+Every path that deregisters an image or deletes a snapshot (retention, failed-build cleanup, orphan cleanup and the pending-image timeout) MUST first resolve the protected set: the images of every launch-template version that the TOML references, including per-zone pins, the recorded previous pin, the pins of a pending promotion journal row, the current candidate and an active build. It MUST NOT deregister a protected image.
 
 #### Scenario: A protected image
-- **WHEN** an image is the pin's, the previous pin's or the candidate's
-- **THEN** retention skips it
+- **WHEN** an image is the pin's, the previous pin's, a journal pin's or the candidate's
+- **THEN** every deletion path skips it
+
+#### Scenario: A failed build's image is pinned by hand
+- **WHEN** an operator has pinned a version that names the image of a failed build
+- **THEN** failed-build cleanup skips that image and its snapshots
+- **AND** the build row records that its image is protected
+
+#### Scenario: A pending journal pins an image
+- **WHEN** a promotion journal row is pending and names a version whose image would otherwise be removed
+- **THEN** no deletion path removes it
+
+### Requirement: Every image deletion is verified and fails closed
+Every deletion path MUST verify the ownership tags (image-build, deployment and build id) before it deletes, MUST delete nothing when the TOML or a launch-template version cannot be read, and MUST delete a snapshot only after a confirmed deregistration of its image. A deletion path MUST only report what it would remove unless `--apply` is given.
+
+#### Scenario: The pin read fails
+- **WHEN** the TOML or a launch-template version cannot be read during failed-build cleanup, orphan cleanup or retention
+- **THEN** that path deletes nothing and reports the refusal
+
+#### Scenario: Deregister fails
+- **WHEN** the deregister call for an image fails or is not confirmed
+- **THEN** its snapshots are not deleted
+
+#### Scenario: Ownership tags do not match
+- **WHEN** an image or snapshot lacks the image-build tag, the deployment tag or the build id of the build
+- **THEN** no deletion path removes it
+
+#### Scenario: A deletion path is rerun after the cause is fixed
+- **WHEN** the operator fixes the unreadable input and runs `image run --apply` again
+- **THEN** the path proceeds with the same rules
+
+#### Scenario: Deletion without apply
+- **WHEN** an operator runs `image run` without `--apply`
+- **THEN** the output lists what each path would remove and nothing is deleted
+
+### Requirement: Retention keeps a minimum set of images
+Retention MUST keep at least `retain` images for the deployment (default 3, range 2 to 6) and MUST consider only images older than `retain_min_age_seconds`. It runs inside `image run`.
 
 #### Scenario: Fewer images than the minimum
 - **WHEN** the deployment has `retain` images or fewer
 - **THEN** retention removes none
 
-### Requirement: Retention deletes in a safe order and fails closed
-Retention MUST consider only images older than `retain_min_age_seconds`, MUST deregister before it deletes snapshots, MUST delete only snapshots that carry the same build id, and MUST delete nothing when the pin, a zone pin or a version's contents cannot be read. Retention runs inside `image run`, and MUST only report what it would remove unless `--apply` is given.
-
-#### Scenario: The pin cannot be read
-- **WHEN** the configured pin or a version's contents cannot be read
-- **THEN** retention deletes nothing and reports the refusal
-
-#### Scenario: Deregister fails
-- **WHEN** the deregister call for an image fails
-- **THEN** its snapshots are not deleted
-
-#### Scenario: Retention is rerun after the cause is fixed
-- **WHEN** the operator fixes the unreadable input and runs `image run --apply` again
-- **THEN** retention proceeds with the same rules
-
-#### Scenario: Retention without apply
-- **WHEN** an operator runs `image run` without `--apply`
-- **THEN** the output lists what retention would remove and nothing is deleted
+#### Scenario: A young image
+- **WHEN** an unprotected image is younger than `retain_min_age_seconds`
+- **THEN** retention keeps it
 
 ### Requirement: Image operations are observable without secrets
 The image path MUST write an append-only event file and an atomically written Prometheus textfile for build state, outcome timestamps, duration, console latency, consecutive failures, candidate waiting, staleness and leaked resources by kind. Events MUST carry only ids, 12-character digests, counts and stable reason codes. A failed-build event MAY carry a framed, byte-sanitized console tail.

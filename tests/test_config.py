@@ -1,9 +1,11 @@
+import copy
+import json
 import re
 import tempfile
 import unittest
 from pathlib import Path
 
-from ci_burst.config import load
+from ci_burst.config import ImageConfig, load
 from ci_burst.errors import ConfigRefusal
 
 from support import write_config
@@ -317,3 +319,341 @@ class ConfigTests(unittest.TestCase):
     def test_live_verified_qualification_permits_live(self):
         config = load(write_config(self.root))
         config.require_live_contract()
+
+
+#: One valid, enabled image configuration with synthetic names only. Each test
+#: overrides or removes single keys so a refusal names exactly one cause.
+_IMAGE = {
+    "enabled": True,
+    "profile": "example-image-role",
+    "source": {
+        "token_env": "EXAMPLE_IMAGE_TOKEN",
+        "basis_paths": ["example.lock"],
+    },
+    "warm": {"commands": ["bash scripts/example-warm.sh"]},
+    "build": {"launch_template_name": "example-builder", "launch_template_version": 1},
+    "storage": {"bucket": "example-staging", "prefix": "example-prefix/"},
+}
+
+
+def _toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    # JSON string escapes are valid TOML except for DEL, which JSON leaves raw.
+    return json.dumps(value).replace("\x7f", "\\u007f")
+
+
+def _image_text(image):
+    """Render an ``[image]`` table and its sub-tables, in TOML."""
+    lines = ["", "[image]"]
+    for key, value in image.items():
+        if not isinstance(value, dict):
+            lines.append(f"{key} = {_toml_value(value)}")
+    for name, table in image.items():
+        if isinstance(table, dict):
+            lines.append(f"[image.{name}]")
+            lines.extend(f"{key} = {_toml_value(value)}" for key, value in table.items())
+    return "\n".join(lines) + "\n"
+
+
+class ImageConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+
+    def _path(self, image=None, *, aws=None, raw=None):
+        path = write_config(self.root, config={"aws": aws} if aws else None)
+        if raw is not None:
+            path.write_text(path.read_text() + raw)
+        elif image is not None:
+            path.write_text(path.read_text() + _image_text(image))
+        return path
+
+    def _image(self, *, top=None, **tables):
+        """A valid image table with ``top`` keys and per-table keys changed.
+
+        A ``None`` value removes the key; a ``None`` table removes the table.
+        """
+        image = copy.deepcopy(_IMAGE)
+        for key, value in (top or {}).items():
+            image.pop(key, None) if value is None else image.__setitem__(key, value)
+        for name, changes in tables.items():
+            if changes is None:
+                image.pop(name, None)
+                continue
+            for key, value in changes.items():
+                image[name].pop(key, None) if value is None else image[name].__setitem__(key, value)
+        return image
+
+    def _load(self, image, **kwargs):
+        return load(self._path(image, **kwargs))
+
+    def assertRefused(self, image, fragment, **kwargs):
+        with self.assertRaises(ConfigRefusal) as raised:
+            self._load(image, **kwargs)
+        self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
+        self.assertIn(fragment, raised.exception.detail)
+
+    def test_an_absent_table_is_disabled_and_changes_nothing_else(self):
+        plain = load(write_config(self.root))
+        self.assertEqual(plain.image, ImageConfig())
+        self.assertFalse(plain.image.enabled)
+        enabled_off = self._load({"enabled": False})
+        self.assertEqual(enabled_off.image, ImageConfig())
+        for name in ("deployment", "forgejo", "worker", "controller", "aws", "budget", "state"):
+            self.assertEqual(getattr(enabled_off, name), getattr(plain, name))
+
+    def test_enabled_false_is_disabled_without_the_other_tables(self):
+        self.assertEqual(self._load({"enabled": False}).image, ImageConfig())
+        self.assertEqual(self._load({}).image, ImageConfig())
+
+    def test_enabled_false_keeps_a_complete_table_disabled(self):
+        config = self._load(self._image(top={"enabled": False}))
+        self.assertEqual(config.image, ImageConfig())
+
+    def test_enabled_false_still_refuses_an_unknown_or_out_of_range_key(self):
+        self.assertRefused({"enabled": False, "surprise": 1}, "unknown key(s) surprise")
+        self.assertRefused({"enabled": False, "retain": 99}, "image.retain: must be between 2 and 6")
+        self.assertRefused(
+            {"enabled": False, "source": {"basis_paths": ["../x"]}}, "image.source.basis_paths[0]"
+        )
+
+    def test_enabled_must_be_a_boolean(self):
+        self.assertRefused({"enabled": 1}, "image.enabled: must be true or false")
+
+    def test_an_enabled_table_needs_its_required_keys(self):
+        self.assertRefused(self._image(top={"profile": None}), "image.profile: is required")
+        for table, key in (
+            ("source", "token_env"),
+            ("source", "basis_paths"),
+            ("warm", "commands"),
+            ("build", "launch_template_name"),
+            ("build", "launch_template_version"),
+            ("storage", "bucket"),
+            ("storage", "prefix"),
+        ):
+            with self.subTest(table=table, key=key):
+                self.assertRefused(self._image(**{table: {key: None}}), f"image.{table}.{key}: is required")
+        for table in ("source", "warm", "build", "storage"):
+            with self.subTest(table=table):
+                self.assertRefused(self._image(**{table: None}), f"image.{table}.")
+
+    def test_defaults(self):
+        image = self._load(self._image()).image
+        self.assertTrue(image.enabled)
+        self.assertEqual(image.profile, "example-image-role")
+        self.assertEqual(image.min_build_interval_seconds, 86_400)
+        self.assertEqual(image.max_builds_per_day, 2)
+        self.assertEqual(image.build_deadline_seconds, 2700)
+        self.assertEqual(image.failure_cooldown_seconds, 21_600)
+        self.assertEqual(image.max_consecutive_failures, 3)
+        self.assertEqual(image.retain, 3)
+        self.assertEqual(image.retain_min_age_seconds, 86_400)
+        self.assertEqual(image.promote_max_age_seconds, 172_800)
+        self.assertEqual(image.source.branch, "main")
+        self.assertEqual(image.source.token_env, "EXAMPLE_IMAGE_TOKEN")
+        self.assertEqual(image.source.basis_paths, ("example.lock",))
+        self.assertEqual(image.source.max_archive_bytes, 268_435_456)
+        self.assertEqual(image.source.presign_seconds, 1800)
+        self.assertEqual(image.source.strip_components, 1)
+        self.assertEqual(image.warm.commands, ("bash scripts/example-warm.sh",))
+        self.assertEqual(image.warm.gate_command, "")
+        self.assertFalse(image.warm.allow_no_gate)
+        self.assertEqual(image.warm.lifetime_seconds, 3600)
+        self.assertEqual(image.warm.snapshot_seconds, 1800)
+        self.assertEqual(image.build.launch_template_name, "example-builder")
+        self.assertEqual(image.build.launch_template_version, 1)
+        self.assertEqual(image.storage.bucket, "example-staging")
+        self.assertEqual(image.storage.prefix, "example-prefix/")
+
+    def test_explicit_values_are_loaded(self):
+        image = self._load(
+            self._image(
+                top={"retain": 5},
+                source={"branch": "release/1", "strip_components": 0, "presign_seconds": 600},
+                warm={
+                    "gate_command": "bash scripts/example-gate.sh",
+                    "allow_no_gate": True,
+                    "commands": ["first", "second"],
+                },
+            )
+        ).image
+        self.assertEqual(image.retain, 5)
+        self.assertEqual(image.source.branch, "release/1")
+        self.assertEqual(image.source.strip_components, 0)
+        self.assertEqual(image.source.presign_seconds, 600)
+        self.assertEqual(image.warm.gate_command, "bash scripts/example-gate.sh")
+        self.assertTrue(image.warm.allow_no_gate)
+        self.assertEqual(image.warm.commands, ("first", "second"))
+
+    def test_an_empty_gate_command_loads_so_the_command_can_decide(self):
+        image = self._load(self._image(warm={"gate_command": "", "allow_no_gate": True})).image
+        self.assertEqual(image.warm.gate_command, "")
+
+    def test_bounds(self):
+        # key location, minimum, maximum
+        bounds = (
+            (None, "min_build_interval_seconds", 3600, 604_800),
+            (None, "max_builds_per_day", 1, 6),
+            (None, "build_deadline_seconds", 900, 14_400),
+            (None, "failure_cooldown_seconds", 600, 172_800),
+            (None, "max_consecutive_failures", 1, 10),
+            (None, "retain", 2, 6),
+            (None, "retain_min_age_seconds", 3600, 2_592_000),
+            (None, "promote_max_age_seconds", 3600, 2_592_000),
+            ("source", "max_archive_bytes", 1_048_576, 2_147_483_648),
+            ("source", "presign_seconds", 300, 3600),
+            ("source", "strip_components", 0, 1),
+            ("warm", "lifetime_seconds", 600, 14_400),
+            ("warm", "snapshot_seconds", 60, 3600),
+            ("build", "launch_template_version", 1, 10_000),
+        )
+        for table, key, low, high in bounds:
+            where = f"image.{table}.{key}" if table else f"image.{key}"
+            for value in (low, high):
+                with self.subTest(key=where, accepted=value):
+                    image = self._image(**{table: {key: value}}) if table else self._image(top={key: value})
+                    parsed = self._load(image).image
+                    target = getattr(parsed, table) if table else parsed
+                    self.assertEqual(getattr(target, key), value)
+            for value in (low - 1, high + 1):
+                with self.subTest(key=where, refused=value):
+                    image = self._image(**{table: {key: value}}) if table else self._image(top={key: value})
+                    self.assertRefused(image, f"{where}: must be between {low} and {high}")
+
+    def test_refuses_a_non_integer(self):
+        for value in (1.0, "2", True):
+            with self.subTest(value=value):
+                self.assertRefused(
+                    self._image(top={"max_builds_per_day": value}),
+                    "image.max_builds_per_day: must be an integer",
+                )
+        self.assertRefused(
+            self._image(source={"presign_seconds": 900.5}), "image.source.presign_seconds: must be an integer"
+        )
+
+    def test_refuses_an_unknown_key_in_every_table(self):
+        self.assertRefused(self._image(top={"check_interval_seconds": 21_600}), "unknown key(s) check_interval_seconds")
+        for table in ("source", "warm", "build", "storage"):
+            with self.subTest(table=table):
+                self.assertRefused(self._image(**{table: {"surprise": 1}}), f"image.{table}: unknown key(s) surprise")
+        self.assertRefused(self._image(top={"surprise": 1}), "image: unknown key(s) surprise")
+
+    def test_a_sub_table_must_be_a_table(self):
+        self.assertRefused(
+            {"enabled": True, "profile": "example-image-role", "source": 1},
+            "image.source: must be a table",
+        )
+
+    def test_refuses_the_scaling_profile(self):
+        self.assertRefused(
+            self._image(top={"profile": "example-scaling"}),
+            "image.profile: must differ from aws.profile",
+            aws={"profile": "example-scaling"},
+        )
+        # Equality is refused even while the feature is disabled.
+        self.assertRefused(
+            {"enabled": False, "profile": "example-scaling"},
+            "image.profile: must differ from aws.profile",
+            aws={"profile": "example-scaling"},
+        )
+
+    def test_a_different_or_unset_scaling_profile_is_accepted(self):
+        config = self._load(self._image(), aws={"profile": "example-scaling"})
+        self.assertEqual(config.image.profile, "example-image-role")
+        self.assertIsNone(self._load(self._image()).aws.profile)
+
+    def test_refuses_an_unsafe_basis_path(self):
+        for path in ("../secrets", "a/../b", "a/..", "..", "/etc/example", "a\x00b", "a\nb"):
+            with self.subTest(path=path):
+                self.assertRefused(
+                    self._image(source={"basis_paths": ["example.lock", path]}),
+                    "image.source.basis_paths[1]",
+                )
+
+    def test_refuses_an_empty_basis_path_or_list(self):
+        self.assertRefused(self._image(source={"basis_paths": [""]}), "image.source.basis_paths[0]: must be a non-empty string")
+        self.assertRefused(self._image(source={"basis_paths": []}), "image.source.basis_paths: must be a non-empty array")
+        self.assertRefused(self._image(source={"basis_paths": "example.lock"}), "image.source.basis_paths: must be a non-empty array")
+
+    def test_basis_path_count_bound(self):
+        paths = [f"example-{index}.lock" for index in range(33)]
+        self.assertEqual(len(self._load(self._image(source={"basis_paths": paths[:32]})).image.source.basis_paths), 32)
+        self.assertRefused(
+            self._image(source={"basis_paths": paths}),
+            "image.source.basis_paths: must list at most 32 paths",
+        )
+
+    def test_refuses_a_control_character_in_a_warm_command(self):
+        for character in ("\n", "\r", "\t", "\x00", "\x1b", "\x7f"):
+            with self.subTest(character=repr(character)):
+                self.assertRefused(
+                    self._image(warm={"commands": ["bash ok.sh", f"bash a{character}b"]}),
+                    "image.warm.commands[1]: must not contain a control character",
+                )
+
+    def test_refuses_a_control_character_in_the_gate_command(self):
+        for character in ("\n", "\x00", "\x7f"):
+            with self.subTest(character=repr(character)):
+                self.assertRefused(
+                    self._image(warm={"gate_command": f"bash a{character}b"}),
+                    "image.warm.gate_command: must not contain a control character",
+                )
+
+    def test_refuses_empty_commands(self):
+        self.assertRefused(self._image(warm={"commands": []}), "image.warm.commands: must be a non-empty array")
+        self.assertRefused(self._image(warm={"commands": ["  "]}), "image.warm.commands[0]: must be a non-empty string")
+        self.assertRefused(self._image(warm={"gate_command": "  "}), "image.warm.gate_command: must be empty or a command")
+        self.assertRefused(self._image(warm={"gate_command": 1}), "image.warm.gate_command: must be a string")
+
+    def test_refuses_a_strip_components_value_other_than_zero_or_one(self):
+        for value in (2, -1):
+            with self.subTest(value=value):
+                self.assertRefused(
+                    self._image(source={"strip_components": value}),
+                    "image.source.strip_components: must be between 0 and 1",
+                )
+
+    def test_refuses_the_token_env_of_apply(self):
+        # The base configuration names CI_BURST_TEST_TOKEN for forgejo.token_env.
+        self.assertRefused(
+            self._image(source={"token_env": "CI_BURST_TEST_TOKEN"}),
+            "image.source.token_env: must differ from forgejo.token_env",
+        )
+        self.assertRefused(
+            {"enabled": False, "source": {"token_env": "CI_BURST_TEST_TOKEN"}},
+            "image.source.token_env: must differ from forgejo.token_env",
+        )
+        self.assertEqual(
+            self._load(self._image()).image.source.token_env, "EXAMPLE_IMAGE_TOKEN"
+        )
+
+    def test_refuses_the_worker_launch_template_as_the_builder(self):
+        # The base configuration names ci-burst-runner for aws.launch_template_name.
+        # [aws] carries only a name, so the comparison is by name.
+        self.assertRefused(
+            self._image(build={"launch_template_name": "ci-burst-runner"}),
+            "image.build.launch_template_name: must differ from aws.launch_template_name",
+        )
+        self.assertRefused(
+            {"enabled": False, "build": {"launch_template_name": "ci-burst-runner"}},
+            "image.build.launch_template_name: must differ from aws.launch_template_name",
+        )
+        self.assertEqual(
+            self._load(self._image()).image.build.launch_template_name, "example-builder"
+        )
+
+    def test_refuses_a_malformed_storage_or_source_name(self):
+        self.assertRefused(self._image(storage={"prefix": "/example/"}), "image.storage.prefix")
+        self.assertRefused(self._image(storage={"prefix": "a/../b"}), "image.storage.prefix")
+        self.assertRefused(self._image(storage={"prefix": "a\nb"}), "image.storage.prefix")
+        self.assertRefused(self._image(storage={"bucket": "Bad_Bucket"}), "image.storage.bucket")
+        self.assertRefused(self._image(source={"token_env": "lower"}), "image.source.token_env")
+        self.assertRefused(self._image(source={"branch": "a/../b"}), "image.source.branch")
+        self.assertRefused(self._image(build={"launch_template_name": "x"}), "image.build.launch_template_name")
+

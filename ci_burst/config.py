@@ -15,7 +15,8 @@ type-major order is the priority the controller falls back through.
 
 import re
 import tomllib
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .errors import ConfigRefusal
@@ -45,6 +46,8 @@ _TEMPLATE_NAME = re.compile(r"^[A-Za-z0-9()\\./_ -]{3,128}$")
 #: hexadecimal characters. Any other length would reach the provider as a
 #: malformed identifier instead of being refused here.
 _SUBNET = re.compile(r"^subnet-(?:[0-9a-f]{8}|[0-9a-f]{17})$")
+_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+_BUCKET = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 
 #: Keys accepted inside one ``[[aws.availability_zones]]`` table.
 _ZONE_CANDIDATE_KEYS = ("zone", "subnet_id", "launch_template_version")
@@ -61,6 +64,10 @@ MAX_INSTANCE_TYPE_LENGTH = 64
 #: every configured type in every configured zone, so the bound keeps those
 #: synchronous provider reads predictable.
 _MAX_INSTANCE_TYPES = 4
+
+#: How many basis paths one image build may hash. Each path is one raw read
+#: from the forge before any build starts, so the bound keeps that predictable.
+_MAX_BASIS_PATHS = 32
 
 
 @dataclass(frozen=True)
@@ -160,6 +167,66 @@ class StateConfig:
 
 
 @dataclass(frozen=True)
+class ImageSourceConfig:
+    branch: str
+    token_env: str
+    basis_paths: tuple
+    max_archive_bytes: int
+    presign_seconds: int
+    strip_components: int
+
+
+@dataclass(frozen=True)
+class ImageWarmConfig:
+    commands: tuple
+    #: Empty means no gate. The build refuses an empty gate unless
+    #: ``allow_no_gate`` is set, so the loader accepts both.
+    gate_command: str
+    allow_no_gate: bool
+    lifetime_seconds: int
+    snapshot_seconds: int
+
+
+@dataclass(frozen=True)
+class ImageBuildConfig:
+    launch_template_name: str
+    launch_template_version: int
+
+
+@dataclass(frozen=True)
+class ImageStorageConfig:
+    bucket: str
+    prefix: str
+
+
+@dataclass(frozen=True)
+class ImageConfig:
+    """The optional automated warm-image build; disabled unless opted in.
+
+    An absent ``[image]`` table and ``enabled = false`` both yield the same
+    disabled value: ``enabled`` is false and every other field is ``None``, so
+    no consumer can read a half-configured image path. A present table is
+    validated strictly in either case, so a typo is refused before the
+    operator enables it; required keys are enforced only when it is enabled.
+    """
+
+    enabled: bool = False
+    profile: str | None = None
+    min_build_interval_seconds: int | None = None
+    max_builds_per_day: int | None = None
+    build_deadline_seconds: int | None = None
+    failure_cooldown_seconds: int | None = None
+    max_consecutive_failures: int | None = None
+    retain: int | None = None
+    retain_min_age_seconds: int | None = None
+    promote_max_age_seconds: int | None = None
+    source: ImageSourceConfig | None = None
+    warm: ImageWarmConfig | None = None
+    build: ImageBuildConfig | None = None
+    storage: ImageStorageConfig | None = None
+
+
+@dataclass(frozen=True)
 class Config:
     deployment: str
     path: Path
@@ -169,6 +236,7 @@ class Config:
     aws: AwsConfig
     budget: BudgetConfig
     state: StateConfig
+    image: ImageConfig = field(default_factory=ImageConfig)
 
     def require_live_contract(self):
         """Refuse live admission until the operator declares live evidence."""
@@ -360,6 +428,226 @@ def _instance_types(aws_table):
     return tuple(listed)
 
 
+def _boolean(table, key, where, *, default):
+    value = table.get(key, default)
+    if type(value) is not bool:
+        _fail(f"{where}.{key}", "must be true or false")
+    return value
+
+
+def _default(value, fallback):
+    return fallback if value is None else value
+
+
+def _no_control(value, where):
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        _fail(where, "must not contain a control character")
+
+
+def _image_basis_paths(table, where, *, required):
+    value = table.get("basis_paths")
+    if value is None:
+        if required:
+            _fail(f"{where}.basis_paths", "is required")
+        return None
+    if not isinstance(value, list) or not value:
+        _fail(f"{where}.basis_paths", "must be a non-empty array")
+    if len(value) > _MAX_BASIS_PATHS:
+        _fail(f"{where}.basis_paths", f"must list at most {_MAX_BASIS_PATHS} paths")
+    for index, entry in enumerate(value):
+        entry_where = f"{where}.basis_paths[{index}]"
+        if not isinstance(entry, str) or not entry:
+            _fail(entry_where, "must be a non-empty string")
+        if entry.startswith("/") or ".." in entry:
+            _fail(entry_where, 'must be a path inside the archive: no ".." and no leading "/"')
+        _no_control(entry, entry_where)
+    return tuple(value)
+
+
+def _image_commands(table, where, *, required):
+    value = table.get("commands")
+    if value is None:
+        if required:
+            _fail(f"{where}.commands", "is required")
+        return None
+    if not isinstance(value, list) or not value:
+        _fail(f"{where}.commands", "must be a non-empty array of commands")
+    for index, entry in enumerate(value):
+        entry_where = f"{where}.commands[{index}]"
+        if not isinstance(entry, str) or not entry.strip():
+            _fail(entry_where, "must be a non-empty string")
+        _no_control(entry, entry_where)
+    return tuple(value)
+
+
+def _image_gate_command(table, where):
+    value = table.get("gate_command", "")
+    if not isinstance(value, str):
+        _fail(f"{where}.gate_command", "must be a string")
+    if value and not value.strip():
+        _fail(f"{where}.gate_command", "must be empty or a command")
+    _no_control(value, f"{where}.gate_command")
+    return value
+
+
+def _image_source(image_table, forgejo_token_env, *, required):
+    where = "image.source"
+    table = _table(
+        image_table.get("source", {}),
+        where,
+        ("branch", "token_env", "basis_paths", "max_archive_bytes", "presign_seconds", "strip_components"),
+    )
+    branch = _string(table, "branch", where, required=False, pattern=_BRANCH, pattern_name="a branch name")
+    if branch is not None and ".." in branch:
+        _fail(f"{where}.branch", "must not contain \"..\"")
+    token_env = _string(table, "token_env", where, required=required, pattern=_ENV_NAME, pattern_name="ENV_NAME")
+    if token_env is not None and token_env == forgejo_token_env:
+        _fail(
+            f"{where}.token_env",
+            "must differ from forgejo.token_env: the image path never uses the token of apply",
+        )
+    basis_paths = _image_basis_paths(table, where, required=required)
+    max_archive_bytes = _integer(
+        table, "max_archive_bytes", where, minimum=1_048_576, maximum=2_147_483_648, required=False
+    )
+    presign_seconds = _integer(table, "presign_seconds", where, minimum=300, maximum=3600, required=False)
+    strip_components = _integer(table, "strip_components", where, minimum=0, maximum=1, required=False)
+    if not required:
+        return None
+    return ImageSourceConfig(
+        branch=_default(branch, "main"),
+        token_env=token_env,
+        basis_paths=basis_paths,
+        max_archive_bytes=_default(max_archive_bytes, 268_435_456),
+        presign_seconds=_default(presign_seconds, 1800),
+        strip_components=_default(strip_components, 1),
+    )
+
+
+def _image_warm(image_table, *, required):
+    where = "image.warm"
+    table = _table(
+        image_table.get("warm", {}),
+        where,
+        ("commands", "gate_command", "allow_no_gate", "lifetime_seconds", "snapshot_seconds"),
+    )
+    commands = _image_commands(table, where, required=required)
+    gate_command = _image_gate_command(table, where)
+    allow_no_gate = _boolean(table, "allow_no_gate", where, default=False)
+    lifetime_seconds = _integer(table, "lifetime_seconds", where, minimum=600, maximum=14_400, required=False)
+    snapshot_seconds = _integer(table, "snapshot_seconds", where, minimum=60, maximum=3600, required=False)
+    if not required:
+        return None
+    return ImageWarmConfig(
+        commands=commands,
+        gate_command=gate_command,
+        allow_no_gate=allow_no_gate,
+        lifetime_seconds=_default(lifetime_seconds, 3600),
+        snapshot_seconds=_default(snapshot_seconds, 1800),
+    )
+
+
+def _image_build(image_table, worker_template, *, required):
+    where = "image.build"
+    table = _table(
+        image_table.get("build", {}), where, ("launch_template_name", "launch_template_version")
+    )
+    name = _string(
+        table, "launch_template_name", where, required=required,
+        pattern=_TEMPLATE_NAME, pattern_name="a launch template name",
+    )
+    if name is not None and name == worker_template:
+        _fail(
+            f"{where}.launch_template_name",
+            "must differ from aws.launch_template_name: the builder never launches from the worker template",
+        )
+    version = _integer(
+        table, "launch_template_version", where, minimum=1, maximum=10_000, required=required
+    )
+    if not required:
+        return None
+    return ImageBuildConfig(launch_template_name=name, launch_template_version=version)
+
+
+def _image_storage(image_table, *, required):
+    where = "image.storage"
+    table = _table(image_table.get("storage", {}), where, ("bucket", "prefix"))
+    bucket = _string(table, "bucket", where, required=required, pattern=_BUCKET, pattern_name="a bucket name")
+    prefix = _string(table, "prefix", where, required=required)
+    if prefix is not None:
+        if prefix.startswith("/") or ".." in prefix:
+            _fail(f"{where}.prefix", 'must be a key prefix: no ".." and no leading "/"')
+        _no_control(prefix, f"{where}.prefix")
+    if not required:
+        return None
+    return ImageStorageConfig(bucket=bucket, prefix=prefix)
+
+
+def _image(raw, aws_profile, forgejo_token_env, worker_template):
+    """Return the validated image configuration, or the disabled value.
+
+    The tables are checked whenever they are present, so an unknown key, an
+    out-of-range value or an unsafe path never waits for the operator to enable
+    the feature. Required keys and the returned fields exist only when enabled.
+    """
+    image_table = raw.get("image")
+    if image_table is None:
+        return ImageConfig()
+    where = "image"
+    table = _table(
+        image_table,
+        where,
+        (
+            "enabled",
+            "profile",
+            "min_build_interval_seconds",
+            "max_builds_per_day",
+            "build_deadline_seconds",
+            "failure_cooldown_seconds",
+            "max_consecutive_failures",
+            "retain",
+            "retain_min_age_seconds",
+            "promote_max_age_seconds",
+            "source",
+            "warm",
+            "build",
+            "storage",
+        ),
+    )
+    enabled = _boolean(table, "enabled", where, default=False)
+    profile = table.get("profile")
+    if profile is None:
+        if enabled:
+            _fail("image.profile", "is required")
+    elif not isinstance(profile, str) or not profile:
+        _fail("image.profile", "must be a non-empty string")
+    elif profile == aws_profile:
+        _fail("image.profile", "must differ from aws.profile: the image path never reuses the scaling profile")
+    ranges = {
+        "min_build_interval_seconds": (3600, 604_800, 86_400),
+        "max_builds_per_day": (1, 6, 2),
+        "build_deadline_seconds": (900, 14_400, 2700),
+        "failure_cooldown_seconds": (600, 172_800, 21_600),
+        "max_consecutive_failures": (1, 10, 3),
+        "retain": (2, 6, 3),
+        "retain_min_age_seconds": (3600, 2_592_000, 86_400),
+        "promote_max_age_seconds": (3600, 2_592_000, 172_800),
+    }
+    values = {
+        key: _default(_integer(table, key, where, minimum=low, maximum=high, required=False), default)
+        for key, (low, high, default) in ranges.items()
+    }
+    source = _image_source(table, forgejo_token_env, required=enabled)
+    warm = _image_warm(table, required=enabled)
+    build = _image_build(table, worker_template, required=enabled)
+    storage = _image_storage(table, required=enabled)
+    if not enabled:
+        return ImageConfig()
+    return ImageConfig(
+        enabled=True, profile=profile, source=source, warm=warm, build=build, storage=storage, **values
+    )
+
+
 def load(path):
     """Load and validate a configuration file, or raise ``ConfigRefusal``."""
     config_path = Path(path)
@@ -372,7 +660,7 @@ def load(path):
     except tomllib.TOMLDecodeError as error:
         raise ConfigRefusal("CONFIG_INVALID", f"TOML: {error}") from None
 
-    _table(raw, "config", ("deployment", "controller", "forgejo", "worker", "aws", "budget", "state"))
+    _table(raw, "config", ("deployment", "controller", "forgejo", "worker", "aws", "budget", "state", "image"))
 
     deployment = _string(raw, "deployment", "config", pattern=_DEPLOYMENT, pattern_name="a tag-safe name")
 
@@ -501,4 +789,5 @@ def load(path):
         aws=aws,
         budget=budget,
         state=state,
+        image=_image(raw, profile, forgejo.token_env, aws.launch_template_name),
     )

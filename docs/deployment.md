@@ -136,6 +136,86 @@ into the credential file on the host that uses it (Step 4) and never into a
 repository, a terminal history, a chat or a ticket. Both keys are long-lived:
 rotate them on your own schedule and record the rotation with the deployment.
 
+### Image-build role and source identity (optional, not yet used by a command)
+
+The OpenSpec change `automated-warm-image-build` plans controller-built warm
+images. No shipped command uses these identities yet, and the manual runbook in
+[warm-image.md](warm-image.md) stays the supported path. Create nothing here
+until the image commands ship and you have run the policy verification gates
+from that change. You apply all of this IAM yourself: the controller creates
+and changes none of it and has no IAM client.
+
+The role's permissions are in
+[deploy/iam/image-build-policy.json](../deploy/iam/image-build-policy.json).
+It is a separate role from the scaler and the reaper. Replace its placeholders
+(account id, Region, deployment, build and worker template ids, build subnet and
+security group, base image id, bucket and prefix) before attaching it. The
+prefix placeholder is the configured prefix with its trailing slash. The policy
+has no IAM action at all, no `ec2:ModifyLaunchTemplate`, no
+`ec2:DeleteLaunchTemplateVersions`, no `ec2:ModifyImageAttribute` and no
+`ssm:*`. It denies `ec2:RunInstances` for an instance with an instance profile
+and outside the build launch template. IAM cannot restrict what a launch-template
+version contains, so a person still reads and pins every candidate.
+
+A source identity (an IAM user with programmatic access and no console access)
+may only assume that role. Its whole policy is:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AssumeOnlyTheImageBuildRole",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::<account-id>:role/<image-build-role>"
+    }
+  ]
+}
+```
+
+The role's trust policy names that one principal and requires the external ID:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "TrustOnlyTheSourceIdentity",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<account-id>:user/<image-build-source-user>"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "<external-id>"
+        }
+      }
+    }
+  ]
+}
+```
+
+Set the role's maximum session duration to 3600 seconds, which is the IAM
+minimum. A source-identity condition would be stronger than the external ID, but
+whether a shared-config profile alone can supply one is not established, so do
+not rely on it. The external ID is a second secret: keep it in the same
+credential directory as the source key, never in a repository. The SDK assumes
+the role from a profile such as:
+
+```ini
+[profile image-build]
+role_arn          = arn:aws:iam::<account-id>:role/<image-build-role>
+source_profile    = image-build-source
+external_id       = <external-id>
+duration_seconds  = 3600
+role_session_name = ci-burst-image
+```
+
+The source key is long-lived. Rotate it on your own schedule, at least every 90
+days, and record the date with the deployment.
+
 ## 4. Prepare the two hosts
 
 Each host needs rootful podman with `catatonit`, systemd, and the image built

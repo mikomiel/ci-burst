@@ -1,0 +1,221 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadImageBuildInventory",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeImages",
+        "ec2:DescribeSnapshots",
+        "ec2:DescribeLaunchTemplates",
+        "ec2:DescribeLaunchTemplateVersions"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadTaggedBuilderConsoleOutput",
+      "Effect": "Allow",
+      "Action": "ec2:GetConsoleOutput",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/ci-burst:image-build": "true"
+        }
+      }
+    },
+    {
+      "Sid": "LaunchFromTheBuildTemplateOnly",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:<region>:<account-id>:launch-template/<build-template-id>",
+        "arn:aws:ec2:<region>::image/<base-image-id>",
+        "arn:aws:ec2:<region>:<account-id>:subnet/<build-subnet-id>",
+        "arn:aws:ec2:<region>:<account-id>:security-group/<build-security-group-id>"
+      ],
+      "Condition": {
+        "ArnEquals": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:<region>:<account-id>:launch-template/<build-template-id>"
+        }
+      }
+    },
+    {
+      "Sid": "CreateOnlyTaggedBuilderResources",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:<region>:<account-id>:instance/*",
+        "arn:aws:ec2:<region>:<account-id>:volume/*",
+        "arn:aws:ec2:<region>:<account-id>:network-interface/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ci-burst:image-build": "true",
+          "aws:RequestTag/ci-burst:deployment": "<deployment>"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "ci-burst:image-build",
+            "ci-burst:deployment",
+            "ci-burst:build-id",
+            "ci-burst:expires-at",
+            "ci-burst:basis-digest"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyAnyInstanceProfile",
+      "Effect": "Deny",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:instance/*",
+      "Condition": {
+        "Null": {
+          "ec2:InstanceProfile": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyLaunchOutsideTheBuildTemplate",
+      "Effect": "Deny",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:instance/*",
+      "Condition": {
+        "StringNotEquals": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:<region>:<account-id>:launch-template/<build-template-id>"
+        }
+      }
+    },
+    {
+      "Sid": "TagOnlyOnCreation",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": [
+        "arn:aws:ec2:<region>:<account-id>:instance/*",
+        "arn:aws:ec2:<region>:<account-id>:volume/*",
+        "arn:aws:ec2:<region>:<account-id>:network-interface/*",
+        "arn:aws:ec2:<region>::image/*",
+        "arn:aws:ec2:<region>::snapshot/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": [
+            "RunInstances",
+            "CreateImage"
+          ]
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "ci-burst:image-build",
+            "ci-burst:deployment",
+            "ci-burst:build-id",
+            "ci-burst:expires-at",
+            "ci-burst:basis-digest"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ImageOnlyTaggedBuilders",
+      "Effect": "Allow",
+      "Action": "ec2:CreateImage",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/ci-burst:image-build": "true",
+          "ec2:ResourceTag/ci-burst:deployment": "<deployment>"
+        }
+      }
+    },
+    {
+      "Sid": "CreateOnlyTaggedImagesAndSnapshots",
+      "Effect": "Allow",
+      "Action": "ec2:CreateImage",
+      "Resource": [
+        "arn:aws:ec2:<region>::image/*",
+        "arn:aws:ec2:<region>::snapshot/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ci-burst:image-build": "true",
+          "aws:RequestTag/ci-burst:deployment": "<deployment>"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "ci-burst:image-build",
+            "ci-burst:deployment",
+            "ci-burst:build-id",
+            "ci-burst:expires-at",
+            "ci-burst:basis-digest"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "TerminateOnlyTaggedBuilders",
+      "Effect": "Allow",
+      "Action": "ec2:TerminateInstances",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/ci-burst:image-build": "true",
+          "ec2:ResourceTag/ci-burst:deployment": "<deployment>"
+        }
+      }
+    },
+    {
+      "Sid": "AddVersionsToTheWorkerTemplateOnly",
+      "Effect": "Allow",
+      "Action": "ec2:CreateLaunchTemplateVersion",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:launch-template/<worker-template-id>"
+    },
+    {
+      "Sid": "DeregisterOnlyTaggedImages",
+      "Effect": "Allow",
+      "Action": "ec2:DeregisterImage",
+      "Resource": "arn:aws:ec2:<region>::image/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/ci-burst:image-build": "true",
+          "ec2:ResourceTag/ci-burst:deployment": "<deployment>"
+        }
+      }
+    },
+    {
+      "Sid": "DeleteOnlyTaggedSnapshots",
+      "Effect": "Allow",
+      "Action": "ec2:DeleteSnapshot",
+      "Resource": "arn:aws:ec2:<region>::snapshot/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/ci-burst:image-build": "true",
+          "ec2:ResourceTag/ci-burst:deployment": "<deployment>"
+        }
+      }
+    },
+    {
+      "Sid": "ListOnlyTheArchivePrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<bucket>",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "<prefix>*"
+        }
+      }
+    },
+    {
+      "Sid": "ManageOnlyTheArchivePrefix",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>*"
+    }
+  ]
+}

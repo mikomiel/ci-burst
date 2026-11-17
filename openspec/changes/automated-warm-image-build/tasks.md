@@ -25,10 +25,10 @@ and only then the timer (8).
 
 ## 3. Image state
 
-- [ ] 3.1 Add `ci_burst/image_state.py`: its own SQLite file `image-state.sqlite` with its own lock file and schema version, in a directory that the scaling code never opens. Create the tables `image_builds`, `pin_log` and `control` from the design.
-- [ ] 3.2 Create the unique index `one_active` on `image_builds(deployment)` over the states `building` and `imaging`. Do not put it on `id`.
-- [ ] 3.3 Test: a second active row fails on the index, a `candidate` row does not block a new build, the state file never touches the scaling ledger file or its schema version, a reopened file at a newer schema version refuses cleanly, and a lost file is recreated without error.
-- [ ] 3.4 Test that the scaling `apply` path opens its ledger unchanged when an image state file sits beside it, and never reads the image file.
+- [x] 3.1 Add `ci_burst/image_state.py`: its own SQLite file `image-state.sqlite` with its own lock file and schema version, in a directory that the scaling code never opens. Create the tables `image_builds`, `pin_log` and `control` from the design.
+- [x] 3.2 Create the unique index `one_active` on `image_builds(deployment)` over the states `building` and `imaging`. Do not put it on `id`.
+- [x] 3.3 Test: a second active row fails on the index, a `candidate` row does not block a new build, the state file never touches the scaling ledger file or its schema version, a reopened file at a newer schema version refuses cleanly, and a lost file is recreated without error.
+- [x] 3.4 Test that the scaling `apply` path opens its ledger unchanged when an image state file sits beside it, and never reads the image file.
 
 ## 4. Providers
 

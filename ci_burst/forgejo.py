@@ -13,12 +13,13 @@ validated against synthetic fixtures.
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-from .errors import ObservationRefusal
+from .errors import DeadlineRefusal, ObservationRefusal
 
 CONTRACT = "forgejo-17.0.1-runners-jobs"
 
@@ -122,9 +123,10 @@ class UrllibTransport:
     verification stays at the standard-library default and is never disabled.
     """
 
-    def __init__(self, timeout_seconds, max_response_bytes):
+    def __init__(self, timeout_seconds, max_response_bytes, clock=time.time):
         self._timeout = timeout_seconds
         self._limit = max_response_bytes
+        self._clock = clock
 
     def get(self, url, headers):
         request = urllib.request.Request(url, headers=headers, method="GET")
@@ -132,21 +134,54 @@ class UrllibTransport:
             with self._open(request) as response:
                 status = response.status
                 body = response.read(self._limit + 1)
-        except urllib.error.HTTPError as error:
-            raise ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {error.code}") from None
-        except ObservationRefusal:
-            raise
         except (urllib.error.URLError, TimeoutError, OSError) as error:
-            raise ObservationRefusal("FORGEJO_UNAVAILABLE", type(error).__name__) from None
+            raise _transport_refusal(error) from None
         if len(body) > self._limit:
             raise ObservationRefusal("FORGEJO_RESPONSE_TOO_LARGE", f"limit {self._limit} bytes")
         if status != 200:
             raise ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {status}")
         return body
 
+    def stream(self, url, headers, max_bytes, chunk_bytes=65536, deadline=None):
+        """Yield the body in chunks and abort once it passes ``max_bytes``.
+
+        The request opens on the first ``next()``. Passing the cap closes the
+        connection before the refusal is raised, so no byte beyond the cap
+        past one chunk is read, and nothing is buffered or written to disk.
+
+        The socket timeout bounds one operation, not the transfer, so a server
+        that drips bytes could hold the loop. ``deadline`` is an absolute time
+        on this transport's clock, the convention of ``aws.py``: it is checked
+        before every read and refuses with ``DeadlineRefusal`` once reached.
+        """
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with self._open(request) as response:
+                if response.status != 200:
+                    raise ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {response.status}")
+                received = 0
+                while True:
+                    if deadline is not None and self._clock() >= deadline:
+                        raise DeadlineRefusal("archive stream")
+                    chunk = response.read(min(chunk_bytes, max_bytes - received + 1))
+                    if not chunk:
+                        return
+                    received += len(chunk)
+                    if received > max_bytes:
+                        raise ObservationRefusal("FORGEJO_ARCHIVE_TOO_LARGE", f"limit {max_bytes} bytes")
+                    yield chunk
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise _transport_refusal(error) from None
+
     def _open(self, request):
         """Open one request; tests replace this boundary with a fake response."""
         return urllib.request.build_opener(_RefuseRedirects()).open(request, timeout=self._timeout)
+
+
+def _transport_refusal(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {error.code}")
+    return ObservationRefusal("FORGEJO_UNAVAILABLE", type(error).__name__)
 
 
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
@@ -221,6 +256,129 @@ class ForgejoObserver:
             names.add(label)
             names.add(label.split(":", 1)[0])
         return frozenset(names)
+
+
+#: A git object id: 40 hex digits (sha1) or 64 (sha256). The archive is only ever
+#: requested by one of these, never by a branch or tag name.
+_COMMIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+_FORBIDDEN_DETAILS = frozenset({"HTTP 401", "HTTP 403"})
+
+
+@dataclass(frozen=True)
+class BranchHead:
+    """The head commit of one branch and the forge's protected flag."""
+
+    sha: str
+    protected: bool
+
+
+class ForgejoSource:
+    """Read-only access to the source of one repository, for the image build.
+
+    Separate from ``ForgejoObserver`` on purpose: it takes the name of its own
+    token variable and nothing else, so the token that ``apply`` uses cannot be
+    read here and there is no fallback to it. It takes plain parameters, no
+    configuration object. Every read refuses with ``IMAGE_SOURCE_FORBIDDEN`` on
+    a 401 or 403 and never echoes the token.
+    """
+
+    def __init__(
+        self,
+        base_url,
+        repository,
+        token_env,
+        transport=None,
+        environ=None,
+        timeout_seconds=10,
+        max_response_bytes=1_048_576,
+    ):
+        self._base_url = base_url
+        self._owner, self._repository = repository.split("/", 1)
+        self._token_env = token_env
+        self._transport = transport or UrllibTransport(timeout_seconds, max_response_bytes)
+        self._environ = environ if environ is not None else os.environ
+
+    def branch(self, name):
+        """Return the head sha and the protected flag of ``name``.
+
+        Judging the flag is the caller's: a missing or false flag is
+        ``IMAGE_BRANCH_UNPROTECTED`` through ``require_protected``.
+        """
+        if not name or name.startswith("/") or ".." in name.split("/"):
+            raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", "branch name escapes the repository")
+        body = self._get(self._api("/branches/" + urllib.parse.quote(name, safe="/")))
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ObservationRefusal("FORGEJO_INVALID_JSON") from None
+        commit = payload.get("commit") if isinstance(payload, dict) else None
+        sha = commit.get("id") if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or not _COMMIT_SHA.fullmatch(sha):
+            raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", "branch has no commit id")
+        return BranchHead(sha=sha, protected=payload.get("protected") is True)
+
+    def raw_file(self, sha, path):
+        """Return the bytes of ``path`` at ``sha``; the read also tests the token.
+
+        An absent path is ``IMAGE_BASIS_PATH_MISSING``.
+        """
+        if not _COMMIT_SHA.fullmatch(sha):
+            raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", "ref must be a commit sha")
+        if path.startswith("/") or ".." in path.split("/"):
+            raise ObservationRefusal("IMAGE_BASIS_PATH_MISSING", "path escapes the repository")
+        url = self._api("/raw/" + urllib.parse.quote(path, safe="/") + "?" + urllib.parse.urlencode({"ref": sha}))
+        try:
+            return self._get(url)
+        except ObservationRefusal as refusal:
+            if refusal.reason == "FORGEJO_UNEXPECTED_STATUS" and refusal.detail == "HTTP 404":
+                raise ObservationRefusal("IMAGE_BASIS_PATH_MISSING") from None
+            raise
+
+    def archive(self, sha, max_bytes, deadline=None):
+        """Yield the ``.tar.gz`` archive of commit ``sha`` in chunks.
+
+        Requested by sha, never by branch. The request opens on the first
+        ``next()``. The stream aborts with ``FORGEJO_ARCHIVE_TOO_LARGE`` once it
+        passes ``max_bytes``, and with ``DeadlineRefusal`` once the optional
+        ``deadline`` (an absolute time on the transport's clock) is reached. The
+        caller closes the generator to abandon it.
+        """
+        if not _COMMIT_SHA.fullmatch(sha):
+            raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", "archive must be requested by commit sha")
+        url = self._api(f"/archive/{sha}.tar.gz")
+        try:
+            yield from self._transport.stream(url, self._headers(), max_bytes, deadline=deadline)
+        except ObservationRefusal as refusal:
+            raise _source_refusal(refusal) from None
+
+    def _api(self, suffix):
+        return f"{self._base_url}/api/v1/repos/{self._owner}/{self._repository}{suffix}"
+
+    def _headers(self):
+        token = self._environ.get(self._token_env)
+        if not token:
+            raise ObservationRefusal("FORGEJO_TOKEN_MISSING", self._token_env)
+        return {"Authorization": f"token {token}", "User-Agent": "ci-burst/0.1"}
+
+    def _get(self, url):
+        try:
+            return self._transport.get(url, self._headers())
+        except ObservationRefusal as refusal:
+            raise _source_refusal(refusal) from None
+
+
+def require_protected(head):
+    """Refuse unless the forge reports the branch protected; there is no override."""
+    if not head.protected:
+        raise ObservationRefusal("IMAGE_BRANCH_UNPROTECTED")
+    return head
+
+
+def _source_refusal(refusal):
+    if refusal.reason == "FORGEJO_UNEXPECTED_STATUS" and refusal.detail in _FORBIDDEN_DETAILS:
+        return ObservationRefusal("IMAGE_SOURCE_FORBIDDEN", refusal.detail)
+    return refusal
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")

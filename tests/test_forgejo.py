@@ -1,12 +1,19 @@
 import json
 import tempfile
 import unittest
+import urllib.error
 import urllib.parse
 from pathlib import Path
 
 from ci_burst.config import load
-from ci_burst.errors import ObservationRefusal
-from ci_burst.forgejo import ForgejoObserver, UrllibTransport, _RefuseRedirects
+from ci_burst.errors import DeadlineRefusal, ObservationRefusal
+from ci_burst.forgejo import (
+    ForgejoObserver,
+    ForgejoSource,
+    UrllibTransport,
+    _RefuseRedirects,
+    require_protected,
+)
 
 from support import write_config
 
@@ -551,6 +558,282 @@ class ForgejoContractMatrixTests(unittest.TestCase):
                 )
                 self.assertTrue(query.get("labels"))
                 self.assertNotEqual(query["labels"], [""])
+
+
+SHA = "0123456789abcdef0123456789abcdef01234567"
+TOKEN_ENV = "EXAMPLE_IMAGE_TOKEN"
+APPLY_TOKEN_ENV = "CI_BURST_TEST_TOKEN"
+
+
+class RecordingEnviron(dict):
+    """Records every variable name that is read, to prove which ones are not."""
+
+    def __init__(self, *arguments):
+        super().__init__(*arguments)
+        self.reads = []
+
+    def get(self, key, default=None):
+        self.reads.append(key)
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self.reads.append(key)
+        return super().__getitem__(key)
+
+
+class SourceTransport:
+    """The fake transport of the source reads: a body, a stream or a refusal."""
+
+    def __init__(self, body=b"", chunks=(), error=None):
+        self.body = body
+        self.chunks = chunks
+        self.error = error
+        self.calls = []
+        self.streams = []
+        self.deadlines = []
+        self.pulled = 0
+
+    def get(self, url, headers):
+        self.calls.append((url, dict(headers)))
+        if self.error is not None:
+            raise self.error
+        return self.body
+
+    def stream(self, url, headers, max_bytes, deadline=None):
+        self.streams.append((url, dict(headers), max_bytes))
+        self.deadlines.append(deadline)
+        if self.error is not None:
+            raise self.error
+        received = 0
+        for chunk in self.chunks:
+            self.pulled += 1
+            received += len(chunk)
+            if received > max_bytes:
+                raise ObservationRefusal("FORGEJO_ARCHIVE_TOO_LARGE", f"limit {max_bytes} bytes")
+            yield chunk
+
+
+def status_refusal(code):
+    return ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {code}")
+
+
+def branch_body(sha=SHA, **extra):
+    return json.dumps({"name": "main", "commit": {"id": sha}, **extra}).encode()
+
+
+class ForgejoSourceTests(unittest.TestCase):
+    def source(self, transport, environ=None):
+        return ForgejoSource(
+            "https://forgejo.example",
+            "example-org/example-repo",
+            TOKEN_ENV,
+            transport=transport,
+            environ={TOKEN_ENV: "image-secret"} if environ is None else environ,
+        )
+
+    def test_branch_returns_the_head_sha_and_the_protected_flag(self):
+        transport = SourceTransport(body=branch_body(protected=True))
+        head = self.source(transport).branch("main")
+        self.assertEqual((head.sha, head.protected), (SHA, True))
+        url, headers = transport.calls[0]
+        self.assertEqual(urllib.parse.urlsplit(url).path, "/api/v1/repos/example-org/example-repo/branches/main")
+        self.assertEqual(headers["Authorization"], "token image-secret")
+        self.assertIs(require_protected(head), head)
+
+    def test_unprotected_or_missing_flag_is_unprotected(self):
+        for extra in ({"protected": False}, {}, {"protected": "true"}, {"protected": None}):
+            with self.subTest(extra=extra):
+                head = self.source(SourceTransport(body=branch_body(**extra))).branch("main")
+                with self.assertRaises(ObservationRefusal) as raised:
+                    require_protected(head)
+                self.assertEqual(raised.exception.reason, "IMAGE_BRANCH_UNPROTECTED")
+
+    def test_branch_without_a_commit_sha_is_an_unexpected_shape(self):
+        for body in (b"[]", b'{"protected": true}', branch_body(sha="main", protected=True), b"not json"):
+            with self.subTest(body=body):
+                with self.assertRaises(ObservationRefusal) as raised:
+                    self.source(SourceTransport(body=body)).branch("main")
+                self.assertIn(raised.exception.reason, {"FORGEJO_UNEXPECTED_SHAPE", "FORGEJO_INVALID_JSON"})
+
+    def test_unauthorized_and_forbidden_are_source_forbidden_on_every_read(self):
+        for code in (401, 403):
+            reads = {
+                "branch": lambda source: source.branch("main"),
+                "raw": lambda source: source.raw_file(SHA, "uv.lock"),
+                "archive": lambda source: list(source.archive(SHA, 1024)),
+            }
+            for name, read in reads.items():
+                with self.subTest(code=code, read=name):
+                    transport = SourceTransport(error=status_refusal(code))
+                    with self.assertRaises(ObservationRefusal) as raised:
+                        read(self.source(transport))
+                    self.assertEqual(raised.exception.reason, "IMAGE_SOURCE_FORBIDDEN")
+                    self.assertNotIn("image-secret", repr(raised.exception.as_dict()))
+
+    def test_other_statuses_keep_their_own_refusal(self):
+        with self.assertRaises(ObservationRefusal) as raised:
+            self.source(SourceTransport(error=status_refusal(500))).branch("main")
+        self.assertEqual(raised.exception.reason, "FORGEJO_UNEXPECTED_STATUS")
+
+    def test_raw_file_is_read_at_the_sha_and_returns_the_bytes(self):
+        transport = SourceTransport(body=b"lock-bytes")
+        self.assertEqual(self.source(transport).raw_file(SHA, "docs/uv.lock"), b"lock-bytes")
+        url, _ = transport.calls[0]
+        parts = urllib.parse.urlsplit(url)
+        self.assertEqual(parts.path, "/api/v1/repos/example-org/example-repo/raw/docs/uv.lock")
+        self.assertEqual(urllib.parse.parse_qs(parts.query), {"ref": [SHA]})
+
+    def test_missing_raw_path_is_a_basis_path_refusal(self):
+        with self.assertRaises(ObservationRefusal) as raised:
+            self.source(SourceTransport(error=status_refusal(404))).raw_file(SHA, "uv.lock")
+        self.assertEqual(raised.exception.reason, "IMAGE_BASIS_PATH_MISSING")
+
+    def test_raw_path_cannot_escape_and_ref_must_be_a_sha(self):
+        transport = SourceTransport(body=b"x")
+        source = self.source(transport)
+        for sha, path in ((SHA, "../secrets"), (SHA, "/etc/passwd"), (SHA, "a/../b"), ("main", "uv.lock")):
+            with self.subTest(sha=sha, path=path):
+                with self.assertRaises(ObservationRefusal):
+                    source.raw_file(sha, path)
+        self.assertEqual(transport.calls, [])
+
+    def test_branch_name_cannot_escape_the_branches_path(self):
+        transport = SourceTransport(body=branch_body(protected=True))
+        source = self.source(transport)
+        for name in ("", "/main", "../../x", "a/../b", ".."):
+            with self.subTest(name=name):
+                with self.assertRaises(ObservationRefusal):
+                    source.branch(name)
+        self.assertEqual(transport.calls, [])
+        source.branch("release/1.x")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_archive_passes_the_deadline_to_the_transport(self):
+        transport = SourceTransport(chunks=[b"a"])
+        self.assertEqual(list(self.source(transport).archive(SHA, 16, deadline=42.0)), [b"a"])
+        list(self.source(transport).archive(SHA, 16))
+        self.assertEqual(transport.deadlines, [42.0, None])
+
+    def test_archive_is_requested_by_sha_never_by_branch(self):
+        transport = SourceTransport(chunks=[b"abc", b"def"])
+        source = self.source(transport)
+        self.assertEqual(b"".join(source.archive(SHA, 1024)), b"abcdef")
+        url, headers, cap = transport.streams[0]
+        self.assertEqual(
+            urllib.parse.urlsplit(url).path, f"/api/v1/repos/example-org/example-repo/archive/{SHA}.tar.gz"
+        )
+        self.assertEqual((headers["Authorization"], cap), ("token image-secret", 1024))
+        for ref in ("main", "refs/pull/1/head", SHA[:12]):
+            with self.subTest(ref=ref):
+                with self.assertRaises(ObservationRefusal):
+                    list(source.archive(ref, 1024))
+        self.assertEqual(len(transport.streams), 1)
+
+    def test_archive_over_the_cap_aborts_the_stream(self):
+        transport = SourceTransport(chunks=[b"x" * 10] * 5)
+        with self.assertRaises(ObservationRefusal) as raised:
+            list(self.source(transport).archive(SHA, 25))
+        self.assertEqual(raised.exception.reason, "FORGEJO_ARCHIVE_TOO_LARGE")
+        self.assertEqual(transport.pulled, 3)
+
+    def test_only_the_named_token_variable_is_read(self):
+        environ = RecordingEnviron({TOKEN_ENV: "image-secret", APPLY_TOKEN_ENV: "apply-secret"})
+        transport = SourceTransport(body=branch_body(protected=True), chunks=[b"a"])
+        source = self.source(transport, environ=environ)
+        source.branch("main")
+        source.raw_file(SHA, "uv.lock")
+        list(source.archive(SHA, 16))
+        self.assertEqual(set(environ.reads), {TOKEN_ENV})
+        for _, headers in transport.calls:
+            self.assertNotIn("apply-secret", headers["Authorization"])
+
+    def test_absent_image_token_refuses_without_falling_back_to_the_apply_token(self):
+        environ = RecordingEnviron({APPLY_TOKEN_ENV: "apply-secret"})
+        transport = SourceTransport(body=branch_body(protected=True))
+        with self.assertRaises(ObservationRefusal) as raised:
+            self.source(transport, environ=environ).branch("main")
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("FORGEJO_TOKEN_MISSING", TOKEN_ENV))
+        self.assertEqual(environ.reads, [TOKEN_ENV])
+        self.assertEqual(transport.calls, [])
+
+
+class StreamingFakeResponse(FakeResponse):
+    def __init__(self, status, body):
+        super().__init__(status, body)
+        self.offset = 0
+        self.closed = False
+
+    def read(self, limit):
+        chunk = self.body[self.offset : self.offset + limit]
+        self.offset += len(chunk)
+        return chunk
+
+    def __exit__(self, *arguments):
+        self.closed = True
+        return False
+
+
+class StreamTransportTests(unittest.TestCase):
+    def transport(self, status, body):
+        transport = UrllibTransport(timeout_seconds=1, max_response_bytes=16)
+        response = StreamingFakeResponse(status, body)
+        transport._open = lambda request: response
+        return transport, response
+
+    def test_stream_yields_the_body_within_the_cap(self):
+        transport, response = self.transport(200, b"x" * 100)
+        chunks = list(transport.stream("https://forgejo.example/a", {}, 100, chunk_bytes=30))
+        self.assertEqual(b"".join(chunks), b"x" * 100)
+        self.assertTrue(response.closed)
+
+    def test_stream_over_the_cap_stops_reading_and_closes_the_connection(self):
+        transport, response = self.transport(200, b"x" * 1000)
+        with self.assertRaises(ObservationRefusal) as raised:
+            list(transport.stream("https://forgejo.example/a", {}, 100, chunk_bytes=30))
+        self.assertEqual(raised.exception.reason, "FORGEJO_ARCHIVE_TOO_LARGE")
+        self.assertTrue(response.closed)
+        self.assertLessEqual(response.offset, 101)
+
+    def test_stream_refuses_a_non_200(self):
+        transport, _ = self.transport(503, b"")
+        with self.assertRaises(ObservationRefusal) as raised:
+            list(transport.stream("https://forgejo.example/a", {}, 100))
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("FORGEJO_UNEXPECTED_STATUS", "HTTP 503"))
+
+    def test_stream_keeps_the_http_status_of_an_error_response(self):
+        transport = UrllibTransport(timeout_seconds=1, max_response_bytes=16)
+
+        def refuse(request):
+            raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+
+        transport._open = refuse
+        with self.assertRaises(ObservationRefusal) as raised:
+            list(transport.stream("https://forgejo.example/a", {}, 100))
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("FORGEJO_UNEXPECTED_STATUS", "HTTP 403"))
+
+
+    def test_stream_stops_between_chunks_once_the_deadline_passes_and_closes_the_connection(self):
+        ticks = iter([0, 1, 2, 3, 4, 5])
+        transport = UrllibTransport(timeout_seconds=1, max_response_bytes=16, clock=lambda: next(ticks))
+        response = StreamingFakeResponse(200, b"x" * 1000)
+        transport._open = lambda request: response
+        received = []
+        with self.assertRaises(DeadlineRefusal) as raised:
+            for chunk in transport.stream("https://forgejo.example/a", {}, 1000, chunk_bytes=10, deadline=3):
+                received.append(chunk)
+        self.assertEqual(raised.exception.reason, "pass_deadline_exceeded")
+        self.assertEqual(len(received), 3)
+        self.assertEqual(response.offset, 30)
+        self.assertTrue(response.closed)
+
+    def test_stream_without_a_deadline_never_reads_the_clock(self):
+        def clock():
+            raise AssertionError("the clock is only read when a deadline is given")
+
+        transport = UrllibTransport(timeout_seconds=1, max_response_bytes=16, clock=clock)
+        transport._open = lambda request: StreamingFakeResponse(200, b"x" * 50)
+        self.assertEqual(b"".join(transport.stream("https://forgejo.example/a", {}, 100, chunk_bytes=20)), b"x" * 50)
+
 
 
 if __name__ == "__main__":

@@ -204,6 +204,8 @@ One JSON object per line:
 {"id":"i-0123456789abcdef0:spot-interruption:terminate:ip-10-0-0-1:0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b","ts":"...","deployment":"example","instance":"i-0123456789abcdef0","zone":"eu-central-1a","operation":"...","event":"spot-interruption","reason":"spot_interruption","action":"terminate","host":"ip-10-0-0-1","runner":"0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"}
 ```
 
+Every event also carries `instance_type` (for example `"m8g.xlarge"`) when the provider reports the worker's instance type; the key is absent otherwise, and a retained line written before the key existed stays valid.
+
 `event` is `step` (a step name from the shipped script's fixed set), `exit`
 (`bootstrap exiting rc=N`), `job-process` (`bootstrap one-job <outcome> rc=N`,
 where `outcome` is one of `completed`, `failed` or `timeout`), `spot-interruption`

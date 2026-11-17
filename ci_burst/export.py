@@ -82,10 +82,12 @@ FLEET_STALE_SECONDS = 15 * 60
 #: published in every event, so it is validated rather than trusted.
 OPERATION_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
-#: An EC2 instance identifier, and an availability-zone name. Both are published
-#: in events; a tag or a record that fails these patterns is not one of ours.
+#: An EC2 instance identifier, an availability-zone name, and an instance type
+#: such as ``m8g.xlarge``. All three are published in events; a tag or a record
+#: that fails these patterns is not one of ours.
 INSTANCE_PATTERN = re.compile(r"^i-[0-9a-f]{8,17}$")
 ZONE_PATTERN = re.compile(r"^[a-z]{2}-[a-z]+-[0-9][a-z]$")
+INSTANCE_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,15}\.[a-z0-9]{1,16}$")
 
 #: The provider states a worker can be in. Anything else is not published.
 INSTANCE_STATES = frozenset(
@@ -99,6 +101,11 @@ LEDGER_STATES = frozenset(NONTERMINAL + TERMINAL)
 #: against this set, so a Unicode digit, an oversized number or a noncanonical
 #: zero-padded form is rejected by comparison rather than by parsing.
 EXIT_IDENTITIES = frozenset(f"exit:{status}" for status in range(256))
+
+#: Keys an event line may carry in addition to its kind schema. The key is
+#: absent when the provider reported no type, and a retained line written before
+#: the key existed has none, so it is optional rather than part of the schema.
+OPTIONAL_EVENT_KEYS = frozenset({"instance_type"})
 
 #: Events are republished from a file this command also reads. A retired line
 #: must match its exact kind schema, so each kind lists the keys it may carry;
@@ -492,12 +499,14 @@ def _sanitize_record(record):
     state = record.get("state")
     state = state if isinstance(state, str) and state in INSTANCE_STATES else None
     zone = _match(ZONE_PATTERN, record.get("zone"))
+    instance_type = _match(INSTANCE_TYPE_PATTERN, record.get("instance_type"))
     operation = _match(OPERATION_PATTERN, record.get("operation"))
     sanitized = {
         "first_seen": _number(record.get("first_seen")),
         "seen": _number(record.get("seen")),
         "state": state,
         "zone": zone,
+        "instance_type": instance_type,
         "operation": operation,
         "steps": kept_steps,
         "errors": kept_kinds,
@@ -509,7 +518,7 @@ def _sanitize_record(record):
         "counted_registered": bool(record.get("counted_registered")),
         "counted_unregistered": bool(record.get("counted_unregistered")),
     }
-    for key in ("first_seen", "seen", "state", "zone", "operation"):
+    for key in ("first_seen", "seen", "state", "zone", "instance_type", "operation"):
         if sanitized[key] != record.get(key):
             changed = True
     return sanitized, changed
@@ -772,6 +781,7 @@ def _merge_record(record, instance, facts, now, provider_state):
     record["seen"] = now
     record["state"] = provider_state
     record["zone"] = _match(ZONE_PATTERN, instance.availability_zone)
+    record["instance_type"] = _match(INSTANCE_TYPE_PATTERN, instance.instance_type)
     record["operation"] = _operation_of(instance)
     for step in facts.steps:
         if step not in record["steps"]:
@@ -815,6 +825,9 @@ def _events_for(instance, record, now, deployment):
         "zone": _match(ZONE_PATTERN, instance.availability_zone),
         "operation": _operation_of(instance),
     }
+    instance_type = _match(INSTANCE_TYPE_PATTERN, instance.instance_type)
+    if instance_type is not None:
+        base["instance_type"] = instance_type
     emitted = record["emitted"]
 
     def publish(marker, payload):
@@ -867,7 +880,9 @@ def _event_line_is_valid(event, deployment):
     kind = event.get("event")
     if not isinstance(kind, str) or kind not in EVENT_SCHEMA:
         return False
-    if set(event) != EVENT_SCHEMA[kind]:
+    if set(event) - OPTIONAL_EVENT_KEYS != EVENT_SCHEMA[kind]:
+        return False
+    if "instance_type" in event and _match(INSTANCE_TYPE_PATTERN, event["instance_type"]) is None:
         return False
     instance = event.get("instance")
     if not isinstance(instance, str) or not INSTANCE_PATTERN.fullmatch(instance):

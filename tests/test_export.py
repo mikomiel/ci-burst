@@ -1,4 +1,5 @@
 import io
+import dataclasses
 import json
 import tempfile
 import unittest
@@ -277,6 +278,129 @@ class ExporterTests(ExportCase):
         register = next(event for event in events if event.get("step") == "register")
         self.assertEqual(register["zone"], "eu-central-1a")
         self.assertEqual(result["events_emitted"], len(events))
+
+    def test_an_instance_type_is_published_on_every_event_kind(self):
+        typed = dataclasses.replace(
+            instance("i-0123456789abcdef0", state="terminated", zone="eu-central-1a"),
+            instance_type="m8g.xlarge",
+        )
+        exporter = self.build([typed], {"i-0123456789abcdef0": SPOT_NOTICE})
+        self.run_export(exporter)
+        events = self.events_read()
+        self.assertGreater(len({event["event"] for event in events}), 1)
+        for event in events:
+            with self.subTest(event=event["id"]):
+                self.assertEqual(event["instance_type"], "m8g.xlarge")
+        record = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]
+        self.assertEqual(record["instance_type"], "m8g.xlarge")
+
+    def test_an_instance_without_a_type_publishes_no_instance_type_key(self):
+        exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})
+        self.run_export(exporter)
+        events = self.events_read()
+        self.assertTrue(events)
+        for event in events:
+            self.assertNotIn("instance_type", event)
+        record = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]
+        self.assertIsNone(record["instance_type"])
+
+    def test_a_malformed_instance_type_is_not_published(self):
+        for value in ("SYNTHETIC-CONSOLE-SECRET-123", "m8g", "m8g.xlarge\n", "M8g.xlarge"):
+            with self.subTest(value=value):
+                bad = dataclasses.replace(instance("i-0123456789abcdef0"), instance_type=value)
+                self.run_export(self.build([bad], {"i-0123456789abcdef0": CLEAN_BOOT}))
+                for event in self.events_read():
+                    self.assertNotIn("instance_type", event)
+                self.assertNotIn("SYNTHETIC-CONSOLE-SECRET-123", self.events.read_text())
+                self.events.unlink()
+                self.state_file.unlink()
+
+    def test_retained_event_lines_with_and_without_an_instance_type(self):
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        common = {
+            "ts": "2026-11-11T00:00:00Z",
+            "deployment": "test-deployment",
+            "zone": "eu-central-1a",
+            "operation": None,
+            "event": "step",
+            "step": "register",
+        }
+
+        def line(suffix, **extra):
+            instance_id = f"i-0123456789abcde{suffix}"
+            return dict(common, instance=instance_id, id=f"{instance_id}:step:register", **extra)
+
+        old = line("f1")
+        typed = line("f2", instance_type="m8g.xlarge")
+        poisoned = [
+            line("f3", instance_type="SYNTHETIC-CONSOLE-SECRET-123"),
+            line("f4", instance_type=None),
+            line("f5", instance_type=["m8g.xlarge"]),
+            line("f6", instance_type="m8g.xlarge", surprise="x"),
+        ]
+        self.events.write_text("".join(json.dumps(item) + "\n" for item in [old, typed, *poisoned]))
+        result = self.run_export(self.build([], {}))
+        self.assertIn("events_pruned", result["notes"])
+        retained = {event["instance"]: event for event in self.events_read()}
+        self.assertEqual(set(retained), {"i-0123456789abcdef1", "i-0123456789abcdef2"})
+        self.assertNotIn("instance_type", retained["i-0123456789abcdef1"])
+        self.assertEqual(retained["i-0123456789abcdef2"]["instance_type"], "m8g.xlarge")
+        self.assertNotIn("SYNTHETIC-CONSOLE-SECRET-123", self.events.read_text())
+
+    def test_a_persisted_record_without_an_instance_type_loads_unchanged(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": 1,
+                    "totals": {"launches": 1, "registered": 1, "unregistered": 0},
+                    "instances": {
+                        "i-0123456789abcdef0": {
+                            "first_seen": NOW,
+                            "seen": NOW,
+                            "state": "running",
+                            "zone": None,
+                            "operation": None,
+                            "steps": ["register"],
+                            "errors": [],
+                            "exit_code": None,
+                            "job_process": None,
+                            "spot_interruption": None,
+                            "registered": True,
+                            "emitted": ["step:register"],
+                            "counted_registered": True,
+                            "counted_unregistered": False,
+                        }
+                    },
+                }
+            )
+        )
+        state, note = load_state(self.state_file)
+        self.assertIsNone(note)
+        self.assertIsNone(state["instances"]["i-0123456789abcdef0"]["instance_type"])
+
+    def test_a_persisted_malformed_instance_type_is_dropped(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "console_reads": 0,
+                    "totals": {"launches": 1, "registered": 0, "unregistered": 1},
+                    "instances": {
+                        "i-0123456789abcdef0": {
+                            "seen": NOW,
+                            "instance_type": "SYNTHETIC-CONSOLE-SECRET-123",
+                            "emitted": [],
+                        }
+                    },
+                }
+            )
+        )
+        state, _ = load_state(self.state_file)
+        self.assertIsNone(state["instances"]["i-0123456789abcdef0"]["instance_type"])
+        self.assertNotIn("SYNTHETIC-CONSOLE-SECRET-123", json.dumps(state))
 
     def test_second_run_emits_nothing_new(self):
         exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})

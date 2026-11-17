@@ -1083,6 +1083,9 @@ class BootstrapTailTests(TailHarness, unittest.TestCase):
             constant=(status, output),
             registration_file=registration_file,
             clock_offset=clock_offset,
+            # The removal-failure tests assert on the text of the real rm
+            # error, so pin the message locale to the untranslated one.
+            env={"LC_ALL": "C"},
         )
         if registration_file:
             self.assertEqual(completed.stderr, "")

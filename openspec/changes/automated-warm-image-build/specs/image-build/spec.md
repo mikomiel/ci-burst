@@ -485,7 +485,7 @@ No timer and no process that holds AWS credentials MUST write the deployment TOM
 - **THEN** the command refuses with `PROMOTE_PIN_LINE_AMBIGUOUS`
 
 ### Requirement: Promotion is journaled before the rename
-Before the rename, `promote --write` MUST commit a pending-promotion journal row to the image state file with the previous pin, the new pin, the previous and new file sha256, the candidate id and the backup name. After the rename it MUST mark the row complete. `image status` MUST report a pending row and what the file hash implies.
+Before the rename, `promote --write` MUST commit a pending-promotion journal row to the image state file with the previous pin, the new pin, the previous and new file sha256, the candidate id, the backup name, the backup's sha256 and the pin that the backup contains. After the rename it MUST mark the row complete. `image status` MUST report a pending row and what the file hash implies.
 
 #### Scenario: The order of a write
 - **WHEN** `promote --write` succeeds
@@ -544,14 +544,19 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 `promote --rollback --write` MUST write the recorded previous pin with the same journaled procedure as a promotion, after it resolves a pending journal row. The previous pin's image MUST be protected from deletion, so a rollback needs no rebuild.
 
 #### Scenario: A bad promotion is rolled back
-- **WHEN** the record and the newest backup agree on the previous pin
+- **WHEN** the record and the backup named by the newest completed row agree on the previous pin
 - **THEN** the pin returns to that number and a completed rollback row is recorded
 
 ### Requirement: Rollback verifies the records first
-`promote --rollback --write` MUST refuse with `PIN_RECORD_DIVERGED` unless the newest completed promotion's new pin equals the TOML's pin and the newest backup file holds the recorded previous pin. It MUST refuse unless the previous version and its image are recorded as existing with a fresh `verified_at`.
+`promote --rollback --write` MUST use the backup named by the newest completed promotion row, MUST ignore the backups of aborted rows, and MUST refuse with `PIN_RECORD_DIVERGED` unless that row's new pin equals the TOML's pin and the named backup exists with its recorded sha256 and the recorded previous pin. A backup of an aborted row MUST be kept and MUST NOT be used for rollback. It MUST refuse unless the previous version and its image are recorded as existing with a fresh `verified_at`.
+
+#### Scenario: An aborted attempt sits between
+- **WHEN** a promotion from A to B completed, a later promotion from B to C wrote a newer backup and was marked aborted, and the operator runs `promote --rollback --write`
+- **THEN** the rollback uses the backup of the A to B row and restores A
+- **AND** the aborted row's backup is kept and unused
 
 #### Scenario: The records diverge
-- **WHEN** the TOML pin, the newest backup and the completed row disagree
+- **WHEN** the TOML pin, the named backup or its recorded sha256 and the completed row disagree
 - **THEN** the command refuses with `PIN_RECORD_DIVERGED` and writes nothing
 
 #### Scenario: The previous image is missing

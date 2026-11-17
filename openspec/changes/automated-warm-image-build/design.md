@@ -84,6 +84,8 @@ basis_digest = sha256( sorted lines "path NUL sha256(file content) LF"
                      + sha256(shipped warm-cache.sh) )
 ```
 
+The digest does not cover the cold base image or the build launch template. Changing either does not make a rebuild due. The operator forces one with `image run --apply --until-done --force`, and the runbook says so. The digest covers only what the warm layer reads.
+
 The archive hash is not the digest, because archive bytes differ between fetches.
 It is used only for transport integrity. The image behind the configured pin
 carries its `ci-burst:basis-digest` tag. A build starts when all of these hold:
@@ -190,7 +192,7 @@ manual pin are the controls.
 2. Stream the archive endpoint for that sha through a hashing wrapper into a multipart upload at `s3://<bucket>/<prefix>/<build-id>.tar.gz`, with the bucket's default encryption. `source.max_archive_bytes` aborts the upload and deletes the object on overrun. The archive is never written to disk.
 3. Archive layout: a forge archive has one top-level directory. `warm-cache.sh` gains one optional input `WARM_SRC_STRIP_COMPONENTS` (0 or 1, default 0, anything else refused before any consumer command), which is passed to `tar`. Gate G6 confirms the prefix and whether `export-ignore` removes files that the warm commands need.
 4. Presign a GET URL locally. The URL appears only in the rendered user data in memory. It is never logged, never stored in the state file and never in an event.
-5. The presigned URL dies with the role session, whichever comes first. With a 1-hour session and the default `presign_seconds = 1800` the design relies on a fresh session per pass: each pass is a new process that assumes the role anew and presigns at once before the launch. The code MUST NOT presign when the session has less than `presign_seconds` left, and MUST refuse with `IMAGE_CREDENTIAL_SHORT`. Gate G10 measures the real expiry of a URL signed with assumed-role credentials.
+5. The presigned URL dies with the role session, whichever comes first. With a 1-hour session and the default `presign_seconds = 1800` the design relies on a fresh session per pass: each pass is a new process that assumes the role anew and presigns at once before the launch. The `--until-done` supervisor creates a fresh SDK session (it re-reads the assumed-role profile) for every pass, so no pass runs on an expiring session. The code MUST NOT presign when the session has less than `presign_seconds` left, and MUST refuse with `IMAGE_CREDENTIAL_SHORT`. Gate G10 measures the real expiry of a URL signed with assumed-role credentials.
 6. User data size: `warm-cache.sh` is about 13.4 KB against the 16,384 byte limit for EC2 user data (before base64). The rendered user data is a short `#!/bin/bash` stub with quoted `WARM_*` exports and a gzip and base64 payload of the script, which the stub decodes and runs. A test renders the largest allowed `WARM_COMMANDS` and asserts the size is below 16,384 bytes. A larger rendering is refused before `RunInstances` with `IMAGE_USERDATA_TOO_LARGE`. This is decided now, not at runtime.
 7. The controller container copies `warm-cache.sh`, because the image today holds only the Python package. A test asserts that the copy in the build context equals `deploy/runner/image/warm-cache.sh`, byte for byte.
 8. Every exported value comes from configuration, never from the archive. Values are shell-quoted and refused when they contain control characters.
@@ -230,7 +232,7 @@ Tables:
 
 - `image_builds`: id, deployment, client_token, basis_digest, source_sha, archive_key, archive_sha256, builder_id, image_id, template_version, state, reason_code, created_at, updated_at, deadline_at, and the verification record (gate seen, drift result, `verified_at`, `source_pin`).
 - `pin_log`: one row per observed pin: pin version, image id, observed_at.
-- `promotion_journal`: one row per promotion or rollback: previous pin, new pin, previous and new file sha256, candidate id, backup file name, status (`pending`, `complete` or `aborted`) and timestamps.
+- `promotion_journal`: one row per promotion or rollback: previous pin, new pin, previous and new file sha256, candidate id, kind (`promotion` or `rollback`), backup file name, the sha256 of that backup, the pin that the backup contains, status (`pending`, `complete` or `aborted`) and timestamps.
 - `control`: one row with the consecutive failure count, the failure cooldown end, the `blocked` flag and the last check time.
 
 States: `building`, `imaging`, `candidate`, `failed`, `promoted`. No more.
@@ -281,7 +283,7 @@ It then edits only the `launch_template_version` key of the `[aws]` table:
 3. Build the new text with that one value replaced. Re-parse it with the controller's own strict loader. The parsed result MUST equal the original parse except that one key. A failed parse leaves the file unchanged.
 4. Write a temporary file in the same directory with the same mode, flush it and copy the original to `<file>.bak.<UTC timestamp>`.
 5. Re-read the target and compare its sha256 with step 1. A difference refuses with `PROMOTE_FILE_CHANGED`. A narrow race between this check and the rename remains. The file has one human editor, so it is accepted.
-6. Commit a `pending` row to `promotion_journal` (previous pin, new pin, previous and new file sha256, candidate id, backup name). The row is durable before the rename.
+6. Commit a `pending` row to `promotion_journal` (previous pin, new pin, previous and new file sha256, candidate id, backup name, backup sha256 and the pin the backup contains). The row is durable before the rename.
 7. Rename atomically and flush the directory.
 8. Mark the row `complete` and commit.
 
@@ -295,7 +297,9 @@ The order is journal, rename, complete, so a crash never leaves a new pin withou
 
 `image status` reports a pending row and the resolution that the hash implies, but writes nothing (plain status writes only the check timestamp). While a row is `pending`, both of its pins are in the protected set, so no deletion path can remove either image. A diverged row stays until an operator resolves it by hand, for example by restoring the file from the backup, and then reruns a resolving command.
 
-`--rollback` writes the recorded previous pin with the same journaled procedure, after it resolves a pending row. It refuses with `PIN_RECORD_DIVERGED` unless the newest completed promotion's new pin equals the TOML's pin and the newest `.bak` file holds the recorded previous pin, and unless the previous version and its image are recorded as existing at a fresh `verified_at`. Retention protects the previous pin's image, so a rollback needs no rebuild. The TOML owns the current pin and the journal owns the previous pin. Rollback verifies both against the `.bak`, so they cannot diverge silently.
+`--rollback` writes the recorded previous pin with the same journaled procedure, after it resolves a pending row. It uses the backup that the newest completed `promotion` row names, never the globally newest `.bak` file. It refuses with `PIN_RECORD_DIVERGED` unless that row's new pin equals the TOML's pin, the named backup exists with the recorded sha256, and it contains the recorded previous pin. It also refuses unless the previous version and its image are recorded as existing at a fresh `verified_at`. Retention protects the previous pin's image, so a rollback needs no rebuild. The TOML owns the current pin and the journal owns the previous pin. Rollback verifies both against the named backup, so they cannot diverge silently.
+
+The backup of an `aborted` row is kept and never used for rollback. Only the operator removes it, and `promote` never deletes a backup. Example: A to B completes (its backup holds A). B to C writes a newer backup holding B, commits `pending` and crashes before the rename. Recovery marks B to C `aborted`. A rollback still uses the A to B row, validates its backup and restores A. A second rollback after a completed rollback refuses with `PIN_RECORD_DIVERGED`, because the newest completed promotion's new pin no longer equals the TOML's pin.
 
 Promotion needs no restart: the apply unit reads the TOML on each pass, and a worker keeps its image until it expires. The shipped apply unit mounts the file read-only, once per run.
 

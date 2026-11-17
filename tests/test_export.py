@@ -307,7 +307,10 @@ class ExporterTests(ExportCase):
         consoles = {"i-0123456789abcdef0": CLEAN_BOOT}
         self.run_export(self.build([untyped], consoles))
         before = self.events_read()
+        self.assertTrue(before)
+        self.assertTrue(all("instance_type" not in event for event in before))
         emitted = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]["emitted"]
+        self.assertTrue(emitted)
         typed = dataclasses.replace(untyped, instance_type="m8g.xlarge")
         result = self.run_export(self.build([typed], consoles))
         self.assertEqual(result["events_emitted"], 0)
@@ -315,6 +318,27 @@ class ExporterTests(ExportCase):
         record = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]
         self.assertEqual(record["emitted"], emitted)
         self.assertEqual(record["instance_type"], "m8g.xlarge")
+
+    def test_every_configurable_instance_type_is_published_and_retained(self):
+        for value in ("m7i.metal-24xl", "u-6tb1.112xlarge", "m8g.xlarge"):
+            with self.subTest(value=value):
+                self.setUp()
+                typed = dataclasses.replace(instance("i-0123456789abcdef0"), instance_type=value)
+                self.run_export(self.build([typed], {"i-0123456789abcdef0": CLEAN_BOOT}))
+                events = self.events_read()
+                self.assertTrue(events)
+                self.assertTrue(all(event["instance_type"] == value for event in events))
+                record = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]
+                self.assertEqual(record["instance_type"], value)
+                # A rerun reads the retained lines back; none may be dropped.
+                self.run_export(self.build([typed], {"i-0123456789abcdef0": CLEAN_BOOT}))
+                self.assertEqual(self.events_read(), events)
+
+    def test_an_over_long_instance_type_is_not_published(self):
+        value = "m" + "a" * 60 + ".xlarge"
+        typed = dataclasses.replace(instance("i-0123456789abcdef0"), instance_type=value)
+        self.run_export(self.build([typed], {"i-0123456789abcdef0": CLEAN_BOOT}))
+        self.assertTrue(all("instance_type" not in event for event in self.events_read()))
 
     def test_an_instance_without_a_type_publishes_no_instance_type_key(self):
         exporter = self.build([instance("i-0123456789abcdef0")], {"i-0123456789abcdef0": CLEAN_BOOT})

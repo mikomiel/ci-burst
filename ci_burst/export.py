@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .aws import Aws
+from .config import INSTANCE_TYPE_PATTERN, MAX_INSTANCE_TYPE_LENGTH
 from .cost import CostModel
 from .errors import ProviderRefusal
 from .ledger import NONTERMINAL, TERMINAL, Ledger, current_window
@@ -82,12 +83,11 @@ FLEET_STALE_SECONDS = 15 * 60
 #: published in every event, so it is validated rather than trusted.
 OPERATION_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
-#: An EC2 instance identifier, an availability-zone name, and an instance type
-#: such as ``m8g.xlarge``. All three are published in events; a tag or a record
-#: that fails these patterns is not one of ours.
+#: An EC2 instance identifier and an availability-zone name. Both are published
+#: in events; a tag or a record that fails these patterns is not one of ours.
+#: The instance type uses the configuration's own grammar (``_instance_type``).
 INSTANCE_PATTERN = re.compile(r"^i-[0-9a-f]{8,17}$")
 ZONE_PATTERN = re.compile(r"^[a-z]{2}-[a-z]+-[0-9][a-z]$")
-INSTANCE_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,15}\.[a-z0-9]{1,16}$")
 
 #: The provider states a worker can be in. Anything else is not published.
 INSTANCE_STATES = frozenset(
@@ -418,6 +418,13 @@ def _match(pattern, value):
     return value if isinstance(value, str) and pattern.fullmatch(value) else None
 
 
+def _instance_type(value):
+    """Return an instance type the configuration would accept, else ``None``."""
+    if isinstance(value, str) and len(value) > MAX_INSTANCE_TYPE_LENGTH:
+        return None
+    return _match(INSTANCE_TYPE_PATTERN, value)
+
+
 def _number(value):
     """Return a finite timestamp or ``None``.
 
@@ -499,7 +506,7 @@ def _sanitize_record(record):
     state = record.get("state")
     state = state if isinstance(state, str) and state in INSTANCE_STATES else None
     zone = _match(ZONE_PATTERN, record.get("zone"))
-    instance_type = _match(INSTANCE_TYPE_PATTERN, record.get("instance_type"))
+    instance_type = _instance_type(record.get("instance_type"))
     operation = _match(OPERATION_PATTERN, record.get("operation"))
     sanitized = {
         "first_seen": _number(record.get("first_seen")),
@@ -781,7 +788,7 @@ def _merge_record(record, instance, facts, now, provider_state):
     record["seen"] = now
     record["state"] = provider_state
     record["zone"] = _match(ZONE_PATTERN, instance.availability_zone)
-    record["instance_type"] = _match(INSTANCE_TYPE_PATTERN, instance.instance_type)
+    record["instance_type"] = _instance_type(instance.instance_type)
     record["operation"] = _operation_of(instance)
     for step in facts.steps:
         if step not in record["steps"]:
@@ -825,7 +832,7 @@ def _events_for(instance, record, now, deployment):
         "zone": _match(ZONE_PATTERN, instance.availability_zone),
         "operation": _operation_of(instance),
     }
-    instance_type = _match(INSTANCE_TYPE_PATTERN, instance.instance_type)
+    instance_type = _instance_type(instance.instance_type)
     if instance_type is not None:
         base["instance_type"] = instance_type
     emitted = record["emitted"]
@@ -882,7 +889,7 @@ def _event_line_is_valid(event, deployment):
         return False
     if set(event) - OPTIONAL_EVENT_KEYS != EVENT_SCHEMA[kind]:
         return False
-    if "instance_type" in event and _match(INSTANCE_TYPE_PATTERN, event["instance_type"]) is None:
+    if "instance_type" in event and _instance_type(event["instance_type"]) is None:
         return False
     instance = event.get("instance")
     if not isinstance(instance, str) or not INSTANCE_PATTERN.fullmatch(instance):

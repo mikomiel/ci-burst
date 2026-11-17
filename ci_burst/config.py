@@ -54,7 +54,8 @@ _ZONE_CANDIDATE_KEYS = ("zone", "subnet_id", "launch_template_version")
 #: ``m7i.metal-24xl`` do; a leading, trailing or doubled hyphen is refused.
 #: The list is validated here because every configured type multiplies the
 #: placement pools an admission prices.
-_INSTANCE_TYPE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*\.[a-z0-9]+(?:-[a-z0-9]+)*$")
+INSTANCE_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*\.[a-z0-9]+(?:-[a-z0-9]+)*$")
+MAX_INSTANCE_TYPE_LENGTH = 64
 
 #: How many instance types one deployment may list. Every admission prices
 #: every configured type in every configured zone, so the bound keeps those
@@ -348,7 +349,7 @@ def _instance_types(aws_table):
         )
     seen = set()
     for index, entry in enumerate(listed):
-        if not isinstance(entry, str) or not _INSTANCE_TYPE.fullmatch(entry) or len(entry) > 64:
+        if not isinstance(entry, str) or not INSTANCE_TYPE_PATTERN.fullmatch(entry) or len(entry) > MAX_INSTANCE_TYPE_LENGTH:
             _instance_types_refusal(
                 f"{where}[{index}]",
                 'must be an instance type name such as "m7g.xlarge"',

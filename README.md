@@ -67,13 +67,11 @@ Its requirements are promoted to the [capability
 specifications](openspec/specs/), and the next behavioural change needs its own
 proposal.
 
-A release exists. [release-please](https://github.com/googleapis/release-please)
-maintains the version, [CHANGELOG.md](CHANGELOG.md) and the annotated
-`v`-prefixed tag from merged conventional commits.
-[CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the release boundary: a
-maintainer merges the release pull request, and release-please creates the tag
-and the GitHub Release whose notes are that changelog section. A release is not
-a deployment.
+[Release Please](https://github.com/googleapis/release-please) maintains the
+version and [changelog](CHANGELOG.md) from merged conventional commits. It
+creates a lightweight `v`-prefixed tag and publishes an immutable GitHub
+Release. [CONTRIBUTING.md](CONTRIBUTING.md#releases) describes release approval
+and publication. Deployment has its own approval and evidence.
 
 ## Checks
 

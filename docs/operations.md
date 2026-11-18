@@ -15,9 +15,10 @@ scheduler:
 - ci-burst owns launch intent, ownership metadata and a conservative forward
   cost commitment.
 
-The source is released under annotated semantic-version tags but publishes no
-image, deployment or live-qualified Forgejo contract. A green validation run
-proves source behavior only.
+Release Please publishes source with lightweight semantic-version tags and
+immutable GitHub Releases. Image builds, deployment, and live Forgejo
+qualification each have their own approval and evidence. A green validation
+run establishes source behavior.
 
 ## Configuration
 

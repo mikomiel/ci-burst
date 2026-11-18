@@ -591,8 +591,8 @@ What a promotion does and does not do:
 
 Three identities describe a deployment, and none substitutes for another:
 
-- the **release version** — a released source history; `CHANGELOG.md` and the
-  annotated release tag own it. It does not name the image a host built;
+- the **release version** — the source history recorded in `CHANGELOG.md`
+  and named by the immutable lightweight release tag;
 - the **deployed source SHA** — `/var/lib/ci-burst-image/deployed-sha` and the
   `localhost/ci-burst:sha-<12>` tag. It identifies the source commit the build
   context came from;

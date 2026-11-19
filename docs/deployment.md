@@ -119,9 +119,11 @@ name. The policies are deliberately small:
 - `TerminateInstances` carries an `ec2:ResourceTag/ci-burst:managed = true`
   condition, so an instance the controller did not tag cannot be terminated;
 - `ec2:GetConsoleOutput` is one read grant, on `instance/*`, for the `export`
-  command only. The shipped policy is not tag-scoped because the provider has no
-  per-tag condition for this read: the boundary is the identity that holds the
-  grant, so keep it on the scaler user and off every other identity. Skip the
+  command only. The shipped scaler policy is not tag-scoped: the boundary is the
+  identity that holds the grant, so keep it on the scaler user and off every
+  other identity. (The image-build policy below does tag-scope the same read;
+  whether the provider honours a tag condition on this action is not
+  established, see that section.) Skip the
   grant if you do not install the export unit; nothing else reads a console;
 - the reaper has no `RunInstances` at all, and the scaler cannot create users,
   read other parameters or change IAM.
@@ -156,6 +158,22 @@ has no IAM action at all, no `ec2:ModifyLaunchTemplate`, no
 `ssm:*`. It denies `ec2:RunInstances` for an instance with an instance profile
 and outside the build launch template. IAM cannot restrict what a launch-template
 version contains, so a person still reads and pins every candidate.
+
+The policy conditions `ec2:GetConsoleOutput` on the `ci-burst:image-build` tag
+of the instance. This guide does not establish that the provider evaluates a
+tag condition for that action, and none of the verification gates G1 to G13 in
+the design covers it directly; the nearest is G7 (console blind-probe cause).
+Treat it as an evidence gap: check it with the IAM policy simulator or a real
+call before enabling. If the condition does not match, the Allow does not apply
+and the console read is refused, so a build would fail closed with
+`CONSOLE_BLIND`. Do not widen the grant to `instance/*` without the tag to work
+around that; record the result and decide with the maintainer.
+
+Images and snapshots may carry the keys `ci-burst:image-build`,
+`ci-burst:deployment`, `ci-burst:build-id`, `ci-burst:basis-digest`,
+`ci-burst:source-sha`, `ci-burst:script-sha` and `ci-burst:base-image`, and
+`ci-burst:expires-at`. Any other tag key on a created image or snapshot is
+refused.
 
 A source identity (an IAM user with programmatic access and no console access)
 may only assume that role. Its whole policy is:

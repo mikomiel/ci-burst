@@ -48,6 +48,33 @@ PLACEHOLDERS = {
     "<bucket>",
     "<prefix>",
 }
+BUILD_TEMPLATE_ARN = "arn:aws:ec2:<region>:<account-id>:launch-template/<build-template-id>"
+INSTANCE_ARN = "arn:aws:ec2:<region>:<account-id>:instance/*"
+PROFILE_DENY_CONDITION = {"Null": {"ec2:InstanceProfile": "false"}}
+TEMPLATE_DENY_CONDITION = {"StringNotEquals": {"ec2:LaunchTemplate": BUILD_TEMPLATE_ARN}}
+# Tag keys that images and snapshots must be allowed to carry. The spec names the
+# first four keys; it names the last three only by meaning (source sha, script sha,
+# base image), so the key names follow the ci-burst:<name> style of the others.
+IMAGE_TAG_KEYS = {
+    "ci-burst:image-build",
+    "ci-burst:deployment",
+    "ci-burst:build-id",
+    "ci-burst:basis-digest",
+    "ci-burst:source-sha",
+    "ci-burst:script-sha",
+    "ci-burst:base-image",
+}
+IMAGE_TAGGING_SIDS = ("TagOnlyOnCreation", "CreateOnlyTaggedImagesAndSnapshots")
+OWNERSHIP_TAGS = {
+    "ec2:ResourceTag/ci-burst:image-build": "true",
+    "ec2:ResourceTag/ci-burst:deployment": "<deployment>",
+}
+OWNERSHIP_ACTIONS = (
+    "ec2:TerminateInstances",
+    "ec2:DeregisterImage",
+    "ec2:DeleteSnapshot",
+    "ec2:CreateImage",
+)
 FORBIDDEN_EC2 = {
     "ec2:modifylaunchtemplate",
     "ec2:deletelaunchtemplateversions",
@@ -114,20 +141,59 @@ def iam_authority_problems(policy):
     return problems
 
 
-def has_explicit_deny(policy, key, negated):
-    """True when a Deny on ec2:RunInstances tests ``key`` the required way."""
+def has_explicit_deny(policy, condition):
+    """True when a Deny on ec2:RunInstances matches ``condition`` exactly.
+
+    The Deny must name only ``ec2:RunInstances`` (no NotAction or NotResource),
+    cover the instance resource, and carry exactly ``condition``, so an extra
+    narrowing condition or a moved resource scope does not count.
+    """
     for statement in statements(policy):
-        if statement.get("Effect") != "Deny" or "ec2:RunInstances" not in actions(statement):
+        if statement.get("Effect") != "Deny":
             continue
-        for operator, pairs in statement.get("Condition", {}).items():
-            if key not in pairs:
-                continue
-            if key == "ec2:InstanceProfile":
-                if operator == "Null" and str(pairs[key]).lower() == "false":
-                    return True
-            elif operator.endswith("NotEquals") == negated:
-                return True
+        if "NotAction" in statement or "NotResource" in statement:
+            continue
+        if actions(statement) != ["ec2:RunInstances"]:
+            continue
+        if not {"*", INSTANCE_ARN} & set(resources(statement)):
+            continue
+        if statement.get("Condition") == condition:
+            return True
     return False
+
+
+def ownership_problems(policy):
+    """Statements on destructive or image actions that lost a deployment tag guard."""
+    problems = []
+    for action in OWNERSHIP_ACTIONS:
+        found = [
+            s for s in statements(policy)
+            if s.get("Effect") == "Allow" and action in actions(s)
+            and any(key.startswith("ec2:ResourceTag/") for pairs in s.get("Condition", {}).values() for key in pairs)
+        ]
+        if not found:
+            problems.append(f"{action}: no statement with a resource-tag guard")
+        for statement in found:
+            equals = statement["Condition"].get("StringEquals", {})
+            for key, value in OWNERSHIP_TAGS.items():
+                if equals.get(key) != value:
+                    problems.append(f"{statement.get('Sid')}: {key} is not {value}")
+    return problems
+
+
+def image_tag_problems(policy):
+    """Image-tagging statements that do not allow the full required key set."""
+    problems = []
+    by_sid = {s.get("Sid"): s for s in statements(policy)}
+    for sid in IMAGE_TAGGING_SIDS:
+        statement = by_sid.get(sid)
+        if statement is None:
+            problems.append(f"{sid}: missing")
+            continue
+        allowed = set(as_list(statement.get("Condition", {}).get("ForAllValues:StringEquals", {}).get("aws:TagKeys")))
+        for key in sorted(IMAGE_TAG_KEYS - allowed):
+            problems.append(f"{sid}: does not allow {key}")
+    return problems
 
 
 def mutating_allows(policy):
@@ -268,31 +334,132 @@ class ImageBuildPolicyTests(unittest.TestCase):
         self.assertFalse([a for a in every_action if a == "*" or a.endswith(":*")])
         self.assertEqual(iam_authority_problems(self.policy), [])
 
+    def test_the_image_policy_has_no_iam_action_until_gate_g5(self):
+        # Gate G5 may add one scoped iam:PassRole statement. That change must also
+        # replace this assertion; the shared rule above already limits its form.
+        every_action = [a for s in statements(self.policy) for a in actions(s)]
+        self.assertEqual([a for a in every_action if a.lower().startswith("iam:")], [])
+
     def test_instance_profile_is_denied_explicitly(self):
-        self.assertTrue(has_explicit_deny(self.policy, "ec2:InstanceProfile", negated=False))
+        self.assertTrue(has_explicit_deny(self.policy, PROFILE_DENY_CONDITION))
 
     def test_launch_outside_the_build_template_is_denied_explicitly(self):
-        self.assertTrue(has_explicit_deny(self.policy, "ec2:LaunchTemplate", negated=True))
+        self.assertTrue(has_explicit_deny(self.policy, TEMPLATE_DENY_CONDITION))
         for statement in statements(self.policy):
             if statement["Effect"] == "Deny":
                 self.assertEqual(actions(statement), ["ec2:RunInstances"])
 
+    def test_the_allow_and_the_template_deny_name_the_same_template(self):
+        allowed = [
+            s["Condition"]["ArnEquals"]["ec2:LaunchTemplate"]
+            for s in statements(self.policy)
+            if s["Effect"] == "Allow" and "ec2:RunInstances" in actions(s)
+            and "ArnEquals" in s.get("Condition", {})
+        ]
+        self.assertEqual(allowed, [BUILD_TEMPLATE_ARN])
+
+    def _deny_mutants(self, condition):
+        """Policies in which the Deny for ``condition`` is broken in one way."""
+        key = next(iter(next(iter(condition.values()))))
+
+        def variant(change):
+            policy = copy.deepcopy(self.policy)
+            hit = [
+                s for s in policy["Statement"]
+                if s["Effect"] == "Deny"
+                and any(key in pairs for pairs in s.get("Condition", {}).values())
+            ]
+            self.assertEqual(len(hit), 1)
+            change(hit[0])
+            return policy
+
+        def drop(statement):
+            statement["Effect"] = "Allow"
+
+        def wrong_resource(statement):
+            statement["Resource"] = "arn:aws:ec2:<region>:<account-id>:subnet/<build-subnet-id>"
+
+        def not_resource(statement):
+            del statement["Resource"]
+            statement["NotResource"] = INSTANCE_ARN
+
+        def other_action(statement):
+            statement["Action"] = "ec2:StartInstances"
+
+        def extra_narrowing(statement):
+            statement["Condition"]["StringEquals"] = {"aws:RequestTag/ci-burst:image-build": "true"}
+
+        def extra_key(statement):
+            operator = next(iter(statement["Condition"]))
+            statement["Condition"][operator]["ec2:Region"] = "<region>"
+
+        def flip_operator(statement):
+            operator = next(iter(statement["Condition"]))
+            pairs = statement["Condition"].pop(operator)
+            statement["Condition"]["Null" if operator != "Null" else "StringEquals"] = pairs
+
+        def wrong_value(statement):
+            operator = next(iter(statement["Condition"]))
+            statement["Condition"][operator][key] = (
+                "true" if operator == "Null" else BUILD_TEMPLATE_ARN.replace("<build-template-id>", "<worker-template-id>")
+            )
+
+        mutants = {
+            "allow instead of deny": drop,
+            "wrong resource scope": wrong_resource,
+            "NotResource": not_resource,
+            "wrong action": other_action,
+            "extra narrowing condition": extra_narrowing,
+            "extra key in the same operator": extra_key,
+            "wrong operator": flip_operator,
+            "wrong value or template": wrong_value,
+        }
+        return {label: variant(change) for label, change in mutants.items()}
+
     def test_the_deny_checks_can_fail(self):
-        for key, negated in (("ec2:InstanceProfile", False), ("ec2:LaunchTemplate", True)):
-            with self.subTest(key=key):
-                stripped = copy.deepcopy(self.policy)
-                stripped["Statement"] = [
-                    s for s in stripped["Statement"]
-                    if not (s["Effect"] == "Deny"
-                            and any(key in pairs for pairs in s.get("Condition", {}).values()))
-                ]
-                self.assertFalse(has_explicit_deny(stripped, key, negated))
-        # The Deny must be a Deny, and the profile test must be Null = false.
-        flipped = copy.deepcopy(self.policy)
-        for statement in flipped["Statement"]:
-            if "ec2:InstanceProfile" in statement.get("Condition", {}).get("Null", {}):
-                statement["Condition"]["Null"]["ec2:InstanceProfile"] = "true"
-        self.assertFalse(has_explicit_deny(flipped, "ec2:InstanceProfile", negated=False))
+        for condition in (PROFILE_DENY_CONDITION, TEMPLATE_DENY_CONDITION):
+            for label, mutant in self._deny_mutants(condition).items():
+                with self.subTest(condition=next(iter(condition.values())), mutant=label):
+                    self.assertFalse(has_explicit_deny(mutant, condition))
+        stripped = copy.deepcopy(self.policy)
+        stripped["Statement"] = [s for s in stripped["Statement"] if s["Effect"] != "Deny"]
+        self.assertFalse(has_explicit_deny(stripped, PROFILE_DENY_CONDITION))
+        self.assertFalse(has_explicit_deny(stripped, TEMPLATE_DENY_CONDITION))
+
+    def test_destructive_and_image_actions_keep_the_ownership_tags(self):
+        self.assertEqual(ownership_problems(self.policy), [])
+
+    def test_the_ownership_check_can_fail(self):
+        for action in OWNERSHIP_ACTIONS:
+            for dropped in OWNERSHIP_TAGS:
+                with self.subTest(action=action, dropped=dropped):
+                    policy = copy.deepcopy(self.policy)
+                    changed = 0
+                    for statement in policy["Statement"]:
+                        pairs = statement.get("Condition", {}).get("StringEquals", {})
+                        if action in actions(statement) and dropped in pairs:
+                            del pairs[dropped]
+                            changed += 1
+                    self.assertEqual(changed, 1)
+                    self.assertTrue(ownership_problems(policy))
+        stripped = copy.deepcopy(self.policy)
+        stripped["Statement"] = [s for s in stripped["Statement"] if "ec2:DeleteSnapshot" not in actions(s)]
+        self.assertTrue(ownership_problems(stripped))
+
+    def test_images_and_snapshots_may_carry_the_complete_tag_set(self):
+        self.assertEqual(image_tag_problems(self.policy), [])
+
+    def test_the_image_tag_check_can_fail(self):
+        for sid in IMAGE_TAGGING_SIDS:
+            for key in sorted(IMAGE_TAG_KEYS):
+                with self.subTest(statement=sid, dropped=key):
+                    policy = copy.deepcopy(self.policy)
+                    for statement in policy["Statement"]:
+                        if statement["Sid"] == sid:
+                            statement["Condition"]["ForAllValues:StringEquals"]["aws:TagKeys"].remove(key)
+                    self.assertEqual(
+                        image_tag_problems(policy), [f"{sid}: does not allow {key}"]
+                    )
 
     def test_every_mutating_allow_has_a_tag_or_resource_scope(self):
         self.assertEqual(unscoped_mutating(self.policy), [])

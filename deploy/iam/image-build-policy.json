@@ -111,7 +111,10 @@
             "ci-burst:deployment",
             "ci-burst:build-id",
             "ci-burst:expires-at",
-            "ci-burst:basis-digest"
+            "ci-burst:basis-digest",
+            "ci-burst:source-sha",
+            "ci-burst:script-sha",
+            "ci-burst:base-image"
           ]
         }
       }
@@ -147,7 +150,10 @@
             "ci-burst:deployment",
             "ci-burst:build-id",
             "ci-burst:expires-at",
-            "ci-burst:basis-digest"
+            "ci-burst:basis-digest",
+            "ci-burst:source-sha",
+            "ci-burst:script-sha",
+            "ci-burst:base-image"
           ]
         }
       }

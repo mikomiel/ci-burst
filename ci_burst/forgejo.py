@@ -10,9 +10,13 @@ to declare ``live-verified`` in configuration; the bundled contracts are
 validated against synthetic fixtures.
 """
 
+import functools
+import http.client
 import json
 import os
 import re
+import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -149,43 +153,88 @@ class UrllibTransport:
         connection before the refusal is raised, so no byte beyond the cap
         past one chunk is read, and nothing is buffered or written to disk.
 
-        The socket timeout bounds one operation, not the transfer, so a server
-        that drips bytes could hold the loop. ``deadline`` is an absolute time
-        on this transport's clock, the convention of ``aws.py``: it is checked
-        before every read and refuses with ``DeadlineRefusal`` once reached.
-        Each read is ``read1``, at most one receive, so a drip cannot keep one
-        read filling a chunk past the deadline; the socket timeout is also cut
-        to the time left, so one receive overruns the deadline by at most that.
+        The socket timeout restarts on every receive. It bounds a silent
+        server, not a slow one: a server that drips bytes keeps a call blocked
+        for ever, because reading the status line, a header or a chunk-size line
+        repeats receives until the line ends. ``deadline`` is an absolute time
+        on this transport's clock, the convention of ``aws.py``, and two
+        mechanisms enforce it. Before every read the stream refuses with
+        ``DeadlineRefusal`` once the deadline is reached; a body read is
+        ``read1``, so a drip cannot keep one read filling a whole chunk. A
+        watchdog also cancels the request itself: a daemon timer, armed before
+        the request opens, shuts the connected socket down when the time is up.
+        That wakes any call a drip holds blocked. A failure after it, or an end
+        of stream it caused, is a ``DeadlineRefusal``, never a transport
+        refusal and never a complete body.
+
+        The timer runs on real time, not on the transport's clock: its delay is
+        ``deadline - clock()``, read once when the stream starts, so a
+        substituted clock moves the per-read check only. The timer is cancelled
+        when the stream ends, fails or is closed.
+
+        The watchdog reaches only a connected socket, so what runs inside
+        ``connect()`` is not cancelled: name resolution, a proxy tunnel reply
+        and, for TLS, the handshake. The socket timeout, cut to the time left
+        when the request opens, bounds each TCP connect attempt and the
+        handshake; nothing bounds name resolution or a proxy reply that drips.
         """
-        request = urllib.request.Request(url, headers=headers, method="GET")
         timeout = self._timeout
-        if deadline is not None:
+        watchdog = None
+        if deadline is None:
+            request = urllib.request.Request(url, headers=headers, method="GET")
+        else:
             remaining = deadline - self._clock()
             if remaining <= 0:
                 raise DeadlineRefusal("archive stream")
             timeout = min(timeout, remaining)
+            watchdog = _Watchdog(remaining)
+            request = _WatchedRequest(url, headers=headers, method="GET", watchdog=watchdog)
+
+        def expired():
+            return watchdog is not None and (watchdog.fired or self._clock() >= deadline)
+
+        if watchdog is not None:
+            watchdog.start()
         try:
             with self._open(request, timeout) as response:
                 if response.status != 200:
                     raise ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {response.status}")
                 received = 0
                 while True:
-                    if deadline is not None and self._clock() >= deadline:
+                    if expired():
                         raise DeadlineRefusal("archive stream")
                     chunk = response.read1(min(chunk_bytes, max_bytes - received + 1))
                     if not chunk:
+                        # A shut-down socket often reads as a clean end of
+                        # stream, not as an error: a cut-off is not a body.
+                        if expired():
+                            raise DeadlineRefusal("archive stream")
                         return
                     received += len(chunk)
                     if received > max_bytes:
                         raise ObservationRefusal("FORGEJO_ARCHIVE_TOO_LARGE", f"limit {max_bytes} bytes")
                     yield chunk
-        except (urllib.error.URLError, TimeoutError, OSError) as error:
-            raise _transport_refusal(error) from None
+        except _CUT_OFF as error:
+            if expired():
+                raise DeadlineRefusal("archive stream") from None
+            if isinstance(error, OSError):
+                raise _transport_refusal(error) from None
+            raise
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
 
     def _open(self, request, timeout=None):
-        """Open one request; tests replace this boundary with a fake response."""
+        """Open one request; tests replace this boundary with a fake response.
+
+        A request that carries a watchdog opens through connections that report
+        their socket to it.
+        """
         timeout = self._timeout if timeout is None else timeout
-        return urllib.request.build_opener(_RefuseRedirects()).open(request, timeout=timeout)
+        handlers = [_RefuseRedirects()]
+        if isinstance(request, _WatchedRequest):
+            handlers += [_WatchedHTTPHandler(), _WatchedHTTPSHandler()]
+        return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
 
 
 def _transport_refusal(error):
@@ -197,6 +246,108 @@ def _transport_refusal(error):
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, file_pointer, code, message, headers, new_url):
         raise ObservationRefusal("FORGEJO_REDIRECT_REFUSED", f"HTTP {code}")
+
+
+#: What a connection cut off by the watchdog can raise: OSError (URLError and
+#: TimeoutError are OSErrors), the http.client view of a truncated message, and
+#: the ValueError of a read on a closed file or TLS socket.
+_CUT_OFF = (OSError, http.client.HTTPException, ValueError)
+
+#: The thread name of the watchdog timer, so a test can find it.
+_WATCHDOG_THREAD = "ci-burst-stream-deadline"
+
+
+def _shut_down(sock):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass  # already closed: there is nothing left to cut
+
+
+class _Watchdog:
+    """Cancel one request at a time limit by shutting its socket down.
+
+    A socket timeout restarts on every receive, so a server that drips bytes
+    keeps a blocked read alive for ever. After ``delay`` seconds of real time
+    a daemon timer sets ``fired`` and then shuts down the socket that the
+    connection reported, which wakes any call blocked on it. A socket reported
+    after that is shut down at once. A lock orders the two, so one of them
+    always sees the other.
+    """
+
+    def __init__(self, delay):
+        self._lock = threading.Lock()
+        self._socket = None
+        self.fired = False
+        self._timer = threading.Timer(delay, self._fire)
+        self._timer.name = _WATCHDOG_THREAD
+        self._timer.daemon = True
+
+    def start(self):
+        self._timer.start()
+
+    def cancel(self):
+        self._timer.cancel()
+
+    def attach(self, sock):
+        """Record the connected socket; shut it down if the time is already up."""
+        with self._lock:
+            self._socket = sock
+            expired = self.fired
+        if expired:
+            _shut_down(sock)
+
+    def _fire(self):
+        with self._lock:
+            self.fired = True
+            sock = self._socket
+        if sock is not None:
+            _shut_down(sock)
+
+
+class _WatchedRequest(urllib.request.Request):
+    """A request that carries its watchdog to the handler that opens the connection."""
+
+    def __init__(self, *arguments, watchdog, **keywords):
+        super().__init__(*arguments, **keywords)
+        self.watchdog = watchdog
+
+
+class _ReportingConnection:
+    """Mixin: report the connected socket to the watchdog of the request.
+
+    For TLS the socket is the wrapped one, so the watchdog never holds the
+    plain socket that wrapping detaches.
+    """
+
+    def __init__(self, *arguments, watchdog, **keywords):
+        super().__init__(*arguments, **keywords)
+        self._watchdog = watchdog
+
+    def connect(self):
+        super().connect()
+        self._watchdog.attach(self.sock)
+
+
+class _WatchedHTTPConnection(_ReportingConnection, http.client.HTTPConnection):
+    pass
+
+
+class _WatchedHTTPSConnection(_ReportingConnection, http.client.HTTPSConnection):
+    pass
+
+
+class _WatchedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(functools.partial(_WatchedHTTPConnection, watchdog=req.watchdog), req)
+
+
+class _WatchedHTTPSHandler(urllib.request.HTTPSHandler):
+    """The standard handler and its default context: verification stays on."""
+
+    def https_open(self, req):
+        factory = functools.partial(_WatchedHTTPSConnection, watchdog=req.watchdog)
+        return self.do_open(factory, req, context=self._context)
 
 
 class ForgejoObserver:

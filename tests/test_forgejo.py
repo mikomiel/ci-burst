@@ -1,17 +1,29 @@
+import http.client
+import itertools
 import json
+import os
+import socket
+import ssl
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 from ci_burst.config import load
 from ci_burst.errors import DeadlineRefusal, ObservationRefusal
 from ci_burst.forgejo import (
+    _WATCHDOG_THREAD,
     ForgejoObserver,
     ForgejoSource,
     UrllibTransport,
     _RefuseRedirects,
+    _Watchdog,
+    _WatchedHTTPSHandler,
+    _WatchedRequest,
     require_protected,
 )
 
@@ -762,7 +774,15 @@ class ForgejoSourceTests(unittest.TestCase):
             "raw_file": lambda source: source.raw_file(SHA, "uv.lock"),
             "archive": lambda source: list(source.archive(SHA, 16)),
         }
-        for token in ("sentinel-image-secret\n", "sentinel image secret", "sentinel-image-secret\r\nX-Injected: 1"):
+        malformed = (
+            "sentinel-image-secret\n",
+            "sentinel image secret",
+            "sentinel-image-secret\r\nX-Injected: 1",
+            "sentinel-image-secret\tsentinel",  # a tab is not printable ASCII
+            "sentinel-image-secret\x7f",  # DEL
+            "sentinel-image-secret-é",  # a character outside ASCII
+        )
+        for token in malformed:
             for name, read in reads.items():
                 with self.subTest(read=name, token=repr(token)):
                     transport = SourceTransport(body=branch_body(protected=True), chunks=[b"a"])
@@ -892,6 +912,287 @@ class StreamTransportTests(unittest.TestCase):
         transport._open = open_
         with self.assertRaises(DeadlineRefusal):
             list(transport.stream("https://forgejo.example/a", {}, 100, deadline=10))
+
+
+CHUNKED_HEAD = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+LENGTH_HEAD = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n"
+
+
+class LoopbackServer:
+    """Serve one scripted connection on 127.0.0.1 so the real http.client parser reads it.
+
+    ``script(connection, stop)`` runs once the request head has arrived. Every
+    wait is bounded and ``close`` ends the thread, so a failing test leaves
+    neither a blocked client nor a running thread behind.
+    """
+
+    def __init__(self, script):
+        self._script = script
+        self.stop = threading.Event()
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self._listener.settimeout(0.1)
+        self.url = "http://127.0.0.1:%d/archive" % self._listener.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, name="loopback-server", daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        connection = None
+        while connection is None:
+            if self.stop.is_set():
+                return
+            try:
+                connection, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+        with connection:
+            connection.settimeout(5)
+            try:
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    received = connection.recv(4096)
+                    if not received:
+                        return
+                    head += received
+                self._script(connection, self.stop)
+            except OSError:
+                pass  # the client went away: nothing is left to send
+
+    def close(self):
+        self.stop.set()
+        self._thread.join(5)
+        self._listener.close()
+
+
+def drip(connection, stop, data, interval=0.05, limit=5.0):
+    """Send ``data``, an iterable of byte values, one byte per ``interval`` seconds.
+
+    It gives up at ``limit`` seconds, once ``stop`` is set, or when the peer is
+    gone, so a regression that removes the cancellation ends the test late
+    instead of hanging the suite.
+    """
+    give_up = time.monotonic() + limit
+    for value in data:
+        if stop.wait(interval) or time.monotonic() >= give_up:
+            return
+        connection.sendall(bytes([value]))
+
+
+def live_watchdogs():
+    return [thread for thread in threading.enumerate() if thread.name == _WATCHDOG_THREAD]
+
+
+def settled_watchdogs():
+    """The watchdog timers that are still alive once a cancelled one has had time to end."""
+    for thread in live_watchdogs():
+        thread.join(2)
+    return live_watchdogs()
+
+
+class StreamDeadlineTests(unittest.TestCase):
+    """``deadline`` is absolute: a server that keeps sending cannot hold the stream past it.
+
+    Each test reads a real loopback connection through the real opener and the
+    real ``http.client`` parser. A blocked read is drained in a thread that the
+    test waits for at most ``BOUND`` seconds.
+    """
+
+    DEADLINE = 0.5
+    BOUND = 3.0
+
+    def setUp(self):
+        # The opener honours proxy variables; this traffic never leaves the host.
+        patched = mock.patch.dict(os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"})
+        patched.start()
+        self.addCleanup(patched.stop)
+        self._servers = []
+        self._workers = []
+        self.addCleanup(self._release)
+
+    def _release(self):
+        for server in self._servers:
+            server.close()
+        for worker in self._workers:
+            worker.join(5)
+
+    def serve(self, script):
+        server = LoopbackServer(script)
+        self._servers.append(server)
+        return server
+
+    def transport(self):
+        return UrllibTransport(timeout_seconds=1, max_response_bytes=1024, clock=time.monotonic)
+
+    def assert_refused_at_the_deadline(self, script):
+        server = self.serve(script)
+        transport = self.transport()
+        deadline = time.monotonic() + self.DEADLINE
+        outcome = {}
+
+        def read():
+            try:
+                outcome["chunks"] = list(transport.stream(server.url, {}, 1024, deadline=deadline))
+            except Exception as error:  # the test thread judges it
+                outcome["error"] = error
+
+        worker = threading.Thread(target=read, name="stream-under-test", daemon=True)
+        self._workers.append(worker)
+        started = time.monotonic()
+        worker.start()
+        worker.join(self.BOUND)
+        elapsed = time.monotonic() - started
+        self.assertFalse(
+            worker.is_alive(), "still blocked %.1f s after a %.1f s deadline" % (elapsed, self.DEADLINE)
+        )
+        refusal = outcome.get("error")
+        self.assertIsInstance(refusal, DeadlineRefusal, msg=repr(outcome))
+        self.assertEqual((refusal.reason, refusal.detail), ("pass_deadline_exceeded", "archive stream"))
+
+    def test_a_chunk_extension_drip_is_cut_off_at_the_deadline(self):
+        # `1;` opens a chunk-size line that never ends. http.client reads the
+        # line with repeated receives, each one inside the socket timeout.
+        def script(connection, stop):
+            connection.sendall(CHUNKED_HEAD + b"1;")
+            drip(connection, stop, itertools.repeat(ord("x")))
+
+        self.assert_refused_at_the_deadline(script)
+
+    def test_a_status_line_or_header_drip_is_cut_off_at_the_deadline(self):
+        # The head never ends, so the drip holds the open itself.
+        heads = {
+            "status line": (b"", b"HTTP/1.1 200 OK"),
+            "header": (b"HTTP/1.1 200 OK\r\n", b"X-Padding: "),
+        }
+        for name, (sent_at_once, dripped) in heads.items():
+            with self.subTest(drip=name):
+
+                def script(connection, stop, sent_at_once=sent_at_once, dripped=dripped):
+                    connection.sendall(sent_at_once)
+                    drip(connection, stop, itertools.chain(dripped, itertools.repeat(ord("x"))))
+
+                self.assert_refused_at_the_deadline(script)
+
+    def test_a_body_drip_is_cut_off_and_never_ends_as_a_complete_body(self):
+        # A shut-down socket reads as a clean end of stream. The body promised
+        # 1000 bytes and got a few, so that end must not look like success.
+        def script(connection, stop):
+            connection.sendall(LENGTH_HEAD)
+            drip(connection, stop, itertools.repeat(ord("x")))
+
+        self.assert_refused_at_the_deadline(script)
+
+    def test_a_normal_chunked_response_is_yielded_whole_and_its_timer_is_cancelled(self):
+        body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+        server = self.serve(lambda connection, stop: connection.sendall(CHUNKED_HEAD + body))
+        before = set(live_watchdogs())
+        stream = self.transport().stream(server.url, {}, 1024, chunk_bytes=4, deadline=time.monotonic() + 60)
+        first = next(stream)
+        # The check can see a timer: one runs while the stream is open.
+        self.assertTrue(set(live_watchdogs()) - before)
+        self.assertEqual(b"".join([first, *stream]), b"hello world")
+        self.assertEqual(settled_watchdogs(), [])
+
+    def test_the_timer_is_cancelled_when_the_stream_fails_or_is_closed(self):
+        def script(connection, stop):
+            connection.sendall(CHUNKED_HEAD + b"5\r\nhello\r\n")
+            stop.wait(5)
+
+        with self.subTest(end="closed before the end"):
+            stream = self.transport().stream(self.serve(script).url, {}, 1024, deadline=time.monotonic() + 60)
+            self.assertEqual(next(stream), b"hello")
+            stream.close()
+            self.assertEqual(settled_watchdogs(), [])
+        with self.subTest(end="over the cap"):
+            stream = self.transport().stream(self.serve(script).url, {}, 3, deadline=time.monotonic() + 60)
+            with self.assertRaises(ObservationRefusal) as raised:
+                next(stream)
+            self.assertEqual(raised.exception.reason, "FORGEJO_ARCHIVE_TOO_LARGE")
+            self.assertEqual(settled_watchdogs(), [])
+
+    def test_refusals_that_are_not_a_deadline_keep_their_reason_with_and_without_a_deadline(self):
+        # The watched opener must refuse redirects (the request carries a token)
+        # and report a failure before the deadline as it always did.
+        redirect = b"HTTP/1.1 302 Found\r\nLocation: http://forgejo.example/elsewhere\r\nContent-Length: 0\r\n\r\n"
+        forbidden = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        replies = {
+            "redirect": (redirect, "FORGEJO_REDIRECT_REFUSED", "HTTP 302"),
+            "forbidden": (forbidden, "FORGEJO_UNEXPECTED_STATUS", "HTTP 403"),
+        }
+        for name, (reply, reason, detail) in replies.items():
+            for deadline in (None, time.monotonic() + 60):
+                with self.subTest(reply=name, deadline=deadline is not None):
+                    server = self.serve(lambda connection, stop, reply=reply: connection.sendall(reply))
+                    with self.assertRaises(ObservationRefusal) as raised:
+                        list(self.transport().stream(server.url, {}, 1024, deadline=deadline))
+                    self.assertEqual((raised.exception.reason, raised.exception.detail), (reason, detail))
+        with self.subTest(reply="connection refused"):
+            listener = socket.create_server(("127.0.0.1", 0))
+            url = "http://127.0.0.1:%d/archive" % listener.getsockname()[1]
+            listener.close()
+            with self.assertRaises(ObservationRefusal) as raised:
+                list(self.transport().stream(url, {}, 1024, deadline=time.monotonic() + 60))
+            self.assertEqual(raised.exception.reason, "FORGEJO_UNAVAILABLE")
+
+    def test_a_stream_without_a_deadline_arms_no_timer(self):
+        server = self.serve(lambda connection, stop: connection.sendall(CHUNKED_HEAD + b"5\r\nhello\r\n0\r\n\r\n"))
+        before = set(live_watchdogs())
+        stream = self.transport().stream(server.url, {}, 1024)
+        self.assertEqual(next(stream), b"hello")
+        self.assertEqual(set(live_watchdogs()), before)
+        self.assertEqual(list(stream), [])
+
+
+class RecordingSocket:
+    def __init__(self, error=None):
+        self.error = error
+        self.shutdowns = []
+
+    def shutdown(self, how):
+        self.shutdowns.append(how)
+        if self.error is not None:
+            raise self.error
+
+
+def fired_watchdog():
+    watchdog = _Watchdog(0)
+    watchdog.start()
+    give_up = time.monotonic() + 2
+    while not watchdog.fired and time.monotonic() < give_up:
+        time.sleep(0.005)
+    return watchdog
+
+
+class WatchdogTests(unittest.TestCase):
+    def test_a_socket_reported_after_the_time_is_up_is_shut_down_at_once(self):
+        # The timer can fire before the connection exists; the connect hook then
+        # does the cutting as soon as it reports the socket.
+        watchdog = fired_watchdog()
+        self.assertTrue(watchdog.fired)
+        sock = RecordingSocket()
+        watchdog.attach(sock)
+        self.assertEqual(sock.shutdowns, [socket.SHUT_RDWR])
+        watchdog.attach(RecordingSocket(error=OSError("already closed")))  # no error escapes
+
+    def test_the_tls_handler_keeps_certificate_verification_and_reports_its_socket(self):
+        watchdog = fired_watchdog()
+        handler = _WatchedHTTPSHandler()
+        opened = {}
+        handler.do_open = lambda factory, request, **keywords: opened.update(factory=factory, keywords=keywords)
+        handler.https_open(_WatchedRequest("https://forgejo.example/archive", watchdog=watchdog))
+        context = opened["keywords"]["context"]
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+        connection = opened["factory"]("forgejo.example", timeout=1, **opened["keywords"])
+        self.assertIsInstance(connection, http.client.HTTPSConnection)
+        connected = RecordingSocket()
+
+        def connect(self):  # the plain connect and the handshake, without a network
+            self.sock = connected
+
+        with mock.patch.object(http.client.HTTPSConnection, "connect", connect):
+            connection.connect()
+        self.assertEqual(connected.shutdowns, [socket.SHUT_RDWR])
 
 
 if __name__ == "__main__":

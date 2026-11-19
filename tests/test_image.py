@@ -219,8 +219,8 @@ UNCHANGED = {"start": False, "decision": "digest_unchanged", "reason": None, "cl
 CLEARING = {**START, "clear_control": True}
 
 
-def refused(reason):
-    return {"start": False, "decision": "refused", "reason": reason, "clear_control": False}
+def refused(reason, clear=False):
+    return {"start": False, "decision": "refused", "reason": reason, "clear_control": clear}
 
 
 def named(result):
@@ -293,13 +293,14 @@ class BuildDecisionTests(unittest.TestCase):
             "last_build_started_at": NOW - 60,
         }
         # Remove the named condition each time: the next one in line is then named.
+        # The order is the spec's: digest, minimum interval, daily cap, cooldown, blocked, builder.
         steps = (
-            ("IMAGE_BUILD_ALREADY_ACTIVE", {"active": False}),
-            ("IMAGE_DAILY_CAP", {"builds_last_day": 0}),
-            ("IMAGE_BLOCKED", {"control": control(consecutive_failures=1, cooldown_until=NOW + 60)}),
-            ("IMAGE_FAILURE_COOLDOWN", {"control": control()}),
             ("digest_unchanged", {"digest": "digest-new"}),
             ("IMAGE_MIN_INTERVAL", {"last_build_started_at": None}),
+            ("IMAGE_DAILY_CAP", {"builds_last_day": 0}),
+            ("IMAGE_FAILURE_COOLDOWN", {"control": control(blocked=True, consecutive_failures=3)}),
+            ("IMAGE_BLOCKED", {"control": control()}),
+            ("IMAGE_BUILD_ALREADY_ACTIVE", {"active": False}),
             ("start", {}),
         )
         for expected, fix in steps:
@@ -316,9 +317,7 @@ class BuildDecisionTests(unittest.TestCase):
         # The spec scenario: two builds in the last day and --force.
         self.assertEqual(self.decide(force=True, builds_last_day=2), refused("IMAGE_DAILY_CAP"))
         self.assertEqual(self.decide(force=True, active=True), refused("IMAGE_BUILD_ALREADY_ACTIVE"))
-        self.assertEqual(
-            self.decide(force=True, active=True, builds_last_day=2), refused("IMAGE_BUILD_ALREADY_ACTIVE")
-        )
+        self.assertEqual(self.decide(force=True, active=True, builds_last_day=2), refused("IMAGE_DAILY_CAP"))
 
     def test_force_clears_blocked_and_the_cooldown(self):
         rows = {
@@ -336,15 +335,24 @@ class BuildDecisionTests(unittest.TestCase):
             with self.subTest(row=row):
                 self.assertEqual(self.decide(force=True, control=row), START)
 
-    def test_a_refusal_never_asks_for_a_clear(self):
-        # The daily cap comes before blocked, so --force on a blocked row at the cap refuses and clears nothing.
+    def test_a_clearing_applies_even_when_the_start_is_refused(self):
+        # The spec: --force and a digest change clear blocked and the cooldown, whatever else refuses the start.
         row = control(blocked=True, consecutive_failures=3, cooldown_until=NOW + 600)
-        self.assertEqual(self.decide(force=True, builds_last_day=2, control=row), refused("IMAGE_DAILY_CAP"))
-        self.assertEqual(self.decide(force=True, active=True, control=row), refused("IMAGE_BUILD_ALREADY_ACTIVE"))
+        self.assertEqual(
+            self.decide(force=True, builds_last_day=2, control=row), refused("IMAGE_DAILY_CAP", clear=True)
+        )
+        self.assertEqual(
+            self.decide(force=True, active=True, control=row), refused("IMAGE_BUILD_ALREADY_ACTIVE", clear=True)
+        )
         self.assertEqual(
             self.decide(control=row, last_failed_digest="digest-failed", active=True),
-            refused("IMAGE_BUILD_ALREADY_ACTIVE"),
+            refused("IMAGE_BUILD_ALREADY_ACTIVE", clear=True),
         )
+
+    def test_a_refusal_without_a_clearing_asks_for_none(self):
+        row = control(blocked=True, consecutive_failures=3, cooldown_until=NOW + 600)
+        self.assertEqual(self.decide(builds_last_day=2, control=row), refused("IMAGE_DAILY_CAP"))
+        self.assertEqual(self.decide(control=row, last_failed_digest="digest-new"), refused("IMAGE_FAILURE_COOLDOWN"))
 
     def test_blocked_clears_when_the_digest_differs_from_the_last_failed_build(self):
         row = control(blocked=True, consecutive_failures=3)
@@ -371,13 +379,13 @@ class BuildDecisionTests(unittest.TestCase):
     def test_a_recovered_build_still_waits_for_the_minimum_interval(self):
         row = control(blocked=True, consecutive_failures=3)
         result = self.decide(control=row, last_failed_digest="digest-failed", last_build_started_at=NOW - 60)
-        self.assertEqual(result, refused("IMAGE_MIN_INTERVAL"))
+        self.assertEqual(result, refused("IMAGE_MIN_INTERVAL", clear=True))
 
-    def test_a_clear_is_asked_for_only_together_with_a_start(self):
-        # The digest differs from the failed build's but equals the pin's tag: nothing is built and nothing is written.
+    def test_a_recovery_is_asked_for_even_when_the_digest_is_unchanged(self):
+        # The digest differs from the failed build's but equals the pin's tag: nothing is built, blocked still clears.
         row = control(blocked=True, consecutive_failures=3)
         result = self.decide(control=row, last_failed_digest="digest-failed", digest="digest-pinned")
-        self.assertEqual(result, UNCHANGED)
+        self.assertEqual(result, {**UNCHANGED, "clear_control": True})
 
     def test_the_result_has_exactly_the_documented_fields(self):
         for result in (self.decide(), self.decide(active=True), self.decide(digest="digest-pinned")):

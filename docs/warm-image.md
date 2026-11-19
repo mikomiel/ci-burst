@@ -69,6 +69,7 @@ front of the script ([step 3](#3-render-the-user-data)).
 | `WARM_GATE_COMMAND` | no | One command that proves the warm layer is enough, run after the warm commands with downloads forbidden. Join steps with `&&` or `;`. |
 | `WARM_LIFETIME_SECONDS` | no | Builder lifetime bound, 600 to 14400, default 5400. |
 | `WARM_SNAPSHOT_SECONDS` | no | How long the builder stays up after the marker, 60 to 3600, default 1800. |
+| `WARM_SRC_STRIP_COMPONENTS` | no | Leading path components that extraction drops, 0 or 1, default 0. A forge archive wraps the source in one directory and needs 1. Any other value stops the script before the fetch. |
 
 Each command runs from the extracted source root, as the `runner` account, in its
 own transient systemd unit:
@@ -184,9 +185,9 @@ umask 077
   tail -n +2 deploy/runner/image/warm-cache.sh
 } > user-data.sh
 bash -n user-data.sh
-# EC2 refuses user data over 16384 bytes. An oversized file is removed, so the
-# launch below fails instead of sending it; the check itself returns nonzero.
-if [ "$(wc -c < user-data.sh)" -gt 16384 ]; then
+# EC2 refuses user data of 16384 bytes or more. An oversized file is removed,
+# so the launch below fails instead of sending it; the check returns nonzero.
+if [ "$(wc -c < user-data.sh)" -ge 16384 ]; then
   echo "user data too large: move commands into the archive" >&2
   rm -f user-data.sh
   false

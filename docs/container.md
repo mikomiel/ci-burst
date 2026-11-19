@@ -623,8 +623,10 @@ The image-keyed record is authoritative, and its attestation list is
 append-only. One image ID can come from more than one source commit: a commit
 that changes only `docs/`, `tests/` or `deploy/` files is excluded by
 `.dockerignore`, and the Dockerfile copies only the application and packaging
-inputs, so a build of it returns the bytes already recorded under a different
-source. When the build inputs match, the run appends an attestation with the
+inputs and the one warm script, so a build of it returns the bytes already
+recorded under a different source. The exception is
+`deploy/runner/image/warm-cache.sh`: the image ships it for automated image
+builds, so a commit that changes only that file changes the image. When the build inputs match, the run appends an attestation with the
 new source SHA, tree SHA, engine version and timestamp and promotes normally;
 the identical source and tree is a no-op that leaves the file byte-for-byte
 unchanged. When the recorded build inputs differ — the `Dockerfile` sha256, the

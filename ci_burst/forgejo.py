@@ -157,7 +157,7 @@ class UrllibTransport:
           ``FORGEJO_RESPONSE_TRUNCATED`` for fewer bytes than ``Content-Length``
           promised, ``FORGEJO_UNAVAILABLE`` for an incomplete chunked body.
         """
-        request = urllib.request.Request(url, headers=headers, method="GET")
+        request = _request(urllib.request.Request, url, headers=headers, method="GET")
         try:
             with self._open(request) as response:
                 status = response.status
@@ -218,14 +218,15 @@ class UrllibTransport:
         timeout = self._timeout
         watchdog = None
         if deadline is None:
-            request = urllib.request.Request(url, headers=headers, method="GET")
+            request = _request(urllib.request.Request, url, headers=headers, method="GET")
         else:
             remaining = deadline - self._clock()
             if remaining <= 0:
                 raise DeadlineRefusal("archive stream")
             timeout = min(timeout, remaining)
             watchdog = _Watchdog(remaining)
-            request = _WatchedRequest(url, headers=headers, method="GET", watchdog=watchdog)
+            # Built before the timer starts, so a refused URL leaves no timer behind.
+            request = _request(_WatchedRequest, url, headers=headers, method="GET", watchdog=watchdog)
 
         def expired():
             return watchdog is not None and (watchdog.fired or self._clock() >= deadline)
@@ -272,6 +273,14 @@ class UrllibTransport:
         if isinstance(request, _WatchedRequest):
             handlers += [_WatchedHTTPHandler(), _WatchedHTTPSHandler()]
         return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
+
+
+def _request(factory, *arguments, **keywords):
+    """Build a request; a URL that urllib rejects is a transport refusal, not a raw error."""
+    try:
+        return factory(*arguments, **keywords)
+    except ValueError as error:
+        raise _transport_refusal(error) from None
 
 
 def _transport_refusal(error):

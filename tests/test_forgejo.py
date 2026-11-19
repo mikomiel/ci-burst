@@ -1217,6 +1217,20 @@ class TransportFailureTests(unittest.TestCase):
                 # ResourceWarning in whichever test runs next.
                 del refusal, raised
 
+    def test_a_url_that_urllib_rejects_is_refused_before_any_request(self):
+        # A configured base URL passes the prefix check but is not a valid URL.
+        url = f"https://[{self.SENTINEL}/api/v1/repos/owner/repository/archive/x.tar.gz"
+        for name, read in self.READS.items():
+            with self.subTest(read=name):
+                with self.assertRaises(ObservationRefusal) as raised:
+                    read["read"](self.transport(), url, {})
+                refusal = raised.exception
+                self.assertEqual((refusal.reason, refusal.detail), ("FORGEJO_UNAVAILABLE", "ValueError"))
+                self.assertTrue(refusal.__suppress_context__)
+                for text in (str(refusal), repr(refusal), json.dumps(refusal.as_dict())):
+                    self.assertNotIn(self.SENTINEL, text)
+                self.assertEqual(live_watchdogs(), [])
+
     def test_a_body_shorter_than_its_content_length_is_refused(self):
         # http.client ends such a body without an error: read and read1 return what arrived.
         for sent, detail in ((b"partial", "received 7 of 1000 bytes"), (b"", "received 0 of 1000 bytes")):

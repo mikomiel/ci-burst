@@ -125,6 +125,17 @@ class UrllibTransport:
     Redirects are refused outright: the request carries an Authorization
     header, and following a cross-origin redirect would disclose it. TLS
     verification stays at the standard-library default and is never disabled.
+
+    Every failure of the exchange is an ``ObservationRefusal``. A network error,
+    a malformed or over-long status or header line, and a body that ends early
+    refuse; none escapes as a raw ``OSError``, ``http.client`` or ``ValueError``
+    exception. The refusal carries the exception class name and never its
+    message, because the message can quote the status line or a request header.
+    A body that ends short of its ``Content-Length``, or that ends before the
+    closing blank line of a chunked body, is refused and never taken for a
+    complete one. A body that carries neither ``Content-Length`` nor chunking
+    ends when the server closes the connection, and nothing distinguishes that
+    end from a cut-off, so that body is not checked.
     """
 
     def __init__(self, timeout_seconds, max_response_bytes, clock=time.time):
@@ -133,17 +144,32 @@ class UrllibTransport:
         self._clock = clock
 
     def get(self, url, headers):
-        request = urllib.request.Request(url, headers=headers, method="GET")
+        """Return the body of a 200 response of at most ``max_response_bytes``.
+
+        The refusals, in the order they are judged:
+
+        * the exchange failed: ``FORGEJO_UNAVAILABLE``, or
+          ``FORGEJO_UNEXPECTED_STATUS`` when the server answered with an HTTP
+          error status;
+        * the body is over the bound: ``FORGEJO_RESPONSE_TOO_LARGE``;
+        * the status is not 200: ``FORGEJO_UNEXPECTED_STATUS``;
+        * the body ended before the response said it would:
+          ``FORGEJO_RESPONSE_TRUNCATED`` for fewer bytes than ``Content-Length``
+          promised, ``FORGEJO_UNAVAILABLE`` for an incomplete chunked body.
+        """
+        request = _request(urllib.request.Request, url, headers=headers, method="GET")
         try:
             with self._open(request) as response:
                 status = response.status
+                framing = _Framing(response)
                 body = response.read(self._limit + 1)
-        except (urllib.error.URLError, TimeoutError, OSError) as error:
+        except _CUT_OFF as error:
             raise _transport_refusal(error) from None
         if len(body) > self._limit:
             raise ObservationRefusal("FORGEJO_RESPONSE_TOO_LARGE", f"limit {self._limit} bytes")
         if status != 200:
             raise ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {status}")
+        framing.require_complete(len(body), "FORGEJO_RESPONSE_TRUNCATED")
         return body
 
     def stream(self, url, headers, max_bytes, chunk_bytes=65536, deadline=None):
@@ -152,6 +178,17 @@ class UrllibTransport:
         The request opens on the first ``next()``. Passing the cap closes the
         connection before the refusal is raised, so no byte beyond the cap
         past one chunk is read, and nothing is buffered or written to disk.
+
+        A body that ends before the response said it would is refused and is
+        never yielded as complete: ``FORGEJO_ARCHIVE_TRUNCATED`` when fewer bytes
+        arrived than ``Content-Length`` promised, and ``FORGEJO_UNAVAILABLE`` for
+        an incomplete chunked body. The check runs at the end of the stream,
+        after the last chunk was yielded, so a caller treats the body as complete
+        only when the iteration ends without a refusal. Any other failure of the
+        exchange is ``FORGEJO_UNAVAILABLE`` and names only the exception class;
+        an HTTP error status is ``FORGEJO_UNEXPECTED_STATUS``. A body with
+        neither ``Content-Length`` nor chunking ends at the connection close and
+        is not checked.
 
         The socket timeout restarts on every receive. It bounds a silent
         server, not a slow one: a server that drips bytes keeps a call blocked
@@ -181,14 +218,15 @@ class UrllibTransport:
         timeout = self._timeout
         watchdog = None
         if deadline is None:
-            request = urllib.request.Request(url, headers=headers, method="GET")
+            request = _request(urllib.request.Request, url, headers=headers, method="GET")
         else:
             remaining = deadline - self._clock()
             if remaining <= 0:
                 raise DeadlineRefusal("archive stream")
             timeout = min(timeout, remaining)
             watchdog = _Watchdog(remaining)
-            request = _WatchedRequest(url, headers=headers, method="GET", watchdog=watchdog)
+            # Built before the timer starts, so a refused URL leaves no timer behind.
+            request = _request(_WatchedRequest, url, headers=headers, method="GET", watchdog=watchdog)
 
         def expired():
             return watchdog is not None and (watchdog.fired or self._clock() >= deadline)
@@ -199,6 +237,7 @@ class UrllibTransport:
             with self._open(request, timeout) as response:
                 if response.status != 200:
                     raise ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {response.status}")
+                framing = _Framing(response)
                 received = 0
                 while True:
                     if expired():
@@ -209,6 +248,7 @@ class UrllibTransport:
                         # stream, not as an error: a cut-off is not a body.
                         if expired():
                             raise DeadlineRefusal("archive stream")
+                        framing.require_complete(received, "FORGEJO_ARCHIVE_TRUNCATED")
                         return
                     received += len(chunk)
                     if received > max_bytes:
@@ -217,9 +257,7 @@ class UrllibTransport:
         except _CUT_OFF as error:
             if expired():
                 raise DeadlineRefusal("archive stream") from None
-            if isinstance(error, OSError):
-                raise _transport_refusal(error) from None
-            raise
+            raise _transport_refusal(error) from None
         finally:
             if watchdog is not None:
                 watchdog.cancel()
@@ -237,6 +275,14 @@ class UrllibTransport:
         return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
 
 
+def _request(factory, *arguments, **keywords):
+    """Build a request; a URL that urllib rejects is a transport refusal, not a raw error."""
+    try:
+        return factory(*arguments, **keywords)
+    except ValueError as error:
+        raise _transport_refusal(error) from None
+
+
 def _transport_refusal(error):
     if isinstance(error, urllib.error.HTTPError):
         return ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {error.code}")
@@ -248,10 +294,72 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
         raise ObservationRefusal("FORGEJO_REDIRECT_REFUSED", f"HTTP {code}")
 
 
-#: What a connection cut off by the watchdog can raise: OSError (URLError and
-#: TimeoutError are OSErrors), the http.client view of a truncated message, and
-#: the ValueError of a read on a closed file or TLS socket.
+#: What a failed exchange can raise: OSError (URLError and TimeoutError are
+#: OSErrors); the http.client view of a malformed or truncated message
+#: (BadStatusLine, LineTooLong, IncompleteRead and the rest of HTTPException);
+#: and ValueError, from a read on a closed file or TLS socket or from a request
+#: header that http.client rejects. ``get`` and ``stream`` refuse all of them,
+#: and a connection that the watchdog cut off raises them too.
 _CUT_OFF = (OSError, http.client.HTTPException, ValueError)
+
+
+class _LastLine:
+    """The socket file of a chunked response, remembering the last line read.
+
+    ``http.client`` reads each chunk-size line and the trailer through
+    ``readline``, so the last line read shows how the body ended: a body that
+    was sent whole ends with the blank line that closes the trailer section.
+    Every other attribute is the socket file's own.
+    """
+
+    def __init__(self, fp):
+        self._fp = fp
+        self.last = None
+
+    def readline(self, *arguments):
+        self.last = self._fp.readline(*arguments)
+        return self.last
+
+    def __getattr__(self, name):
+        return getattr(self._fp, name)
+
+
+class _Framing:
+    """What a response promised about its body, taken before the first read.
+
+    ``http.client`` reports two kinds of cut-off body as a clean end of stream:
+
+    * a body shorter than its ``Content-Length``: ``read`` and ``read1`` return
+      what arrived and raise nothing;
+    * a chunked body cut off inside the final ``0`` line or before the blank
+      line that closes the trailer section: the parser accepts the missing
+      terminator as complete.
+
+    A chunked body cut off anywhere earlier raises ``IncompleteRead``, which the
+    callers refuse like any other failure. Both kinds above are judged here, at
+    the end of the body. ``length`` is the parser's own reading of
+    ``Content-Length``: it is ``None`` for a chunked response, where the header
+    is ignored, and for a value the parser could not read, so the raw header is
+    never compared. A response object without these attributes, such as a test
+    double, promises nothing and always passes.
+    """
+
+    def __init__(self, response):
+        self._declared = getattr(response, "length", None)
+        self._lines = None
+        fp = getattr(response, "fp", None)
+        if fp is not None and getattr(response, "chunked", False):
+            self._lines = _LastLine(fp)
+            response.fp = self._lines
+
+    def require_complete(self, received, reason):
+        """Refuse a body that ended cleanly but short; call it once, at the end of the body."""
+        if self._declared is not None and received != self._declared:
+            raise ObservationRefusal(reason, f"received {received} of {self._declared} bytes")
+        if self._lines is not None and self._lines.last not in (b"\r\n", b"\n"):
+            # The refusal that a cut-off the parser itself noticed gets.
+            raise _transport_refusal(http.client.IncompleteRead(b""))
+
 
 #: The thread name of the watchdog timer, so a test can find it.
 _WATCHDOG_THREAD = "ci-burst-stream-deadline"
@@ -506,8 +614,11 @@ class ForgejoSource:
         Requested by sha, never by branch. The request opens on the first
         ``next()``. The stream aborts with ``FORGEJO_ARCHIVE_TOO_LARGE`` once it
         passes ``max_bytes``, and with ``DeadlineRefusal`` once the optional
-        ``deadline`` (an absolute time on the transport's clock) is reached. The
-        caller closes the generator to abandon it.
+        ``deadline`` (an absolute time on the transport's clock) is reached. A
+        body that ends early is refused after its last chunk was yielded
+        (``FORGEJO_ARCHIVE_TRUNCATED``, or ``FORGEJO_UNAVAILABLE`` for a chunked
+        body cut off), so the archive is complete only when the generator ends
+        without a refusal. The caller closes the generator to abandon it.
         """
         if not _COMMIT_SHA.fullmatch(sha):
             raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", "archive must be requested by commit sha")

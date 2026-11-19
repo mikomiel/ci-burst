@@ -294,3 +294,21 @@ test('container image CI checker rejects credential and working-directory spelli
     );
   }
 });
+
+test('planning CI installs the hash-locked boto3 and requires it before the policy tests', () => {
+  const steps = workflow('ci.yml').jobs.planning.steps;
+  const index = (predicate) => steps.findIndex(predicate);
+  const python = index((s) => s.uses?.startsWith('actions/setup-python@'));
+  const install = index((s) => s.run === 'python3 -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt');
+  const guard = index((s) => s.run === "python3 -c 'import boto3'");
+  const tests = index((s) => s.run === 'npm run check:policy');
+  assert.ok(python >= 0 && install >= 0 && guard >= 0 && tests >= 0, 'every step must be present');
+  assert.ok(python < install && install < guard && guard < tests, 'install and guard must precede the tests');
+  for (const step of [steps[python], steps[install], steps[guard]]) {
+    assert.equal(step.if, undefined, 'the SDK steps must run unconditionally');
+    assert.equal(step['continue-on-error'], undefined, 'the SDK steps must fail the job');
+  }
+  assert.match(steps[python].uses, /^actions\/setup-python@[a-f0-9]{40}$/);
+  const declared = /requires-python\s*=\s*">=(\d+\.\d+)"/.exec(readFileSync(resolve(root, 'pyproject.toml'), 'utf8'))?.[1];
+  assert.equal(steps[python]['with']['python-version'], declared);
+});

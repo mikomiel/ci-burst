@@ -67,7 +67,7 @@ Image build state MUST live in its own SQLite file with its own lock and its own
 - **AND** no second builder runs
 
 ### Requirement: Image builds use a separate assumed-role identity
-Image builds MUST use a separate AWS role that the SDK assumes through a shared-config profile that names `role_arn` and `source_profile` (or a credential source), with a session of at most one hour. The image path MUST open its own SDK session from `[image].profile` and MUST NOT reuse the scaling session, the scaling credentials or `[aws].profile`.
+Image builds MUST use a separate AWS role that the SDK assumes through a shared-config profile that names `role_arn` and `source_profile`, with a session of at most one hour. The `source_profile` chain MUST end in static keys within five profiles and MUST use no other credential route; anything else MUST be refused with `IMAGE_PROFILE_INVALID`. The image path MUST open its own SDK session from `[image].profile` and MUST NOT reuse the scaling session, the scaling credentials or `[aws].profile`.
 
 #### Scenario: A build assumes the role
 - **WHEN** a pass makes its first AWS call

@@ -5,10 +5,11 @@ with an unexpected field fails the test. Their parameter names follow the EC2
 and S3 APIs from the design and were not checked against an installed SDK,
 which this checkout does not have.
 
-``RealSdkProfileTests`` and ``RealSdkLoggingTests`` are the exception: they run
-the real boto3 and botocore against temporary configuration files, a loopback
-credential endpoint and a stub in place of the HTTP transport, so they make no
-network call. They are skipped where boto3 is not installed.
+``RealSdkProfileTests``, ``RealSdkLoggingTests`` and ``RealSdkCredentialFailureTests``
+are the exception: they run the real boto3 and botocore against temporary
+configuration files, a loopback credential endpoint and a stub in place of the
+HTTP transport, so they make no network call. They are skipped where boto3 is
+not installed.
 
 Sentinel values stand in for the presigned URL, a token and builder user data.
 They are synthetic and carry no key-like or signature-like shape.
@@ -320,6 +321,18 @@ class FakeCredentials:
         return object()
 
 
+class FailingCredentials:
+    """Lazy credentials whose first resolution fails, like an assumed role that the provider refuses."""
+
+    def __init__(self, error):
+        self.error = error
+        self.resolved = 0
+
+    def get_frozen_credentials(self):
+        self.resolved += 1
+        raise self.error
+
+
 class FakeSession:
     def __init__(self, calls, ec2, s3, credentials=None):
         self.calls = calls
@@ -463,6 +476,72 @@ class SessionTests(Base):
             with self.assertRaises(ProviderRefusal) as raised:
                 ImageAws(REGION, PROFILE)._session()
         self.assertEqual(raised.exception.reason, "AWS_SDK_UNAVAILABLE")
+
+    def client_calls(self):
+        """Every operation that needs a client of the image session, by name."""
+        return {
+            "builders": lambda aws: aws.builders(DEPLOYMENT),
+            "instances": lambda aws: aws.instances(["i-0123456789abcdef0"]),
+            "run_builder": lambda aws: self.builder(aws),
+            "image": lambda aws: aws.image("ami-0123456789abcdef0"),
+            "snapshot": lambda aws: aws.snapshot("snap-0123456789abcdef0"),
+            "deregister_image": lambda aws: aws.deregister_image("ami-0123456789abcdef0"),
+            "put_archive": lambda aws: aws.put_archive(BUCKET, PREFIX + "x.tar.gz", [b"data"], max_bytes=100),
+            "presign_get": lambda aws: aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800),
+        }
+
+    def test_a_failure_to_build_a_client_leaves_as_a_provider_refusal_from_every_operation(self):
+        class NoClient(FakeSession):
+            def client(self, service, region_name=None, config=None):
+                raise RuntimeError(LEAKY_MESSAGE)
+
+        def no_session(profile):
+            raise RuntimeError(LEAKY_MESSAGE)
+
+        factories = {"client build": lambda profile: NoClient(self.calls, self.ec2, self.s3), "session": no_session}
+        with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
+            for label, factory in factories.items():
+                for name, call in self.client_calls().items():
+                    with self.subTest(label=label, call=name):
+                        # The expiry is given, so that ``presign_get`` reaches its client.
+                        aws = ImageAws(REGION, PROFILE, session_factory=factory, clock=self.clock, expiry=NOW + 3600)
+                        with self.assertRaises(ProviderRefusal) as raised:
+                            call(aws)
+                        refusal = raised.exception
+                        self.assertEqual(
+                            (refusal.reason, refusal.detail, refusal.uncertain), ("AWS_UNCERTAIN", "RuntimeError", True)
+                        )
+                        rendered = [str(refusal), repr(refusal), repr(refusal.as_dict())]
+                        rendered.append("".join(traceback.format_exception(refusal)))
+                        for text, sentinel in itertools.product(rendered, SENTINELS):
+                            self.assertNotIn(sentinel, text)
+        self.assertEqual(self.names(), [])
+
+    def test_a_refusal_from_the_session_passes_every_operation_unchanged(self):
+        refusal = ProviderRefusal("IMAGE_PROFILE_INVALID", f"profile {PROFILE}: it does not exist")
+
+        class RefusingClient(FakeSession):
+            def client(self, service, region_name=None, config=None):
+                raise refusal
+
+        def refusing_session(profile):
+            raise refusal
+
+        with_expiry = {**self.client_calls(), "credential_expiry": lambda aws: aws.credential_expiry()}
+        scenarios = {
+            "client build": (lambda profile: RefusingClient(self.calls, self.ec2, self.s3), self.client_calls()),
+            "session": (refusing_session, with_expiry),
+        }
+        with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
+            for label, (factory, calls) in scenarios.items():
+                for name, call in calls.items():
+                    # ``credential_expiry`` reads the session only when no expiry is given.
+                    expiry = None if name == "credential_expiry" else NOW + 3600
+                    with self.subTest(label=label, call=name):
+                        aws = ImageAws(REGION, PROFILE, session_factory=factory, clock=self.clock, expiry=expiry)
+                        with self.assertRaises(ProviderRefusal) as raised:
+                            call(aws)
+                        self.assertIs(raised.exception, refusal)
 
     def test_no_iam_client_is_created_by_any_operation(self):
         session = FakeSession(self.calls, self.ec2, self.s3)
@@ -1446,6 +1525,47 @@ class PresignTests(Base):
         aws = self.image_aws(expiry=lambda: NOW + 3600)
         self.assertEqual(aws.presign_get(BUCKET, self.KEY, 1800), SENTINEL_URL)
 
+    def test_a_credential_resolution_that_fails_is_a_provider_refusal_with_a_stable_reason(self):
+        _, modules = sdk_client_error("AccessDenied")
+        exceptions = modules["botocore.exceptions"]
+
+        class Denied(exceptions.ClientError):
+            response = {"Error": {"Code": "AccessDenied", "Message": LEAKY_MESSAGE}}
+
+        class NoCredentialsError(exceptions.BotoCoreError):
+            """botocore's error for credentials that are missing."""
+
+        def adapter(error):
+            credentials = FailingCredentials(error)
+            session = FakeSession(self.calls, self.ec2, self.s3, credentials=credentials)
+            aws = ImageAws(
+                REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock
+            )
+            return aws, credentials
+
+        failures = {
+            "denied": (Denied(LEAKY_MESSAGE), "AccessDenied"),
+            "missing": (NoCredentialsError(LEAKY_MESSAGE), "NoCredentialsError"),
+        }
+        with mock.patch.dict(sys.modules, modules):
+            for label, (error, detail) in failures.items():
+                aws, credentials = adapter(error)
+                calls = {
+                    "credential_expiry": aws.credential_expiry,
+                    "presign_get": lambda aws=aws: aws.presign_get(BUCKET, self.KEY, 1800),
+                }
+                for name, call in calls.items():
+                    with self.subTest(label=label, call=name):
+                        with self.assertRaises(ProviderRefusal) as raised:
+                            call()
+                        refusal = raised.exception
+                        self.assertEqual(
+                            (refusal.reason, refusal.detail, refusal.uncertain), ("AWS_UNCERTAIN", detail, True)
+                        )
+                # Both calls resolved the credentials, and neither went on to sign a URL.
+                self.assertEqual(credentials.resolved, 2)
+        self.assertEqual(self.requests("generate_presigned_url"), [])
+
 
 class Capture:
     """Every surface a secret could reach: logs, streams and error renderings."""
@@ -1580,6 +1700,34 @@ class NoSecretTests(Base):
             capture.run(lambda: self.image_aws(expiry=NOW + 10).presign_get(BUCKET, PREFIX + "x.tar.gz", 1800))
         self.assertEqual(len(capture.rendered), 12)
         self.assert_clean(capture.surfaces(), "presign")
+
+    def test_a_credential_failure_keeps_the_provider_text_out_of_every_rendering(self):
+        _, modules = sdk_client_error("AccessDenied")
+        exceptions = modules["botocore.exceptions"]
+
+        class Denied(exceptions.ClientError):
+            response = {"Error": {"Code": "AccessDenied", "Message": LEAKY_MESSAGE}}
+
+        class NoCredentialsError(exceptions.BotoCoreError):
+            """botocore's error for credentials that are missing."""
+
+        failures = (Denied(LEAKY_MESSAGE), NoCredentialsError(LEAKY_MESSAGE), RuntimeError(LEAKY_MESSAGE))
+        for label, patched in (("sdk", modules), ("no sdk", {"botocore": None, "botocore.exceptions": None})):
+            for error in failures:
+                session = FakeSession(self.calls, self.ec2, self.s3, credentials=FailingCredentials(error))
+                aws = ImageAws(
+                    REGION,
+                    PROFILE,
+                    session_factory=lambda profile, s=session: s,
+                    clients={"s3": self.s3},
+                    clock=self.clock,
+                )
+                with self.subTest(label=label, error=type(error).__name__):
+                    with mock.patch.dict(sys.modules, patched), Capture() as capture:
+                        capture.run(lambda aws=aws: aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800))
+                    # Six surfaces mean a provider refusal came out, not the SDK's own error.
+                    self.assertEqual(len(capture.rendered), 6)
+                    self.assert_clean(capture.surfaces(), f"{label} {type(error).__name__}")
 
     def test_a_whole_successful_pass_logs_and_prints_nothing_secret_and_summaries_omit_it(self):
         self.ec2.versions_store[("example-worker", 3)] = {
@@ -1777,6 +1925,141 @@ class SdkLoggerGuardTests(unittest.TestCase):
                 ImageAws(REGION, PROFILE, **arguments)
                 self.assertEqual(self.levels(), dict.fromkeys(SDK_LOGGER_NAMES, logging.INFO))
 
+    def level(self, name, level):
+        """Give the logger ``name`` this level for the rest of the test, then put its old level back."""
+        logger = logging.getLogger(name)
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.setLevel(level)
+        return logger
+
+    def test_an_explicit_debug_level_on_an_sdk_descendant_is_raised_to_info(self):
+        names = (
+            "botocore.endpoint",
+            "botocore.parsers",
+            "botocore.endpoint.pool",
+            "urllib3.connectionpool",
+            "boto3.resources.action",
+        )
+        root = logging.getLogger()
+        root.setLevel(logging.DEBUG)
+        # The three top-level loggers are where the guard used to stop.
+        for name in SDK_LOGGER_NAMES:
+            logging.getLogger(name).setLevel(logging.INFO)
+        loggers = [self.level(name, logging.DEBUG) for name in names]
+        records = LogRecords()
+        root.addHandler(records)
+        self.addCleanup(root.removeHandler, records)
+
+        def spoken():
+            records.records.clear()
+            for logger in loggers:
+                logger.debug("debug of %s", logger.name)
+                logger.info("info of %s", logger.name)
+            return [message for _, _, message in records.records]
+
+        # A level of its own wins over every ancestor, so each descendant still speaks at DEBUG.
+        self.assertEqual(len(spoken()), 2 * len(names))
+        ImageAws(REGION, PROFILE)
+        self.assertEqual(spoken(), [f"info of {name}" for name in names])
+        self.assertEqual([logger.level for logger in loggers], [logging.INFO] * len(names))
+
+    def test_a_descendant_that_is_unset_or_already_quieter_is_left_alone(self):
+        wanted = {
+            "botocore.endpoint": logging.NOTSET,
+            "botocore.auth": logging.WARNING,
+            "urllib3.connectionpool": logging.ERROR,
+            "boto3.resources.action": logging.INFO,
+        }
+        logging.getLogger().setLevel(logging.DEBUG)
+        for name in SDK_LOGGER_NAMES:
+            logging.getLogger(name).setLevel(logging.NOTSET)
+        for name, level in wanted.items():
+            self.level(name, level)
+        ImageAws(REGION, PROFILE)
+        self.assertEqual({name: logging.getLogger(name).level for name in wanted}, wanted)
+        # An unset descendant has no level of its own, so it follows its parent, which the guard raised.
+        self.assertEqual(logging.getLogger("botocore.endpoint").getEffectiveLevel(), logging.INFO)
+
+    def test_a_logger_that_only_looks_like_an_sdk_logger_is_left_alone(self):
+        names = (
+            "botocore2",
+            "botocore2.endpoint",
+            "boto3x.resources",
+            "urllib3_extras",
+            "myapp.botocore",
+            "myapp.urllib3",
+        )
+        for name in names:
+            self.level(name, logging.DEBUG)
+        ImageAws(REGION, PROFILE)
+        for name in names:
+            with self.subTest(name):
+                self.assertEqual(logging.getLogger(name).level, logging.DEBUG)
+
+    def test_a_logger_between_two_sdk_loggers_that_was_never_created_is_skipped(self):
+        leaf = self.level("botocore.ci_burst_probe.leaf", logging.DEBUG)
+        # Python keeps a placeholder, which has no level, where an ancestor was never created.
+        self.assertIsInstance(logging.Logger.manager.loggerDict["botocore.ci_burst_probe"], logging.PlaceHolder)
+        ImageAws(REGION, PROFILE)
+        self.assertEqual(leaf.level, logging.INFO)
+        self.assertIsInstance(logging.Logger.manager.loggerDict["botocore.ci_burst_probe"], logging.PlaceHolder)
+
+    def test_the_credential_logger_gets_one_filter_however_often_an_image_session_is_built(self):
+        logger = without_filters(self, "botocore.credentials")
+        ImageAws(REGION, PROFILE)
+        ImageAws(REGION, PROFILE, session_factory=lambda profile: object())
+        self.assertEqual(len(logger.filters), 1)
+        self.assertIsInstance(logger.filters[0], logging.Filter)
+
+    def test_a_record_leaves_the_credential_filter_with_its_message_and_without_its_traceback(self):
+        logger = without_filters(self, "botocore.credentials")
+        ImageAws(REGION, PROFILE)
+        try:
+            raise ProviderError("AccessDenied")
+        except ProviderError:
+            exc_info = sys.exc_info()
+        record = logging.LogRecord(
+            logger.name,
+            logging.WARNING,
+            __file__,
+            1,
+            "refresh failed during %s",
+            ("mandatory",),
+            exc_info,
+            sinfo=f"stack {LEAKY_MESSAGE}",
+        )
+        # A handler that formatted the record first leaves its text on the record.
+        record.exc_text = f"Traceback {LEAKY_MESSAGE}"
+        # Python 3.12 returns the record from ``filter``, an earlier Python returns True.
+        self.assertTrue(logger.filter(record))
+        self.assertEqual((record.exc_info, record.exc_text, record.stack_info), (None, None, None))
+        self.assertEqual((record.levelno, record.getMessage()), (logging.WARNING, "refresh failed during mandatory"))
+
+    def test_the_warning_for_a_failed_credential_refresh_keeps_its_line_and_loses_the_provider_text(self):
+        logger = without_filters(self, "botocore.credentials")
+        self.level("botocore.credentials", logging.WARNING)
+        logged = LoggedText()
+        logger.addHandler(logged)
+        self.addCleanup(logger.removeHandler, logged)
+        message = "Refreshing temporary credentials failed during %s refresh period."
+
+        def fail_to_refresh():
+            """Log what the SDK logs when it cannot refresh, and return the one text a handler wrote."""
+            logged.entries.clear()
+            try:
+                raise ProviderError("AccessDenied")
+            except ProviderError:
+                logger.warning(message, "mandatory", exc_info=True)
+            ((_, _, text),) = logged.entries
+            return text
+
+        # Control: as the SDK leaves it, the record carries the traceback and the provider's message.
+        control = fail_to_refresh()
+        self.assertIn("Traceback", control)
+        self.assertIn(SENTINEL_TOKEN, control)
+        ImageAws(REGION, PROFILE)
+        self.assertEqual(fail_to_refresh(), "WARNING botocore.credentials: " + message % "mandatory")
+
 
 # -- the real SDK -------------------------------------------------------------
 #
@@ -1807,6 +2090,14 @@ def assume_role_response():
         "</AssumeRoleResult><ResponseMetadata><RequestId>request-0002</RequestId></ResponseMetadata>"
         "</AssumeRoleResponse>"
     ).encode()
+
+
+#: What STS answers when the caller may not assume the role, with a message that carries the sentinels.
+DENIED_RESPONSE = (
+    '<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type>'
+    f"<Code>AccessDenied</Code><Message>{LEAKY_MESSAGE}</Message></Error>"
+    "<RequestId>request-0003</RequestId></ErrorResponse>"
+).encode()
 
 
 def profile_config(name, **settings):
@@ -1895,6 +2186,36 @@ class LogRecords(logging.Handler):
         return [
             name for name, level, _ in self.records if level < logging.INFO and name.split(".")[0] in SDK_LOGGER_NAMES
         ]
+
+
+class LoggedText(logging.Handler):
+    """What a handler with a plain ``Formatter`` writes for each record it is given, traceback included.
+
+    ``LogRecords`` keeps only the message, which is why a traceback needs this one.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        self.entries = []
+
+    def emit(self, record):
+        self.entries.append((record.name, record.levelno, self.format(record)))
+
+    def warnings_from(self, name):
+        return [text for logger, level, text in self.entries if logger == name and level == logging.WARNING]
+
+
+def without_filters(case, name):
+    """The logger ``name`` with no filter on it until the test ends, when its filters come back.
+
+    Building an ``ImageAws`` leaves a filter on the SDK's credential logger for the life of the
+    process, so a test that wants to see the filter added, or the record before it, starts here.
+    """
+    logger = logging.getLogger(name)
+    case.addCleanup(setattr, logger, "filters", list(logger.filters))
+    logger.filters.clear()
+    return logger
 
 
 class RealSdkCase(unittest.TestCase):
@@ -2132,19 +2453,35 @@ class RealSdkLoggingTests(RealSdkCase):
     """The SDK's DEBUG records print requests and credentials, so the adapter silences them.
 
     Each test first shows the leak with the SDK loggers as botocore leaves them,
-    so a clean second half is not a capture that sees nothing.
+    so a clean second half is not a capture that sees nothing. Two descendants
+    have a level of their own, as a debugging session leaves them, and a level of
+    its own wins over every ancestor: a second control shows that raising only the
+    three top-level loggers leaves those two speaking.
     """
+
+    #: SDK loggers below the top three that carry an explicit DEBUG level.
+    LEVELLED = ("botocore.endpoint", "botocore.parsers")
 
     def setUp(self):
         root = logging.getLogger()
-        for logger in (root, *map(logging.getLogger, SDK_LOGGER_NAMES)):
+        for logger in (root, *map(logging.getLogger, (*SDK_LOGGER_NAMES, *self.LEVELLED))):
             self.addCleanup(logger.setLevel, logger.level)
         for name in SDK_LOGGER_NAMES:
             logging.getLogger(name).setLevel(logging.NOTSET)
+        for name in self.LEVELLED:
+            logging.getLogger(name).setLevel(logging.DEBUG)
         self.records = LogRecords()
         root.addHandler(self.records)
         self.addCleanup(root.removeHandler, self.records)
         root.setLevel(logging.DEBUG)
+
+    def set_the_top_level_loggers(self, level):
+        for name in SDK_LOGGER_NAMES:
+            logging.getLogger(name).setLevel(level)
+
+    def assert_only_the_levelled_loggers_speak(self):
+        self.assertTrue(self.records.sdk_debug())
+        self.assertLessEqual(set(self.records.sdk_debug()), set(self.LEVELLED))
 
     def stub(self, request, body, calls):
         """Answer a request with ``body``, noting its form fields in ``calls``."""
@@ -2162,13 +2499,28 @@ class RealSdkLoggingTests(RealSdkCase):
         markers = (*SENTINELS, SENTINEL_CLIENT_TOKEN)
         user_data_text = base64.b64encode(LEAKY_MESSAGE.encode()).decode()
         template = {"LaunchTemplateName": "example-ci-burst-image-builder", "Version": "2"}
+        launch = {
+            "LaunchTemplate": template,
+            "MinCount": 1,
+            "MaxCount": 1,
+            "ClientToken": SENTINEL_CLIENT_TOKEN,
+            "UserData": LEAKY_MESSAGE,
+        }
 
         # Control: a plain client logs the whole request, encoded user data and token included.
-        session.client("ec2", region_name=REGION).run_instances(
-            LaunchTemplate=template, MinCount=1, MaxCount=1, ClientToken=SENTINEL_CLIENT_TOKEN, UserData=LEAKY_MESSAGE
-        )
+        session.client("ec2", region_name=REGION).run_instances(**launch)
         self.assertIn(user_data_text, self.records.text())
         self.assertCountEqual(markers_in(self.records.text(), markers), markers)
+
+        # Control: with only the top-level loggers raised, the request still reaches the log
+        # through the two descendants that have a level of their own, and through nothing else.
+        self.set_the_top_level_loggers(logging.INFO)
+        self.records.records.clear()
+        session.client("ec2", region_name=REGION).run_instances(**launch)
+        self.assertCountEqual(markers_in(self.records.text(), markers), markers)
+        self.assert_only_the_levelled_loggers_speak()
+        # The adapter starts from loggers that are unset, so it has to raise those three itself.
+        self.set_the_top_level_loggers(logging.NOTSET)
 
         self.records.records.clear()
         requests.clear()
@@ -2203,6 +2555,18 @@ class RealSdkLoggingTests(RealSdkCase):
         plain.get_credentials().get_frozen_credentials()
         self.assertCountEqual(markers_in(self.records.text(), ASSUMED_MARKERS), ASSUMED_MARKERS)
 
+        # Control: with only the top-level loggers raised, the response still reaches the log
+        # through the descendants that have a level of their own, and through nothing else.
+        self.set_the_top_level_loggers(logging.INFO)
+        self.records.records.clear()
+        again = botocore.session.Session(profile=PROFILE)
+        again.register("before-send.sts.AssumeRole", sts)
+        again.get_credentials().get_frozen_credentials()
+        self.assertCountEqual(markers_in(self.records.text(), ASSUMED_MARKERS), ASSUMED_MARKERS)
+        self.assert_only_the_levelled_loggers_speak()
+        # The adapter starts from loggers that are unset, so it has to raise those three itself.
+        self.set_the_top_level_loggers(logging.NOTSET)
+
         self.records.records.clear()
         requests.clear()
         aws = ImageAws(REGION, PROFILE)
@@ -2212,6 +2576,108 @@ class RealSdkLoggingTests(RealSdkCase):
         self.assertEqual([call["Action"] for call in requests], [["AssumeRole"]])
         self.assertEqual(markers_in(self.records.text(), ASSUMED_MARKERS), [])
         self.assertEqual(self.records.sdk_debug(), [])
+
+
+@unittest.skipIf(boto3 is None, REAL_SDK_REASON)
+class RealSdkCredentialFailureTests(RealSdkCase):
+    """A role that the provider will not let the adapter assume leaves as a sanitized refusal.
+
+    The role is assumed on the first use of the credentials, not when the session is built,
+    so the provider's answer, with its message, comes out of whichever call needs them first.
+    botocore also logs a failed refresh at WARNING, with the provider's message in the
+    traceback. The adapter keeps that line and drops the traceback, which the second test measures.
+    """
+
+    def setUp(self):
+        self.use_files(profile_config(PROFILE, **ASSUME_ROLE_SETTINGS), SOURCE_CREDENTIALS)
+        self.sent = self.forbid_transport()
+        self.asked = []
+        root = logging.getLogger()
+        for logger in (root, *map(logging.getLogger, SDK_LOGGER_NAMES)):
+            self.addCleanup(logger.setLevel, logger.level)
+        # A handler on the root keeps botocore's warning off the last-resort stream.
+        records = LogRecords()
+        root.addHandler(records)
+        self.addCleanup(root.removeHandler, records)
+        # Earlier tests built an ImageAws, which left its filter on this logger for good.
+        without_filters(self, "botocore.credentials")
+
+    def deny(self, request, **kwargs):
+        """Answer an AssumeRole request the way STS answers a caller that may not assume the role."""
+        sent = request.body.decode() if isinstance(request.body, bytes) else request.body
+        self.asked.append(urllib.parse.parse_qs(sent)["Action"])
+        return AWSResponse(request.url, 403, {}, RawBody(DENIED_RESPONSE))
+
+    def test_a_denied_role_leaves_as_a_sanitized_refusal_from_every_call_that_needs_the_credentials(self):
+        # Control: the SDK's own error carries the provider's message.
+        plain = botocore.session.Session(profile=PROFILE)
+        plain.register("before-send.sts.AssumeRole", self.deny)
+        with self.assertRaises(botocore.exceptions.ClientError) as raised:
+            plain.get_credentials().get_frozen_credentials()
+        self.assertIn(SENTINEL_TOKEN, str(raised.exception))
+        self.assertEqual(self.asked, [["AssumeRole"]])
+
+        self.asked.clear()
+        aws = ImageAws(REGION, PROFILE)
+        aws._session().events.register("before-send.sts.AssumeRole", self.deny)
+        key = PREFIX + "x.tar.gz"
+        calls = {
+            "credential_expiry": aws.credential_expiry,
+            "presign_get": lambda: aws.presign_get(BUCKET, key, 1800),
+            "builders": lambda: aws.builders(DEPLOYMENT),
+            "image": lambda: aws.image("ami-0123456789abcdef0"),
+            "put_archive": lambda: aws.put_archive(BUCKET, key, [b"data"], max_bytes=100),
+        }
+        for name, call in calls.items():
+            with self.subTest(call=name):
+                with self.assertRaises(ProviderRefusal) as raised:
+                    call()
+                refusal = raised.exception
+                self.assertEqual(
+                    (refusal.reason, refusal.detail, refusal.uncertain), ("AWS_UNCERTAIN", "AccessDenied", True)
+                )
+                rendered = [str(refusal), repr(refusal), repr(refusal.as_dict()), repr(vars(refusal))]
+                rendered.append("".join(traceback.format_exception(refusal)))
+                for text, sentinel in itertools.product(rendered, SENTINELS):
+                    self.assertNotIn(sentinel, text)
+        # Each call went and asked, so none was stopped short of the credentials or answered from a cache.
+        self.assertEqual(self.asked, [["AssumeRole"]] * len(calls))
+        self.assertEqual(self.sent, [])
+
+    def test_the_warning_botocore_logs_for_the_failed_refresh_keeps_its_line_and_loses_the_provider_text(self):
+        # The SDK's loggers as they stand when nobody has set them, so that both halves emit the warning.
+        root = logging.getLogger()
+        root.setLevel(logging.WARNING)
+        for name in SDK_LOGGER_NAMES:
+            logging.getLogger(name).setLevel(logging.NOTSET)
+        logged = LoggedText()
+        root.addHandler(logged)
+        self.addCleanup(root.removeHandler, logged)
+
+        # Control: a plain session leaves the provider's message in the traceback of the SDK's own warning.
+        plain = botocore.session.Session(profile=PROFILE)
+        plain.register("before-send.sts.AssumeRole", self.deny)
+        with self.assertRaises(botocore.exceptions.ClientError):
+            plain.get_credentials().get_frozen_credentials()
+        controls = logged.warnings_from("botocore.credentials")
+        self.assertTrue(controls)
+        for text in controls:
+            self.assertIn("Traceback", text)
+            self.assertIn(SENTINEL_TOKEN, text)
+
+        logged.entries.clear()
+        aws = ImageAws(REGION, PROFILE)
+        aws._session().events.register("before-send.sts.AssumeRole", self.deny)
+        # The credential read and a request signed with the credentials are two routes into the refresh.
+        for call in (aws.credential_expiry, lambda: aws.builders(DEPLOYMENT)):
+            with self.assertRaises(ProviderRefusal):
+                call()
+        warnings = logged.warnings_from("botocore.credentials")
+        # The warning is still logged, and what is logged is its message line alone.
+        self.assertTrue(warnings)
+        self.assertLessEqual(set(warnings), {text.splitlines()[0] for text in controls})
+        for text, sentinel in itertools.product(warnings, SENTINELS):
+            self.assertNotIn(sentinel, text)
 
 
 if __name__ == "__main__":

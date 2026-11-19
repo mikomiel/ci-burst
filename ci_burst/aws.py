@@ -15,10 +15,12 @@ one named shared-config profile, never from ``[aws].profile``, and it can reach
 only the EC2 and S3 services. The module has no IAM client. The presigned
 archive URL, user data and the full template payload are never logged, echoed in
 an error or placed in a returned summary. The module emits no log record of its
-own; it only raises the level of the SDK's loggers, whose DEBUG records would
-print those values (see ``_quiet_sdk_loggers``).
+own; it raises the level of the SDK's loggers, whose DEBUG records would print
+those values, and it strips the traceback from the one WARNING the SDK logs when
+an assumed role's credentials fail to refresh (see ``_quiet_sdk_loggers``).
 """
 
+import contextlib
 import copy
 import hashlib
 import logging
@@ -459,7 +461,8 @@ _STATIC_KEYS = ("aws_access_key_id", "aws_secret_access_key")
 #: holds the static keys. botocore has no limit and refuses only a cycle.
 MAX_PROFILE_CHAIN = 5
 
-#: The SDK loggers that ``ImageAws`` keeps at INFO or above.
+#: The top-level SDK loggers. ``ImageAws`` keeps them, and the loggers below
+#: them that exist when it is built, at INFO or above.
 SDK_LOGGERS = ("botocore", "boto3", "urllib3")
 
 
@@ -621,6 +624,16 @@ def _profile_problem(sdk_session, profile):
     return None
 
 
+class _WithoutTraceback(logging.Filter):
+    """Pass a record on with its message, and without its traceback or stack."""
+
+    def filter(self, record):
+        record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
+        return True
+
+
 def _quiet_sdk_loggers():
     """Keep the SDK's own diagnostics from printing what this adapter keeps private.
 
@@ -632,16 +645,39 @@ def _quiet_sdk_loggers():
     command: it holds for any handler or root level that is set later, and it
     suits a command that runs one pass and exits.
 
-    Each logger is set to INFO, or to the level it already has or inherits when
-    that is higher. A logger that is unset or below INFO is raised, a quieter one
-    keeps its level, and no logger becomes more verbose than it was (an unset
-    logger under a root set to WARNING stays at WARNING, not INFO). A logger that
-    a caller levelled explicitly further down the tree (for example
-    ``botocore.endpoint``) is not reached.
+    Each top-level logger is set to INFO, or to the level it already has or
+    inherits when that is higher. One that is unset or below INFO is raised, a
+    quieter one keeps its level, and none becomes more verbose than it was (an
+    unset logger under a root set to WARNING stays at WARNING, not INFO).
+
+    A level of its own wins over every ancestor, and Python does not apply an
+    ancestor's level again to a logger that already has one. So every logger
+    below the top-level three that exists now and was levelled below INFO (for
+    example ``botocore.endpoint`` set to DEBUG) is raised to INFO as well. An
+    unset one follows its raised parent and a quieter one keeps its level. A
+    logger that is levelled to DEBUG after this call is the caller's choice.
+
+    A level cannot hide one record. When an assumed role's credentials fail to
+    refresh, the SDK's ``RefreshableCredentials._protected_refresh`` logs a
+    WARNING with ``exc_info=True``, and the traceback ends in the provider's
+    error message. Raw provider payloads must stay out of every log, and raising
+    ``botocore.credentials`` above WARNING would also silence that module's
+    other warnings. So a filter on that logger keeps the record, message line
+    included, and clears its traceback and stack. It is added once, however
+    often an ``ImageAws`` is built.
     """
     for name in SDK_LOGGERS:
         logger = logging.getLogger(name)
         logger.setLevel(max(logging.INFO, logger.getEffectiveLevel()))
+    # A copy, because a thread may create a logger while this walks. A placeholder
+    # stands where an ancestor was never created and has no level to raise.
+    for name, logger in list(logging.Logger.manager.loggerDict.items()):
+        is_sdk_logger = isinstance(logger, logging.Logger) and name.partition(".")[0] in SDK_LOGGERS
+        if is_sdk_logger and logging.NOTSET < logger.level < logging.INFO:
+            logger.setLevel(logging.INFO)
+    credentials = logging.getLogger("botocore.credentials")
+    if not any(isinstance(existing, _WithoutTraceback) for existing in credentials.filters):
+        credentials.addFilter(_WithoutTraceback())
 
 
 def _session_expiry(session):
@@ -670,7 +706,10 @@ class ImageAws:
     otherwise fall back to its default chain, which may be the scaling identity.
     The default session factory refuses a profile that is not an assume-role
     route, or whose ``source_profile`` chain does not end in static keys, for
-    the same reason (see ``_boto3_session``).
+    the same reason (see ``_boto3_session``). A failure of the session, of a
+    client's construction or of the credentials, an assumed role's included,
+    leaves as a ``ProviderRefusal`` that carries an error code or class name and
+    none of the SDK's text (see ``_sdk_failures``).
 
     Primitives here do not decide what may be deleted or terminated. The caller
     verifies the ownership tags first (see the image deletion rule).
@@ -712,7 +751,8 @@ class ImageAws:
                 read_timeout=READ_TIMEOUT_SECONDS,
                 **overrides,
             )
-            self._clients[service] = self._session().client(service, region_name=self._region, config=config)
+            with _sdk_failures():
+                self._clients[service] = self._session().client(service, region_name=self._region, config=config)
         return self._clients[service]
 
     def _invoke(self, service, method, *, read=False, absent=None, **arguments):
@@ -857,8 +897,9 @@ class ImageAws:
 
     def image(self, image_id):
         """One image, or ``None`` when the provider no longer knows it."""
+        client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
         try:
-            response = self._client("ec2").describe_images(ImageIds=[image_id], Owners=["self"])
+            response = client.describe_images(ImageIds=[image_id], Owners=["self"])
         except Exception as error:  # noqa: BLE001 - classified below
             if _error_code(error) == "InvalidAMIID.NotFound":
                 return None
@@ -878,8 +919,9 @@ class ImageAws:
 
     def snapshot(self, snapshot_id):
         """One snapshot, or ``None`` when the provider no longer knows it."""
+        client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
         try:
-            response = self._client("ec2").describe_snapshots(SnapshotIds=[snapshot_id], OwnerIds=["self"])
+            response = client.describe_snapshots(SnapshotIds=[snapshot_id], OwnerIds=["self"])
         except Exception as error:  # noqa: BLE001 - classified below
             if _error_code(error) == "InvalidSnapshot.NotFound":
                 return None
@@ -1073,10 +1115,17 @@ class ImageAws:
         self._invoke("s3", "delete_object", Bucket=bucket, Key=key)
 
     def credential_expiry(self):
-        """Epoch expiry of this session's credentials, or ``None`` when unknown."""
+        """Epoch expiry of this session's credentials, or ``None`` when unknown.
+
+        An assumed role is assumed here, when its credentials are first read, so
+        this is where the provider refuses it (an expired source key, a trust
+        policy that denies the caller). That failure leaves as a ``ProviderRefusal``
+        with the provider's error code and never its message.
+        """
         if self._expiry is not None:
             return self._expiry() if callable(self._expiry) else self._expiry
-        return _session_expiry(self._session())
+        with _sdk_failures():
+            return _session_expiry(self._session())
 
     def presign_get(self, bucket, key, expires_seconds):
         """Presign a GET for one object, only if the session outlives the URL.
@@ -1177,6 +1226,24 @@ def _translate_read(error):
     """
     refusal = _translate(error)
     return ProviderRefusal(refusal.reason, refusal.detail, uncertain=True)
+
+
+@contextlib.contextmanager
+def _sdk_failures():
+    """Let only a refusal leave a call that builds the session, a client or credentials.
+
+    Credentials of an assumed role resolve on their first use, so the SDK's own
+    error for a role it was refused comes out of whichever call needs them first,
+    and its message can carry what was asked. A refusal, such as the profile
+    check's, passes unchanged. Any other failure leaves as ``_translate`` makes
+    it: the error's code or class and nothing of its text.
+    """
+    try:
+        yield
+    except Refusal:
+        raise
+    except Exception as error:  # noqa: BLE001 - classified by _translate
+        raise _translate(error) from None
 
 
 def _error_code(error):

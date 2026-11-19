@@ -22,6 +22,16 @@ jobs:
         with:
           node-version: '24'
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      # 3.12 is the minimum that pyproject.toml declares and the version of the
+      # container image. The runner's system python3 is externally managed
+      # (PEP 668), so pip cannot install into it.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install boto3 and its dependencies from the hash-locked file
+        run: "python3 -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt"
+      - name: Fail unless boto3 is importable, so a test that needs the SDK cannot skip unnoticed
+        run: python3 -c 'import boto3'
       - run: npm run check:policy
       - run: npm run check:spec
 

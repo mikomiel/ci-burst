@@ -26,6 +26,11 @@
 #                                    default 5400
 #   WARM_SNAPSHOT_SECONDS  optional  how long the builder stays up after the
 #                                    marker, 60..3600, default 1800
+#   WARM_SRC_STRIP_COMPONENTS
+#                          optional  leading path components that extraction
+#                                    drops from every archive member, 0 or 1,
+#                                    default 0; a forge archive wraps the
+#                                    source in one directory, so it needs 1
 #
 # The extraction and every command run from the extracted source root as the job
 # account, each in its own transient systemd unit:
@@ -61,6 +66,7 @@ WARM_COMMANDS=${WARM_COMMANDS:-}
 WARM_GATE_COMMAND=${WARM_GATE_COMMAND:-}
 WARM_LIFETIME_SECONDS=${WARM_LIFETIME_SECONDS:-5400}
 WARM_SNAPSHOT_SECONDS=${WARM_SNAPSHOT_SECONDS:-1800}
+WARM_SRC_STRIP_COMPONENTS=${WARM_SRC_STRIP_COMPONENTS:-0}
 
 DEFAULT_LIFETIME_SECONDS=5400
 FAIL_HOLD_SECONDS=300
@@ -130,6 +136,10 @@ refuse() {
 # Refusals come before the first consumer command and before any fetch.
 in_range "$WARM_LIFETIME_SECONDS" 600 14400 || refuse "WARM_LIFETIME_SECONDS must be a whole number from 600 to 14400"
 in_range "$WARM_SNAPSHOT_SECONDS" 60 3600 || refuse "WARM_SNAPSHOT_SECONDS must be a whole number from 60 to 3600"
+case $WARM_SRC_STRIP_COMPONENTS in
+  0 | 1) ;;
+  *) refuse "WARM_SRC_STRIP_COMPONENTS must be 0 or 1" ;;
+esac
 [ -n "$WARM_SRC_SHA256" ] || refuse "WARM_SRC_SHA256 is required"
 expected_sha256=${WARM_SRC_SHA256,,}
 [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || refuse "WARM_SRC_SHA256 must be 64 hex digits"
@@ -270,7 +280,7 @@ echo "STEP source verified sha256=${actual_sha256}"
 rm -rf -- "$SRC_DIR"
 install -d -m 0755 "$SRC_DIR"
 chown runner:runner "$SRC_DIR"
-run_in_unit extract "$ARCHIVE" tar -xzf - -C "$SRC_DIR" --no-same-owner --no-same-permissions
+run_in_unit extract "$ARCHIVE" tar -xzf - -C "$SRC_DIR" --no-same-owner --no-same-permissions --strip-components="$WARM_SRC_STRIP_COMPONENTS"
 rm -f -- "$ARCHIVE"
 install -d -m 0755 "$CACHE_DIR"
 chown runner:runner "$CACHE_DIR"

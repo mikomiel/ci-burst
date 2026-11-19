@@ -89,8 +89,10 @@ podman build --network=host --tag localhost/ci-burst:latest .
 ```
 
 The build context is default-deny: only `pyproject.toml`, `README.md`,
-`LICENSE` and `ci_burst/` enter it, and `pip install .` installs the CLI. The
-tag stays local; nothing is pushed.
+`LICENSE`, `ci_burst/` and `deploy/runner/image/warm-cache.sh` enter it.
+`pip install .` installs the CLI, and the warm script is copied to
+`/srv/ci-burst/share/warm-cache.sh` for automated image builds. The tag stays
+local; nothing is pushed.
 
 Both hosts run the same local tag. Build it on each host, or build once and
 copy it with `podman save` and `podman load`. No registry is involved.

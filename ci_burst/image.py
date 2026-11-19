@@ -1,0 +1,243 @@
+"""The pure inputs of an automated warm-image build.
+
+Three questions are answered here without a provider call, a forge call or a
+state write: what a build is made of (``basis_digest``), whether one may start
+(``build_decision``) and what the builder is told to run (``render_user_data``).
+The callers read the facts and write the consequences, so every rule is
+testable with plain values.
+
+Nothing here logs. A refusal names the rule that failed, never a value: the
+presigned archive URL and the warm commands reach this module as arguments and
+leave it only inside the user data it returns.
+"""
+
+import base64
+import gzip
+import hashlib
+import re
+import shlex
+from pathlib import Path
+
+from .config import _no_control
+from .errors import ConfigRefusal, ImageRefusal
+
+#: Where the container build puts ``deploy/runner/image/warm-cache.sh``. The
+#: Dockerfile ``COPY`` and this path are pinned together by tests/test_image.py.
+DEFAULT_SCRIPT_PATH = Path("/srv/ci-burst/share/warm-cache.sh")
+
+#: EC2 refuses user data of this many raw bytes or more (measured before the
+#: SDK encodes it as base64).
+USER_DATA_LIMIT = 16_384
+
+_EXPORT_NAME = re.compile(r"WARM_[A-Z0-9_]+")
+
+#: The script reads this export one command per line, so a line feed separates
+#: its commands. It is the one control character an export may hold, and each
+#: line is still checked on its own.
+_LINE_SEPARATED = frozenset({"WARM_COMMANDS"})
+
+#: The part of the user data after the exports. ``warm-cache.sh`` arms its own
+#: lifetime timer first, so a stub that cannot hand over would leave a builder
+#: with no timer: it powers the builder off itself instead. The payload is
+#: base64, which never holds an underscore, so the here-document delimiter
+#: cannot occur inside it.
+_STUB_RUN = """\
+set -o pipefail
+stop() { echo "warm stub: $1" >&2; shutdown -h now; exit 1; }
+d=$(mktemp -d /run/warm-stub.XXXXXX) || stop "no private directory"
+trap 'rm -rf -- "$d"' EXIT
+base64 -d <<'WARM_PAYLOAD_END' | gunzip >"$d/warm-cache.sh" || stop "the payload does not decode"
+"""
+_STUB_END = """\
+WARM_PAYLOAD_END
+bash "$d/warm-cache.sh"
+exit $?
+"""
+
+
+def script_sha256(script_bytes):
+    """The hex sha256 of the shipped script, as ``image plan`` shows it."""
+    return hashlib.sha256(script_bytes).hexdigest()
+
+
+def render_commands(commands, gate_command):
+    """The ``WARM_COMMANDS`` and ``WARM_GATE_COMMAND`` values, as the builder reads them.
+
+    This is the one encoding of the commands: the digest hashes these values
+    and the user data exports them, so the two cannot disagree. The script
+    reads one command per line. A command with a control character, a line
+    feed included, is refused, so no command can split in two or hide a third.
+    """
+    if isinstance(commands, str) or not commands:
+        raise ConfigRefusal("CONFIG_INVALID", "warm commands: must be a non-empty list of commands")
+    for index, command in enumerate(commands):
+        where = f"warm commands[{index}]"
+        if not isinstance(command, str):
+            raise ConfigRefusal("CONFIG_INVALID", f"{where}: must be a string")
+        _no_control(command, where)
+    if not isinstance(gate_command, str):
+        raise ConfigRefusal("CONFIG_INVALID", "warm gate command: must be a string")
+    _no_control(gate_command, "warm gate command")
+    return {"WARM_COMMANDS": "\n".join(commands), "WARM_GATE_COMMAND": gate_command}
+
+
+def basis_digest(files, warm_commands, gate_command, script_bytes):
+    """The hex digest that says whether a build is due.
+
+    ``files`` maps each basis path to the bytes read at the resolved sha. The
+    digest covers the sorted lines ``path NUL sha256(content) LF``, then the
+    hash of the rendered commands (``render_commands``, commands and gate, one
+    value separated by a NUL) and the hash of the shipped script, each followed
+    by a line feed. It never covers the archive hash: the same sha can produce
+    different archive bytes, and the digest must not change with them.
+    """
+    entries = []
+    for path, content in files.items():
+        # A line feed or NUL in a path would let two file sets share one digest.
+        _no_control(path, "basis path")
+        entries.append((path.encode("utf-8"), hashlib.sha256(content).hexdigest().encode("ascii")))
+    values = render_commands(warm_commands, gate_command)
+    rendered = (values["WARM_COMMANDS"] + "\0" + values["WARM_GATE_COMMAND"]).encode("utf-8")
+    digest = hashlib.sha256()
+    for path, content_hash in sorted(entries):
+        digest.update(path + b"\0" + content_hash + b"\n")
+    digest.update(hashlib.sha256(rendered).hexdigest().encode("ascii") + b"\n")
+    digest.update(script_sha256(script_bytes).encode("ascii") + b"\n")
+    return digest.hexdigest()
+
+
+def _refused(reason):
+    return {"start": False, "decision": "refused", "reason": reason, "clear_control": False}
+
+
+def build_decision(
+    *,
+    digest,
+    pin_digest,
+    now,
+    last_build_started_at,
+    builds_last_day,
+    control,
+    active,
+    config,
+    force=False,
+    last_failed_digest=None,
+):
+    """Say whether a build may start and, if not, which condition stopped it.
+
+    ``digest`` is the current ``basis_digest``. ``pin_digest`` is the
+    ``ci-burst:basis-digest`` tag of the image behind the configured pin, or
+    ``None`` when that image has no such tag. ``now`` and
+    ``last_build_started_at`` (``None`` before the first build) are epoch
+    seconds. ``builds_last_day`` counts builds started in the last 24 hours.
+    ``control`` is the state file's control row. ``active`` is true while a
+    builder or an active build exists. ``config`` is the enabled
+    ``ImageConfig``. ``last_failed_digest`` is the basis digest of the last
+    failed build (``Control`` has no such field), or ``None``.
+
+    The first failing condition wins, in this order:
+
+    1. ``IMAGE_BUILD_ALREADY_ACTIVE``
+    2. ``IMAGE_DAILY_CAP``
+    3. ``IMAGE_BLOCKED``
+    4. ``IMAGE_FAILURE_COOLDOWN``
+    5. the digest equals ``pin_digest``: decision ``digest_unchanged``, which
+       is an answer and not a refusal
+    6. ``IMAGE_MIN_INTERVAL``
+
+    ``force`` skips only the digest comparison and the minimum interval, and
+    clears ``blocked`` and the cooldown. It never skips a builder that is
+    already active or the daily cap. ``blocked`` also clears when ``digest``
+    differs from ``last_failed_digest``; with no failed digest to compare it
+    stays blocked. A clearing resets the cooldown with it.
+
+    The result is ``{"start", "decision", "reason", "clear_control"}``. The
+    decision is ``start``, ``digest_unchanged`` or ``refused``, and ``reason``
+    is the code of a refusal, else ``None``. ``clear_control`` is true only
+    with ``start``, when the caller must clear ``blocked`` and the cooldown
+    (``blocked`` false, ``cooldown_until`` none) as it records the build. A
+    refusal or ``digest_unchanged`` changes nothing, and this function writes
+    no state.
+    """
+    if active:
+        return _refused("IMAGE_BUILD_ALREADY_ACTIVE")
+    if builds_last_day >= config.max_builds_per_day:
+        return _refused("IMAGE_DAILY_CAP")
+    clear = False
+    if control.blocked:
+        if not force and (last_failed_digest is None or digest == last_failed_digest):
+            return _refused("IMAGE_BLOCKED")
+        clear = True
+    elif control.cooldown_until is not None and now < control.cooldown_until:
+        if not force:
+            return _refused("IMAGE_FAILURE_COOLDOWN")
+        clear = True
+    if not force:
+        if pin_digest is not None and digest == pin_digest:
+            return {"start": False, "decision": "digest_unchanged", "reason": None, "clear_control": False}
+        if last_build_started_at is not None and now - last_build_started_at < config.min_build_interval_seconds:
+            return _refused("IMAGE_MIN_INTERVAL")
+    return {"start": True, "decision": "start", "reason": None, "clear_control": clear}
+
+
+def warm_exports(config, source_url, archive_sha256):
+    """The ``WARM_*`` inputs of one build, from configuration and two build facts.
+
+    ``config`` is the enabled ``ImageConfig``. ``source_url`` is the presigned
+    archive URL and ``archive_sha256`` the hash of the staged archive. The
+    names and encodings are the ones ``warm-cache.sh`` reads.
+    """
+    exports = render_commands(config.warm.commands, config.warm.gate_command)
+    exports["WARM_SRC_URL"] = source_url
+    exports["WARM_SRC_SHA256"] = archive_sha256
+    exports["WARM_LIFETIME_SECONDS"] = str(config.warm.lifetime_seconds)
+    exports["WARM_SNAPSHOT_SECONDS"] = str(config.warm.snapshot_seconds)
+    exports["WARM_SRC_STRIP_COMPONENTS"] = str(config.source.strip_components)
+    return exports
+
+
+def _check_export(name, value):
+    if not isinstance(name, str) or not _EXPORT_NAME.fullmatch(name):
+        raise ConfigRefusal("CONFIG_INVALID", "a user data export name must match WARM_[A-Z0-9_]+")
+    where = f"user data export {name}"
+    if not isinstance(value, str):
+        raise ConfigRefusal("CONFIG_INVALID", f"{where}: must be a string")
+    for part in value.split("\n") if name in _LINE_SEPARATED else (value,):
+        _no_control(part, where)
+
+
+def render_user_data(script_bytes, exports):
+    """Render the builder's user data: a short stub that carries the script.
+
+    The stub exports each value quoted for the shell, in name order, then
+    decodes a gzip and base64 payload of ``script_bytes`` into a private
+    directory, runs it with ``bash`` and exits with its status. The output is
+    a function of the arguments alone: the gzip header has no timestamp.
+
+    ``exports`` maps ``WARM_*`` names to strings. A name outside
+    ``WARM_[A-Z0-9_]+`` or a value with a control character is refused with
+    ``CONFIG_INVALID``, and a refusal never holds a value. The result is
+    refused with ``IMAGE_USERDATA_TOO_LARGE`` when its UTF-8 size, the size
+    EC2 measures before base64, is ``USER_DATA_LIMIT`` or more.
+    """
+    lines = ["#!/bin/bash"]
+    for name in sorted(exports):
+        _check_export(name, exports[name])
+        lines.append(f"export {name}={shlex.quote(exports[name])}")
+    payload = base64.b64encode(gzip.compress(script_bytes, compresslevel=9, mtime=0)).decode("ascii")
+    text = "\n".join(lines) + "\n" + _STUB_RUN + payload + "\n" + _STUB_END
+    size = len(text.encode("utf-8"))
+    if size >= USER_DATA_LIMIT:
+        raise ImageRefusal(
+            "IMAGE_USERDATA_TOO_LARGE",
+            f"the rendered user data is {size} bytes; EC2 refuses {USER_DATA_LIMIT} or more",
+        )
+    return text
+
+
+def shipped_script(path=DEFAULT_SCRIPT_PATH):
+    """The bytes of the warm script the container ships."""
+    try:
+        return Path(path).read_bytes()
+    except OSError as error:
+        raise ImageRefusal("IMAGE_SCRIPT_MISSING", f"cannot read {path}: {type(error).__name__}") from None

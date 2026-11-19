@@ -79,6 +79,23 @@ def make_archive(directory, files=None):
     return archive, sha256(archive.read_bytes()).hexdigest()
 
 
+def make_wrapped_archive(directory, prefix="example-repo", files=None):
+    """A .tar.gz whose members all sit under one top-level directory, as a forge archive does."""
+    files = files or {"lock.txt": "locked\n"}
+    source = Path(directory) / "wrapped-source"
+    source.mkdir(exist_ok=True)
+    archive = Path(directory) / "wrapped.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        top = tarfile.TarInfo(prefix)
+        top.type = tarfile.DIRTYPE
+        top.mode = 0o755
+        tar.addfile(top)
+        for name, content in files.items():
+            (source / name).write_text(content, encoding="utf-8")
+            tar.add(source / name, arcname=f"{prefix}/{name}")
+    return archive, sha256(archive.read_bytes()).hexdigest()
+
+
 STUB_BODIES = {
     "shutdown": "",
     "systemd-run": "",
@@ -355,6 +372,15 @@ class RefusalTests(WarmHarness, unittest.TestCase):
                 self.events.write_text("", encoding="utf-8")
                 self.assertRefused(self.start(**inputs))
 
+    def test_a_strip_components_value_other_than_zero_or_one_refuses(self):
+        # Only the exact text 0 or 1 passes; the empty value is the default and is covered below.
+        for value in ("2", "-1", "1 ", " 1", "x", "01", "1\n", "0x1", "1.0", "10"):
+            with self.subTest(value=value):
+                self.events.write_text("", encoding="utf-8")
+                self.assertRefused(self.start(WARM_SRC_STRIP_COMPONENTS=value))
+                self.assertIn("WARM_SRC_STRIP_COMPONENTS must be 0 or 1", self.output)
+                self.assertFalse([e for e in self.event_list() if e.startswith("EXTRACT")])
+
     def test_an_invalid_lifetime_still_arms_the_default_timer(self):
         self.start(WARM_LIFETIME_SECONDS="soon")
         timers = [e for e in self.event_list() if e.startswith("systemd-run")]
@@ -395,6 +421,53 @@ class SourceTests(WarmHarness, unittest.TestCase):
         self.start(WARM_COMMANDS=f"pwd > {self.root}/cwd.txt\ncat lock.txt")
         self.assertEqual((self.root / "cwd.txt").read_text(encoding="utf-8").strip(), str(self.vartmp / "warm-src"))
         self.assertNotIn(str(self.home), str(self.vartmp / "warm-src"))
+
+
+class StripComponentsTests(WarmHarness, unittest.TestCase):
+    """WARM_SRC_STRIP_COMPONENTS is the only thing that decides how many components extraction drops."""
+
+    def extraction(self):
+        return [e for e in self.event_list() if e.startswith("EXTRACT ")]
+
+    def argv(self, strip):
+        return f"EXTRACT tar -xzf - -C {self.vartmp / 'warm-src'} --no-same-owner --no-same-permissions {strip}"
+
+    def test_unset_empty_and_zero_keep_every_path_component(self):
+        self.archive, self.digest = make_wrapped_archive(self.root)
+        kept = self.root / "kept.txt"
+        cases = (
+            ("unset", {}),
+            ("empty", {"WARM_SRC_STRIP_COMPONENTS": ""}),
+            ("zero", {"WARM_SRC_STRIP_COMPONENTS": "0"}),
+        )
+        for label, inputs in cases:
+            with self.subTest(label):
+                self.events.write_text("", encoding="utf-8")
+                kept.unlink(missing_ok=True)
+                completed = self.start(WARM_COMMANDS=f"cat example-repo/lock.txt > {kept}", **inputs)
+                self.assertEqual(completed.returncode, 0, self.output)
+                self.assertEqual(kept.read_text(encoding="utf-8"), "locked\n")
+                self.assertEqual(self.extraction(), [self.argv("--strip-components=0")])
+
+    def test_one_drops_the_leading_directory_so_commands_run_from_the_source_root(self):
+        self.archive, self.digest = make_wrapped_archive(self.root)
+        seen = self.root / "seen.txt"
+        completed = self.start(
+            WARM_SRC_STRIP_COMPONENTS="1",
+            WARM_COMMANDS=f"cat lock.txt > {seen}\ntest ! -e example-repo",
+        )
+        self.assertEqual(completed.returncode, 0, self.output)
+        self.assertEqual(seen.read_text(encoding="utf-8"), "locked\n")
+        self.assertEqual(self.extraction(), [self.argv("--strip-components=1")])
+        self.assertEqual(self.lines[-1], MARKER)
+
+    def test_a_wrapped_archive_stays_wrapped_without_the_input(self):
+        # The counterpart of the test above: the flag is what moves the files.
+        self.archive, self.digest = make_wrapped_archive(self.root)
+        completed = self.start(WARM_COMMANDS="cat lock.txt")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("WARM FAIL warm 1/1 rc=1", self.output)
+        self.assertEqual(self.unframed_markers(), [])
 
 
 class FailureTests(WarmHarness, unittest.TestCase):
@@ -723,7 +796,7 @@ class ExtractionTests(WarmHarness, unittest.TestCase):
         extract = [e for e in events if e.startswith("EXTRACT ")]
         self.assertEqual(
             extract,
-            [f"EXTRACT tar -xzf - -C {self.vartmp / 'warm-src'} --no-same-owner --no-same-permissions"],
+            [f"EXTRACT tar -xzf - -C {self.vartmp / 'warm-src'} --no-same-owner --no-same-permissions --strip-components=0"],
         )
         # The unit that ran it is the first one, and it ran before any warm command.
         self.assertLess(events.index("UNIT warm-job-1"), events.index("CONSUMER"))
@@ -733,7 +806,7 @@ class ExtractionTests(WarmHarness, unittest.TestCase):
         text = SCRIPT.read_text(encoding="utf-8")
         executable = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
         self.assertEqual([l.strip() for l in executable if re.search(r"(?<![\w./=-])tar\s", l)],
-                         ["run_in_unit extract \"$ARCHIVE\" tar -xzf - -C \"$SRC_DIR\" --no-same-owner --no-same-permissions"])
+                         ["run_in_unit extract \"$ARCHIVE\" tar -xzf - -C \"$SRC_DIR\" --no-same-owner --no-same-permissions --strip-components=\"$WARM_SRC_STRIP_COMPONENTS\""])
         self.assertFalse([l for l in executable if re.search(r"\bchown\s+-\w*R", l)])
         self.assertFalse([l for l in executable if re.search(r"\brunuser\b", l)])
 

@@ -41,6 +41,11 @@ COPY pyproject.toml README.md LICENSE ./
 COPY ci_burst ./ci_burst
 RUN pip install --no-cache-dir .
 
+# The warm script ships beside the code, so the controller renders builder user
+# data from the exact bytes the repository carries. Root owns it and the job
+# user cannot write it. tests/test_image.py pins this path to the loader's.
+COPY --chown=0:0 --chmod=0644 deploy/runner/image/warm-cache.sh /srv/ci-burst/share/warm-cache.sh
+
 USER 10001:10001
 
 # No CMD: a run always names its command, for example

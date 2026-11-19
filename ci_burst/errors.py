@@ -39,6 +39,10 @@ class ProviderRefusal(Refusal):
     """AWS refused or could not answer the requested read or mutation."""
 
 
+class ImageRefusal(Refusal):
+    """The inputs of an automated image build are absent or out of bounds."""
+
+
 #: The local pass budget ended before the next read, phase or mutation could
 #: start. This is not a provider answer, so it has its own reason code.
 PASS_DEADLINE_EXCEEDED = "pass_deadline_exceeded"

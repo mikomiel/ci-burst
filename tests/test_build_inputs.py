@@ -381,8 +381,8 @@ class RefreshBuildRecordBehaviourTests(unittest.TestCase):
         )
 
     def test_a_same_image_from_a_different_commit_appends_an_attestation(self):
-        # A commit that changes only docs/, tests/ or deploy/ files is excluded
-        # by .dockerignore, so a build of it returns the image already on the
+        # A commit that changes only docs/, tests/ or deploy/ files (other
+        # than deploy/runner/image/warm-cache.sh) is excluded by .dockerignore, so a build of it returns the image already on the
         # host under another source. That is not a contradiction: record both
         # sources against the image and promote normally.
         first = self.run_script()

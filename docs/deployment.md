@@ -119,9 +119,11 @@ name. The policies are deliberately small:
 - `TerminateInstances` carries an `ec2:ResourceTag/ci-burst:managed = true`
   condition, so an instance the controller did not tag cannot be terminated;
 - `ec2:GetConsoleOutput` is one read grant, on `instance/*`, for the `export`
-  command only. The shipped policy is not tag-scoped because the provider has no
-  per-tag condition for this read: the boundary is the identity that holds the
-  grant, so keep it on the scaler user and off every other identity. Skip the
+  command only. The shipped scaler policy is not tag-scoped: the boundary is the
+  identity that holds the grant, so keep it on the scaler user and off every
+  other identity. (The image-build policy below does tag-scope the same read;
+  whether the provider honours a tag condition on this action is not
+  established, see that section.) Skip the
   grant if you do not install the export unit; nothing else reads a console;
 - the reaper has no `RunInstances` at all, and the scaler cannot create users,
   read other parameters or change IAM.
@@ -135,6 +137,102 @@ Create one access key per user. The secret is shown once; write it straight
 into the credential file on the host that uses it (Step 4) and never into a
 repository, a terminal history, a chat or a ticket. Both keys are long-lived:
 rotate them on your own schedule and record the rotation with the deployment.
+
+### Image-build role and source identity (optional, not yet used by a command)
+
+The OpenSpec change `automated-warm-image-build` plans controller-built warm
+images. No shipped command uses these identities yet, and the manual runbook in
+[warm-image.md](warm-image.md) stays the supported path. Create nothing here
+until the image commands ship and you have run the policy verification gates
+from that change. You apply all of this IAM yourself: the controller creates
+and changes none of it and has no IAM client.
+
+The role's permissions are in
+[deploy/iam/image-build-policy.json](../deploy/iam/image-build-policy.json).
+It is a separate role from the scaler and the reaper. Replace its placeholders
+(account id, Region, deployment, build and worker template ids, build subnet and
+security group, base image id, bucket and prefix) before attaching it. The
+prefix placeholder is the configured prefix with its trailing slash. The policy
+has no IAM action at all, no `ec2:ModifyLaunchTemplate`, no
+`ec2:DeleteLaunchTemplateVersions`, no `ec2:ModifyImageAttribute` and no
+`ssm:*`. It denies `ec2:RunInstances` for an instance with an instance profile
+and outside the build launch template. IAM cannot restrict what a launch-template
+version contains, so a person still reads and pins every candidate.
+
+The policy conditions `ec2:GetConsoleOutput` on the `ci-burst:image-build` tag
+of the instance. This guide does not establish that the provider evaluates a
+tag condition for that action, and none of the verification gates G1 to G13 in
+the design covers it directly; the nearest is G7 (console blind-probe cause).
+Treat it as an evidence gap: check it with the IAM policy simulator or a real
+call before enabling. If the condition does not match, the Allow does not apply
+and the console read is refused, so a build would fail closed with
+`CONSOLE_BLIND`. Do not widen the grant to `instance/*` without the tag to work
+around that; record the result and decide with the maintainer.
+
+Images and snapshots may carry the keys `ci-burst:image-build`,
+`ci-burst:deployment`, `ci-burst:build-id`, `ci-burst:basis-digest`,
+`ci-burst:source-sha`, `ci-burst:script-sha` and `ci-burst:base-image`, and
+`ci-burst:expires-at`. Any other tag key on a created image or snapshot is
+refused.
+
+A source identity (an IAM user with programmatic access and no console access)
+may only assume that role. Its whole policy is:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AssumeOnlyTheImageBuildRole",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::<account-id>:role/<image-build-role>"
+    }
+  ]
+}
+```
+
+The role's trust policy names that one principal and requires the external ID:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "TrustOnlyTheSourceIdentity",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<account-id>:user/<image-build-source-user>"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "<external-id>"
+        }
+      }
+    }
+  ]
+}
+```
+
+Set the role's maximum session duration to 3600 seconds, which is the IAM
+minimum. A source-identity condition would be stronger than the external ID, but
+whether a shared-config profile alone can supply one is not established, so do
+not rely on it. The external ID is a second secret: keep it in the same
+credential directory as the source key, never in a repository. The SDK assumes
+the role from a profile such as:
+
+```ini
+[profile image-build]
+role_arn          = arn:aws:iam::<account-id>:role/<image-build-role>
+source_profile    = image-build-source
+external_id       = <external-id>
+duration_seconds  = 3600
+role_session_name = ci-burst-image
+```
+
+The source key is long-lived. Rotate it on your own schedule, at least every 90
+days, and record the date with the deployment.
 
 ## 4. Prepare the two hosts
 

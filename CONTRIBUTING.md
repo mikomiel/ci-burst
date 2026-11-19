@@ -152,8 +152,9 @@ update one release pull request: it bumps `pyproject.toml` and
 `ci_burst/__init__.py`, writes `CHANGELOG.md` and records the version in
 `.release-please-manifest.json`. That update is observed after both a
 maintainer merge and a merge by the repository's own automation. Merging the
-release pull request is the release decision; release-please then creates the
-annotated `v`-prefixed tag and the GitHub Release. Never tag by hand.
+release pull request authorizes publication. Release Please creates a lightweight
+`vMAJOR.MINOR.PATCH` tag on the release commit and publishes an immutable GitHub
+Release. GitHub locks the tag and any attached assets at publication.
 
 Before 1.0, a `feat` commit is a minor release, a `fix` or `perf` commit is a
 patch, and a breaking change is a minor release. A released section lists

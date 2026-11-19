@@ -9,6 +9,14 @@ The version, this file and the release tag are maintained by
 conventional commits on `main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases)
 owns the release boundary. Do not edit a released section by hand.
 
+## [0.11.0](https://github.com/mikomiel/ci-burst/compare/v0.10.0...v0.11.0) (2026-11-18)
+
+
+### Added
+
+* **config:** add the optional strict image tables ([#169](https://github.com/mikomiel/ci-burst/issues/169)) ([15afa88](https://github.com/mikomiel/ci-burst/commit/15afa88899fb2f78a4836dc761793c6f7b3e12b2))
+* **image:** add a separate image build state file ([#168](https://github.com/mikomiel/ci-burst/issues/168)) ([ad5bf75](https://github.com/mikomiel/ci-burst/commit/ad5bf75e751f20acc924129596a60ab0bbc6f812))
+
 ## [0.10.0](https://github.com/mikomiel/ci-burst/compare/v0.9.0...v0.10.0) (2026-11-17)
 
 

@@ -5,23 +5,48 @@ with an unexpected field fails the test. Their parameter names follow the EC2
 and S3 APIs from the design and were not checked against an installed SDK,
 which this checkout does not have.
 
+``RealSdkProfileTests`` and ``RealSdkLoggingTests`` are the exception: they run
+the real boto3 and botocore against temporary configuration files, a loopback
+credential endpoint and a stub in place of the HTTP transport, so they make no
+network call. They are skipped where boto3 is not installed.
+
 Sentinel values stand in for the presigned URL, a token and builder user data.
 They are synthetic and carry no key-like or signature-like shape.
 """
 
+import ast
+import base64
 import contextlib
 import copy
+import http.server
 import inspect
 import io
+import itertools
+import json
 import logging
+import os
+import re
+import shlex
 import sys
 import tempfile
+import threading
 import traceback
 import types
 import unittest
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
+
+try:
+    import boto3
+    import botocore.credentials
+    import botocore.exceptions
+    import botocore.httpsession
+    import botocore.session
+    from botocore.awsrequest import AWSResponse
+except ImportError:  # the suite also runs on a checkout with no SDK
+    boto3 = None
 
 from ci_burst import aws as aws_module
 from ci_burst.aws import (
@@ -35,7 +60,7 @@ from ci_burst.aws import (
     ImageAws,
 )
 from ci_burst.config import load
-from ci_burst.errors import DeadlineRefusal, ProviderRefusal, Refusal
+from ci_burst.errors import DeadlineRefusal, ProviderRefusal, Refusal, StateRefusal
 
 from support import Clock, write_config
 from test_aws import sdk_client_error
@@ -52,6 +77,20 @@ SENTINEL_TOKEN = "sentinel-forge-token-marker"
 SENTINEL_USER_DATA = "#!/bin/bash\necho sentinel-user-data-marker"
 SENTINELS = (SENTINEL_URL, SENTINEL_TOKEN, SENTINEL_USER_DATA, "sentinel-user-data-marker")
 LEAKY_MESSAGE = f"request {SENTINEL_URL} header {SENTINEL_TOKEN} body {SENTINEL_USER_DATA}"
+
+ROLE_ARN = "arn:aws:iam::123456789012:role/example-image-build-role"
+INTERMEDIATE_ROLE_ARN = "arn:aws:iam::123456789012:role/example-intermediate-role"
+SOURCE_PROFILE = "example-image-source"
+LINK_PROFILE = "example-image-link"
+#: Synthetic and short on purpose: nothing here has the shape of a real key.
+STATIC_KEYS = {"aws_access_key_id": "fake-id", "aws_secret_access_key": "fake-pw"}
+REAL_SDK_REASON = "boto3 is not installed"
+
+#: The loggers the adapter must keep quiet. Written out here, not read from the
+#: module, so that dropping one from the module fails a test.
+SDK_LOGGER_NAMES = ("botocore", "boto3", "urllib3")
+SENTINEL_CLIENT_TOKEN = "sentinel-client-token-marker"
+ASSUMED_MARKERS = ("assumed-id-marker", "assumed-pw-marker", "assumed-session-marker")
 
 
 class ProviderError(Exception):
@@ -298,6 +337,48 @@ class FakeSession:
         return self.credentials
 
 
+class FakeSdkSession:
+    """A botocore session stand-in: the merged profile configuration and the credentials.
+
+    ``scoped`` is the image profile. It leads to a source profile that holds
+    static keys, unless ``profiles`` (every profile by name) says otherwise.
+    """
+
+    def __init__(self, steps, scoped=None, credentials=None, config_error=None, credentials_error=None, profiles=None):
+        self.steps = steps
+        self.profiles = profiles if profiles is not None else {PROFILE: scoped, SOURCE_PROFILE: dict(STATIC_KEYS)}
+        self.credentials = credentials
+        self.config_error = config_error
+        self.credentials_error = credentials_error
+
+    @property
+    def full_config(self):
+        self.steps.append("full_config")
+        if self.config_error is not None:
+            raise self.config_error
+        return {"profiles": self.profiles}
+
+    def get_credentials(self):
+        self.steps.append("get_credentials")
+        if self.credentials_error is not None:
+            raise self.credentials_error
+        return self.credentials
+
+
+def chained_profiles(length):
+    """``length`` profiles: the image profile, roles that each name the next, and a last one that holds static keys.
+
+    Returns the profiles by name and their names in order.
+    """
+    names = [PROFILE, *(f"{LINK_PROFILE}-{number}" for number in range(1, length))]
+    profiles = {
+        name: {"role_arn": ROLE_ARN, "source_profile": following, "region": REGION}
+        for name, following in itertools.pairwise(names)
+    }
+    profiles[names[-1]] = dict(STATIC_KEYS)
+    return profiles, names
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.calls = []
@@ -429,6 +510,258 @@ class SessionTests(Base):
         source = Path(aws_module.__file__).read_text(encoding="utf-8")
         self.assertNotIn('"iam"', source.replace('IMAGE_SERVICES = frozenset({"ec2", "s3"})', ""))
         self.assertNotIn("'iam'", source)
+
+
+class ProfileRouteTests(Base):
+    """The default session factory takes the profile's assume-role route or refuses.
+
+    Fake ``boto3`` and ``botocore.session`` modules stand in for the SDK, so these
+    run where it is absent. ``RealSdkProfileTests`` runs the decisive cases
+    against the real one.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.steps = []
+
+    def session_for(self, sdk_session, constructor_error=None):
+        def fake_botocore_session(*, profile):
+            self.steps.append(("botocore.session.Session", profile))
+            if constructor_error is not None:
+                raise constructor_error
+            return sdk_session
+
+        def fake_boto3_session(*, botocore_session):
+            self.steps.append("boto3.Session")
+            return ("boto3 session", botocore_session)
+
+        boto3_module = types.ModuleType("boto3")
+        boto3_module.Session = fake_boto3_session
+        session_module = types.ModuleType("botocore.session")
+        session_module.Session = fake_botocore_session
+        botocore_module = types.ModuleType("botocore")
+        botocore_module.session = session_module
+        modules = {"boto3": boto3_module, "botocore": botocore_module, "botocore.session": session_module}
+        with mock.patch.dict(sys.modules, modules):
+            return ImageAws(REGION, PROFILE)._session()
+
+    def refusal(self, constructor_error=None, **sdk):
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.session_for(FakeSdkSession(self.steps, **sdk), constructor_error)
+        refusal = raised.exception
+        self.assertEqual(refusal.reason, "IMAGE_PROFILE_INVALID")
+        self.assertIn(PROFILE, refusal.detail)
+        # No session is handed out, so no client can be built on it.
+        self.assertNotIn("boto3.Session", self.steps)
+        return refusal
+
+    def test_a_role_with_a_source_profile_is_accepted_and_the_session_is_the_checked_one(self):
+        scoped = {"role_arn": ROLE_ARN, "source_profile": SOURCE_PROFILE, "region": REGION}
+        sdk_session = FakeSdkSession(self.steps, scoped, types.SimpleNamespace(method="assume-role"))
+        session = self.session_for(sdk_session)
+        self.assertEqual(session, ("boto3 session", sdk_session))
+        # The configuration is read before the credentials are resolved.
+        self.assertEqual(
+            self.steps,
+            [("botocore.session.Session", PROFILE), "full_config", "get_credentials", "boto3.Session"],
+        )
+
+    def test_a_profile_without_both_a_role_and_a_source_profile_is_refused_before_credentials_resolve(self):
+        cases = {
+            "no credential route": {"region": REGION},
+            "a role without a source": {"role_arn": ROLE_ARN},
+            "a source without a role": {"source_profile": SOURCE_PROFILE},
+            "an empty role": {"role_arn": "", "source_profile": SOURCE_PROFILE},
+            "an empty source": {"role_arn": ROLE_ARN, "source_profile": ""},
+            "static keys and no role": dict(STATIC_KEYS),
+        }
+        for label, scoped in cases.items():
+            with self.subTest(label):
+                self.steps.clear()
+                # The credentials would pass the method check: the configuration alone refuses.
+                refusal = self.refusal(scoped=scoped, credentials=types.SimpleNamespace(method="assume-role"))
+                self.assertIn("it needs both role_arn and source_profile", refusal.detail)
+                self.assertNotIn("get_credentials", self.steps)
+
+    def test_a_profile_that_names_a_credential_source_is_refused_before_credentials_resolve(self):
+        for source in ("Ec2InstanceMetadata", "EcsContainer", "Environment"):
+            with self.subTest(source):
+                self.steps.clear()
+                scoped = {"role_arn": ROLE_ARN, "source_profile": SOURCE_PROFILE, "credential_source": source}
+                refusal = self.refusal(scoped=scoped, credentials=types.SimpleNamespace(method="assume-role"))
+                self.assertIn("credential_source", refusal.detail)
+                self.assertNotIn("get_credentials", self.steps)
+
+    def assume_role_credentials(self):
+        return types.SimpleNamespace(method="assume-role")
+
+    def test_a_chain_of_roles_that_ends_in_static_keys_is_accepted(self):
+        profiles, names = chained_profiles(3)
+        for name in names[:-1]:
+            profiles[name].update(external_id="example-external-id", role_session_name="example")
+            profiles[name]["duration_seconds"] = "900"
+        sdk_session = FakeSdkSession(self.steps, profiles=profiles, credentials=self.assume_role_credentials())
+        session = self.session_for(sdk_session)
+        self.assertEqual(session, ("boto3 session", sdk_session))
+        self.assertEqual(
+            self.steps,
+            [("botocore.session.Session", PROFILE), "full_config", "get_credentials", "boto3.Session"],
+        )
+
+    def test_a_chain_may_span_five_profiles_and_not_six(self):
+        for length, accepted in ((2, True), (4, True), (5, True), (6, False), (40, False)):
+            with self.subTest(length=length):
+                self.steps.clear()
+                profiles, _ = chained_profiles(length)
+                credentials = self.assume_role_credentials()
+                if accepted:
+                    self.session_for(FakeSdkSession(self.steps, profiles=profiles, credentials=credentials))
+                    continue
+                refusal = self.refusal(profiles=profiles, credentials=credentials)
+                self.assertIn("longer than 5 profiles", refusal.detail)
+                self.assertNotIn("get_credentials", self.steps)
+
+    def test_a_chain_that_returns_to_a_profile_is_refused_before_credentials_resolve(self):
+        first, second = f"{LINK_PROFILE}-1", f"{LINK_PROFILE}-2"
+
+        def role(source):
+            return {"role_arn": ROLE_ARN, "source_profile": source}
+
+        cases = {
+            "the image profile names itself": ({PROFILE: role(PROFILE)}, PROFILE),
+            "a link names the image profile": ({PROFILE: role(first), first: role(PROFILE)}, PROFILE),
+            "two links name each other": ({PROFILE: role(first), first: role(second), second: role(first)}, first),
+        }
+        for label, (profiles, repeated) in cases.items():
+            with self.subTest(label):
+                self.steps.clear()
+                refusal = self.refusal(profiles=profiles, credentials=self.assume_role_credentials())
+                self.assertIn(f"returns to {repeated}", refusal.detail)
+                self.assertNotIn("get_credentials", self.steps)
+
+    def test_a_profile_that_the_chain_names_but_the_files_lack_is_refused(self):
+        missing = f"{LINK_PROFILE}-missing"
+        cases = {
+            "a link": (
+                {PROFILE: {"role_arn": ROLE_ARN, "source_profile": missing}},
+                f"source profile {missing} does not exist",
+            ),
+            "the image profile": ({SOURCE_PROFILE: dict(STATIC_KEYS)}, "it does not exist"),
+        }
+        for label, (profiles, wanted) in cases.items():
+            with self.subTest(label):
+                self.steps.clear()
+                refusal = self.refusal(profiles=profiles, credentials=self.assume_role_credentials())
+                self.assertIn(wanted, refusal.detail)
+                self.assertNotIn("get_credentials", self.steps)
+
+    def test_a_chained_credential_source_is_refused_before_credentials_resolve(self):
+        """The case that the method check cannot see.
+
+        botocore reports the assume-role method for this chain, but it asks the
+        ambient route for the root credentials as soon as they are requested.
+        """
+        profiles = {
+            PROFILE: {"role_arn": ROLE_ARN, "source_profile": LINK_PROFILE, "region": REGION},
+            LINK_PROFILE: {"role_arn": INTERMEDIATE_ROLE_ARN, "credential_source": "EcsContainer"},
+        }
+        refusal = self.refusal(profiles=profiles, credentials=self.assume_role_credentials())
+        self.assertIn(f"source profile {LINK_PROFILE} may not name credential_source", refusal.detail)
+        self.assertNotIn("get_credentials", self.steps)
+
+    def test_a_profile_anywhere_in_the_chain_that_names_an_ambient_route_is_refused_without_echoing_its_value(self):
+        keys = (
+            "credential_source",
+            "web_identity_token_file",
+            "credential_process",
+            "login_session",
+            "sso_session",
+            "sso_start_url",
+            "sso_role_name",
+        )
+        for position, label in enumerate(("the image profile", "a middle link", "the profile with the keys")):
+            for key in keys:
+                with self.subTest(position=label, key=key):
+                    self.steps.clear()
+                    profiles, names = chained_profiles(3)
+                    profiles[names[position]][key] = LEAKY_MESSAGE
+                    refusal = self.refusal(profiles=profiles, credentials=self.assume_role_credentials())
+                    self.assertIn(f"may not name {key}", refusal.detail)
+                    if position:
+                        self.assertIn(f"source profile {names[position]} ", refusal.detail)
+                    for sentinel in SENTINELS:
+                        self.assertNotIn(sentinel, refusal.detail)
+                    self.assertNotIn("get_credentials", self.steps)
+
+    def test_the_last_profile_of_the_chain_must_hold_both_static_keys(self):
+        cases = {
+            "no keys": {"region": REGION},
+            "an access key only": {"aws_access_key_id": "fake-id"},
+            "a secret key only": {"aws_secret_access_key": "fake-pw"},
+            "empty keys": {"aws_access_key_id": "", "aws_secret_access_key": ""},
+            "no settings": {},
+        }
+        for label, settings in cases.items():
+            with self.subTest(label):
+                self.steps.clear()
+                profiles, names = chained_profiles(3)
+                profiles[names[-1]] = settings
+                refusal = self.refusal(profiles=profiles, credentials=self.assume_role_credentials())
+                self.assertIn(f"source profile {names[-1]} ends the chain without static keys", refusal.detail)
+                self.assertNotIn("get_credentials", self.steps)
+
+    def test_a_link_that_names_a_role_is_followed_as_a_role_even_when_it_holds_keys(self):
+        """botocore would stop at the keys; this adapter refuses what it did not check."""
+        profiles, names = chained_profiles(3)
+        profiles[names[1]].update(STATIC_KEYS)
+        profiles[names[-1]] = {"credential_source": "EcsContainer"}
+        refusal = self.refusal(profiles=profiles, credentials=self.assume_role_credentials())
+        self.assertIn(f"source profile {names[-1]} may not name credential_source", refusal.detail)
+        self.steps.clear()
+        del profiles[names[1]]["source_profile"]
+        refusal = self.refusal(profiles=profiles, credentials=self.assume_role_credentials())
+        self.assertIn(f"source profile {names[1]} needs both role_arn and source_profile", refusal.detail)
+
+    def test_credentials_that_do_not_come_from_assume_role_are_refused(self):
+        scoped = {"role_arn": ROLE_ARN, "source_profile": SOURCE_PROFILE}
+        cases = {
+            "none at all": None,
+            "the container route": types.SimpleNamespace(method="container-role"),
+            "the instance route": types.SimpleNamespace(method="iam-role"),
+            "web identity": types.SimpleNamespace(method="assume-role-with-web-identity"),
+            "a shared file": types.SimpleNamespace(method="shared-credentials-file"),
+            "the environment": types.SimpleNamespace(method="env"),
+            "no method at all": object(),
+        }
+        for label, credentials in cases.items():
+            with self.subTest(label):
+                self.steps.clear()
+                refusal = self.refusal(scoped=scoped, credentials=credentials)
+                self.assertIn("assume-role", refusal.detail)
+
+    def test_an_sdk_error_is_refused_by_class_name_and_never_by_its_message(self):
+        class ProfileNotFound(Exception):
+            pass
+
+        scoped = {"role_arn": ROLE_ARN, "source_profile": SOURCE_PROFILE}
+        stages = {
+            "the session": dict(scoped=scoped, constructor_error=ProfileNotFound(LEAKY_MESSAGE)),
+            "the configuration": dict(scoped=scoped, config_error=ProfileNotFound(LEAKY_MESSAGE)),
+            "the credentials": dict(scoped=scoped, credentials_error=ProfileNotFound(LEAKY_MESSAGE)),
+        }
+        for stage, sdk in stages.items():
+            with self.subTest(stage):
+                refusal = self.refusal(**sdk)
+                self.assertIn("ProfileNotFound", refusal.detail)
+                renderings = (
+                    str(refusal),
+                    repr(refusal),
+                    repr(refusal.as_dict()),
+                    "".join(traceback.format_exception(refusal)),
+                )
+                for text in renderings:
+                    for sentinel in SENTINELS:
+                        self.assertNotIn(sentinel, text)
 
 
 class BuilderTests(Base):
@@ -795,13 +1128,167 @@ class ArchiveTests(Base):
     def test_a_refusal_from_the_source_stream_keeps_its_reason_after_cleanup(self):
         def stream():
             yield b"x" * 15
-            raise Refusal("IMAGE_SOURCE_FORBIDDEN")
+            raise Refusal("IMAGE_SOURCE_FORBIDDEN", LEAKY_MESSAGE)
 
         with self.assertRaises(Refusal) as raised:
             self.put(stream())
         self.assertEqual(raised.exception.reason, "IMAGE_SOURCE_FORBIDDEN")
         self.assertEqual(len(self.requests("abort_multipart_upload")), 1)
         self.assertEqual(len(self.requests("delete_object")), 1)
+        # The reason crosses the boundary; the URL, token and user data the source
+        # put in its detail do not.
+        refusal = raised.exception
+        for text in (str(refusal), repr(refusal), repr(refusal.as_dict()), refusal.detail):
+            for sentinel in SENTINELS:
+                self.assertNotIn(sentinel, text)
+
+    @staticmethod
+    def refusing_after_one_chunk(refusal):
+        yield b"x" * 15
+        raise refusal
+
+    def test_a_refusal_from_the_source_is_rebuilt_with_its_class_its_reason_and_a_fixed_detail(self):
+        sources = {
+            "plain": Refusal("IMAGE_SOURCE_FORBIDDEN", LEAKY_MESSAGE),
+            "uncertain": Refusal("IMAGE_SOURCE_UNREADABLE", LEAKY_MESSAGE, uncertain=True),
+            "provider": ProviderRefusal("IMAGE_SOURCE_FORBIDDEN", LEAKY_MESSAGE),
+            "uncertain provider": ProviderRefusal("AWS_UNCERTAIN", LEAKY_MESSAGE, uncertain=True),
+            "state": StateRefusal("IMAGE_SOURCE_UNREADABLE", LEAKY_MESSAGE),
+        }
+        for label, original in sources.items():
+            with self.subTest(label):
+                self.calls.clear()
+                with self.assertRaises(Refusal) as raised:
+                    self.put(self.refusing_after_one_chunk(original))
+                refusal = raised.exception
+                self.assertIsNot(refusal, original)
+                # A caller that catches the class (a provider refusal, say) still catches it.
+                self.assertIs(type(refusal), type(original))
+                self.assertEqual(refusal.reason, original.reason)
+                self.assertEqual(refusal.uncertain, original.uncertain)
+                self.assertEqual(refusal.detail, "archive source refused")
+                self.assertEqual(len(self.requests("abort_multipart_upload")), 1)
+                self.assertEqual(len(self.requests("delete_object")), 1)
+                for text in (str(refusal), repr(refusal), repr(refusal.as_dict()), repr(vars(refusal))):
+                    for sentinel in SENTINELS:
+                        self.assertNotIn(sentinel, text)
+
+    def test_a_refusal_class_that_cannot_be_rebuilt_from_reason_detail_and_uncertainty_comes_out_plain(self):
+        class OneArgument(Refusal):
+            def __init__(self, detail):
+                super().__init__("IMAGE_SOURCE_ODD", detail)
+
+        class WithRequest(Refusal):
+            def __init__(self, reason, detail="", uncertain=False, *, request=None):
+                super().__init__(reason, detail, uncertain)
+                self.request = request
+
+        class Reordered(Refusal):
+            def __init__(self, detail="", uncertain=False, request=None):
+                super().__init__("IMAGE_SOURCE_ODD", detail, uncertain)
+                self.request = request
+
+        with self.subTest("a constructor with another signature"):
+            with self.assertRaises(Refusal) as raised:
+                self.put(self.refusing_after_one_chunk(OneArgument(LEAKY_MESSAGE)))
+            refusal = raised.exception
+            self.assertIs(type(refusal), Refusal)
+            fields = (refusal.reason, refusal.detail, refusal.uncertain)
+            self.assertEqual(fields, ("IMAGE_SOURCE_ODD", "archive source refused", False))
+        with self.subTest("a constructor that takes three arguments in another order"):
+            self.calls.clear()
+            with self.assertRaises(Refusal) as raised:
+                self.put(self.refusing_after_one_chunk(Reordered(LEAKY_MESSAGE, True)))
+            refusal = raised.exception
+            # Building it from (reason, detail, uncertain) would run, and shuffle the fields.
+            self.assertIs(type(refusal), Refusal)
+            fields = (refusal.reason, refusal.detail, refusal.uncertain)
+            self.assertEqual(fields, ("IMAGE_SOURCE_ODD", "archive source refused", True))
+        with self.subTest("an extra attribute is not copied"):
+            self.calls.clear()
+            original = WithRequest("IMAGE_SOURCE_ODD", LEAKY_MESSAGE, True, request=LEAKY_MESSAGE)
+            with self.assertRaises(Refusal) as raised:
+                self.put(self.refusing_after_one_chunk(original))
+            refusal = raised.exception
+            self.assertIs(type(refusal), WithRequest)
+            self.assertIsNone(refusal.request)
+            fields = (refusal.reason, refusal.detail, refusal.uncertain)
+            self.assertEqual(fields, ("IMAGE_SOURCE_ODD", "archive source refused", True))
+            for sentinel in SENTINELS:
+                self.assertNotIn(sentinel, repr(vars(refusal)))
+
+    def test_a_deadline_refusal_from_the_source_stays_a_deadline_refusal_with_a_fixed_detail(self):
+        with self.assertRaises(DeadlineRefusal) as raised:
+            self.put(self.refusing_after_one_chunk(DeadlineRefusal(LEAKY_MESSAGE)))
+        self.assertEqual(raised.exception.detail, "archive upload")
+        self.assertEqual(len(self.requests("abort_multipart_upload")), 1)
+        self.assertEqual(len(self.requests("delete_object")), 1)
+
+    def test_unconfirmed_cleanup_is_stated_for_a_refusal_and_for_a_deadline(self):
+        def stalled():
+            yield b"x" * 5
+            self.clock.advance(300)
+            yield b"x" * 5
+
+        self.s3.errors["abort_multipart_upload"] = ProviderError("InternalError")
+        with self.assertRaises(Refusal) as refused:
+            self.put(self.refusing_after_one_chunk(Refusal("IMAGE_SOURCE_FORBIDDEN", LEAKY_MESSAGE)))
+        self.assertEqual(refused.exception.detail, "archive source refused; upload cleanup not confirmed")
+        with self.assertRaises(DeadlineRefusal) as late:
+            self.put(stalled(), deadline=self.clock() + 240)
+        self.assertEqual(late.exception.detail, "archive upload; upload cleanup not confirmed")
+        # The delete still ran each time although the abort failed.
+        self.assertEqual(len(self.requests("delete_object")), 2)
+
+    def slow_part(self, number):
+        """Make the upload of one part (counted from 1) take 300 seconds on the test clock."""
+        original = self.s3.upload_part
+
+        def upload_part(**arguments):
+            if arguments["PartNumber"] == number:
+                self.clock.advance(300)
+            return original(**arguments)
+
+        self.s3.upload_part = upload_part
+
+    def assert_discarded_and_not_completed(self):
+        self.assertNotIn("complete_multipart_upload", self.names())
+        self.assertEqual(len(self.requests("abort_multipart_upload")), 1)
+        self.assertEqual(len(self.requests("delete_object")), 1)
+
+    def test_a_deadline_that_has_passed_opens_no_upload(self):
+        for offset in (-1, 0):
+            with self.subTest(offset=offset):
+                self.calls.clear()
+                with self.assertRaises(DeadlineRefusal):
+                    self.put([b"x" * 15], deadline=self.clock() + offset)
+                # Not even the create call: there is nothing to abort or delete.
+                self.assertEqual(self.names(), [])
+
+    def test_an_only_part_that_crosses_the_deadline_is_not_completed(self):
+        self.slow_part(1)
+        with self.assertRaises(DeadlineRefusal):
+            self.put([b"x" * 5], deadline=self.clock() + 240)
+        # The part went up; completing the upload is what is refused.
+        self.assertEqual([len(part) for part in self.s3.uploaded], [5])
+        self.assert_discarded_and_not_completed()
+
+    def test_a_final_part_that_crosses_the_deadline_is_not_completed(self):
+        self.slow_part(2)
+        with self.assertRaises(DeadlineRefusal):
+            self.put([b"x" * 15], deadline=self.clock() + 240)
+        self.assertEqual([len(part) for part in self.s3.uploaded], [10, 5])
+        self.assert_discarded_and_not_completed()
+
+    def test_a_stream_that_ends_after_the_deadline_is_not_completed(self):
+        def stream():
+            yield b"x" * 10  # exactly one part, so nothing is left to send at the end
+            self.clock.advance(300)  # the source takes its time to report that it is done
+
+        with self.assertRaises(DeadlineRefusal):
+            self.put(stream(), deadline=self.clock() + 240)
+        self.assertEqual([len(part) for part in self.s3.uploaded], [10])
+        self.assert_discarded_and_not_completed()
 
     def test_a_stalled_source_stream_stops_at_the_deadline_and_is_cleaned_up(self):
         def stream():
@@ -1121,10 +1608,78 @@ class NoSecretTests(Base):
         self.assertEqual(url, SENTINEL_URL)
         self.assert_clean([*capture.surfaces(), *summaries], "successful pass")
 
+    def test_a_refusal_from_the_source_keeps_its_detail_out_of_every_rendering(self):
+        def stream():
+            yield b"x" * 15
+            raise ProviderRefusal("IMAGE_SOURCE_FORBIDDEN", LEAKY_MESSAGE)
+
+        aws = self.image_aws()
+        with Capture() as capture:
+            capture.run(lambda: aws.put_archive(BUCKET, PREFIX + "x.tar.gz", stream(), max_bytes=100, part_bytes=10))
+        self.assertEqual(len(capture.rendered), 6)
+        self.assert_clean(capture.surfaces(), "source refusal")
+
     def test_the_adapter_does_not_log_at_all(self):
-        source = Path(aws_module.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("import logging", source)
-        self.assertNotIn("print(", source)
+        """No print, no record and no handler: ``logging`` is reached only to set a level.
+
+        The adapter imports ``logging`` to keep the SDK's own loggers at INFO or
+        above, so a search for the word cannot tell that from logging. This reads
+        the calls instead.
+        """
+
+        def called_names(tree):
+            return {
+                node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+            }
+
+        def emitting(names):
+            speaking = {
+                "print",
+                "debug",
+                "info",
+                "warning",
+                "warn",
+                "error",
+                "exception",
+                "critical",
+                "fatal",
+                "log",
+                "emit",
+                "handle",
+                "makeRecord",
+                "basicConfig",
+                "addHandler",
+            }
+            return {name for name in names if name in speaking or str(name).endswith("Handler")}
+
+        def calls_on_logging(tree):
+            return {
+                node.func.attr
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logging"
+            }
+
+        tree = ast.parse(Path(aws_module.__file__).read_text(encoding="utf-8"))
+        self.assertEqual(emitting(called_names(tree)), set())
+        # The module names ``logging`` only as ``logging.<name>`` and calls nothing on it but ``getLogger``.
+        names_imported = [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "logging"
+            for alias in node.names
+        ]
+        self.assertEqual(names_imported, [])
+        self.assertLessEqual(calls_on_logging(tree), {"getLogger"})
+        # The walks can find what they forbid.
+        probe = ast.parse("logger.debug('x')\nprint('x')\nlogging.StreamHandler()\nhandler.emit(record)")
+        self.assertEqual(emitting(called_names(probe)), {"debug", "print", "StreamHandler", "emit"})
+        on_logging = ast.parse("logging.warning('x')\nlogging.getLogger('x')")
+        self.assertEqual(calls_on_logging(on_logging), {"warning", "getLogger"})
 
     def test_the_launch_request_is_the_only_place_user_data_travels(self):
         self.launch(self.image_aws())
@@ -1155,6 +1710,508 @@ class NoSecretTests(Base):
             self.assertNotIn("InstanceProfile", str(key))
             self.assertNotIn("IamInstanceProfile", str(key))
         self.assertNotIn("InstanceMarketOptions", every_key)
+
+
+class SdkLoggerGuardTests(unittest.TestCase):
+    """The SDK's loggers stay at INFO or above once an image session exists."""
+
+    def setUp(self):
+        for logger in (logging.getLogger(), *map(logging.getLogger, SDK_LOGGER_NAMES)):
+            self.addCleanup(logger.setLevel, logger.level)
+
+    def levels(self):
+        return {name: logging.getLogger(name).level for name in SDK_LOGGER_NAMES}
+
+    def test_an_unset_or_verbose_sdk_logger_is_raised_to_info(self):
+        logging.getLogger().setLevel(logging.DEBUG)
+        for level in (logging.NOTSET, logging.DEBUG):
+            with self.subTest(level=level):
+                for name in SDK_LOGGER_NAMES:
+                    logging.getLogger(name).setLevel(level)
+                ImageAws(REGION, PROFILE)
+                self.assertEqual(self.levels(), dict.fromkeys(SDK_LOGGER_NAMES, logging.INFO))
+
+    def test_an_unset_logger_under_a_quieter_root_is_not_made_more_verbose(self):
+        logging.getLogger().setLevel(logging.ERROR)
+        for name in SDK_LOGGER_NAMES:
+            logging.getLogger(name).setLevel(logging.NOTSET)
+        ImageAws(REGION, PROFILE)
+        self.assertEqual(self.levels(), dict.fromkeys(SDK_LOGGER_NAMES, logging.ERROR))
+
+    def test_a_logger_that_is_already_quieter_is_left_alone(self):
+        wanted = {"botocore": logging.ERROR, "boto3": logging.WARNING, "urllib3": logging.INFO}
+        for name, level in wanted.items():
+            logging.getLogger(name).setLevel(level)
+        ImageAws(REGION, PROFILE)
+        self.assertEqual(self.levels(), wanted)
+
+    def test_a_root_level_set_after_the_guard_does_not_reopen_the_sdk_or_its_child_loggers(self):
+        children = (
+            "botocore.endpoint",
+            "botocore.auth",
+            "botocore.parsers",
+            "botocore.credentials",
+            "urllib3.connectionpool",
+            "boto3.resources.action",
+        )
+        for name in SDK_LOGGER_NAMES:
+            logging.getLogger(name).setLevel(logging.NOTSET)
+        logging.getLogger().setLevel(logging.WARNING)
+        ImageAws(REGION, PROFILE)
+        logging.getLogger().setLevel(logging.DEBUG)
+        for child in children:
+            with self.subTest(child):
+                self.assertFalse(logging.getLogger(child).isEnabledFor(logging.DEBUG))
+
+    def test_the_guard_covers_a_session_or_client_that_is_injected(self):
+        constructions = {
+            "default": {},
+            "clients": {"clients": {"ec2": object(), "s3": object()}},
+            "session factory": {"session_factory": lambda profile: object()},
+        }
+        for label, arguments in constructions.items():
+            with self.subTest(label):
+                logging.getLogger().setLevel(logging.DEBUG)
+                for name in SDK_LOGGER_NAMES:
+                    logging.getLogger(name).setLevel(logging.NOTSET)
+                ImageAws(REGION, PROFILE, **arguments)
+                self.assertEqual(self.levels(), dict.fromkeys(SDK_LOGGER_NAMES, logging.INFO))
+
+
+# -- the real SDK -------------------------------------------------------------
+#
+# Everything below needs boto3 and is skipped without it. It makes no network
+# call: the configuration is a temporary file, the one HTTP route the SDK could
+# take is a loopback endpoint that records its visitors, and requests that would
+# leave the process are answered by a stub on botocore's ``before-send`` event.
+
+LAUNCH_RESPONSE = (
+    b'<RunInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">'
+    b"<requestId>request-0001</requestId><reservationId>r-0123456789abcdef0</reservationId>"
+    b"<instancesSet><item><instanceId>i-0123456789abcdef0</instanceId></item></instancesSet>"
+    b"</RunInstancesResponse>"
+)
+ASSUME_ROLE_SETTINGS = {"role_arn": ROLE_ARN, "source_profile": SOURCE_PROFILE, "region": REGION}
+SOURCE_CREDENTIALS = f"[{SOURCE_PROFILE}]\n" + "".join(f"{key} = {value}\n" for key, value in STATIC_KEYS.items())
+BASE64_RUN = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+
+
+def assume_role_response():
+    identifier, credential, session_marker = ASSUMED_MARKERS
+    return (
+        '<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials>'
+        f"<AccessKeyId>{identifier}</AccessKeyId><SecretAccessKey>{credential}</SecretAccessKey>"
+        f"<SessionToken>{session_marker}</SessionToken><Expiration>2999-01-01T00:00:00Z</Expiration></Credentials>"
+        "<AssumedRoleUser><AssumedRoleId>role-0001:session-0001</AssumedRoleId>"
+        "<Arn>arn:aws:sts::123456789012:assumed-role/example-image-build-role/session-0001</Arn></AssumedRoleUser>"
+        "</AssumeRoleResult><ResponseMetadata><RequestId>request-0002</RequestId></ResponseMetadata>"
+        "</AssumeRoleResponse>"
+    ).encode()
+
+
+def profile_config(name, **settings):
+    lines = [f"[profile {name}]", *(f"{key} = {value}" for key, value in settings.items())]
+    return "\n".join(lines) + "\n"
+
+
+def profile_configs(profiles):
+    """One configuration file holding every profile of ``profiles`` (name -> settings)."""
+    return "\n".join(profile_config(name, **settings) for name, settings in profiles.items())
+
+
+def markers_in(text, markers):
+    """The markers found in ``text``, raw or inside any base64 run of it."""
+    decoded = []
+    for run in BASE64_RUN.findall(text):
+        unpadded = run.rstrip("=")
+        with contextlib.suppress(ValueError):  # a run that is not base64 at all
+            decoded.append(base64.b64decode(unpadded + "=" * (-len(unpadded) % 4)).decode("utf-8", "replace"))
+    return [marker for marker in markers if marker in text or any(marker in part for part in decoded)]
+
+
+class RawBody(io.BytesIO):
+    """The raw half of a botocore ``AWSResponse``, which botocore reads through ``stream()``."""
+
+    def stream(self, *args, **kwargs):
+        yield self.read()
+
+
+class AmbientCredentials:
+    """A loopback container-credentials endpoint: the ambient identity that must not be used."""
+
+    def __init__(self):
+        self.hits = []
+        ambient = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                ambient.hits.append(self.path)
+                body = json.dumps(
+                    {
+                        "AccessKeyId": "ambient-id",
+                        "SecretAccessKey": "ambient-pw",
+                        "Token": "ambient-tk",
+                        "Expiration": "2999-01-01T00:00:00Z",
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                """Keep request lines out of the test output."""
+
+        self._server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}/ambient"
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join()
+        return False
+
+
+class LogRecords(logging.Handler):
+    """Every record that reaches the root logger, with its logger name and level."""
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append((record.name, record.levelno, record.getMessage()))
+
+    def text(self):
+        return "\n".join(message for _, _, message in self.records)
+
+    def sdk_debug(self):
+        return [
+            name for name, level, _ in self.records if level < logging.INFO and name.split(".")[0] in SDK_LOGGER_NAMES
+        ]
+
+
+class RealSdkCase(unittest.TestCase):
+    """The real boto3 and botocore on temporary files, with nothing else of the environment."""
+
+    def use_files(self, config, credentials="", **environment):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="ci-burst-sdk-")))
+        (directory / "config").write_text(config, encoding="utf-8")
+        (directory / "credentials").write_text(credentials, encoding="utf-8")
+        values = {
+            "AWS_CONFIG_FILE": str(directory / "config"),
+            "AWS_SHARED_CREDENTIALS_FILE": str(directory / "credentials"),
+            "AWS_EC2_METADATA_DISABLED": "true",
+            "NO_PROXY": "127.0.0.1",
+            "no_proxy": "127.0.0.1",
+            "HOME": str(directory),
+        }
+        values.update(environment)
+        # No other AWS_* or proxy variable of this process survives into the SDK.
+        self.enterContext(mock.patch.dict(os.environ, values, clear=True))
+
+    def forbid_transport(self):
+        """Record, and refuse, every request that reaches the SDK's HTTP layer."""
+        sent = []
+
+        def send(session, request):
+            sent.append(request.url)
+            raise AssertionError("the SDK reached for the network")
+
+        self.enterContext(mock.patch.object(botocore.httpsession.URLLib3Session, "send", send))
+        return sent
+
+
+@unittest.skipIf(boto3 is None, REAL_SDK_REASON)
+class RealSdkProfileTests(RealSdkCase):
+    """The default session factory against the real botocore, with no network call.
+
+    Without the check, the route botocore would take is the loopback endpoint
+    here, so a refusal is proved by that endpoint never being asked.
+    """
+
+    def ambient(self, config, credentials=""):
+        endpoint = self.enterContext(AmbientCredentials())
+        self.use_files(config, credentials, AWS_CONTAINER_CREDENTIALS_FULL_URI=endpoint.url)
+        return endpoint
+
+    def assert_refused(self):
+        with self.assertRaises(ProviderRefusal) as raised:
+            ImageAws(REGION, PROFILE)._session()
+        self.assertEqual(raised.exception.reason, "IMAGE_PROFILE_INVALID")
+        self.assertIn(PROFILE, raised.exception.detail)
+        return raised.exception
+
+    def test_a_profile_with_no_credential_route_does_not_fall_back_to_the_ambient_identity(self):
+        endpoint = self.ambient(profile_config(PROFILE, region=REGION))
+        # Control: the session this adapter used to build resolves the ambient identity.
+        plain = boto3.Session(profile_name=PROFILE).get_credentials()
+        self.assertEqual(plain.method, "container-role")
+        self.assertEqual(len(endpoint.hits), 1)
+        endpoint.hits.clear()
+        sent = self.forbid_transport()
+        self.assert_refused()
+        self.assertEqual(endpoint.hits, [])
+        self.assertEqual(sent, [])
+
+    def test_a_profile_that_takes_its_root_credentials_from_a_credential_source_is_refused_unresolved(self):
+        config = profile_config(PROFILE, role_arn=ROLE_ARN, credential_source="EcsContainer", region=REGION)
+        endpoint = self.ambient(config)
+        # Control: the method alone would pass this profile, and resolving it asks the ambient endpoint at once.
+        plain = boto3.Session(profile_name=PROFILE).get_credentials()
+        self.assertEqual(plain.method, aws_module.ASSUME_ROLE_METHOD)
+        self.assertEqual(len(endpoint.hits), 1)
+        endpoint.hits.clear()
+        sent = self.forbid_transport()
+        self.assert_refused()
+        self.assertEqual(endpoint.hits, [])
+        self.assertEqual(sent, [])
+
+    def test_a_credential_source_beside_a_source_profile_is_read_from_the_real_configuration(self):
+        config = profile_config(PROFILE, **ASSUME_ROLE_SETTINGS, credential_source="EcsContainer")
+        self.ambient(config, SOURCE_CREDENTIALS)
+        self.assertIn("it may not name credential_source", self.assert_refused().detail)
+
+    def test_a_role_that_assumes_through_a_web_identity_file_is_refused(self):
+        config = profile_config(PROFILE, **ASSUME_ROLE_SETTINGS, web_identity_token_file="/nonexistent/token")
+        endpoint = self.ambient(config, SOURCE_CREDENTIALS)
+        # Control: botocore resolves this profile through web identity, not through the assume-role route.
+        plain = boto3.Session(profile_name=PROFILE).get_credentials()
+        self.assertEqual(plain.method, "assume-role-with-web-identity")
+        sent = self.forbid_transport()
+        refusal = self.assert_refused()
+        self.assertIn("it may not name web_identity_token_file", refusal.detail)
+        self.assertEqual(endpoint.hits, [])
+        self.assertEqual(sent, [])
+
+    def test_a_credential_source_further_along_the_chain_is_refused_unresolved(self):
+        config = profile_configs(
+            {
+                PROFILE: {"role_arn": ROLE_ARN, "source_profile": LINK_PROFILE, "region": REGION},
+                LINK_PROFILE: {"role_arn": INTERMEDIATE_ROLE_ARN, "credential_source": "EcsContainer"},
+            }
+        )
+        endpoint = self.ambient(config)
+        # Control: botocore reports the assume-role method for this chain, so the method alone
+        # passes it, and resolving it asks the ambient endpoint at once.
+        plain = boto3.Session(profile_name=PROFILE).get_credentials()
+        self.assertEqual(plain.method, aws_module.ASSUME_ROLE_METHOD)
+        self.assertEqual(len(endpoint.hits), 1)
+        endpoint.hits.clear()
+        sent = self.forbid_transport()
+        refusal = self.assert_refused()
+        self.assertIn(f"source profile {LINK_PROFILE} may not name credential_source", refusal.detail)
+        self.assertEqual(endpoint.hits, [])
+        self.assertEqual(sent, [])
+
+    def test_a_credential_process_further_along_the_chain_is_refused_and_never_run(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="ci-burst-process-")))
+        marker = directory / "ran"
+        script = directory / "credential_process.py"
+        script.write_text(
+            "import json, pathlib\n"
+            f"pathlib.Path({str(marker)!r}).write_text('ran')\n"
+            "print(json.dumps({'Version': 1, 'AccessKeyId': 'fake-id', 'SecretAccessKey': 'fake-pw'}))\n",
+            encoding="utf-8",
+        )
+        config = profile_configs(
+            {
+                PROFILE: {"role_arn": ROLE_ARN, "source_profile": LINK_PROFILE, "region": REGION},
+                LINK_PROFILE: {"credential_process": shlex.join([sys.executable, str(script)])},
+            }
+        )
+        self.use_files(config)
+        # Control: resolving the chain as botocore does runs the command.
+        boto3.Session(profile_name=PROFILE).get_credentials()
+        self.assertTrue(marker.exists())
+        marker.unlink()
+        sent = self.forbid_transport()
+        refusal = self.assert_refused()
+        self.assertIn(f"source profile {LINK_PROFILE} may not name credential_process", refusal.detail)
+        self.assertFalse(marker.exists())
+        self.assertEqual(sent, [])
+
+    def test_a_source_profile_without_keys_is_refused_and_the_ambient_identity_is_not_asked(self):
+        config = profile_configs(
+            {
+                PROFILE: {"role_arn": ROLE_ARN, "source_profile": LINK_PROFILE, "region": REGION},
+                LINK_PROFILE: {"region": REGION},
+            }
+        )
+        endpoint = self.ambient(config)
+        # Control: botocore itself does not fall back to the container route for a source profile.
+        with self.assertRaises(botocore.exceptions.InvalidConfigError):
+            boto3.Session(profile_name=PROFILE).get_credentials()
+        self.assertEqual(endpoint.hits, [])
+        sent = self.forbid_transport()
+        refusal = self.assert_refused()
+        self.assertIn(f"source profile {LINK_PROFILE} ends the chain without static keys", refusal.detail)
+        self.assertEqual(endpoint.hits, [])
+        self.assertEqual(sent, [])
+
+    def test_a_chain_of_roles_with_static_keys_in_the_config_file_is_accepted_without_any_network_call(self):
+        config = profile_configs(
+            {
+                PROFILE: {"role_arn": ROLE_ARN, "source_profile": LINK_PROFILE, "region": REGION},
+                LINK_PROFILE: {"role_arn": INTERMEDIATE_ROLE_ARN, "source_profile": SOURCE_PROFILE},
+                SOURCE_PROFILE: STATIC_KEYS,
+            }
+        )
+        endpoint = self.ambient(config)
+        sent = self.forbid_transport()
+        aws = ImageAws(REGION, PROFILE)
+        session = aws._session()
+        self.assertIsInstance(session, boto3.Session)
+        self.assertEqual(session.get_credentials().method, aws_module.ASSUME_ROLE_METHOD)
+        self.assertEqual(aws._client("ec2").meta.region_name, REGION)
+        # Each role in the chain is assumed on first use, not before.
+        self.assertEqual(sent, [])
+        self.assertEqual(endpoint.hits, [])
+
+    def test_a_role_with_static_source_keys_is_accepted_without_any_network_call(self):
+        endpoint = self.ambient(profile_config(PROFILE, **ASSUME_ROLE_SETTINGS), SOURCE_CREDENTIALS)
+        sent = self.forbid_transport()
+        aws = ImageAws(REGION, PROFILE)
+        session = aws._session()
+        self.assertIsInstance(session, boto3.Session)
+        self.assertEqual(session.profile_name, PROFILE)
+        self.assertEqual(session.get_credentials().method, aws_module.ASSUME_ROLE_METHOD)
+        # Both clients build on that session; the role is assumed on first use, not before.
+        self.assertEqual(aws._client("ec2").meta.region_name, REGION)
+        self.assertEqual(aws._client("s3").meta.region_name, REGION)
+        self.assertEqual(sent, [])
+        self.assertEqual(endpoint.hits, [])
+
+    def test_a_profile_that_is_in_neither_file_is_refused(self):
+        self.use_files(profile_config("another-profile", region=REGION))
+        self.assertIn("it does not exist", self.assert_refused().detail)
+
+    def test_the_assume_role_method_name_is_the_installed_botocores(self):
+        self.assertEqual(botocore.credentials.AssumeRoleProvider.METHOD, aws_module.ASSUME_ROLE_METHOD)
+
+    def test_the_providers_that_can_answer_for_a_profile_in_the_chain_are_covered_by_the_denied_settings(self):
+        """A botocore that adds a provider fails here, so that the denied settings are read again.
+
+        Each provider is listed with the setting that selects it. The shared-credentials and config
+        providers read the static keys the chain must end in; every other setting is refused.
+        """
+        selected_by = {
+            "AssumeRoleWithWebIdentityProvider": "web_identity_token_file",
+            "SSOProvider": "sso_session",
+            "SharedCredentialProvider": None,
+            "LoginProvider": "login_session",
+            "ProcessProvider": "credential_process",
+            "ConfigProvider": None,
+        }
+        self.use_files("")
+        builder = botocore.credentials.ProfileProviderBuilder(botocore.session.Session())
+        installed = {type(provider).__name__ for provider in builder.providers("example-profile")}
+        self.assertLessEqual(installed, set(selected_by))
+        for provider, setting in selected_by.items():
+            if setting is None:
+                continue
+            with self.subTest(provider):
+                config = profile_configs(
+                    {
+                        PROFILE: {"role_arn": ROLE_ARN, "source_profile": LINK_PROFILE, "region": REGION},
+                        LINK_PROFILE: {**STATIC_KEYS, setting: "example-value"},
+                    }
+                )
+                self.use_files(config)
+                self.assertIn(f"may not name {setting}", self.assert_refused().detail)
+
+
+@unittest.skipIf(boto3 is None, REAL_SDK_REASON)
+class RealSdkLoggingTests(RealSdkCase):
+    """The SDK's DEBUG records print requests and credentials, so the adapter silences them.
+
+    Each test first shows the leak with the SDK loggers as botocore leaves them,
+    so a clean second half is not a capture that sees nothing.
+    """
+
+    def setUp(self):
+        root = logging.getLogger()
+        for logger in (root, *map(logging.getLogger, SDK_LOGGER_NAMES)):
+            self.addCleanup(logger.setLevel, logger.level)
+        for name in SDK_LOGGER_NAMES:
+            logging.getLogger(name).setLevel(logging.NOTSET)
+        self.records = LogRecords()
+        root.addHandler(self.records)
+        self.addCleanup(root.removeHandler, self.records)
+        root.setLevel(logging.DEBUG)
+
+    def stub(self, request, body, calls):
+        """Answer a request with ``body``, noting its form fields in ``calls``."""
+        sent = request.body.decode() if isinstance(request.body, bytes) else request.body
+        calls.append(urllib.parse.parse_qs(sent))
+        return AWSResponse(request.url, 200, {}, RawBody(body))
+
+    def test_a_builder_launch_through_the_real_client_logs_no_user_data_or_token(self):
+        self.use_files(profile_config("default", region=REGION))
+        session = boto3.Session(aws_access_key_id="fake-id", aws_secret_access_key="fake-pw", region_name=REGION)
+        requests = []
+        session.events.register(
+            "before-send.ec2.RunInstances", lambda request, **kwargs: self.stub(request, LAUNCH_RESPONSE, requests)
+        )
+        markers = (*SENTINELS, SENTINEL_CLIENT_TOKEN)
+        user_data_text = base64.b64encode(LEAKY_MESSAGE.encode()).decode()
+        template = {"LaunchTemplateName": "example-ci-burst-image-builder", "Version": "2"}
+
+        # Control: a plain client logs the whole request, encoded user data and token included.
+        session.client("ec2", region_name=REGION).run_instances(
+            LaunchTemplate=template, MinCount=1, MaxCount=1, ClientToken=SENTINEL_CLIENT_TOKEN, UserData=LEAKY_MESSAGE
+        )
+        self.assertIn(user_data_text, self.records.text())
+        self.assertCountEqual(markers_in(self.records.text(), markers), markers)
+
+        self.records.records.clear()
+        requests.clear()
+        aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session)
+        instance_id = aws.run_builder(
+            template_name=template["LaunchTemplateName"],
+            template_version=2,
+            deployment=DEPLOYMENT,
+            build_id="build-0001",
+            expires_at=NOW + 2700,
+            user_data=LEAKY_MESSAGE,
+            client_token=SENTINEL_CLIENT_TOKEN,
+        )
+        self.assertEqual(instance_id, "i-0123456789abcdef0")
+        # The request really travelled through the real client and carried both values.
+        (request,) = requests
+        self.assertEqual(request["UserData"], [user_data_text])
+        self.assertEqual(request["ClientToken"], [SENTINEL_CLIENT_TOKEN])
+        self.assertEqual(markers_in(self.records.text(), markers), [])
+        self.assertEqual(self.records.sdk_debug(), [])
+
+    def test_assumed_role_credentials_are_not_logged_when_they_are_resolved(self):
+        self.use_files(profile_config(PROFILE, **ASSUME_ROLE_SETTINGS), SOURCE_CREDENTIALS)
+        requests = []
+
+        def sts(request, **kwargs):
+            return self.stub(request, assume_role_response(), requests)
+
+        # Control: a plain session logs the response that holds the assumed credentials.
+        plain = botocore.session.Session(profile=PROFILE)
+        plain.register("before-send.sts.AssumeRole", sts)
+        plain.get_credentials().get_frozen_credentials()
+        self.assertCountEqual(markers_in(self.records.text(), ASSUMED_MARKERS), ASSUMED_MARKERS)
+
+        self.records.records.clear()
+        requests.clear()
+        aws = ImageAws(REGION, PROFILE)
+        aws._session().events.register("before-send.sts.AssumeRole", sts)
+        self.assertIsNotNone(aws.credential_expiry())
+        # The role really was assumed, through the stub.
+        self.assertEqual([call["Action"] for call in requests], [["AssumeRole"]])
+        self.assertEqual(markers_in(self.records.text(), ASSUMED_MARKERS), [])
+        self.assertEqual(self.records.sdk_debug(), [])
 
 
 if __name__ == "__main__":

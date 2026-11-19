@@ -14,11 +14,14 @@ use to exercise pagination and response parsing without any SDK.
 one named shared-config profile, never from ``[aws].profile``, and it can reach
 only the EC2 and S3 services. The module has no IAM client. The presigned
 archive URL, user data and the full template payload are never logged, echoed in
-an error or placed in a returned summary.
+an error or placed in a returned summary. The module emits no log record of its
+own; it only raises the level of the SDK's loggers, whose DEBUG records would
+print those values (see ``_quiet_sdk_loggers``).
 """
 
 import copy
 import hashlib
+import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -434,6 +437,31 @@ BUILDER_TAGGED_RESOURCES = ("instance", "volume", "network-interface")
 #: replace them, and none may be the managed tag.
 _IMAGE_RESERVED_TAGS = frozenset({MANAGED_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG, BUILD_ID_TAG, BASIS_DIGEST_TAG})
 
+#: What botocore calls credentials that come from a profile's ``role_arn``
+#: (``AssumeRoleProvider.METHOD``). A test with the real SDK pins this value to
+#: the installed botocore.
+ASSUME_ROLE_METHOD = "assume-role"
+
+#: Profile settings that select a credential provider other than static keys:
+#: an ambient endpoint, a web identity token file, a command, a console login
+#: session or (every key that starts with ``_SSO_PREFIX``) an SSO session. None
+#: may appear in any profile of the image profile's ``source_profile`` chain. A
+#: test with the real SDK lists botocore's profile providers, so a new one is noticed.
+_AMBIENT_PROFILE_KEYS = frozenset(
+    {"credential_source", "web_identity_token_file", "credential_process", "login_session"}
+)
+_SSO_PREFIX = "sso_"
+
+#: The static keys that must end the ``source_profile`` chain.
+_STATIC_KEYS = ("aws_access_key_id", "aws_secret_access_key")
+
+#: The most profiles a chain may span, from the image profile to the one that
+#: holds the static keys. botocore has no limit and refuses only a cycle.
+MAX_PROFILE_CHAIN = 5
+
+#: The SDK loggers that ``ImageAws`` keeps at INFO or above.
+SDK_LOGGERS = ("botocore", "boto3", "urllib3")
+
 
 @dataclass(frozen=True)
 class Image:
@@ -509,11 +537,111 @@ class _ArchiveTooLarge(Exception):
 
 
 def _boto3_session(profile):
+    """A boto3 session whose credentials can only be ``profile``'s assume-role route.
+
+    ``Session(profile_name=...)`` alone is not enough: a profile with no
+    credential route falls through to the container and instance-metadata
+    providers, and on the controller host those are the scaling identity. The
+    first profile is not enough either. botocore resolves the root of a
+    ``source_profile`` chain as soon as credentials are requested, so a profile
+    further along that names a ``credential_source`` asks the ambient route at
+    once, whatever the first profile says, and one that names a web identity
+    token file, a credential process, a login session or an SSO session takes
+    its credentials from there instead of from keys. So the whole chain is read
+    from the merged configuration first (see ``_profile_problem``): the profile
+    must name ``role_arn`` and ``source_profile``, every profile it leads to must
+    exist and name none of those routes, and the chain must end in static keys.
+    The credentials the SDK then resolves must be the assume-role ones.
+
+    The configuration walk reads files only, so a profile that fails it is
+    refused before the SDK is asked for credentials and no ambient route is
+    contacted. Assumed-role credentials are deferred, so the method check makes
+    no STS call either. The detail names the profile and at most the class of an
+    SDK error, never the SDK's message or a credential.
+    """
     try:
         import boto3
+        import botocore.session
     except ImportError:
         raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
-    return boto3.Session(profile_name=profile)
+    try:
+        sdk_session = botocore.session.Session(profile=profile)
+        problem = _profile_problem(sdk_session, profile)
+    except Exception as error:  # noqa: BLE001 - reported as a class name only
+        problem = f"the SDK could not resolve it ({type(error).__name__})"
+    if problem is not None:
+        raise ProviderRefusal("IMAGE_PROFILE_INVALID", f"profile {profile}: {problem}")
+    return boto3.Session(botocore_session=sdk_session)
+
+
+def _profile_problem(sdk_session, profile):
+    """Why ``profile`` is not an assume-role route that ends in static keys, or ``None`` when it is.
+
+    Follows ``source_profile`` through the SDK's merged configuration (the config
+    file and the credentials file), the same mapping botocore resolves from. A
+    profile with ``role_arn`` is a role: it needs a ``source_profile``, which is
+    the next link. One without ``role_arn`` is the end of the chain and needs
+    both static keys. Each link must exist and may not name a key of
+    ``_AMBIENT_PROFILE_KEYS`` or one that starts with ``_SSO_PREFIX``, and a
+    chain that returns to a profile or spans more than ``MAX_PROFILE_CHAIN``
+    profiles is refused.
+
+    This is stricter than botocore in one place: a link past the first that has
+    both ``role_arn`` and static keys is resolved by botocore from the keys, and
+    is followed here as a role. The detail names a profile and a key, never a value.
+    """
+    profiles = sdk_session.full_config["profiles"]
+    chain, name = [], profile
+    while True:
+        who = f"source profile {name}" if chain else "it"
+        if name in chain:
+            return f"its source_profile chain returns to {name}"
+        if len(chain) == MAX_PROFILE_CHAIN:
+            return f"its source_profile chain is longer than {MAX_PROFILE_CHAIN} profiles"
+        settings = profiles.get(name)
+        if settings is None:
+            return f"{who} does not exist"
+        for key in settings:
+            if key in _AMBIENT_PROFILE_KEYS or key.startswith(_SSO_PREFIX):
+                return f"{who} may not name {key}"
+        chain.append(name)
+        if settings.get("role_arn"):
+            name = settings.get("source_profile")
+            if not name:
+                return f"{who} needs both role_arn and source_profile"
+        elif len(chain) == 1:
+            return "it needs both role_arn and source_profile"
+        elif all(settings.get(key) for key in _STATIC_KEYS):
+            break
+        else:
+            return f"{who} ends the chain without static keys"
+    credentials = sdk_session.get_credentials()
+    if getattr(credentials, "method", None) != ASSUME_ROLE_METHOD:
+        return "its credentials do not come from the assume-role route"
+    return None
+
+
+def _quiet_sdk_loggers():
+    """Keep the SDK's own diagnostics from printing what this adapter keeps private.
+
+    Botocore's DEBUG records print the request parameters (the builder's user
+    data, which holds the presigned archive URL, and the client token), the
+    response bodies (an assumed role's credentials) and the request signature.
+    No client or ``Config`` option switches that off, so the level of the SDK's
+    loggers is raised instead. This is a process-wide guard for the image
+    command: it holds for any handler or root level that is set later, and it
+    suits a command that runs one pass and exits.
+
+    Each logger is set to INFO, or to the level it already has or inherits when
+    that is higher. A logger that is unset or below INFO is raised, a quieter one
+    keeps its level, and no logger becomes more verbose than it was (an unset
+    logger under a root set to WARNING stays at WARNING, not INFO). A logger that
+    a caller levelled explicitly further down the tree (for example
+    ``botocore.endpoint``) is not reached.
+    """
+    for name in SDK_LOGGERS:
+        logger = logging.getLogger(name)
+        logger.setLevel(max(logging.INFO, logger.getEffectiveLevel()))
 
 
 def _session_expiry(session):
@@ -540,18 +668,25 @@ class ImageAws:
     profile for every pass. The session comes from ``profile`` alone and never
     from ``[aws].profile``: an empty profile is refused, because the SDK would
     otherwise fall back to its default chain, which may be the scaling identity.
+    The default session factory refuses a profile that is not an assume-role
+    route, or whose ``source_profile`` chain does not end in static keys, for
+    the same reason (see ``_boto3_session``).
 
     Primitives here do not decide what may be deleted or terminated. The caller
     verifies the ownership tags first (see the image deletion rule).
 
     ``session_factory`` (profile name -> session), ``clients`` (service name ->
     client), ``clock`` and ``expiry`` (epoch seconds, or a callable returning
-    them) let tests run without the SDK or a network.
+    them) let tests run without the SDK or a network. An injected factory
+    replaces the profile check, so it is the caller's to make.
     """
 
     def __init__(self, region, profile, *, session_factory=None, clients=None, clock=time.time, expiry=None):
         if not isinstance(profile, str) or not profile:
             raise ProviderRefusal("IMAGE_PROFILE_MISSING", "an image session needs a named profile")
+        # Before any session or client exists, injected ones included: the SDK
+        # logs the request, and the credential response, from the first call.
+        _quiet_sdk_loggers()
         self._region = region
         self._profile = profile
         self._session_factory = session_factory or _boto3_session
@@ -829,9 +964,15 @@ class ImageAws:
         The archive is never written to disk. Overrunning ``max_bytes``, a failed
         part or completion, or a failing source iterator aborts the upload and
         deletes the key. The detail never carries the provider's message or the
-        iterator's, which could hold a URL or a token. ``deadline`` is checked
-        before each chunk and each part, so a stalled stream ends the upload too.
+        iterator's, which could hold a URL or a token: a refusal that the
+        iterator raises leaves here as a new one with the same reason code and a
+        fixed detail, of the same class where the class can be rebuilt from its
+        reason, detail and uncertainty (see ``_rebuilt_refusal``). ``deadline`` is
+        checked before the upload opens, before each chunk and each part, and
+        immediately before completion, so a stalled stream or a slow last part
+        ends the upload instead of finishing it.
         """
+        self._check_deadline(deadline, "archive upload")
         started = self._invoke("s3", "create_multipart_upload", Bucket=bucket, Key=key)
         upload_id = started.get("UploadId")
         if not isinstance(upload_id, str) or not upload_id:
@@ -842,8 +983,16 @@ class ImageAws:
             cleaned = self._discard_upload(bucket, key, upload_id)
             raise ProviderRefusal("IMAGE_ARCHIVE_TOO_LARGE", _cleanup_detail(f"over {max_bytes} bytes", cleaned)) from None
         except Refusal as refusal:
-            self._discard_upload(bucket, key, upload_id)
-            raise refusal from None
+            # The source iterator's refusal can carry a URL or a token in its
+            # detail, so only its reason code (and whether it was uncertain)
+            # crosses this boundary, on a new object. The class survives, so a
+            # caller that catches a ``ProviderRefusal`` or a ``DeadlineRefusal``
+            # still does; the deadline refusal takes only a detail, so it is
+            # rebuilt on its own line.
+            cleaned = self._discard_upload(bucket, key, upload_id)
+            if isinstance(refusal, DeadlineRefusal):
+                raise DeadlineRefusal(_cleanup_detail("archive upload", cleaned)) from None
+            raise _rebuilt_refusal(refusal, _cleanup_detail("archive source refused", cleaned)) from None
         except Exception as error:  # noqa: BLE001 - reported as a code only
             cleaned = self._discard_upload(bucket, key, upload_id)
             code = (_error_code(error) or type(error).__name__)[:64]
@@ -878,6 +1027,9 @@ class ImageAws:
             raise ValueError("archive stream was empty")
         if buffer:
             send(bytes(buffer))
+        # The last part can cross the deadline while it uploads, and the per-part
+        # check above ran before it: a late upload must not be completed.
+        self._check_deadline(deadline, "archive upload")
         s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts})
         return ArchiveUpload(key=key, size=total, sha256=digest.hexdigest())
 
@@ -961,6 +1113,26 @@ def _require_version(version):
 
 def _cleanup_detail(detail, cleaned):
     return detail if cleaned else detail + "; upload cleanup not confirmed"
+
+
+def _rebuilt_refusal(refusal, detail):
+    """A new refusal with ``refusal``'s reason and uncertainty and the given ``detail``.
+
+    It has the class of ``refusal`` when that class can be built from ``(reason,
+    detail, uncertain)`` and then carries exactly those, which is every class of
+    ``errors`` but the deadline refusal. Anything else a class carries is not
+    copied, because it could hold the text that is being dropped. A class built
+    another way, or one that would shuffle the three, comes out as a plain
+    ``Refusal``.
+    """
+    wanted = (refusal.reason, detail, refusal.uncertain)
+    try:
+        rebuilt = type(refusal)(*wanted)
+    except TypeError:
+        rebuilt = None
+    if rebuilt is None or (rebuilt.reason, rebuilt.detail, rebuilt.uncertain) != wanted:
+        rebuilt = Refusal(*wanted)
+    return rebuilt
 
 
 def _sdk_config(**overrides):

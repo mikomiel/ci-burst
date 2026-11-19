@@ -1143,6 +1143,239 @@ class StreamDeadlineTests(unittest.TestCase):
         self.assertEqual(list(stream), [])
 
 
+class TransportFailureTests(unittest.TestCase):
+    """Every failed exchange is a stable refusal, and a body cut short is never complete.
+
+    Each test reads one scripted loopback connection through the real opener and
+    the real ``http.client`` parser, three ways: through ``get``, through
+    ``stream`` and through ``stream`` with a deadline. A raw ``http.client``
+    exception, a clean end of a body that was cut short, or a refusal that quotes
+    the peer fails a test here. ``SENTINEL`` marks text that only the peer, or a
+    request header that the parser rejected, could have supplied.
+    """
+
+    SENTINEL = "sentinel"
+    READS = {
+        "get": {
+            "truncated": "FORGEJO_RESPONSE_TRUNCATED",
+            "too_large": "FORGEJO_RESPONSE_TOO_LARGE",
+            "read": lambda transport, url, headers: transport.get(url, headers),
+        },
+        "stream": {
+            "truncated": "FORGEJO_ARCHIVE_TRUNCATED",
+            "too_large": "FORGEJO_ARCHIVE_TOO_LARGE",
+            "read": lambda transport, url, headers: b"".join(transport.stream(url, headers, 1024)),
+        },
+        "stream with a deadline": {
+            "truncated": "FORGEJO_ARCHIVE_TRUNCATED",
+            "too_large": "FORGEJO_ARCHIVE_TOO_LARGE",
+            "read": lambda transport, url, headers: b"".join(
+                transport.stream(url, headers, 1024, deadline=time.monotonic() + 60)
+            ),
+        },
+    }
+
+    def setUp(self):
+        # The opener honours proxy variables; this traffic never leaves the host.
+        patched = mock.patch.dict(os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"})
+        patched.start()
+        self.addCleanup(patched.stop)
+        self._servers = []
+        self.addCleanup(self._release)
+
+    def _release(self):
+        for server in self._servers:
+            server.close()
+
+    def transport(self):
+        return UrllibTransport(timeout_seconds=1, max_response_bytes=1024, clock=time.monotonic)
+
+    def reply(self, payload):
+        """The URL of a server that answers the request with ``payload`` and closes the connection."""
+        server = LoopbackServer(lambda connection, stop: connection.sendall(payload))
+        self._servers.append(server)
+        return server.url
+
+    def assert_refused(self, payload, reason, detail, headers=None):
+        """Every read refuses ``payload`` with ``reason`` and ``detail`` and quotes nothing.
+
+        ``reason`` is a code, or ``"truncated"`` or ``"too_large"`` for the code
+        that each read uses: ``get`` and ``stream`` name those two differently.
+        """
+        for name, read in self.READS.items():
+            with self.subTest(read=name):
+                url = self.reply(payload)
+                with self.assertRaises(ObservationRefusal) as raised:
+                    read["read"](self.transport(), url, headers or {})
+                refusal = raised.exception
+                self.assertEqual((refusal.reason, refusal.detail), (read.get(reason, reason), detail))
+                self.assertTrue(refusal.__context__ is None or refusal.__suppress_context__)
+                for text in (str(refusal), repr(refusal), json.dumps(refusal.as_dict())):
+                    self.assertNotIn(self.SENTINEL, text)
+                # The refusal's __context__ is the urllib error, which holds the response and its
+                # socket. Left to the garbage collector, that socket is reported as a
+                # ResourceWarning in whichever test runs next.
+                del refusal, raised
+
+    def test_a_body_shorter_than_its_content_length_is_refused(self):
+        # http.client ends such a body without an error: read and read1 return what arrived.
+        for sent, detail in ((b"partial", "received 7 of 1000 bytes"), (b"", "received 0 of 1000 bytes")):
+            with self.subTest(sent=sent):
+                self.assert_refused(LENGTH_HEAD + sent, "truncated", detail)
+
+    def test_a_refused_stream_has_already_yielded_what_arrived(self):
+        # The check runs at the end of the body, so only a clean end of the iteration means complete.
+        stream = self.transport().stream(self.reply(LENGTH_HEAD + b"partial"), {}, 1024)
+        self.assertEqual(next(stream), b"partial")
+        with self.assertRaises(ObservationRefusal) as raised:
+            next(stream)
+        self.assertEqual(
+            (raised.exception.reason, raised.exception.detail),
+            ("FORGEJO_ARCHIVE_TRUNCATED", "received 7 of 1000 bytes"),
+        )
+
+    def test_a_chunked_body_that_ends_early_is_refused(self):
+        # http.client raises IncompleteRead for the first six cuts. It reads the last four as a
+        # clean end, because it accepts a closing line that is missing or unfinished; the
+        # transport refuses those too, as it does for any chunked body without its blank line.
+        cuts = {
+            "no chunk at all": b"",
+            "inside the first size line": b"5",
+            "inside the chunk data": b"5\r\nhel",
+            "before the CRLF that ends a chunk": b"5\r\nhello",
+            "between chunks": b"5\r\nhello\r\n",
+            "inside the next size line": b"5\r\nhello\r\n5",
+            "inside the final 0 line": b"5\r\nhello\r\n0",
+            "after the final 0 and its CR": b"5\r\nhello\r\n0\r",
+            "before the blank line that ends the body": b"5\r\nhello\r\n0\r\n",
+            "inside a trailer": b"5\r\nhello\r\n0\r\nX-Trailer: a",
+        }
+        for name, sent in cuts.items():
+            with self.subTest(cut=name):
+                self.assert_refused(CHUNKED_HEAD + sent, "FORGEJO_UNAVAILABLE", "IncompleteRead")
+
+    def test_a_malformed_status_line_or_an_over_long_header_is_refused_without_its_text(self):
+        # The message of BadStatusLine quotes the status line that the peer sent.
+        replies = {
+            "status line": (b"sentinel-status garbage\r\n\r\n", "BadStatusLine"),
+            "header line": (b"HTTP/1.1 200 OK\r\nX-Sentinel: " + b"x" * 70000 + b"\r\n\r\n", "LineTooLong"),
+        }
+        for name, (payload, detail) in replies.items():
+            with self.subTest(reply=name):
+                self.assert_refused(payload, "FORGEJO_UNAVAILABLE", detail)
+
+    def test_a_request_header_that_http_client_rejects_is_not_quoted(self):
+        # http.client raises ValueError and quotes the rejected value, here a token with a line break.
+        self.assert_refused(
+            b"", "FORGEJO_UNAVAILABLE", "ValueError", headers={"Authorization": "token sentinel\nsecret"}
+        )
+
+    def test_a_read_on_a_closed_file_is_a_refusal(self):
+        class ClosedResponse(StreamingFakeResponse):
+            def read(self, limit):
+                raise ValueError("sentinel: I/O operation on closed file.")
+
+            def read1(self, limit):
+                raise ValueError("sentinel: I/O operation on closed file.")
+
+        for name, read in self.READS.items():
+            if name == "stream with a deadline":
+                continue  # the deadline is the next test
+            with self.subTest(read=name):
+                transport = self.transport()
+                transport._open = lambda request, timeout=None: ClosedResponse(200, b"")
+                with self.assertRaises(ObservationRefusal) as raised:
+                    read["read"](transport, "https://forgejo.example/a", {})
+                refusal = raised.exception
+                self.assertEqual((refusal.reason, refusal.detail), ("FORGEJO_UNAVAILABLE", "ValueError"))
+                for text in (str(refusal), repr(refusal), json.dumps(refusal.as_dict())):
+                    self.assertNotIn(self.SENTINEL, text)
+
+    def test_an_error_once_the_deadline_has_passed_is_a_deadline_refusal(self):
+        # Mapping a failure must not hide its cause: a cut-off by the deadline stays a deadline refusal.
+        errors = (
+            http.client.IncompleteRead(b""),
+            http.client.BadStatusLine("sentinel"),
+            ValueError("sentinel: I/O operation on closed file."),
+            OSError("sentinel"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                clock = {"now": 0}
+
+                class Failing(StreamingFakeResponse):
+                    def read1(self, limit, error=error):
+                        clock["now"] = 10  # the deadline passes during this read
+                        raise error
+
+                transport = UrllibTransport(timeout_seconds=30, max_response_bytes=16, clock=lambda: clock["now"])
+                transport._open = lambda request, timeout=None: Failing(200, b"")
+                with self.assertRaises(DeadlineRefusal) as raised:
+                    list(transport.stream("https://forgejo.example/a", {}, 100, deadline=5))
+                self.assertEqual(raised.exception.detail, "archive stream")
+
+    def test_a_dropped_connection_an_error_status_and_a_redirect_keep_their_reason(self):
+        head = b"HTTP/1.1 %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        replies = {
+            "closed without a reply": (b"", "FORGEJO_UNAVAILABLE", "RemoteDisconnected"),
+            "forbidden": (head % b"403 Forbidden", "FORGEJO_UNEXPECTED_STATUS", "HTTP 403"),
+            "unavailable": (head % b"503 Service Unavailable", "FORGEJO_UNEXPECTED_STATUS", "HTTP 503"),
+            "redirect": (
+                b"HTTP/1.1 302 Found\r\nLocation: http://forgejo.example/elsewhere\r\nContent-Length: 0\r\n\r\n",
+                "FORGEJO_REDIRECT_REFUSED",
+                "HTTP 302",
+            ),
+        }
+        for name, (payload, reason, detail) in replies.items():
+            with self.subTest(reply=name):
+                self.assert_refused(payload, reason, detail)
+
+    def test_the_bound_and_the_status_are_judged_before_a_short_body(self):
+        # get reads at most the bound plus one byte, so it never reaches the end of a larger body.
+        length = b"HTTP/1.1 200 OK\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n"
+        replies = {
+            "over the bound, Content-Length not reached": (length + b"x" * 3000, "too_large", "limit 1024 bytes"),
+            "over the bound, chunked": (
+                CHUNKED_HEAD + b"7d0\r\n" + b"x" * 2000 + b"\r\n0\r\n\r\n",
+                "too_large",
+                "limit 1024 bytes",
+            ),
+            "status 206 with a short body": (
+                b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1000\r\nConnection: close\r\n\r\npartial",
+                "FORGEJO_UNEXPECTED_STATUS",
+                "HTTP 206",
+            ),
+        }
+        for name, (payload, reason, detail) in replies.items():
+            with self.subTest(reply=name):
+                self.assert_refused(payload, reason, detail)
+
+    def test_complete_bodies_are_returned_whole(self):
+        closing = b"0\r\n\r\n"
+        bodies = {
+            "Content-Length": (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world",
+                b"hello world",
+            ),
+            "chunked": (CHUNKED_HEAD + b"5\r\nhello\r\n6\r\n world\r\n" + closing, b"hello world"),
+            "chunked with a trailer": (CHUNKED_HEAD + b"5\r\nhello\r\n0\r\nX-Trailer: a\r\n\r\n", b"hello"),
+            "chunked closed by a bare line feed": (CHUNKED_HEAD + b"5\r\nhello\r\n0\r\n\n", b"hello"),
+            "chunked and an ignored Content-Length": (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 999\r\nConnection: close\r\n\r\n"
+                b"5\r\nhello\r\n" + closing,
+                b"hello",
+            ),
+            "no length and not chunked, ended by the close": (
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello world",
+                b"hello world",
+            ),
+        }
+        for name, (payload, body) in bodies.items():
+            for read_name, read in self.READS.items():
+                with self.subTest(body=name, read=read_name):
+                    self.assertEqual(read["read"](self.transport(), self.reply(payload), {}), body)
+
+
 class RecordingSocket:
     def __init__(self, error=None):
         self.error = error

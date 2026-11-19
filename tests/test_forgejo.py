@@ -756,6 +756,25 @@ class ForgejoSourceTests(unittest.TestCase):
         self.assertEqual(environ.reads, [TOKEN_ENV])
         self.assertEqual(transport.calls, [])
 
+    def test_a_malformed_token_is_refused_without_its_value_on_every_read(self):
+        reads = {
+            "branch": lambda source: source.branch("main"),
+            "raw_file": lambda source: source.raw_file(SHA, "uv.lock"),
+            "archive": lambda source: list(source.archive(SHA, 16)),
+        }
+        for token in ("sentinel-image-secret\n", "sentinel image secret", "sentinel-image-secret\r\nX-Injected: 1"):
+            for name, read in reads.items():
+                with self.subTest(read=name, token=repr(token)):
+                    transport = SourceTransport(body=branch_body(protected=True), chunks=[b"a"])
+                    source = self.source(transport, environ=RecordingEnviron({TOKEN_ENV: token}))
+                    with self.assertRaises(ObservationRefusal) as raised:
+                        read(source)
+                    refusal = raised.exception
+                    self.assertEqual((refusal.reason, refusal.detail), ("FORGEJO_TOKEN_INVALID", TOKEN_ENV))
+                    self.assertEqual(transport.calls, [])
+                    for text in (str(refusal), repr(refusal), json.dumps(refusal.as_dict())):
+                        self.assertNotIn("sentinel", text)
+
 
 class StreamingFakeResponse(FakeResponse):
     def __init__(self, status, body):
@@ -763,10 +782,13 @@ class StreamingFakeResponse(FakeResponse):
         self.offset = 0
         self.closed = False
 
-    def read(self, limit):
+    def read1(self, limit):
         chunk = self.body[self.offset : self.offset + limit]
         self.offset += len(chunk)
         return chunk
+
+    def read(self, limit):
+        raise AssertionError("the stream reads with read1, one receive at a time")
 
     def __exit__(self, *arguments):
         self.closed = True
@@ -777,7 +799,7 @@ class StreamTransportTests(unittest.TestCase):
     def transport(self, status, body):
         transport = UrllibTransport(timeout_seconds=1, max_response_bytes=16)
         response = StreamingFakeResponse(status, body)
-        transport._open = lambda request: response
+        transport._open = lambda request, timeout=None: response
         return transport, response
 
     def test_stream_yields_the_body_within_the_cap(self):
@@ -803,7 +825,7 @@ class StreamTransportTests(unittest.TestCase):
     def test_stream_keeps_the_http_status_of_an_error_response(self):
         transport = UrllibTransport(timeout_seconds=1, max_response_bytes=16)
 
-        def refuse(request):
+        def refuse(request, timeout=None):
             raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
 
         transport._open = refuse
@@ -813,10 +835,11 @@ class StreamTransportTests(unittest.TestCase):
 
 
     def test_stream_stops_between_chunks_once_the_deadline_passes_and_closes_the_connection(self):
-        ticks = iter([0, 1, 2, 3, 4, 5])
+        # The first tick sets the socket timeout; the rest are checked before each read.
+        ticks = iter([0, 0, 1, 2, 3, 4, 5])
         transport = UrllibTransport(timeout_seconds=1, max_response_bytes=16, clock=lambda: next(ticks))
         response = StreamingFakeResponse(200, b"x" * 1000)
-        transport._open = lambda request: response
+        transport._open = lambda request, timeout=None: response
         received = []
         with self.assertRaises(DeadlineRefusal) as raised:
             for chunk in transport.stream("https://forgejo.example/a", {}, 1000, chunk_bytes=10, deadline=3):
@@ -831,9 +854,44 @@ class StreamTransportTests(unittest.TestCase):
             raise AssertionError("the clock is only read when a deadline is given")
 
         transport = UrllibTransport(timeout_seconds=1, max_response_bytes=16, clock=clock)
-        transport._open = lambda request: StreamingFakeResponse(200, b"x" * 50)
+        transport._open = lambda request, timeout=None: StreamingFakeResponse(200, b"x" * 50)
         self.assertEqual(b"".join(transport.stream("https://forgejo.example/a", {}, 100, chunk_bytes=20)), b"x" * 50)
 
+
+    def test_a_drip_feed_is_stopped_inside_one_chunk_once_the_deadline_passes(self):
+        # Each receive returns one byte and costs one second. A read that filled
+        # the whole 64 KiB chunk would run far past the deadline before returning.
+        clock = {"now": 0}
+
+        class DripResponse(StreamingFakeResponse):
+            def read1(self, limit):
+                clock["now"] += 1
+                return super().read1(min(limit, 1))
+
+        transport = UrllibTransport(timeout_seconds=30, max_response_bytes=16, clock=lambda: clock["now"])
+        response = DripResponse(200, b"x" * 100000)
+        opened = []
+
+        def open_(request, timeout=None):
+            opened.append(timeout)
+            return response
+
+        transport._open = open_
+        with self.assertRaises(DeadlineRefusal):
+            list(transport.stream("https://forgejo.example/a", {}, 1000000, deadline=5))
+        self.assertEqual(response.offset, 5)
+        self.assertEqual(opened, [5])
+        self.assertTrue(response.closed)
+
+    def test_a_deadline_already_passed_refuses_before_opening(self):
+        transport = UrllibTransport(timeout_seconds=1, max_response_bytes=16, clock=lambda: 10)
+
+        def open_(request, timeout=None):
+            raise AssertionError("no request once the deadline has passed")
+
+        transport._open = open_
+        with self.assertRaises(DeadlineRefusal):
+            list(transport.stream("https://forgejo.example/a", {}, 100, deadline=10))
 
 
 if __name__ == "__main__":

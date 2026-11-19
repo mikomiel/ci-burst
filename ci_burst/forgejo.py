@@ -153,17 +153,26 @@ class UrllibTransport:
         that drips bytes could hold the loop. ``deadline`` is an absolute time
         on this transport's clock, the convention of ``aws.py``: it is checked
         before every read and refuses with ``DeadlineRefusal`` once reached.
+        Each read is ``read1``, at most one receive, so a drip cannot keep one
+        read filling a chunk past the deadline; the socket timeout is also cut
+        to the time left, so one receive overruns the deadline by at most that.
         """
         request = urllib.request.Request(url, headers=headers, method="GET")
+        timeout = self._timeout
+        if deadline is not None:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise DeadlineRefusal("archive stream")
+            timeout = min(timeout, remaining)
         try:
-            with self._open(request) as response:
+            with self._open(request, timeout) as response:
                 if response.status != 200:
                     raise ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {response.status}")
                 received = 0
                 while True:
                     if deadline is not None and self._clock() >= deadline:
                         raise DeadlineRefusal("archive stream")
-                    chunk = response.read(min(chunk_bytes, max_bytes - received + 1))
+                    chunk = response.read1(min(chunk_bytes, max_bytes - received + 1))
                     if not chunk:
                         return
                     received += len(chunk)
@@ -173,9 +182,10 @@ class UrllibTransport:
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise _transport_refusal(error) from None
 
-    def _open(self, request):
+    def _open(self, request, timeout=None):
         """Open one request; tests replace this boundary with a fake response."""
-        return urllib.request.build_opener(_RefuseRedirects()).open(request, timeout=self._timeout)
+        timeout = self._timeout if timeout is None else timeout
+        return urllib.request.build_opener(_RefuseRedirects()).open(request, timeout=timeout)
 
 
 def _transport_refusal(error):
@@ -263,6 +273,10 @@ class ForgejoObserver:
 _COMMIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 _FORBIDDEN_DETAILS = frozenset({"HTTP 401", "HTTP 403"})
+
+#: Printable ASCII without space. A token outside this set is refused before it
+#: reaches a header: http.client would quote the rejected value in its error.
+_TOKEN_SHAPE = re.compile(r"[\x21-\x7e]+")
 
 
 @dataclass(frozen=True)
@@ -359,6 +373,8 @@ class ForgejoSource:
         token = self._environ.get(self._token_env)
         if not token:
             raise ObservationRefusal("FORGEJO_TOKEN_MISSING", self._token_env)
+        if not _TOKEN_SHAPE.fullmatch(token):
+            raise ObservationRefusal("FORGEJO_TOKEN_INVALID", self._token_env)
         return {"Authorization": f"token {token}", "User-Agent": "ci-burst/0.1"}
 
     def _get(self, url):

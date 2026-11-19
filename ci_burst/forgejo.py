@@ -10,15 +10,20 @@ to declare ``live-verified`` in configuration; the bundled contracts are
 validated against synthetic fixtures.
 """
 
+import functools
+import http.client
 import json
 import os
 import re
+import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-from .errors import ObservationRefusal
+from .errors import DeadlineRefusal, ObservationRefusal
 
 CONTRACT = "forgejo-17.0.1-runners-jobs"
 
@@ -122,9 +127,10 @@ class UrllibTransport:
     verification stays at the standard-library default and is never disabled.
     """
 
-    def __init__(self, timeout_seconds, max_response_bytes):
+    def __init__(self, timeout_seconds, max_response_bytes, clock=time.time):
         self._timeout = timeout_seconds
         self._limit = max_response_bytes
+        self._clock = clock
 
     def get(self, url, headers):
         request = urllib.request.Request(url, headers=headers, method="GET")
@@ -132,26 +138,216 @@ class UrllibTransport:
             with self._open(request) as response:
                 status = response.status
                 body = response.read(self._limit + 1)
-        except urllib.error.HTTPError as error:
-            raise ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {error.code}") from None
-        except ObservationRefusal:
-            raise
         except (urllib.error.URLError, TimeoutError, OSError) as error:
-            raise ObservationRefusal("FORGEJO_UNAVAILABLE", type(error).__name__) from None
+            raise _transport_refusal(error) from None
         if len(body) > self._limit:
             raise ObservationRefusal("FORGEJO_RESPONSE_TOO_LARGE", f"limit {self._limit} bytes")
         if status != 200:
             raise ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {status}")
         return body
 
-    def _open(self, request):
-        """Open one request; tests replace this boundary with a fake response."""
-        return urllib.request.build_opener(_RefuseRedirects()).open(request, timeout=self._timeout)
+    def stream(self, url, headers, max_bytes, chunk_bytes=65536, deadline=None):
+        """Yield the body in chunks and abort once it passes ``max_bytes``.
+
+        The request opens on the first ``next()``. Passing the cap closes the
+        connection before the refusal is raised, so no byte beyond the cap
+        past one chunk is read, and nothing is buffered or written to disk.
+
+        The socket timeout restarts on every receive. It bounds a silent
+        server, not a slow one: a server that drips bytes keeps a call blocked
+        for ever, because reading the status line, a header or a chunk-size line
+        repeats receives until the line ends. ``deadline`` is an absolute time
+        on this transport's clock, the convention of ``aws.py``, and two
+        mechanisms enforce it. Before every read the stream refuses with
+        ``DeadlineRefusal`` once the deadline is reached; a body read is
+        ``read1``, so a drip cannot keep one read filling a whole chunk. A
+        watchdog also cancels the request itself: a daemon timer, armed before
+        the request opens, shuts the connected socket down when the time is up.
+        That wakes any call a drip holds blocked. A failure after it, or an end
+        of stream it caused, is a ``DeadlineRefusal``, never a transport
+        refusal and never a complete body.
+
+        The timer runs on real time, not on the transport's clock: its delay is
+        ``deadline - clock()``, read once when the stream starts, so a
+        substituted clock moves the per-read check only. The timer is cancelled
+        when the stream ends, fails or is closed.
+
+        The watchdog reaches only a connected socket, so what runs inside
+        ``connect()`` is not cancelled: name resolution, a proxy tunnel reply
+        and, for TLS, the handshake. The socket timeout, cut to the time left
+        when the request opens, bounds each TCP connect attempt and the
+        handshake; nothing bounds name resolution or a proxy reply that drips.
+        """
+        timeout = self._timeout
+        watchdog = None
+        if deadline is None:
+            request = urllib.request.Request(url, headers=headers, method="GET")
+        else:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise DeadlineRefusal("archive stream")
+            timeout = min(timeout, remaining)
+            watchdog = _Watchdog(remaining)
+            request = _WatchedRequest(url, headers=headers, method="GET", watchdog=watchdog)
+
+        def expired():
+            return watchdog is not None and (watchdog.fired or self._clock() >= deadline)
+
+        if watchdog is not None:
+            watchdog.start()
+        try:
+            with self._open(request, timeout) as response:
+                if response.status != 200:
+                    raise ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {response.status}")
+                received = 0
+                while True:
+                    if expired():
+                        raise DeadlineRefusal("archive stream")
+                    chunk = response.read1(min(chunk_bytes, max_bytes - received + 1))
+                    if not chunk:
+                        # A shut-down socket often reads as a clean end of
+                        # stream, not as an error: a cut-off is not a body.
+                        if expired():
+                            raise DeadlineRefusal("archive stream")
+                        return
+                    received += len(chunk)
+                    if received > max_bytes:
+                        raise ObservationRefusal("FORGEJO_ARCHIVE_TOO_LARGE", f"limit {max_bytes} bytes")
+                    yield chunk
+        except _CUT_OFF as error:
+            if expired():
+                raise DeadlineRefusal("archive stream") from None
+            if isinstance(error, OSError):
+                raise _transport_refusal(error) from None
+            raise
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
+
+    def _open(self, request, timeout=None):
+        """Open one request; tests replace this boundary with a fake response.
+
+        A request that carries a watchdog opens through connections that report
+        their socket to it.
+        """
+        timeout = self._timeout if timeout is None else timeout
+        handlers = [_RefuseRedirects()]
+        if isinstance(request, _WatchedRequest):
+            handlers += [_WatchedHTTPHandler(), _WatchedHTTPSHandler()]
+        return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
+
+
+def _transport_refusal(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return ObservationRefusal("FORGEJO_UNEXPECTED_STATUS", f"HTTP {error.code}")
+    return ObservationRefusal("FORGEJO_UNAVAILABLE", type(error).__name__)
 
 
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, file_pointer, code, message, headers, new_url):
         raise ObservationRefusal("FORGEJO_REDIRECT_REFUSED", f"HTTP {code}")
+
+
+#: What a connection cut off by the watchdog can raise: OSError (URLError and
+#: TimeoutError are OSErrors), the http.client view of a truncated message, and
+#: the ValueError of a read on a closed file or TLS socket.
+_CUT_OFF = (OSError, http.client.HTTPException, ValueError)
+
+#: The thread name of the watchdog timer, so a test can find it.
+_WATCHDOG_THREAD = "ci-burst-stream-deadline"
+
+
+def _shut_down(sock):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass  # already closed: there is nothing left to cut
+
+
+class _Watchdog:
+    """Cancel one request at a time limit by shutting its socket down.
+
+    A socket timeout restarts on every receive, so a server that drips bytes
+    keeps a blocked read alive for ever. After ``delay`` seconds of real time
+    a daemon timer sets ``fired`` and then shuts down the socket that the
+    connection reported, which wakes any call blocked on it. A socket reported
+    after that is shut down at once. A lock orders the two, so one of them
+    always sees the other.
+    """
+
+    def __init__(self, delay):
+        self._lock = threading.Lock()
+        self._socket = None
+        self.fired = False
+        self._timer = threading.Timer(delay, self._fire)
+        self._timer.name = _WATCHDOG_THREAD
+        self._timer.daemon = True
+
+    def start(self):
+        self._timer.start()
+
+    def cancel(self):
+        self._timer.cancel()
+
+    def attach(self, sock):
+        """Record the connected socket; shut it down if the time is already up."""
+        with self._lock:
+            self._socket = sock
+            expired = self.fired
+        if expired:
+            _shut_down(sock)
+
+    def _fire(self):
+        with self._lock:
+            self.fired = True
+            sock = self._socket
+        if sock is not None:
+            _shut_down(sock)
+
+
+class _WatchedRequest(urllib.request.Request):
+    """A request that carries its watchdog to the handler that opens the connection."""
+
+    def __init__(self, *arguments, watchdog, **keywords):
+        super().__init__(*arguments, **keywords)
+        self.watchdog = watchdog
+
+
+class _ReportingConnection:
+    """Mixin: report the connected socket to the watchdog of the request.
+
+    For TLS the socket is the wrapped one, so the watchdog never holds the
+    plain socket that wrapping detaches.
+    """
+
+    def __init__(self, *arguments, watchdog, **keywords):
+        super().__init__(*arguments, **keywords)
+        self._watchdog = watchdog
+
+    def connect(self):
+        super().connect()
+        self._watchdog.attach(self.sock)
+
+
+class _WatchedHTTPConnection(_ReportingConnection, http.client.HTTPConnection):
+    pass
+
+
+class _WatchedHTTPSConnection(_ReportingConnection, http.client.HTTPSConnection):
+    pass
+
+
+class _WatchedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(functools.partial(_WatchedHTTPConnection, watchdog=req.watchdog), req)
+
+
+class _WatchedHTTPSHandler(urllib.request.HTTPSHandler):
+    """The standard handler and its default context: verification stays on."""
+
+    def https_open(self, req):
+        factory = functools.partial(_WatchedHTTPSConnection, watchdog=req.watchdog)
+        return self.do_open(factory, req, context=self._context)
 
 
 class ForgejoObserver:
@@ -221,6 +417,135 @@ class ForgejoObserver:
             names.add(label)
             names.add(label.split(":", 1)[0])
         return frozenset(names)
+
+
+#: A git object id: 40 hex digits (sha1) or 64 (sha256). The archive is only ever
+#: requested by one of these, never by a branch or tag name.
+_COMMIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+_FORBIDDEN_DETAILS = frozenset({"HTTP 401", "HTTP 403"})
+
+#: Printable ASCII without space. A token outside this set is refused before it
+#: reaches a header: http.client would quote the rejected value in its error.
+_TOKEN_SHAPE = re.compile(r"[\x21-\x7e]+")
+
+
+@dataclass(frozen=True)
+class BranchHead:
+    """The head commit of one branch and the forge's protected flag."""
+
+    sha: str
+    protected: bool
+
+
+class ForgejoSource:
+    """Read-only access to the source of one repository, for the image build.
+
+    Separate from ``ForgejoObserver`` on purpose: it takes the name of its own
+    token variable and nothing else, so the token that ``apply`` uses cannot be
+    read here and there is no fallback to it. It takes plain parameters, no
+    configuration object. Every read refuses with ``IMAGE_SOURCE_FORBIDDEN`` on
+    a 401 or 403 and never echoes the token.
+    """
+
+    def __init__(
+        self,
+        base_url,
+        repository,
+        token_env,
+        transport=None,
+        environ=None,
+        timeout_seconds=10,
+        max_response_bytes=1_048_576,
+    ):
+        self._base_url = base_url
+        self._owner, self._repository = repository.split("/", 1)
+        self._token_env = token_env
+        self._transport = transport or UrllibTransport(timeout_seconds, max_response_bytes)
+        self._environ = environ if environ is not None else os.environ
+
+    def branch(self, name):
+        """Return the head sha and the protected flag of ``name``.
+
+        Judging the flag is the caller's: a missing or false flag is
+        ``IMAGE_BRANCH_UNPROTECTED`` through ``require_protected``.
+        """
+        if not name or name.startswith("/") or ".." in name.split("/"):
+            raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", "branch name escapes the repository")
+        body = self._get(self._api("/branches/" + urllib.parse.quote(name, safe="/")))
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ObservationRefusal("FORGEJO_INVALID_JSON") from None
+        commit = payload.get("commit") if isinstance(payload, dict) else None
+        sha = commit.get("id") if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or not _COMMIT_SHA.fullmatch(sha):
+            raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", "branch has no commit id")
+        return BranchHead(sha=sha, protected=payload.get("protected") is True)
+
+    def raw_file(self, sha, path):
+        """Return the bytes of ``path`` at ``sha``; the read also tests the token.
+
+        An absent path is ``IMAGE_BASIS_PATH_MISSING``.
+        """
+        if not _COMMIT_SHA.fullmatch(sha):
+            raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", "ref must be a commit sha")
+        if path.startswith("/") or ".." in path.split("/"):
+            raise ObservationRefusal("IMAGE_BASIS_PATH_MISSING", "path escapes the repository")
+        url = self._api("/raw/" + urllib.parse.quote(path, safe="/") + "?" + urllib.parse.urlencode({"ref": sha}))
+        try:
+            return self._get(url)
+        except ObservationRefusal as refusal:
+            if refusal.reason == "FORGEJO_UNEXPECTED_STATUS" and refusal.detail == "HTTP 404":
+                raise ObservationRefusal("IMAGE_BASIS_PATH_MISSING") from None
+            raise
+
+    def archive(self, sha, max_bytes, deadline=None):
+        """Yield the ``.tar.gz`` archive of commit ``sha`` in chunks.
+
+        Requested by sha, never by branch. The request opens on the first
+        ``next()``. The stream aborts with ``FORGEJO_ARCHIVE_TOO_LARGE`` once it
+        passes ``max_bytes``, and with ``DeadlineRefusal`` once the optional
+        ``deadline`` (an absolute time on the transport's clock) is reached. The
+        caller closes the generator to abandon it.
+        """
+        if not _COMMIT_SHA.fullmatch(sha):
+            raise ObservationRefusal("FORGEJO_UNEXPECTED_SHAPE", "archive must be requested by commit sha")
+        url = self._api(f"/archive/{sha}.tar.gz")
+        try:
+            yield from self._transport.stream(url, self._headers(), max_bytes, deadline=deadline)
+        except ObservationRefusal as refusal:
+            raise _source_refusal(refusal) from None
+
+    def _api(self, suffix):
+        return f"{self._base_url}/api/v1/repos/{self._owner}/{self._repository}{suffix}"
+
+    def _headers(self):
+        token = self._environ.get(self._token_env)
+        if not token:
+            raise ObservationRefusal("FORGEJO_TOKEN_MISSING", self._token_env)
+        if not _TOKEN_SHAPE.fullmatch(token):
+            raise ObservationRefusal("FORGEJO_TOKEN_INVALID", self._token_env)
+        return {"Authorization": f"token {token}", "User-Agent": "ci-burst/0.1"}
+
+    def _get(self, url):
+        try:
+            return self._transport.get(url, self._headers())
+        except ObservationRefusal as refusal:
+            raise _source_refusal(refusal) from None
+
+
+def require_protected(head):
+    """Refuse unless the forge reports the branch protected; there is no override."""
+    if not head.protected:
+        raise ObservationRefusal("IMAGE_BRANCH_UNPROTECTED")
+    return head
+
+
+def _source_refusal(refusal):
+    if refusal.reason == "FORGEJO_UNEXPECTED_STATUS" and refusal.detail in _FORBIDDEN_DETAILS:
+        return ObservationRefusal("IMAGE_SOURCE_FORBIDDEN", refusal.detail)
+    return refusal
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")

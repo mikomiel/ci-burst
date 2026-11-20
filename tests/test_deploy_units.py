@@ -774,9 +774,18 @@ class ContainerImageCITests(unittest.TestCase):
         self.assertIsNotNone(timeout, "the job needs its own timeout")
         self.assertLessEqual(int(timeout.group(1)), 10)
 
-    def test_it_runs_the_exact_build_command(self):
+    def test_it_runs_the_exact_build_command_and_compares_the_shipped_warm_cache_script(self):
         commands = re.findall(r"(?m)^        run: (.+)$", self.job_body())
-        self.assertEqual(commands, ["docker build --tag ci-burst:ci ."])
+        self.assertEqual(
+            commands,
+            [
+                "docker build --tag ci-burst:ci .",
+                "docker run --rm --network none --entrypoint cat ci-burst:ci /srv/ci-burst/share/warm-cache.sh"
+                " | cmp - deploy/runner/image/warm-cache.sh",
+            ],
+        )
+        # bash with pipefail, so a failed docker run fails the step even if cmp would not
+        self.assertRegex(self.job_body(), r"(?m)^        shell: bash\n        run: docker run ")
 
     def test_the_workflow_grants_only_the_read_token(self):
         grants = re.search(r"(?m)^permissions:\n((?:  [^\n]*\n)+)", self.TEXT)

@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
-from ci_burst import image, image_deletion, image_promote
+from ci_burst import image, image_deletion, image_pipeline, image_promote
 from ci_burst.aws import BASIS_DIGEST_TAG
 from ci_burst.config import load
 from ci_burst.errors import ImageRefusal, StateRefusal
@@ -155,9 +155,13 @@ class PromoteCase(CliCase):
 
     # -- the files and the rows --------------------------------------------------------
     def fingerprint(self):
-        """What a refused write leaves alone: the deployment directory (its lock file apart) and the tables."""
+        """What a refused write leaves alone: the deployment directory (its lock file apart), the tables, the events."""
         files = {name: data for name, data in snapshot_tree(self.config_dir).items() if not name.endswith(".lock")}
-        return files, self.dump()
+        return files, self.dump(), self.promoted_events()
+
+    def promoted_events(self):
+        """The ``image_promoted`` events of the event file, oldest first. The passes write other events there."""
+        return self.events("image_promoted")
 
     def backups(self):
         return sorted(self.config_dir.glob("deployment.toml.bak.*"))
@@ -1459,6 +1463,229 @@ class RollbackTests(PromoteCase):
         self.refusal(("--rollback",), "PROMOTE_DIRECTORY_NOT_DEDICATED")
         (self.config_dir / "runner.env").unlink()
         self.rolled_back()
+
+
+# -- the image_promoted event ----------------------------------------------------------------
+
+
+class EventTests(PromoteCase):
+    """A write that moved the pin appends one ``image_promoted`` event, last, to the file that the passes use."""
+
+    def events_path(self):
+        return self.state_dir / image_pipeline.EVENTS_FILE
+
+    def test_a_promotion_writes_one_event(self):
+        self.seed()
+        self.clock.advance(30)
+        payload = self.promoted()
+        after = self.config_path.read_bytes()
+        self.assertEqual(
+            self.events(),
+            [
+                {
+                    "ts": "2027-01-15T08:00:30Z",
+                    "deployment": DEPLOYMENT,
+                    "event": "image_promoted",
+                    "old_pin": PIN,
+                    "new_pin": 5,
+                    "build_id": "build-b",
+                    "image_id": ami(0xB1),
+                    "rollback": False,
+                    "file_digest": sha(after)[:12],
+                }
+            ],
+        )
+        self.assertEqual((payload["notes"], payload["file_sha256_after"]), ([], sha(after)))
+
+    def test_a_rollback_writes_one_event_that_names_no_candidate(self):
+        original = self.config_path.read_bytes()
+        self.seed()
+        self.refresh()
+        self.promoted()
+        self.clock.advance(60)
+        payload = self.rolled_back()
+        promotion, rollback = self.events()
+        self.assertEqual(
+            rollback,
+            {
+                "ts": "2027-01-15T08:01:00Z",
+                "deployment": DEPLOYMENT,
+                "event": "image_promoted",
+                "old_pin": 5,
+                "new_pin": PIN,
+                "build_id": None,
+                "image_id": ami(0xA1),
+                "rollback": True,
+                "file_digest": sha(original)[:12],
+            },
+        )
+        self.assertEqual((payload["notes"], promotion["rollback"], promotion["build_id"]), ([], False, "build-b"))
+
+    def test_a_preview_writes_no_event(self):
+        self.seed()
+        self.refresh()
+        code, payload = self.show()
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "promote"))
+        self.assertFalse(self.events_path().exists())
+        self.promoted()
+        (event,) = self.events()
+        code, payload = self.show("--rollback")
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "rollback"))
+        self.assertEqual(self.events(), [event])
+
+    def test_a_refusal_writes_no_event(self):
+        self.seed()
+        runner = self.config_dir / "runner.env"
+        runner.write_text("synthetic\n", encoding="utf-8")
+        self.refusal((), "PROMOTE_DIRECTORY_NOT_DEDICATED")  # before a lock is taken
+        runner.unlink()
+        with image_promote.file_lock(self.config_path.resolve()):
+            self.refusal((), "PROMOTE_BUSY")  # at the first lock
+        self.refusal(("--rollback",), "ROLLBACK_NO_PROMOTION")  # under both locks, with nothing to roll back
+        self.change("build-b", drift_result="TEMPLATE_DRIFT")
+        self.refusal(("--version", "5"), "PROMOTE_DRIFT_NOT_CLEAN")  # after the record is judged
+        self.assertEqual(self.events(), [])
+        self.change("build-b", drift_result="clean")
+        self.promoted()
+        (event,) = self.events()
+        self.refusal((), "PROMOTE_NO_CANDIDATE")  # after a write, with nothing left to promote
+        self.assertEqual(self.events(), [event])
+
+    def test_an_attempt_that_does_not_finish_writes_no_event_and_the_attempt_that_does_writes_one(self):
+        self.seed()
+        with self.rename_fails(OSError(errno.EXDEV, "cross-device link")):
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_WRITE_FAILED"))
+        self.assertEqual(self.events(), [])
+        self.clock.advance(60)
+        self.crash_before_rename()
+        self.assertEqual(self.events(), [])
+        self.clock.advance(60)
+        self.promoted()  # it resolves the aborted row, and that resolution writes no event of its own
+        self.assertEqual([event["event"] for event in self.events()], ["image_promoted"])
+
+    def test_resolving_a_pending_row_writes_no_event(self):
+        self.seed()
+        self.crash_after_rename()  # the row is not complete yet, so the event is not written yet
+        self.assertEqual(self.events(), [])
+        code, payload = self.write_pin()  # it completes the row, then refuses: the file holds the pin already
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_NO_CANDIDATE"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["complete"])
+        self.assertEqual(self.events(), [])
+
+    def test_run_apply_resolving_a_pending_row_writes_no_event(self):
+        self.seed()
+        self.crash_after_rename()
+        self.world.images[ami(0xB1)]["Tags"] = tag_list({**owned("build-b"), BASIS_DIGEST_TAG: self.digest()})
+        self.allow_clients()
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual([item["resolution"] for item in payload["journal_resolved"]], ["complete"])
+        self.assertEqual(self.promoted_events(), [])
+
+    def test_the_event_is_written_once_after_the_rename_and_after_the_row_is_complete(self):
+        self.seed()
+        seen = []
+        real = image_pipeline._append_line
+
+        def append(path, line):
+            seen.append(
+                {
+                    "file": Path(path).name,
+                    "target": self.config_path.read_bytes(),
+                    "statuses": [row["status"] for row in self.table("promotion_journal")],
+                    "build": self.row("build-b")["state"],
+                    "temporary": self.temporary().exists(),
+                }
+            )
+            return real(path, line)
+
+        with mock.patch.object(image_pipeline, "_append_line", append):
+            self.promoted()
+        after = self.config_path.read_bytes()
+        self.assertEqual(
+            seen,
+            [
+                {
+                    "file": image_pipeline.EVENTS_FILE,
+                    "target": after,
+                    "statuses": ["complete"],
+                    "build": "promoted",
+                    "temporary": False,
+                }
+            ],
+        )
+
+    def test_the_event_joins_the_events_of_the_passes_in_the_same_file(self):
+        build = self.build_candidate()
+        passes = self.events()
+        self.assertTrue(passes)
+        self.promoted()
+        *earlier, event = self.events()
+        self.assertEqual(earlier, passes)
+        self.assertEqual(
+            (event["event"], event["build_id"], event["image_id"]), ("image_promoted", build.id, build.image_id)
+        )
+
+    def test_the_fields_pass_the_allowlist_and_hold_no_path_no_content_and_no_url(self):
+        self.seed()
+        self.refresh()
+        self.promoted()
+        self.clock.advance(60)
+        self.rolled_back()
+        lines = [
+            line for line in self.events_path().read_text(encoding="utf-8").splitlines() if "image_promoted" in line
+        ]
+        events = self.promoted_events()
+        self.assertEqual([event["rollback"] for event in events], [False, True])
+        for event, line in zip(events, lines, strict=True):
+            with self.subTest(rollback=event["rollback"]):
+                fields = {key: value for key, value in event.items() if key not in ("ts", "deployment", "event")}
+                self.assertEqual(set(fields), image_pipeline._EVENT_FIELDS["image_promoted"])
+                for key, value in fields.items():
+                    image_pipeline._check_event_value("image_promoted", key, value)  # raises ValueError
+                    if isinstance(value, str):
+                        # The allowlist lets "/" through, so a path would pass it: an id, a digest or a code does not.
+                        self.assertRegex(value, r"\A[A-Za-z0-9._-]{1,64}\Z")
+                self.assertEqual(len(fields["file_digest"]), 12)
+                for text in (str(self.dir), self.config_path.name, "launch_template", "/", "://"):
+                    self.assertNotIn(text, line)
+                self.assertIsNone(re.search(r"[0-9a-f]{64}", line), "only the short digest is written")
+
+    # -- a write of the event that fails: the promotion is done and stays ----------------------
+    def test_a_failing_event_write_after_the_rename_leaves_the_promotion_in_place_and_is_noted(self):
+        self.seed()
+        self.refresh()
+        before = self.config_path.read_bytes()
+        failure = OSError(errno.ENOSPC, "No space left on device", str(self.events_path()))
+        with mock.patch.object(image_pipeline, "_append_line", side_effect=failure) as append:
+            code, payload = self.write_pin()
+        self.assertEqual(append.call_count, 1)
+        self.assertEqual((code, payload["decision"], payload["notes"]), (0, "promoted", ["event_write:ENOSPC"]))
+        self.assertNotEqual(self.config_path.read_bytes(), before)
+        self.assertEqual((self.pin_in_file(), payload["new_pin"]), (5, 5))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["complete"])
+        self.assertEqual(self.row("build-b")["state"], "promoted")
+        self.assertEqual(self.events(), [])
+        # The promotion is whole: the rollback that follows works, and it writes its event.
+        self.clock.advance(60)
+        self.rolled_back()
+        self.assertEqual([event["rollback"] for event in self.events()], [True])
+
+    def test_a_failing_event_write_without_an_errno_is_noted_by_the_type_of_its_error(self):
+        self.seed()
+        with mock.patch.object(image_pipeline, "_append_line", side_effect=OSError("synthetic /secret/path")):
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["decision"], payload["notes"]), (0, "promoted", ["event_write:OSError"]))
+        self.assertEqual(self.pin_in_file(), 5)
+
+    def test_a_value_that_the_allowlist_refuses_is_noted_and_the_promotion_stays(self):
+        self.seed("build=b")  # an id with a character that no event value may hold
+        code, payload = self.write_pin()
+        self.assertEqual((code, payload["decision"], payload["notes"]), (0, "promoted", ["event_write:ValueError"]))
+        self.assertEqual((self.pin_in_file(), self.row("build=b")["state"]), (5, "promoted"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["complete"])
+        self.assertEqual(self.events(), [])
 
 
 # -- the module stays local ------------------------------------------------------------------

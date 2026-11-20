@@ -64,17 +64,19 @@ build deadline no builder is launched, and the build fails ``CONSOLE_BLIND``.
 Secrets. The presigned archive URL and the rendered user data live in local
 variables of ``_Pass._launch`` and nowhere else: not in the state file, not in an
 event, not in the metrics, not in an exception detail. Events pass through a
-whitelist of fields and values (``_Telemetry.event``), so a value that is not an
-id, a short digest, a count or a reason code is refused instead of written, and
-no value holds ``://``. Only the failed-build event carries console text, and
-only the framed, sanitized tail that ``image_console.framed_tail`` returns, with
-every URL, every presigned query string and the archive's object key shown as
-``[archive-url]``.
+whitelist of fields and values (``write_event``, the one writer of the event
+file: ``_Telemetry.event`` calls it, and the command line hands it to
+``promote``), so a value that is not an id, a short digest, a count or a reason
+code is refused instead of written, and no value holds ``://``. Only the
+failed-build event carries console text, and only the framed, sanitized tail
+that ``image_console.framed_tail`` returns, with every URL, every presigned
+query string and the archive's object key shown as ``[archive-url]``.
 
 Files written into the state directory besides ``image-state.sqlite``:
-``image-events.ndjson`` (append-only), ``image-metrics.prom`` (replaced
-atomically) and ``image-telemetry.json`` (the counters that cannot be derived
-from the state file, replaced atomically).
+``image-events.ndjson`` (append-only; ``promote`` adds its ``image_promoted``
+event), ``image-metrics.prom`` (replaced atomically) and
+``image-telemetry.json`` (the counters that cannot be derived from the state
+file, replaced atomically).
 """
 
 import errno
@@ -424,6 +426,8 @@ _EVENT_FIELDS = {
     ),
     "image_pruned": frozenset({"deregistered", "snapshots_deleted", "failed", "skipped"}),
     "image_blocked": frozenset({"consecutive_failures", "build_id"}),
+    # Written by ``promote`` (``image_promote``), not by a pass. ``file_digest`` is the short digest of the new file.
+    "image_promoted": frozenset({"old_pin", "new_pin", "build_id", "image_id", "rollback", "file_digest"}),
 }
 
 #: An ordinary event value is an id, a digest, a code or a short list of names. The set holds ``:`` and ``/``,
@@ -491,6 +495,31 @@ def _append_line(path, line):
         os.close(descriptor)
 
 
+def write_event(directory, deployment, clock, name, **fields):
+    """Append one event to ``image-events.ndjson`` in ``directory``.
+
+    This is the one writer of the event file. A pass reaches it through ``_Telemetry.event``, and ``promote`` through
+    the command line, which binds the directory, the deployment and the clock. ``ValueError`` means a field that the
+    event does not have or a value that is not an id, a digest, a count or a code: it is raised before any byte is
+    written. ``OSError`` is the file system's, a short write included (``_append_line`` says what that leaves in the
+    file). Nothing is retried.
+    """
+    allowed = _EVENT_FIELDS[name]
+    for key, value in fields.items():
+        if key not in allowed:
+            raise ValueError(f"event {name} has no field {key}")
+        _check_event_value(name, key, value)
+    record = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock())),
+        "deployment": deployment,
+        "event": name,
+        **fields,
+    }
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    _append_line(directory / EVENTS_FILE, json.dumps(record, sort_keys=True) + "\n")
+
+
 class _Telemetry:
     """The event file, the counters that survive between passes and the metrics textfile."""
 
@@ -518,19 +547,7 @@ class _Telemetry:
         }
 
     def event(self, name, **fields):
-        allowed = _EVENT_FIELDS[name]
-        for key, value in fields.items():
-            if key not in allowed:
-                raise ValueError(f"event {name} has no field {key}")
-            _check_event_value(name, key, value)
-        record = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._clock())),
-            "deployment": self._deployment,
-            "event": name,
-            **fields,
-        }
-        self._directory.mkdir(parents=True, exist_ok=True)
-        _append_line(self._directory / EVENTS_FILE, json.dumps(record, sort_keys=True) + "\n")
+        write_event(self._directory, self._deployment, self._clock, name, **fields)
 
     def leak(self, kind, count):
         if count:

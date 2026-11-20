@@ -14,6 +14,7 @@ provider failure (a refusal of the provider that escapes, or the result
 """
 
 import argparse
+import functools
 import json
 import sys
 import time
@@ -26,7 +27,7 @@ from .controller import Controller
 from .errors import ImageRefusal, ProviderRefusal, Refusal
 from .export import Exporter
 from .forgejo import ForgejoSource
-from .image_pipeline import ImagePipeline
+from .image_pipeline import ImagePipeline, write_event
 from .image_state import ImageState
 
 FAILED_DECISIONS = ("launch_failed", "cleanup_failed", "cleanup_degraded", "uncertain")
@@ -207,6 +208,7 @@ def _image(config, arguments):
             config,
             state=state,
             clock=image_clock,
+            events=functools.partial(write_event, state.directory, config.deployment, image_clock),
             version=arguments.version,
             rollback=arguments.rollback,
             write=arguments.write,

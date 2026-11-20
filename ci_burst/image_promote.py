@@ -2,8 +2,9 @@
 
 ``promote`` is pure local. It reads the image state file and the deployment
 TOML, and it writes only the TOML (its backup and one temporary file), the state
-file and one lock file next to the TOML. It makes no AWS or forge call and holds
-no credential: the module imports neither adapter, and a test pins that. Its
+file, one lock file next to the TOML and, once a write is done, one line of the
+event file in the state directory. It makes no AWS or forge call and holds no
+credential: the module imports neither adapter, and a test pins that. Its
 verification comes from the record that a pass or ``image status --refresh``
 left in the state file.
 
@@ -24,6 +25,11 @@ follows the design's eight steps, in this order:
 7. the ``pending`` journal row is committed, then the temporary file replaces the
    target and the directory is flushed;
 8. the row is marked ``complete``.
+
+Then, and only then, one ``image_promoted`` event is appended (``promote`` says
+what it holds and what a failure of that write does). The event is a notice and
+the journal row is the record: a crash after the rename loses the event and
+never the promotion.
 
 A crash between two of these steps leaves a state that the next command resolves
 from the file hash (``resolve_pending``). Nothing here deletes a backup that a
@@ -656,7 +662,7 @@ def describe_rollback(plan, refusal):
 # -- the commands --------------------------------------------------------------------
 
 
-def promote(config, *, state, clock, version=None, rollback=False, write=False):
+def promote(config, *, state, clock, events, version=None, rollback=False, write=False):
     """Print the evidence of a promotion or a rollback, or write it.
 
     ``state`` is an ``ImageState`` that is not connected; this function opens
@@ -664,10 +670,27 @@ def promote(config, *, state, clock, version=None, rollback=False, write=False):
     for reading only: nothing is created or written, and a pending journal row
     is reported with the resolution that the file hash implies, not resolved.
     A refusal is raised.
+
+    A write appends one ``image_promoted`` event through ``events``, a function
+    of the event name and its fields. The command line hands in the writer of
+    the passes (``image_pipeline.write_event``) with the state directory, the
+    deployment and the clock bound, so the event goes to the same file under the
+    same allowlist and this module imports no adapter. The event is written
+    after the journal row is complete and never before. It holds the previous and
+    the new pin, the candidate's build id (``None`` for a rollback), the image id
+    behind the new pin, whether it was a rollback and the short digest of the new
+    file: ids, digests, counts and codes, no path, no content of the file and no
+    URL. A dry run, a refusal and the resolution of a pending row write none.
+
+    By the time the event is written the pin has moved. A failing write (the
+    file system's ``OSError``, or a value that the allowlist refuses) therefore
+    does not raise and does not undo the promotion: the result's ``notes`` lists
+    ``event_write:<code>``, an errno name or an exception type and never a path.
+    ``notes`` is empty when the event was written.
     """
     snapshot = read_snapshot(config)
     if write:
-        return _write(snapshot, state, clock, version, rollback)
+        return _write(snapshot, state, clock, events, version, rollback)
     return _preview(snapshot, state, clock, version, rollback)
 
 
@@ -766,7 +789,30 @@ def _pin_report(state, snapshot):
     }
 
 
-def _write(snapshot, state, clock, version, rollback):
+def _announce(events, done, *, build_id, image_id, rollback):
+    """Append the ``image_promoted`` event of a completed write; return the notes that it leaves in the result.
+
+    The caller has completed the journal row, so the pin has moved: a failing write is a note and never an error,
+    because an error would turn a finished promotion into an unexpected failure. The note carries the errno name or
+    the type name and never ``str(error)``, which holds the path.
+    """
+    try:
+        events(
+            "image_promoted",
+            old_pin=done["old_pin"],
+            new_pin=done["new_pin"],
+            build_id=build_id,
+            image_id=image_id,
+            rollback=rollback,
+            file_digest=_short(done["file_sha256_after"]),
+        )
+    except (OSError, ValueError) as error:
+        code = errno.errorcode.get(error.errno, "OSError") if isinstance(error, OSError) else type(error).__name__
+        return [f"event_write:{code}"]
+    return []
+
+
+def _write(snapshot, state, clock, events, version, rollback):
     # Nothing is written until the checks that need only the file pass.
     check_directory(snapshot.target)
     check_zone_pins(snapshot.raw)
@@ -796,7 +842,7 @@ def _write(snapshot, state, clock, version, rollback):
                     candidate_id=plan.target.id,
                     clock=clock,
                 )
-                decision = "rolled_back"
+                decision, build_id, image_id = "rolled_back", None, plan.target.image_id
             else:
                 build = select_candidate(state, config.deployment, version)
                 verify_candidate(build, config.image, now, snapshot.pin)
@@ -809,7 +855,9 @@ def _write(snapshot, state, clock, version, rollback):
                     candidate_id=build.id,
                     clock=clock,
                 )
-                decision = "promoted"
+                decision, build_id, image_id = "promoted", build.id, build.image_id
+            # The rename is done and the row is complete: from here on nothing may undo or hide the promotion.
+            notes = _announce(events, done, build_id=build_id, image_id=image_id, rollback=rollback)
         finally:
             state.close()
-    return {"decision": decision, "resolved": resolved, **subject, **done}
+    return {"decision": decision, "resolved": resolved, **subject, **done, "notes": notes}

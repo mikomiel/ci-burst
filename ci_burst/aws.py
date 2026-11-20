@@ -526,6 +526,22 @@ class TemplateVersion:
 
 
 @dataclass(frozen=True)
+class SecurityGroup:
+    """One security group, read to see whether it admits inbound traffic.
+
+    ``ingress_rules`` counts the inbound rules. The rules themselves stay out of
+    this object, because a rule can carry an address range.
+    """
+
+    group_id: str
+    name: str
+    ingress_rules: int
+
+    def as_dict(self):
+        return {"group_id": self.group_id, "name": self.name, "ingress_rules": self.ingress_rules}
+
+
+@dataclass(frozen=True)
 class StoredObject:
     key: str
     size: int
@@ -901,8 +917,12 @@ class ImageAws:
             items.extend(_images(response))
         return items
 
-    def image(self, image_id):
-        """One image, or ``None`` when the provider no longer knows it."""
+    def image(self, image_id, *, deadline=None):
+        """One image, or ``None`` when the provider no longer knows it.
+
+        ``deadline`` is checked before the request, as the listings check it before each page.
+        """
+        self._check_deadline(deadline, "describe_images")
         client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
         try:
             response = client.describe_images(ImageIds=[image_id], Owners=["self"])
@@ -980,6 +1000,26 @@ class ImageAws:
         if len(found) != 1 or found[0].version != version:
             raise _incomplete_inventory(f"DescribeLaunchTemplateVersions did not return exactly version {version}")
         return found[0]
+
+    # -- security groups --------------------------------------------------
+    def security_groups(self, *, group_ids=(), group_names=(), deadline=None):
+        """Read security groups by id and by name, with their inbound rule counts.
+
+        Ids go in one request and names in another. EC2 fails a request that
+        names an unknown id, and that failure is a refusal here, never an empty
+        group. A name that matches nothing gives no entry, so the caller compares
+        the answer with what it asked for. A name filter matches the group of
+        that name in every VPC of the Region.
+        """
+        items = []
+        if group_ids:
+            for response in self._ec2_pages("describe_security_groups", deadline, GroupIds=list(group_ids)):
+                items.extend(_security_groups(response))
+        if group_names:
+            filters = [{"Name": "group-name", "Values": list(group_names)}]
+            for response in self._ec2_pages("describe_security_groups", deadline, Filters=filters):
+                items.extend(_security_groups(response))
+        return items
 
     def create_template_version(self, name, source_version, image_id, description, client_token):
         """Create a non-default version that differs from the pin only in its image.
@@ -1133,13 +1173,13 @@ class ImageAws:
         with _sdk_failures():
             return _session_expiry(self._session())
 
-    def presign_get(self, bucket, key, expires_seconds):
-        """Presign a GET for one object, only if the session outlives the URL.
+    def check_credential_life(self, expires_seconds):
+        """Refuse with ``IMAGE_CREDENTIAL_SHORT`` unless the session outlives a URL of ``expires_seconds``.
 
         The signature dies with the credentials, so a URL that is meant to last
         ``expires_seconds`` needs at least that much credential life. An unknown
-        expiry is a refusal, not "long enough". The URL is returned and never
-        logged, stored or placed in an error.
+        expiry is a refusal, not "long enough". Nothing is presigned, so a caller
+        can ask before it spends anything on the build the URL is for.
         """
         expiry = self.credential_expiry()
         if expiry is None:
@@ -1150,6 +1190,14 @@ class ImageAws:
                 "IMAGE_CREDENTIAL_SHORT",
                 f"{max(int(remaining), 0)} seconds of credential life remain, {expires_seconds} are needed",
             )
+
+    def presign_get(self, bucket, key, expires_seconds):
+        """Presign a GET for one object, only if the session outlives the URL.
+
+        ``check_credential_life`` decides that. The URL is returned and never
+        logged, stored or placed in an error.
+        """
+        self.check_credential_life(expires_seconds)
         client = self._client("s3")
         try:
             return client.generate_presigned_url(
@@ -1494,6 +1542,19 @@ def _template_versions(response, name):
                 data=copy.deepcopy(dict(data)),
             )
         )
+    return result
+
+
+def _security_groups(response):
+    result = []
+    for item in _entries(response, "SecurityGroups", "DescribeSecurityGroups"):
+        group_id, name, rules = item.get("GroupId"), item.get("GroupName"), item.get("IpPermissions")
+        # A group with no readable rule list is not a group without ingress.
+        if not isinstance(group_id, str) or not group_id or not isinstance(name, str) or not name:
+            raise _incomplete_inventory("DescribeSecurityGroups returned a group without an id or a name")
+        if not isinstance(rules, list):
+            raise _incomplete_inventory("DescribeSecurityGroups returned a group without its inbound rules")
+        result.append(SecurityGroup(group_id=group_id, name=name, ingress_rules=len(rules)))
     return result
 
 

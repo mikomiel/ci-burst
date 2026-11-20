@@ -246,6 +246,29 @@ def s3_problems(policy):
     return problems
 
 
+def security_group_read_problems(policy):
+    """Why ``ec2:DescribeSecurityGroups`` is not one read-only Allow, or ``[]``.
+
+    The build precheck reads the security groups its launch template names, so
+    the grant must exist exactly once and, in that statement, no action may
+    change anything. A describe action takes no resource scope, so the grant
+    shares the describe-only statement.
+    """
+    action = "ec2:DescribeSecurityGroups"
+    holders = [s for s in statements(policy) if action in actions(s)]
+    if len(holders) != 1:
+        return [f"{len(holders)} statements name {action}"]
+    (holder,) = holders
+    sid = holder.get("Sid", "<no sid>")
+    problems = []
+    if holder.get("Effect") != "Allow":
+        problems.append(f"{sid}: {action} is not an Allow")
+    for name in actions(holder):
+        if not name.split(":", 1)[1].startswith(READ_VERBS):
+            problems.append(f"{sid}: {name} is not a read")
+    return problems
+
+
 def iam_client_calls(source):
     """Line numbers where source builds an IAM client or resource."""
     found = []
@@ -325,6 +348,28 @@ class ImageBuildPolicyTests(unittest.TestCase):
         self.assertEqual(len(sids), len(set(sids)))
         for statement in statements(self.policy):
             self.assertIn(statement.get("Effect"), {"Allow", "Deny"})
+
+    def test_the_template_security_groups_can_be_read_by_a_read_only_statement(self):
+        self.assertEqual(security_group_read_problems(self.policy), [])
+
+    def test_the_security_group_read_check_can_fail(self):
+        action = "ec2:DescribeSecurityGroups"
+
+        def holder(policy):
+            (found,) = [s for s in policy["Statement"] if action in actions(s)]
+            return found
+
+        absent = copy.deepcopy(self.policy)
+        holder(absent)["Action"] = [name for name in actions(holder(absent)) if name != action]
+        mutating = copy.deepcopy(self.policy)
+        holder(mutating)["Action"] = [*actions(holder(mutating)), "ec2:ModifySecurityGroupRules"]
+        denied = copy.deepcopy(self.policy)
+        holder(denied)["Effect"] = "Deny"
+        twice = copy.deepcopy(self.policy)
+        twice["Statement"].append({"Sid": "Again", **{k: v for k, v in holder(twice).items() if k != "Sid"}})
+        for label, policy in {"absent": absent, "mutating": mutating, "denied": denied, "twice": twice}.items():
+            with self.subTest(variant=label):
+                self.assertTrue(security_group_read_problems(policy))
 
     def test_policy_omits_the_actions_the_design_leaves_out(self):
         every_action = {action.lower() for s in statements(self.policy) for action in actions(s)}

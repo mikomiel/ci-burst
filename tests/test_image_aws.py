@@ -116,6 +116,7 @@ class FakeEc2:
         self.snapshots_store = []
         self.templates_store = []
         self.versions_store = {}
+        self.security_groups_store = []
         self.consoles = {}
         self.errors = {}
         self.pages = {}
@@ -241,6 +242,24 @@ class FakeEc2:
             if name == LaunchTemplateName and str(number) in Versions
         ]
         return {"LaunchTemplateVersions": copy.deepcopy(found)}
+
+    def describe_security_groups(self, *, GroupIds=None, Filters=None, NextToken=None):
+        self._enter("describe_security_groups", dict(GroupIds=GroupIds, Filters=Filters, NextToken=NextToken))
+        found = list(self.security_groups_store)
+        if GroupIds is not None:
+            known = {item.get("GroupId") for item in found}
+            # Like EC2: one unknown id fails the whole request.
+            if any(group_id not in known for group_id in GroupIds):
+                raise ProviderError("InvalidGroup.NotFound")
+            found = [item for item in found if item.get("GroupId") in GroupIds]
+        for entry in Filters or []:
+            if entry["Name"] != "group-name":
+                raise AssertionError(f"unexpected filter {entry['Name']}")
+            found = [item for item in found if item.get("GroupName") in entry["Values"]]
+        response = {"SecurityGroups": copy.deepcopy(found)}
+        if "describe_security_groups" in self.pages:
+            response["NextToken"] = "next-page"
+        return response
 
     def create_launch_template_version(
         self, *, LaunchTemplateName, SourceVersion, LaunchTemplateData, VersionDescription, ClientToken
@@ -1038,6 +1057,26 @@ class ImageAndTemplateTests(Base):
             self.image_aws().image("ami-0123456789abcdef0")
         self.assertTrue(raised.exception.uncertain)
 
+    def test_an_image_read_stops_at_the_deadline_before_any_request(self):
+        self.ec2.images_store.append({"ImageId": "ami-0123456789abcdef0", "State": "available", "Tags": []})
+        with self.assertRaises(DeadlineRefusal):
+            self.image_aws().image("ami-0123456789abcdef0", deadline=NOW)
+        self.assertEqual(self.calls, [])
+
+    def test_an_image_read_before_its_deadline_is_made_as_one_without_a_deadline_is(self):
+        self.ec2.images_store.append({"ImageId": "ami-0123456789abcdef0", "State": "available", "Tags": []})
+        aws = self.image_aws()
+        self.assertEqual(aws.image("ami-0123456789abcdef0", deadline=NOW + 1).state, "available")
+        self.assertIsNone(aws.image("ami-0000000000000000f", deadline=NOW + 1))
+        self.assertEqual(aws.image("ami-0123456789abcdef0").state, "available")
+        self.assertEqual(len(self.requests("describe_images")), 3)
+
+    def test_an_unreadable_image_is_still_the_providers_refusal_when_a_deadline_is_given(self):
+        self.ec2.errors["describe_images"] = ProviderError("RequestLimitExceeded")
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.image_aws().image("ami-0123456789abcdef0", deadline=NOW + 1)
+        self.assertTrue(raised.exception.uncertain)
+
     def test_deregister_and_snapshot_delete_name_exactly_one_resource(self):
         aws = self.image_aws()
         aws.deregister_image("ami-0123456789abcdef0")
@@ -1126,6 +1165,92 @@ class ImageAndTemplateTests(Base):
             [request["LaunchTemplateNames"] for request in self.requests("describe_launch_templates")],
             [["example-missing"], ["example-worker"]],
         )
+
+    def add_group(self, group_id, name, rules=()):
+        self.ec2.security_groups_store.append(
+            {"GroupId": group_id, "GroupName": name, "IpPermissions": [dict(rule) for rule in rules]}
+        )
+
+    def test_security_groups_are_read_by_id_and_by_name_with_their_inbound_rule_counts(self):
+        rule = {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22}
+        self.add_group("sg-00000000000000001", "example-closed")
+        self.add_group("sg-00000000000000002", "example-open", [rule, rule])
+        self.add_group("sg-00000000000000003", "example-other")
+        aws = self.image_aws()
+        found = aws.security_groups(group_ids=["sg-00000000000000002", "sg-00000000000000001"])
+        self.assertEqual(
+            [(item.group_id, item.name, item.ingress_rules) for item in found],
+            [("sg-00000000000000001", "example-closed", 0), ("sg-00000000000000002", "example-open", 2)],
+        )
+        found = aws.security_groups(group_names=["example-open", "example-missing"])
+        self.assertEqual([(item.name, item.ingress_rules) for item in found], [("example-open", 2)])
+        self.assertEqual(
+            self.requests("describe_security_groups"),
+            [
+                {"GroupIds": ["sg-00000000000000002", "sg-00000000000000001"], "Filters": None, "NextToken": None},
+                {
+                    "GroupIds": None,
+                    "Filters": [{"Name": "group-name", "Values": ["example-open", "example-missing"]}],
+                    "NextToken": None,
+                },
+            ],
+        )
+
+    def test_a_security_group_entry_carries_no_rule_detail(self):
+        rule = {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "UserIdGroupPairs": [{"GroupId": "sg-hidden-marker"}]}
+        self.add_group("sg-00000000000000001", "example-open", [rule])
+        (item,) = self.image_aws().security_groups(group_ids=["sg-00000000000000001"])
+        for text in (repr(item), str(item.as_dict())):
+            self.assertNotIn("sg-hidden-marker", text)
+
+    def test_reading_no_group_makes_no_call(self):
+        self.assertEqual(self.image_aws().security_groups(), [])
+        self.assertEqual(self.calls, [])
+
+    def test_a_group_id_the_provider_does_not_know_fails_the_read_and_is_not_an_empty_group(self):
+        self.add_group("sg-00000000000000001", "example-closed")
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.image_aws().security_groups(group_ids=["sg-00000000000000001", "sg-0000000000000000f"])
+        self.assertTrue(raised.exception.uncertain)
+
+    def test_an_unreadable_security_group_is_refused_without_the_provider_message(self):
+        self.ec2.errors["describe_security_groups"] = ProviderError("UnauthorizedOperation")
+        for arguments in ({"group_ids": ["sg-00000000000000001"]}, {"group_names": ["example-closed"]}):
+            with self.subTest(arguments=sorted(arguments)):
+                with self.assertRaises(ProviderRefusal) as raised:
+                    self.image_aws().security_groups(**arguments)
+                self.assertTrue(raised.exception.uncertain)
+                for sentinel in SENTINELS:
+                    self.assertNotIn(sentinel, raised.exception.detail)
+                    self.assertNotIn(sentinel, str(raised.exception.as_dict()))
+
+    def test_security_group_reads_stop_at_the_deadline(self):
+        self.add_group("sg-00000000000000001", "example-closed")
+        for arguments in ({"group_ids": ["sg-00000000000000001"]}, {"group_names": ["example-closed"]}):
+            with self.subTest(arguments=sorted(arguments)):
+                with self.assertRaises(DeadlineRefusal):
+                    self.image_aws().security_groups(deadline=NOW, **arguments)
+        self.assertEqual(self.calls, [])
+
+    def test_a_truncated_or_malformed_security_group_answer_is_refused_and_not_read_as_no_ingress(self):
+        self.add_group("sg-00000000000000001", "example-closed")
+        self.ec2.pages["describe_security_groups"] = True
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.image_aws().security_groups(group_ids=["sg-00000000000000001"])
+        self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
+        self.ec2.pages.clear()
+        for broken in (
+            {"GroupName": "example-closed", "IpPermissions": []},
+            {"GroupId": "sg-00000000000000001", "IpPermissions": []},
+            {"GroupId": "sg-00000000000000001", "GroupName": "example-closed"},
+            {"GroupId": "sg-00000000000000001", "GroupName": "example-closed", "IpPermissions": None},
+        ):
+            with self.subTest(broken=sorted(broken)):
+                self.ec2.security_groups_store[:] = [broken]
+                arguments = {"group_ids": [broken["GroupId"]]} if "GroupId" in broken else {"group_names": ["example-closed"]}
+                with self.assertRaises(ProviderRefusal) as raised:
+                    self.image_aws().security_groups(**arguments)
+                self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
 
     def test_a_version_read_that_returns_another_version_is_refused(self):
         self.ec2.versions_store[("example-worker", 4)] = {
@@ -1524,6 +1649,38 @@ class PresignTests(Base):
     def test_expiry_may_be_a_callable(self):
         aws = self.image_aws(expiry=lambda: NOW + 3600)
         self.assertEqual(aws.presign_get(BUCKET, self.KEY, 1800), SENTINEL_URL)
+
+    def test_the_credential_check_alone_presigns_nothing(self):
+        aws = self.image_aws(expiry=NOW + 1800)
+        self.assertIsNone(aws.check_credential_life(1800))
+        self.assertEqual(self.requests("generate_presigned_url"), [])
+        self.assertEqual(self.names(), [])
+
+    def test_the_credential_check_refuses_a_session_that_is_too_short_with_the_code_of_presign(self):
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.image_aws(expiry=NOW + 1799).check_credential_life(1800)
+        self.assertEqual((raised.exception.reason, raised.exception.uncertain), ("IMAGE_CREDENTIAL_SHORT", False))
+        self.assertIn("1799 seconds", raised.exception.detail)
+        self.assertEqual(self.requests("generate_presigned_url"), [])
+
+    def test_the_credential_check_refuses_an_unknown_expiry(self):
+        session = FakeSession(self.calls, self.ec2, self.s3, credentials=FakeCredentials(None))
+        aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock)
+        with self.assertRaises(ProviderRefusal) as raised:
+            aws.check_credential_life(300)
+        self.assertEqual(raised.exception.reason, "IMAGE_CREDENTIAL_SHORT")
+
+    def test_a_refusal_of_the_session_passes_the_credential_check_unchanged(self):
+        refusal = ProviderRefusal("IMAGE_PROFILE_INVALID", f"profile {PROFILE}: it does not exist")
+
+        def refusing_session(profile):
+            raise refusal
+
+        with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
+            aws = ImageAws(REGION, PROFILE, session_factory=refusing_session, clock=self.clock)
+            with self.assertRaises(ProviderRefusal) as raised:
+                aws.check_credential_life(1800)
+        self.assertIs(raised.exception, refusal)
 
     def test_a_credential_resolution_that_fails_is_a_provider_refusal_with_a_stable_reason(self):
         _, modules = sdk_client_error("AccessDenied")

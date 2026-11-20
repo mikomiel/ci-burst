@@ -16,6 +16,7 @@ import gzip
 import hashlib
 import re
 import shlex
+from dataclasses import replace
 from pathlib import Path
 
 from .config import _no_control
@@ -246,3 +247,63 @@ def shipped_script(path=DEFAULT_SCRIPT_PATH):
         return Path(path).read_bytes()
     except OSError as error:
         raise ImageRefusal("IMAGE_SCRIPT_MISSING", f"cannot read {path}: {type(error).__name__}") from None
+
+
+# -- failure bounds ----------------------------------------------------------
+# What a build leaves behind in the control row when it fails or succeeds, and
+# when a build must be over. These are pure like the rest of this module: they
+# take the control row the caller read and return the one the caller writes.
+# ``build_decision`` reads that row, and its ``clear_control`` says when the
+# caller writes the clearing: ``blocked`` false and ``cooldown_until`` none, with
+# ``consecutive_failures`` left alone, because the count ends only with a success.
+
+
+def build_deadline(started_at, config):
+    """The epoch second by which a build that started at ``started_at`` must be over.
+
+    ``config`` is the enabled ``ImageConfig``. A build with no verdict at this
+    second ends as ``failed``.
+    """
+    return started_at + config.build_deadline_seconds
+
+
+def record_failure(control, now, config):
+    """The control row after one more failed build.
+
+    ``control`` is the state file's control row, ``now`` is epoch seconds and
+    ``config`` is the enabled ``ImageConfig``. The result is
+    ``{"control", "newly_blocked"}``. ``control`` is a new row of the same type
+    with the failure count one higher, the cooldown ending
+    ``failure_cooldown_seconds`` after ``now``, and ``blocked`` true once the
+    count reaches ``max_consecutive_failures`` (a row that is already blocked
+    stays blocked). ``newly_blocked`` is true only when this failure is the one
+    that blocked the row, so the caller writes its ``image_blocked`` event once.
+
+    The count does not restart when a recovery clears ``blocked`` (the design
+    clears ``blocked`` and the cooldown and nothing else), so the first failure
+    after a recovery blocks the row again: a recovered build has one try. Only
+    ``record_success`` ends the count. The argument is not changed.
+    """
+    failures = control.consecutive_failures + 1
+    blocked = control.blocked or failures >= config.max_consecutive_failures
+    updated = replace(
+        control,
+        consecutive_failures=failures,
+        cooldown_until=now + config.failure_cooldown_seconds,
+        blocked=blocked,
+    )
+    return {"control": updated, "newly_blocked": blocked and not control.blocked}
+
+
+def record_success(control):
+    """The control row after a build that reached ``candidate``: no failures, no cooldown, not blocked."""
+    return replace(control, consecutive_failures=0, cooldown_until=None, blocked=False)
+
+
+def blocked_explanation():
+    """What ``image status`` says about a blocked control row: the two ways to clear it.
+
+    Both are the clearings ``build_decision`` implements: a basis digest that
+    differs from the last failed build's, and ``--force``.
+    """
+    return {"blocked": True, "clear_by": ["a basis digest change", "image run --apply --force"]}

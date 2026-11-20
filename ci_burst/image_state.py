@@ -337,6 +337,59 @@ class ImageState:
         )
         return _build(row) if row else None
 
+    def builds(self, deployment):
+        """Every build of ``deployment``, oldest first."""
+        rows = self._require().execute(
+            "SELECT * FROM image_builds WHERE deployment = ? ORDER BY created_at, rowid", (deployment,)
+        )
+        return [_build(row) for row in rows]
+
+    def builds_started_since(self, deployment, since):
+        """How many builds of ``deployment``, in any state, started strictly after ``since``.
+
+        ``since`` is epoch seconds. A build started exactly at ``since`` is not
+        counted, which matches the minimum-interval check: a window that has
+        run its full length is over. ``build_decision`` takes the count of the
+        last day as ``builds_last_day``.
+        """
+        row = (
+            self._require()
+            .execute(
+                "SELECT COUNT(*) FROM image_builds WHERE deployment = ? AND created_at > ?",
+                (deployment, since),
+            )
+            .fetchone()
+        )
+        return row[0]
+
+    def last_build(self, deployment):
+        """The newest build of ``deployment`` by start time, in any state, or ``None``."""
+        return self._newest_build(deployment)
+
+    def last_failed_build(self, deployment):
+        """The newest build of ``deployment`` in state ``failed``, or ``None``."""
+        return self._newest_build(deployment, "failed")
+
+    def candidate(self, deployment):
+        """The newest build of ``deployment`` in state ``candidate``, or ``None``.
+
+        This is the state alone. A build that an earlier pass marked unusable
+        is not told apart here.
+        """
+        return self._newest_build(deployment, "candidate")
+
+    def _newest_build(self, deployment, state=None):
+        clause, arguments = ("", (deployment,)) if state is None else (" AND state = ?", (deployment, state))
+        row = (
+            self._require()
+            .execute(
+                f"SELECT * FROM image_builds WHERE deployment = ?{clause} ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                arguments,
+            )
+            .fetchone()
+        )
+        return _build(row) if row else None
+
     @contextmanager
     def _write_active_guard(self):
         """Report the ``one_active`` index as a named refusal, not a raw error."""

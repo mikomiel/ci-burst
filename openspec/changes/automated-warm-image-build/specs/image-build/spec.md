@@ -567,7 +567,7 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 Every path that deregisters an image or deletes a snapshot (retention, failed-build cleanup, orphan cleanup and the pending-image timeout) MUST first resolve the protected set: the images of every launch-template version that the TOML references, including per-zone pins, the recorded previous pin, the pins of a pending promotion journal row, the current candidate unless its row records `TEMPLATE_DRIFT`, and an active build. It MUST NOT deregister a protected image.
 
 #### Scenario: A protected image
-- **WHEN** an image is the pin's, the previous pin's, a journal pin's or the candidate's
+- **WHEN** an image is the pin's, the previous pin's, a journal pin's, or the candidate's while its row does not record `TEMPLATE_DRIFT`
 - **THEN** every deletion path skips it
 
 #### Scenario: A failed build's image is pinned by hand

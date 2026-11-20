@@ -323,7 +323,7 @@ Out of scope. A later change would need explicit gates (the marker, a clean cana
 
 One deletion rule covers every path that deregisters an image or deletes a snapshot: retention, failed-build cleanup in reconcile, orphan cleanup and the pending-image timeout. No path has its own rule.
 
-- Resolve the protected set first: the images of every launch-template version that the TOML references (the `[aws]` pin and every `[[aws.availability_zones]]` pin), the recorded previous pin, the pins of any pending or diverged promotion journal row, the current candidate (unless its row records `TEMPLATE_DRIFT`) and an active build. With the defaults that is three images, and `retain` (default 3, range 2..6) never goes below that. A failed build's image that an operator has pinned by hand is protected like any other.
+- Resolve the protected set first: the images of every launch-template version that the TOML references (the `[aws]` pin and every `[[aws.availability_zones]]` pin), the recorded previous pin, the pins of any pending or diverged promotion journal row, the current candidate (unless its row records `TEMPLATE_DRIFT`) and an active build. With the defaults that is at most three images (two when the candidate has drifted, since its image is then removed after the 24-hour hold), and `retain` (default 3, range 2..6) never goes below that. A failed build's image that an operator has pinned by hand is protected like any other.
 - Never deregister a protected image.
 - Verify the ownership tags (image-build, deployment and the build id) before deleting. An image or snapshot without them is left alone.
 - Fail closed: if the TOML or any launch-template version cannot be read, delete nothing.

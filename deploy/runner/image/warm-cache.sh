@@ -66,7 +66,7 @@ WARM_COMMANDS=${WARM_COMMANDS:-}
 WARM_GATE_COMMAND=${WARM_GATE_COMMAND:-}
 WARM_LIFETIME_SECONDS=${WARM_LIFETIME_SECONDS:-5400}
 WARM_SNAPSHOT_SECONDS=${WARM_SNAPSHOT_SECONDS:-1800}
-WARM_SRC_STRIP_COMPONENTS=${WARM_SRC_STRIP_COMPONENTS:-0}
+WARM_SRC_STRIP_COMPONENTS=${WARM_SRC_STRIP_COMPONENTS-0}
 
 DEFAULT_LIFETIME_SECONDS=5400
 FAIL_HOLD_SECONDS=300
@@ -150,6 +150,7 @@ case $WARM_SRC_URL in
 esac
 case $WARM_SRC_URL in
   *[[:space:]]*) refuse "WARM_SRC_URL must not contain whitespace" ;;
+  *[\"\\]*) refuse "WARM_SRC_URL must not contain a quote or a backslash" ;;
 esac
 warm_commands=()
 while IFS= read -r line; do
@@ -259,10 +260,13 @@ assert_clean() {
   fi
 }
 
-# Fetch without credentials; the URL is never echoed. The error text of curl is
-# dropped for the same reason, and --proto keeps a redirect on https.
+# Fetch without credentials; the URL is never echoed. It reaches curl on stdin as
+# a config line, never as an argument, so it is not in any process listing. The
+# error text of curl is dropped for the same reason, and --proto keeps a
+# redirect on https. The checks above keep a quote and a backslash out of it.
 fetch_rc=0
-curl -fsS --proto '=https' --max-time 600 -o "$ARCHIVE" "$WARM_SRC_URL" 2>/dev/null || fetch_rc=$?
+printf 'url = "%s"\n' "$WARM_SRC_URL" |
+  curl -fsS --proto '=https' --max-time 600 -o "$ARCHIVE" --config - 2>/dev/null || fetch_rc=$?
 if [ "$fetch_rc" -ne 0 ]; then
   echo "WARM FAIL fetch rc=${fetch_rc}"
   exit 1

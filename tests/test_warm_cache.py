@@ -116,6 +116,7 @@ out=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -o) out=$2; shift 2 ;;
+    --config) [ "$2" = - ] && cat > "$STUB_DIR/curl-config"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -362,6 +363,9 @@ class RefusalTests(WarmHarness, unittest.TestCase):
             "a missing URL": {"WARM_SRC_URL": ""},
             "a URL that is not https": {"WARM_SRC_URL": "http://builder-source.invalid/a.tar.gz"},
             "a URL with whitespace": {"WARM_SRC_URL": "https://builder-source.invalid/a b"},
+            "a URL with a quote": {"WARM_SRC_URL": 'https://builder-source.invalid/a"b'},
+            "a URL with a backslash": {"WARM_SRC_URL": "https://builder-source.invalid/a\\b"},
+            "an empty strip setting": {"WARM_SRC_STRIP_COMPONENTS": ""},
             "a lifetime below the bound": {"WARM_LIFETIME_SECONDS": "10"},
             "a lifetime above the bound": {"WARM_LIFETIME_SECONDS": "99999"},
             "a lifetime that is not a number": {"WARM_LIFETIME_SECONDS": "soon"},
@@ -432,12 +436,11 @@ class StripComponentsTests(WarmHarness, unittest.TestCase):
     def argv(self, strip):
         return f"EXTRACT tar -xzf - -C {self.vartmp / 'warm-src'} --no-same-owner --no-same-permissions {strip}"
 
-    def test_unset_empty_and_zero_keep_every_path_component(self):
+    def test_unset_and_zero_keep_every_path_component(self):
         self.archive, self.digest = make_wrapped_archive(self.root)
         kept = self.root / "kept.txt"
         cases = (
             ("unset", {}),
-            ("empty", {"WARM_SRC_STRIP_COMPONENTS": ""}),
             ("zero", {"WARM_SRC_STRIP_COMPONENTS": "0"}),
         )
         for label, inputs in cases:
@@ -468,6 +471,21 @@ class StripComponentsTests(WarmHarness, unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("WARM FAIL warm 1/1 rc=1", self.output)
         self.assertEqual(self.unframed_markers(), [])
+
+
+class FetchTests(WarmHarness, unittest.TestCase):
+    """The presigned URL reaches curl on stdin, never as an argument."""
+
+    def test_the_url_is_never_a_process_argument(self):
+        completed = self.start()
+        self.assertEqual(completed.returncode, 0, self.output)
+        fetches = [e for e in self.event_list() if e.startswith("curl")]
+        self.assertEqual(len(fetches), 1)
+        self.assertNotIn(SECRET_URL_TOKEN, fetches[0])
+        self.assertIn("--config -", fetches[0])
+        config = (self.stub / "curl-config").read_text(encoding="utf-8")
+        self.assertEqual(config, f'url = "{SOURCE_URL}"\n')
+        self.assertNotIn(SECRET_URL_TOKEN, self.output)
 
 
 class FailureTests(WarmHarness, unittest.TestCase):

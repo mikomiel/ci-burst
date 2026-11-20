@@ -223,9 +223,10 @@ def render_user_data(script_bytes, exports):
     refused with ``IMAGE_USERDATA_TOO_LARGE`` when its UTF-8 size, the size
     EC2 measures before base64, is ``USER_DATA_LIMIT`` or more.
     """
+    for name, value in exports.items():
+        _check_export(name, value)
     lines = ["#!/bin/bash"]
     for name in sorted(exports):
-        _check_export(name, exports[name])
         lines.append(f"export {name}={shlex.quote(exports[name])}")
     payload = base64.b64encode(gzip.compress(script_bytes, compresslevel=9, mtime=0)).decode("ascii")
     text = "\n".join(lines) + "\n" + _STUB_RUN + payload + "\n" + _STUB_END

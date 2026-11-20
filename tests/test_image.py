@@ -432,7 +432,7 @@ def payload_of(text):
 
 class WarmExportsTests(unittest.TestCase):
     def test_the_names_are_the_inputs_the_script_reads(self):
-        read = set(re.findall(r"(?m)^(WARM_[A-Z0-9_]+)=\$\{\1:-", SCRIPT.read_text(encoding="utf-8")))
+        read = set(re.findall(r"(?m)^(WARM_[A-Z0-9_]+)=\$\{\1:?-", SCRIPT.read_text(encoding="utf-8")))
         self.assertEqual(len(read), 7)
         self.assertEqual(set(image.warm_exports(load_image(), SENTINEL_URL, "ab" * 32)), read)
 
@@ -642,6 +642,13 @@ class RenderUserDataTests(unittest.TestCase):
         for name in ("WARM_X", "WARM_SRC_SHA256", "WARM_A_1", "WARM_0"):
             with self.subTest(name=name):
                 image.render_user_data(b"x", {name: "value"})
+
+    def test_a_name_that_is_not_a_string_is_refused_beside_a_valid_one(self):
+        for name in (1, None, b"WARM_X"):
+            with self.subTest(name=name):
+                with self.assertRaises(ConfigRefusal) as raised:
+                    image.render_user_data(b"x", {"WARM_X": "value", name: "value"})
+                self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
 
     def test_a_value_that_is_not_text_is_refused(self):
         for value in (3000, None, b"bytes", ["a"]):

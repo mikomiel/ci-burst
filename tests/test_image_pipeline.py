@@ -115,6 +115,7 @@ IMAGE_TOML = """
 [image]
 enabled = true
 profile = "example-image-role"
+state_directory = "{state_directory}"
 {image_extra}
 [image.source]
 token_env = "EXAMPLE_IMAGE_TOKEN"
@@ -133,10 +134,12 @@ bucket = "{bucket}"
 prefix = "{prefix}"
 """
 GATE = 'gate_command = "bash scripts/example-gate.sh"'
+STATE_DIRECTORY = "/var/lib/example-image-state"
 
 
-def render_toml(*, image_extra="", source_extra="", gate=GATE):
+def render_toml(*, image_extra="", source_extra="", gate=GATE, state_directory=STATE_DIRECTORY):
     return IMAGE_TOML.format(
+        state_directory=state_directory,
         image_extra=image_extra,
         source_extra=source_extra,
         gate=gate,

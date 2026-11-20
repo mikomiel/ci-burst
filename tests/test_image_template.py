@@ -20,7 +20,7 @@ import unittest
 
 from ci_burst.aws import ImageAws, TemplateVersion
 from ci_burst.errors import ProviderRefusal
-from ci_burst.image_template import create_candidate_version
+from ci_burst.image_template import create_candidate_version, differing_fields
 
 from support import Clock
 from test_image_aws import FakeEc2, ProviderError
@@ -463,6 +463,53 @@ class PlumbingTests(unittest.TestCase):
         nested = {"A": [1, {"B": [2, 3]}], "C": {"D": None}}
         stub = StubAws(read=[version(PIN, ImageId=OLD_IMAGE, **copy.deepcopy(nested)), version(7, ImageId=NEW_IMAGE, **nested)])
         self.assertEqual(self.call(stub), {"version": 7, "drift": "clean"})
+
+
+class DifferingFieldsTests(unittest.TestCase):
+    """The one comparison that the creation of a candidate and ``status --refresh`` share."""
+
+    def pair(self, **changes):
+        """The pin's data and a candidate's: the same, except for the new image and ``changes``."""
+        source, created = pin_data(), pin_data()
+        created["ImageId"] = NEW_IMAGE
+        created.update(changes)
+        return source, created
+
+    def test_data_that_differs_in_the_image_alone_is_clean(self):
+        source, created = self.pair()
+        self.assertEqual(differing_fields(source, created, NEW_IMAGE), [])
+
+    def test_the_image_must_be_exactly_the_expected_one(self):
+        source, created = self.pair()
+        for label, expected in (("another image", OLD_IMAGE), ("no image expected", None)):
+            with self.subTest(case=label):
+                self.assertEqual(differing_fields(source, created, expected), ["ImageId"])
+        del created["ImageId"]
+        self.assertEqual(differing_fields(source, created, NEW_IMAGE), ["ImageId"])
+
+    def test_the_image_of_the_source_is_never_compared(self):
+        source, created = self.pair()
+        source["ImageId"] = "ami-0aaaaaaaaaaaaaaaa"
+        self.assertEqual(differing_fields(source, created, NEW_IMAGE), [])
+
+    def test_every_other_difference_is_named_once_sorted_and_without_a_value(self):
+        source, created = self.pair(InstanceType="t4g.large", KeyName="example-key")
+        created["MetadataOptions"]["HttpTokens"] = "optional"  # nested: the top-level name is reported
+        del created["IamInstanceProfile"]
+        fields = differing_fields(source, created, NEW_IMAGE)
+        self.assertEqual(fields, ["IamInstanceProfile", "InstanceType", "KeyName", "MetadataOptions"])
+        self.assertTrue(all(isinstance(name, str) for name in fields))
+
+    def test_a_key_in_one_mapping_only_is_a_difference_even_when_its_value_is_none(self):
+        source, created = self.pair(Empty=None)
+        self.assertEqual(differing_fields(source, created, NEW_IMAGE), ["Empty"])
+        self.assertEqual(differing_fields(created, source, OLD_IMAGE), ["Empty"])
+
+    def test_the_mappings_are_left_as_they_were(self):
+        source, created = self.pair(InstanceType="t4g.large")
+        before = copy.deepcopy((source, created))
+        differing_fields(source, created, NEW_IMAGE)
+        self.assertEqual((source, created), before)
 
 
 if __name__ == "__main__":

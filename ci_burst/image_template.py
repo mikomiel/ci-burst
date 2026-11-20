@@ -61,13 +61,24 @@ def create_candidate_version(aws, *, template_name, source_pin, image_id, build_
             f"the read-back did not return exactly versions {source_pin} and {version}",
             uncertain=True,
         )
-    source, created = by_number[source_pin].data, by_number[version].data
+    fields = differing_fields(by_number[source_pin].data, by_number[version].data, image_id)
+    if fields:
+        return {"version": version, "drift": TEMPLATE_DRIFT, "fields": fields}
+    return {"version": version, "drift": CLEAN}
+
+
+def differing_fields(source, created, image_id):
+    """The sorted top-level names in which ``created`` differs from ``source``, the image aside.
+
+    ``source`` and ``created`` are the two ``LaunchTemplateData`` mappings, the
+    pin's and the candidate's. The image is expected to differ, so only a wrong
+    image counts: ``created`` must carry exactly ``image_id``. A key that exists
+    in one mapping only is a difference. Names only, never values. An empty
+    result is ``CLEAN``. Both the creation of a candidate and ``status
+    --refresh`` use this one comparison, so the two cannot disagree.
+    """
     fields = {key for key in set(source) | set(created) if source.get(key, _MISSING) != created.get(key, _MISSING)}
-    # The image is expected to differ, so only a wrong image counts: the new
-    # version must carry exactly the image that was built.
     fields.discard(_IMAGE_FIELD)
     if created.get(_IMAGE_FIELD) != image_id:
         fields.add(_IMAGE_FIELD)
-    if fields:
-        return {"version": version, "drift": TEMPLATE_DRIFT, "fields": sorted(fields)}
-    return {"version": version, "drift": CLEAN}
+    return sorted(fields)

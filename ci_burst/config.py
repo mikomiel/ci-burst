@@ -13,6 +13,7 @@ instance-type list multiplies those candidates into one pool per type; the same
 type-major order is the priority the controller falls back through.
 """
 
+import os
 import re
 import tomllib
 import unicodedata
@@ -224,6 +225,10 @@ class ImageConfig:
     warm: ImageWarmConfig | None = None
     build: ImageBuildConfig | None = None
     storage: ImageStorageConfig | None = None
+    #: The directory of ``image-state.sqlite`` and its telemetry files. It is a
+    #: different directory from the scaling ledger's and not inside it, so the
+    #: image unit never mounts the ledger.
+    state_directory: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -583,7 +588,40 @@ def _image_storage(image_table, *, required):
     return ImageStorageConfig(bucket=bucket, prefix=prefix)
 
 
-def _image(raw, aws_profile, forgejo_token_env, worker_template):
+def _image_state_directory(table, where, *, required, ledger_directory):
+    """The image state directory: absolute, and apart from the scaling ledger's directory.
+
+    The image unit mounts this directory writable and must never see the ledger,
+    so the two directories may not be the same, and neither may lie inside the
+    other. The comparison follows symbolic links on both sides. The value that
+    is returned is the path as the operator wrote it (``.`` and doubled
+    separators collapsed), because that is the path the unit mounts.
+    """
+    value = table.get("state_directory")
+    if value is None:
+        if required:
+            _fail(f"{where}.state_directory", "is required")
+        return None
+    if not isinstance(value, str) or not value:
+        _fail(f"{where}.state_directory", "must be a non-empty string")
+    _no_control(value, f"{where}.state_directory")
+    path = Path(value)
+    if not path.is_absolute():
+        _fail(f"{where}.state_directory", "must be an absolute path")
+    if ".." in path.parts:
+        _fail(f"{where}.state_directory", 'must not contain ".."')
+    directory = Path(os.path.normpath(path))
+    resolved, ledger = Path(os.path.realpath(directory)), Path(os.path.realpath(ledger_directory))
+    if resolved == ledger or ledger in resolved.parents or resolved in ledger.parents:
+        _fail(
+            f"{where}.state_directory",
+            "must be a different directory from the scaling ledger's directory (the parent of state.database), "
+            "neither inside it nor containing it",
+        )
+    return directory
+
+
+def _image(raw, aws_profile, forgejo_token_env, worker_template, ledger_directory):
     """Return the validated image configuration, or the disabled value.
 
     The tables are checked whenever they are present, so an unknown key, an
@@ -608,6 +646,7 @@ def _image(raw, aws_profile, forgejo_token_env, worker_template):
             "retain",
             "retain_min_age_seconds",
             "promote_max_age_seconds",
+            "state_directory",
             "source",
             "warm",
             "build",
@@ -641,10 +680,18 @@ def _image(raw, aws_profile, forgejo_token_env, worker_template):
     warm = _image_warm(table, required=enabled)
     build = _image_build(table, worker_template, required=enabled)
     storage = _image_storage(table, required=enabled)
+    state_directory = _image_state_directory(table, where, required=enabled, ledger_directory=ledger_directory)
     if not enabled:
         return ImageConfig()
     return ImageConfig(
-        enabled=True, profile=profile, source=source, warm=warm, build=build, storage=storage, **values
+        enabled=True,
+        profile=profile,
+        source=source,
+        warm=warm,
+        build=build,
+        storage=storage,
+        state_directory=state_directory,
+        **values,
     )
 
 
@@ -652,11 +699,24 @@ def load(path):
     """Load and validate a configuration file, or raise ``ConfigRefusal``."""
     config_path = Path(path)
     try:
-        raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        text = config_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         raise ConfigRefusal("CONFIG_MISSING", str(config_path)) from None
     except (OSError, UnicodeDecodeError) as error:
         raise ConfigRefusal("CONFIG_UNREADABLE", f"{config_path}: {error}") from None
+    return loads(text, config_path)
+
+
+def loads(text, path):
+    """Validate configuration text as ``load`` validates a file, or raise ``ConfigRefusal``.
+
+    ``path`` is where the text lives: it is kept as ``Config.path`` and a relative
+    ``state.database`` resolves against its directory. Nothing is read or written,
+    so a caller can check a new text before it replaces the file.
+    """
+    config_path = Path(path)
+    try:
+        raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         raise ConfigRefusal("CONFIG_INVALID", f"TOML: {error}") from None
 
@@ -789,5 +849,5 @@ def load(path):
         aws=aws,
         budget=budget,
         state=state,
-        image=_image(raw, profile, forgejo.token_env, aws.launch_template_name),
+        image=_image(raw, profile, forgejo.token_env, aws.launch_template_name, database.parent),
     )

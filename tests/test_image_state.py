@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -11,7 +12,15 @@ from ci_burst import image_state
 from ci_burst.config import load
 from ci_burst.controller import Controller
 from ci_burst.errors import StateRefusal
-from ci_burst.image_state import SCHEMA_VERSION, STATE_FILE, ImageState
+from ci_burst.image_state import (
+    PIN_RECORD_PREFIX,
+    PIN_RECORD_REASON,
+    SCHEMA_VERSION,
+    STATE_FILE,
+    Build,
+    ImageState,
+    PinObservation,
+)
 from ci_burst.ledger import SCHEMA_VERSION as LEDGER_SCHEMA_VERSION
 from ci_burst.ledger import Ledger, current_window
 
@@ -725,6 +734,208 @@ class BuildReadTests(ImageStateCase):
             with self.subTest(read=read):
                 with self.assertRaises(StateRefusal) as raised:
                     read()
+                self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNAVAILABLE")
+        self.assertFalse((self.root / "unconnected").exists())
+
+
+class PromotionSupportTests(ImageStateCase):
+    """What ``promote``, ``rollback`` and ``status --refresh`` ask of the state, beyond the build pass."""
+
+    DEPLOYMENT = "example-deployment"
+    OTHER = "example-other-deployment"
+    T0 = 1_800_000_000.0
+    IMAGE = "ami-0123456789abcdef0"
+    OTHER_IMAGE = "ami-0fedcba9876543210"
+
+    def owner(self, build_id, version, at, *, state="candidate", deployment=None):
+        """A build that started at ``at``, launched template ``version`` and is now in ``state``."""
+        self.clock.now = at
+        self.add_build(build_id, deployment=deployment or self.DEPLOYMENT)
+        with self.state.transaction():
+            return self.state.advance_build(build_id, state=state, template_version=version, image_id=self.IMAGE)
+
+    def pin_record(self, version=3, image_id=None):
+        with self.state.transaction():
+            return self.state.insert_pin_record(
+                deployment=self.DEPLOYMENT, version=version, image_id=image_id or self.IMAGE
+            )
+
+    def verify(self, build_id, **changes):
+        values = {
+            "image_state": "available",
+            "template_version_exists": 1,
+            "drift_result": "clean",
+            "verified_at": self.T0 + 500,
+            **changes,
+        }
+        with self.state.transaction():
+            return self.state.record_verification(build_id, **values)
+
+    # -- version_owner -----------------------------------------------------------------
+    def test_a_version_is_owned_by_its_newest_candidate_or_promoted_row(self):
+        self.assertIsNone(self.state.version_owner(self.DEPLOYMENT, 5))
+        self.owner("b-old", 5, self.T0, state="promoted")
+        newest = self.owner("b-new", 5, self.T0 + 10)
+        self.owner("b-other-version", 6, self.T0 + 20)
+        self.assertEqual(self.state.version_owner(self.DEPLOYMENT, 5), newest)
+        self.assertEqual(self.state.version_owner(self.DEPLOYMENT, 6).id, "b-other-version")
+        self.assertIsNone(self.state.version_owner(self.DEPLOYMENT, 7))
+
+    def test_rows_that_started_together_are_ordered_by_insertion(self):
+        self.owner("b-first", 5, self.T0)
+        self.owner("b-second", 5, self.T0)
+        self.assertEqual(self.state.version_owner(self.DEPLOYMENT, 5).id, "b-second")
+
+    def test_a_failed_or_a_running_build_never_owns_a_version(self):
+        self.owner("b-failed", 5, self.T0, state="failed")
+        self.owner("b-running", 6, self.T0 + 10, state="building")
+        self.assertIsNone(self.state.version_owner(self.DEPLOYMENT, 5))
+        self.assertIsNone(self.state.version_owner(self.DEPLOYMENT, 6))
+
+    def test_a_version_has_an_owner_in_its_own_deployment_only(self):
+        self.owner("o-1", 5, self.T0, deployment=self.OTHER)
+        self.assertIsNone(self.state.version_owner(self.DEPLOYMENT, 5))
+        self.assertEqual(self.state.version_owner(self.OTHER, 5).id, "o-1")
+
+    # -- insert_pin_record -------------------------------------------------------------
+    def test_a_pin_record_is_a_promoted_row_that_owns_the_version_and_proves_nothing_yet(self):
+        self.clock.now = self.T0
+        record = self.pin_record(3)
+        self.assertEqual(
+            record,
+            Build(
+                id=f"{PIN_RECORD_PREFIX}3",
+                deployment=self.DEPLOYMENT,
+                client_token="pin:3",
+                basis_digest="",
+                source_sha="",
+                state="promoted",
+                reason_code=PIN_RECORD_REASON,
+                created_at=0.0,
+                updated_at=self.T0,
+                deadline_at=0.0,
+                image_id=self.IMAGE,
+                template_version=3,
+            ),
+        )
+        self.assertEqual(record.id, "pin-3")
+        self.assertEqual(self.state.version_owner(self.DEPLOYMENT, 3), record)
+        self.assertEqual(self.state.build("pin-3"), record)
+
+    def test_a_second_pin_record_for_the_same_version_returns_the_first_and_changes_nothing(self):
+        self.clock.now = self.T0
+        first = self.pin_record(3)
+        self.clock.now = self.T0 + 60
+        again = self.pin_record(3, image_id=self.OTHER_IMAGE)
+        self.assertEqual(again, first)
+        self.assertEqual(self.state.build("pin-3").image_id, self.IMAGE)
+        self.assertEqual(len(self.state.builds(self.DEPLOYMENT)), 1)
+
+    def test_a_pin_record_is_never_a_build_that_started_or_a_candidate(self):
+        self.owner("b-running", 5, self.T0, state="building")
+        self.pin_record(3)  # the one_active index does not meet it
+        self.assertEqual(self.state.active_build(self.DEPLOYMENT).id, "b-running")
+        self.assertEqual(self.state.builds_started_since(self.DEPLOYMENT, self.T0 - 86_400), 1)
+        self.assertEqual(self.state.last_build(self.DEPLOYMENT).id, "b-running")
+        self.assertIsNone(self.state.candidate(self.DEPLOYMENT))
+        self.assertIsNone(self.state.verified_candidate(self.DEPLOYMENT))
+
+    # -- record_verification -----------------------------------------------------------
+    def test_record_verification_replaces_the_four_columns_and_nothing_else(self):
+        before = self.owner("b-1", 5, self.T0)
+        self.clock.now = self.T0 + 500
+        after = self.verify("b-1")
+        self.assertEqual(
+            (after.image_state, after.template_version_exists, after.drift_result, after.verified_at),
+            ("available", 1, "clean", self.T0 + 500),
+        )
+        blank = {"image_state": None, "template_version_exists": None, "drift_result": None, "verified_at": None}
+        self.assertEqual(replace(after, **blank), replace(before, **blank))
+        self.assertEqual(after.updated_at, before.updated_at, "the end of the build is not the time of a read")
+        self.assertEqual(self.state.build("b-1"), after)
+
+    def test_a_newer_verification_replaces_an_older_one_and_none_is_stored_as_null(self):
+        self.owner("b-1", 5, self.T0)
+        self.verify("b-1")
+        later = self.verify(
+            "b-1", image_state="missing", template_version_exists=0, drift_result=None, verified_at=self.T0 + 900
+        )
+        self.assertEqual(
+            (later.image_state, later.template_version_exists, later.drift_result, later.verified_at),
+            ("missing", 0, None, self.T0 + 900),
+        )
+        cleared = self.verify(
+            "b-1", image_state=None, template_version_exists=None, drift_result=None, verified_at=None
+        )
+        self.assertEqual(
+            (cleared.image_state, cleared.template_version_exists, cleared.drift_result, cleared.verified_at),
+            (None, None, None, None),
+        )
+
+    def test_a_pin_record_takes_a_verification(self):
+        self.pin_record(3)
+        record = self.verify("pin-3")
+        self.assertEqual((record.image_state, record.verified_at), ("available", self.T0 + 500))
+        self.assertEqual(record.state, "promoted")
+
+    def test_record_verification_of_an_unknown_build_is_refused(self):
+        with self.assertRaises(StateRefusal) as raised:
+            self.verify("b-unknown")
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("IMAGE_BUILD_UNKNOWN", "b-unknown"))
+        self.assertEqual(self.state.builds(self.DEPLOYMENT), [])
+
+    # -- journal_last_complete ---------------------------------------------------------
+    def test_the_last_complete_row_skips_pending_and_aborted_rows_and_may_be_asked_for_a_kind(self):
+        self.assertIsNone(self.state.journal_last_complete())
+        self.assertIsNone(self.state.journal_last_complete(kind="promotion"))
+        promotion = self.add_journal(old_pin=3, new_pin=4)
+        rollback = self.add_journal(kind="rollback", old_pin=4, new_pin=3)
+        pending = self.add_journal(old_pin=3, new_pin=5)
+        aborted = self.add_journal(old_pin=3, new_pin=6)
+        with self.state.transaction():
+            self.state.journal_complete(promotion.id)
+            self.state.journal_complete(rollback.id)
+            self.state.journal_abort(aborted.id)
+        self.assertEqual(self.state.journal_last_complete().id, rollback.id)
+        self.assertEqual(self.state.journal_last_complete(kind="promotion").id, promotion.id)
+        self.assertEqual(self.state.journal_last_complete(kind="rollback").id, rollback.id)
+        self.assertEqual([row.id for row in self.state.pending_journal()], [pending.id])
+
+    def test_a_kind_without_a_complete_row_gives_none(self):
+        pending = self.add_journal()
+        rollback = self.add_journal(kind="rollback", old_pin=4, new_pin=3)
+        with self.state.transaction():
+            self.state.journal_complete(rollback.id)
+        self.assertIsNone(self.state.journal_last_complete(kind="promotion"))
+        self.assertEqual(self.state.journal_last_complete().id, rollback.id)
+        self.assertEqual(self.state.journal(pending.id).status, "pending")
+
+    # -- pin_for_version ---------------------------------------------------------------
+    def test_a_version_is_found_by_its_newest_observation(self):
+        self.assertIsNone(self.state.pin_for_version(3))
+        for offset, version, image_id in ((0, 3, self.IMAGE), (10, 4, self.OTHER_IMAGE), (20, 3, self.OTHER_IMAGE)):
+            self.clock.now = self.T0 + offset
+            self.assertTrue(self.state.pin_observe(version, image_id))
+        self.assertEqual(self.state.pin_for_version(3), PinObservation(3, self.OTHER_IMAGE, self.T0 + 20))
+        self.assertEqual(self.state.pin_for_version(4), PinObservation(4, self.OTHER_IMAGE, self.T0 + 10))
+        self.assertIsNone(self.state.pin_for_version(5))
+        self.assertEqual(self.state.pin_last(), self.state.pin_for_version(3))
+
+    def test_the_new_reads_and_writes_refuse_a_state_file_that_is_not_connected(self):
+        unconnected = ImageState(self.root / "unconnected", clock=self.clock)
+        calls = (
+            lambda: unconnected.version_owner(self.DEPLOYMENT, 3),
+            lambda: unconnected.journal_last_complete(),
+            lambda: unconnected.pin_for_version(3),
+            lambda: unconnected.insert_pin_record(deployment=self.DEPLOYMENT, version=3, image_id=self.IMAGE),
+            lambda: unconnected.record_verification(
+                "b-1", image_state=None, template_version_exists=None, drift_result=None, verified_at=None
+            ),
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                with self.assertRaises(StateRefusal) as raised:
+                    call()
                 self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNAVAILABLE")
         self.assertFalse((self.root / "unconnected").exists())
 

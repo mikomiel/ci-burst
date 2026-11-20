@@ -47,6 +47,7 @@ IMAGE_TOML = """
 [image]
 enabled = true
 profile = "example-image-role"
+state_directory = "/var/lib/example-image-state"
 [image.source]
 token_env = "EXAMPLE_IMAGE_TOKEN"
 basis_paths = ["example.lock"]

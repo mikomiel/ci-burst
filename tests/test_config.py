@@ -1,11 +1,12 @@
 import copy
 import json
+import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
 
-from ci_burst.config import ImageConfig, load
+from ci_burst.config import ImageConfig, load, loads
 from ci_burst.errors import ConfigRefusal
 
 from support import write_config
@@ -326,6 +327,7 @@ class ConfigTests(unittest.TestCase):
 _IMAGE = {
     "enabled": True,
     "profile": "example-image-role",
+    "state_directory": "/var/lib/example-image-state",
     "source": {
         "token_env": "EXAMPLE_IMAGE_TOKEN",
         "basis_paths": ["example.lock"],
@@ -657,3 +659,104 @@ class ImageConfigTests(unittest.TestCase):
         self.assertRefused(self._image(source={"branch": "a/../b"}), "image.source.branch")
         self.assertRefused(self._image(build={"launch_template_name": "x"}), "image.build.launch_template_name")
 
+    # -- [image].state_directory ---------------------------------------------
+    # The image unit mounts this directory writable and must never see the
+    # scaling ledger, so the two are different directories, neither inside the
+    # other. The ledger directory here is the temporary root: ``state.database``
+    # is the relative ``state.sqlite3`` that ``write_config`` writes.
+
+    def test_an_enabled_table_needs_a_state_directory(self):
+        self.assertRefused(self._image(top={"state_directory": None}), "image.state_directory: is required")
+
+    def test_an_absent_or_disabled_table_needs_no_state_directory(self):
+        self.assertEqual(load(write_config(self.root)).image, ImageConfig())
+        self.assertEqual(self._load({"enabled": False}).image, ImageConfig())
+        self.assertIsNone(self._load(self._image(top={"enabled": False})).image.state_directory)
+
+    def test_a_valid_state_directory_loads_as_an_absolute_path(self):
+        for written in (
+            "/var/lib/example-image-state",
+            "/var/lib/example-image-state/",
+            "/var/lib//example-image-state",
+        ):
+            with self.subTest(written=written):
+                image = self._load(self._image(top={"state_directory": written})).image
+                self.assertEqual(image.state_directory, Path("/var/lib/example-image-state"))
+
+    def test_refuses_an_unsafe_state_directory(self):
+        for value, fragment in (
+            ("state", "image.state_directory: must be an absolute path"),
+            ("./state", "image.state_directory: must be an absolute path"),
+            ("/var/lib/../state", 'image.state_directory: must not contain ".."'),
+            ("/var/lib/example/..", 'image.state_directory: must not contain ".."'),
+            ("", "image.state_directory: must be a non-empty string"),
+            (7, "image.state_directory: must be a non-empty string"),
+            ("/var/lib/a\nb", "image.state_directory: must not contain a control character"),
+            ("/var/lib/a\x00b", "image.state_directory: must not contain a control character"),
+        ):
+            with self.subTest(value=value):
+                self.assertRefused(self._image(top={"state_directory": value}), fragment)
+
+    def test_refuses_the_ledger_directory_and_anything_inside_it(self):
+        inside = (str(self.root), str(self.root / "image"), str(self.root / "a" / "b"))
+        for value in inside:
+            with self.subTest(value=value):
+                self.assertRefused(
+                    self._image(top={"state_directory": value}),
+                    "image.state_directory: must be a different directory from the scaling ledger's directory",
+                )
+
+    def test_refuses_a_directory_that_contains_the_ledger_directory(self):
+        # Mounting the parent would mount the ledger with it.
+        for value in (str(self.root.parent), "/"):
+            with self.subTest(value=value):
+                self.assertRefused(
+                    self._image(top={"state_directory": value}),
+                    "image.state_directory: must be a different directory from the scaling ledger's directory",
+                )
+
+    def test_the_ledger_comparison_follows_symbolic_links(self):
+        with tempfile.TemporaryDirectory() as other:
+            link = Path(other) / "alias"
+            os.symlink(self.root, link)
+            self.assertRefused(
+                self._image(top={"state_directory": str(link)}),
+                "image.state_directory: must be a different directory from the scaling ledger's directory",
+            )
+            below = Path(other) / "below"
+            os.symlink(self.root, below)
+            self.assertRefused(
+                self._image(top={"state_directory": str(below / "image")}),
+                "image.state_directory: must be a different directory from the scaling ledger's directory",
+            )
+
+    def test_the_ledger_directory_is_the_parent_of_an_absolute_database(self):
+        with tempfile.TemporaryDirectory() as ledger:
+            path = write_config(self.root, config={"state": {"database": str(Path(ledger) / "scaling.sqlite3")}})
+            base = path.read_text(encoding="utf-8")
+            path.write_text(base + _image_text(self._image(top={"state_directory": ledger})), encoding="utf-8")
+            with self.assertRaises(ConfigRefusal) as raised:
+                load(path)
+            self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
+            self.assertIn("image.state_directory: must be a different directory", raised.exception.detail)
+            # The configuration directory is not the ledger directory here.
+            path.write_text(base + _image_text(self._image(top={"state_directory": str(self.root)})), encoding="utf-8")
+            self.assertEqual(load(path).image.state_directory, self.root)
+
+    def test_a_disabled_table_still_refuses_the_ledger_directory(self):
+        self.assertRefused(
+            {"enabled": False, "state_directory": str(self.root)},
+            "image.state_directory: must be a different directory",
+        )
+
+    def test_loads_validates_text_as_load_validates_the_file(self):
+        path = self._path(self._image())
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(loads(text, path), load(path))
+        # A relative database resolves against the directory of the path given.
+        self.assertEqual(loads(text, path).state.database, self.root / "state.sqlite3")
+        for broken in (text + "\nenabled = ", text.replace("[image]", "[image]\nsurprise = 1")):
+            with self.subTest(broken=broken[-12:]):
+                with self.assertRaises(ConfigRefusal) as raised:
+                    loads(broken, path)
+                self.assertEqual(raised.exception.reason, "CONFIG_INVALID")

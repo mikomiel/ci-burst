@@ -66,7 +66,7 @@ product boundary.
 | Worker template | The launch template that workers use. Its pinned version is the production pin. |
 | Pin | `aws.launch_template_version` in the deployment TOML. The only value that decides which image workers use. |
 | Candidate | A built image with a created, drift-checked, inert worker-template version, waiting for a person. |
-| Basis digest | A digest over the lockfiles, the warm and gate commands and the shipped script (see Triggers). |
+| Basis digest | A digest over the lockfiles, the warm and gate commands, `source.strip_components` and the shipped script (see Triggers). |
 | Marker | The framed console line pair `WARM_SOURCE_SHA256 <digest>` then `IMAGE_READY`. |
 | Pass | One invocation of `image run`. It is bounded by a pass deadline. |
 
@@ -80,9 +80,11 @@ The command resolves the head sha of `source.branch` and computes:
 ```
 basis_digest = sha256( sorted lines "path NUL sha256(file content) LF"
                        for each basis path at that sha
-                     + sha256(rendered warm commands and gate command)
+                     + sha256(rendered warm commands NUL gate command NUL source.strip_components)
                      + sha256(shipped warm-cache.sh) )
 ```
+
+Deploying the code that adds `source.strip_components` to the digest makes an image whose recorded digest lacks it look changed once, so one rebuild becomes due.
 
 The digest does not cover the cold base image or the build launch template. Changing either does not make a rebuild due. The operator forces one with `image run --apply --until-done --force`, and the runbook says so. The digest covers only what the warm layer reads.
 

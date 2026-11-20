@@ -82,15 +82,19 @@ def render_commands(commands, gate_command):
     return {"WARM_COMMANDS": "\n".join(commands), "WARM_GATE_COMMAND": gate_command}
 
 
-def basis_digest(files, warm_commands, gate_command, script_bytes):
+def basis_digest(files, warm_commands, gate_command, strip_components, script_bytes):
     """The hex digest that says whether a build is due.
 
-    ``files`` maps each basis path to the bytes read at the resolved sha. The
+    ``files`` maps each basis path to the bytes read at the resolved sha.
+    ``strip_components`` is ``source.strip_components``, the value the builder
+    receives as ``WARM_SRC_STRIP_COMPONENTS``: it sets how many leading path
+    components the extraction drops, so a change of it changes the image. The
     digest covers the sorted lines ``path NUL sha256(content) LF``, then the
-    hash of the rendered commands (``render_commands``, commands and gate, one
-    value separated by a NUL) and the hash of the shipped script, each followed
-    by a line feed. It never covers the archive hash: the same sha can produce
-    different archive bytes, and the digest must not change with them.
+    hash of the rendered commands (``render_commands``, commands and gate, then
+    ``strip_components`` as a decimal integer, one value with a NUL between its
+    parts) and the hash of the shipped script, each followed by a line feed. It
+    never covers the archive hash: the same sha can produce different archive
+    bytes, and the digest must not change with them.
     """
     entries = []
     for path, content in files.items():
@@ -98,7 +102,9 @@ def basis_digest(files, warm_commands, gate_command, script_bytes):
         _no_control(path, "basis path")
         entries.append((path.encode("utf-8"), hashlib.sha256(content).hexdigest().encode("ascii")))
     values = render_commands(warm_commands, gate_command)
-    rendered = (values["WARM_COMMANDS"] + "\0" + values["WARM_GATE_COMMAND"]).encode("utf-8")
+    rendered = (
+        values["WARM_COMMANDS"] + "\0" + values["WARM_GATE_COMMAND"] + "\0" + str(strip_components)
+    ).encode("utf-8")
     digest = hashlib.sha256()
     for path, content_hash in sorted(entries):
         digest.update(path + b"\0" + content_hash + b"\n")

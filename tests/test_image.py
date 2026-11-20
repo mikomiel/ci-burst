@@ -73,6 +73,11 @@ def load_image(toml=IMAGE_TOML):
         return load(path).image
 
 
+def load_image_with_strip(strip):
+    """The ``ImageConfig`` of ``IMAGE_TOML`` with ``source.strip_components`` set to ``strip``."""
+    return load_image(IMAGE_TOML.replace("[image.source]\n", f"[image.source]\nstrip_components = {strip}\n"))
+
+
 def sha256_hex(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -81,16 +86,18 @@ class BasisDigestTests(unittest.TestCase):
     FILES = {"example.lock": b"locked\n", "docs/example.cfg": b"cfg\n"}
     COMMANDS = ("bash scripts/example-warm.sh", "bash scripts/example-extra.sh --flag")
     GATE = "bash scripts/example-gate.sh"
+    STRIP = 1
     SCRIPT = b"#!/bin/bash\necho warm\n"
 
     #: Derived by hand from the specification's definition, not by this module.
-    VECTOR = "56716548674a004a6aa0e786b12a23f2993b1803989960c773d22d3edf0190d3"
+    VECTOR = "9c8b5c0f9c7cf8e71815dd79c633a3d108d9b52aa364e617e9b9fddb16086f2d"
 
-    def digest(self, files=None, commands=None, gate=None, script=None):
+    def digest(self, files=None, commands=None, gate=None, script=None, strip=None):
         return image.basis_digest(
             self.FILES if files is None else files,
             self.COMMANDS if commands is None else commands,
             self.GATE if gate is None else gate,
+            self.STRIP if strip is None else strip,
             self.SCRIPT if script is None else script,
         )
 
@@ -99,16 +106,19 @@ class BasisDigestTests(unittest.TestCase):
 
     def test_the_vector_follows_the_documented_definition(self):
         # The same recipe written out again from its parts: sorted path/hash
-        # lines, the hash of the rendered commands, the hash of the script.
+        # lines, the hash of the rendered commands, gate and strip value, the
+        # hash of the script. Zero is a value too: it is hashed as the text "0".
         lines = b"".join(
             path.encode() + b"\0" + sha256_hex(self.FILES[path]).encode() + b"\n"
             for path in sorted(self.FILES, key=lambda path: path.encode())
         )
-        rendered = ("\n".join(self.COMMANDS) + "\0" + self.GATE).encode()
-        expected = sha256_hex(
-            lines + sha256_hex(rendered).encode() + b"\n" + sha256_hex(self.SCRIPT).encode() + b"\n"
-        )
-        self.assertEqual(self.digest(), expected)
+        for strip in (0, 1):
+            with self.subTest(strip=strip):
+                rendered = ("\n".join(self.COMMANDS) + "\0" + self.GATE + "\0" + str(strip)).encode()
+                expected = sha256_hex(
+                    lines + sha256_hex(rendered).encode() + b"\n" + sha256_hex(self.SCRIPT).encode() + b"\n"
+                )
+                self.assertEqual(self.digest(strip=strip), expected)
 
     def test_changing_a_basis_file_changes_the_digest(self):
         changed = dict(self.FILES, **{"example.lock": b"locked again\n"})
@@ -135,6 +145,12 @@ class BasisDigestTests(unittest.TestCase):
         digests = {self.digest(), self.digest(gate="bash scripts/example-other-gate.sh"), self.digest(gate="")}
         self.assertEqual(len(digests), 3)
 
+    def test_changing_the_strip_components_changes_the_digest(self):
+        # Only the archive layout differs between the two inputs. The builder receives the value as
+        # WARM_SRC_STRIP_COMPONENTS, so the image differs and a build must be due.
+        self.assertEqual(self.digest(strip=0), self.digest(strip=0))
+        self.assertNotEqual(self.digest(strip=0), self.digest(strip=1))
+
     def test_changing_the_script_by_one_byte_changes_the_digest(self):
         self.assertNotEqual(self.digest(script=self.SCRIPT + b"#"), self.digest())
 
@@ -151,7 +167,7 @@ class BasisDigestTests(unittest.TestCase):
         by_bytes = b"".join(
             path.encode() + b"\0" + sha256_hex(files[path]).encode() + b"\n" for path in order
         )
-        rendered = ("\n".join(self.COMMANDS) + "\0" + self.GATE).encode()
+        rendered = ("\n".join(self.COMMANDS) + "\0" + self.GATE + "\0" + str(self.STRIP)).encode()
         expected = sha256_hex(
             by_bytes + sha256_hex(rendered).encode() + b"\n" + sha256_hex(self.SCRIPT).encode() + b"\n"
         )
@@ -169,21 +185,27 @@ class BasisDigestTests(unittest.TestCase):
 
     def test_the_digest_takes_no_archive_hash(self):
         parameters = list(inspect.signature(image.basis_digest).parameters)
-        self.assertEqual(parameters, ["files", "warm_commands", "gate_command", "script_bytes"])
+        self.assertEqual(parameters, ["files", "warm_commands", "gate_command", "strip_components", "script_bytes"])
 
     def test_the_digest_hashes_the_values_the_build_exports(self):
-        # One encoding serves both: the digest hashes what warm_exports puts in the user data.
-        config = load_image()
-        built = image.warm_exports(config, SENTINEL_URL, "ab" * 32)
-        rendered = (built["WARM_COMMANDS"] + "\0" + built["WARM_GATE_COMMAND"]).encode()
+        # One encoding serves both: the digest hashes what warm_exports puts in the user data,
+        # the strip value as exported included.
         files = {"example.lock": b"locked\n"}
         lines = b"example.lock\0" + sha256_hex(files["example.lock"]).encode() + b"\n"
-        expected = sha256_hex(
-            lines + sha256_hex(rendered).encode() + b"\n" + sha256_hex(self.SCRIPT).encode() + b"\n"
-        )
-        self.assertEqual(
-            image.basis_digest(files, config.warm.commands, config.warm.gate_command, self.SCRIPT), expected
-        )
+        for strip in (0, 1):
+            with self.subTest(strip=strip):
+                config = load_image_with_strip(strip)
+                built = image.warm_exports(config, SENTINEL_URL, "ab" * 32)
+                rendered = "\0".join(
+                    (built["WARM_COMMANDS"], built["WARM_GATE_COMMAND"], built["WARM_SRC_STRIP_COMPONENTS"])
+                ).encode()
+                expected = sha256_hex(
+                    lines + sha256_hex(rendered).encode() + b"\n" + sha256_hex(self.SCRIPT).encode() + b"\n"
+                )
+                digest = image.basis_digest(
+                    files, config.warm.commands, config.warm.gate_command, config.source.strip_components, self.SCRIPT
+                )
+                self.assertEqual(digest, expected)
 
     def test_a_path_or_command_with_a_control_character_is_refused(self):
         for label, arguments in (
@@ -270,6 +292,23 @@ class BuildDecisionTests(unittest.TestCase):
 
     def test_an_unchanged_digest_is_an_answer_and_not_a_refusal(self):
         self.assertEqual(self.decide(digest="digest-pinned"), UNCHANGED)
+
+    def test_a_changed_strip_components_is_not_an_unchanged_digest(self):
+        # The pin's image was built under strip_components 0 and the configuration now says 1.
+        # Nothing else differs, so the digest alone must say that a build is due.
+        files = {"example.lock": b"locked\n"}
+        script = b"#!/bin/bash\necho warm\n"
+
+        def digest_under(config):
+            return image.basis_digest(
+                files, config.warm.commands, config.warm.gate_command, config.source.strip_components, script
+            )
+
+        pinned, current = load_image_with_strip(0), load_image_with_strip(1)
+        pin_digest = digest_under(pinned)
+        # The control: the same strip value on both sides is an unchanged digest.
+        self.assertEqual(self.decide(config=pinned, digest=digest_under(pinned), pin_digest=pin_digest), UNCHANGED)
+        self.assertEqual(self.decide(config=current, digest=digest_under(current), pin_digest=pin_digest), START)
 
     def test_the_limits_are_exact(self):
         self.assertEqual(self.decide(builds_last_day=1), START)

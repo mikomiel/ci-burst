@@ -722,7 +722,8 @@ class ImagePipeline:
 
     def _digest(self, files, script):
         warm = self._image.warm
-        return image.basis_digest(files, warm.commands, warm.gate_command, script)
+        strip = self._image.source.strip_components
+        return image.basis_digest(files, warm.commands, warm.gate_command, strip, script)
 
     def _pin_facts(self, aws, deadline):
         """The image behind the configured pin and that image's ``ci-burst:basis-digest`` tag."""

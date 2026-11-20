@@ -40,7 +40,7 @@ and only then the timer (8).
 
 ## 5. Build pipeline
 
-- [x] 5.1 Add `ci_burst/image.py`: the basis digest (sorted `path NUL content-hash LF` lines, then the command hash and the script hash), the trigger conditions with the first failing condition named, `--force` semantics and the daily cap.
+- [x] 5.1 Add `ci_burst/image.py`: the basis digest (sorted `path NUL content-hash LF` lines, then the hash of the commands, the gate and `source.strip_components`, and the script hash), the trigger conditions with the first failing condition named, `--force` semantics and the daily cap.
 - [x] 5.2 Render builder user data: a short stub with quoted exports and a gzip and base64 payload of `warm-cache.sh`. Refuse with `IMAGE_USERDATA_TOO_LARGE` at 16,384 bytes or more. Reject control characters in exported values.
 - [x] 5.3 Test the rendered size with the largest allowed `WARM_COMMANDS` (the 16,384 byte limit), the refusal path, the quoting of hostile values and that the decoded payload equals the script byte for byte.
 - [x] 5.4 Add `WARM_SRC_STRIP_COMPONENTS` to `deploy/runner/image/warm-cache.sh` (0 or 1, default 0, anything else ends the script before any consumer command and without the marker) and test it in `tests/test_warm_cache.py` by copying the pattern of the existing input tests. The same script, before any fetch or consumer command, rejects the IPv4 and IPv6 metadata addresses for the `runner` account in the firewall and checks each rule (design.md, risks), and masks the URL in a failure tail.

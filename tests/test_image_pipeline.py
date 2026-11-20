@@ -27,6 +27,7 @@ import os
 import re
 import shlex
 import sqlite3
+import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -51,6 +52,7 @@ from ci_burst.image_pipeline import ImagePipeline
 from ci_burst.image_state import ImageState
 
 from support import Clock, write_config
+from test_aws import sdk_client_error
 from test_image_aws import SENTINELS, ProviderError, tag_list
 
 NOW = 1_800_000_000.0
@@ -263,22 +265,42 @@ class WorldEc2:
         return {"Instances": [{"InstanceId": instance_id}]}
 
     # -- images and snapshots --------------------------------------------------
+    def _name_taken(self, name):
+        """Whether an image of the account has this name, listed or not. A deregistered image frees its name."""
+        return any(item.get("Name") == name for item in self.w.images.values())
+
+    def _add_image(self, name, specifications):
+        specs = {spec["ResourceType"]: self._tags(spec) for spec in specifications}
+        image_id, snapshot_id = self.w.new_id("ami"), self.w.new_id("snap")
+        self.w.add_image(image_id, tags=specs["image"], state="pending", age=0, snapshots=(snapshot_id,), name=name)
+        self.w.add_snapshot(snapshot_id, tags=specs["snapshot"], age=0)
+        if self.w.hide_images_for:
+            for identifier in (image_id, snapshot_id):
+                self.w.hidden_until[identifier] = self.w.clock() + self.w.hide_images_for
+        return image_id
+
     def create_image(self, *, InstanceId, Name, NoReboot, TagSpecifications):
-        self.w.enter(
-            "create_image", dict(InstanceId=InstanceId, Name=Name, NoReboot=NoReboot, TagSpecifications=TagSpecifications)
-        )
+        try:
+            self.w.enter(
+                "create_image",
+                dict(InstanceId=InstanceId, Name=Name, NoReboot=NoReboot, TagSpecifications=TagSpecifications),
+            )
+        except Exception:
+            if self.w.ghost_image and InstanceId in self.w.instances and not self._name_taken(Name):
+                self._add_image(Name, TagSpecifications)  # the request was sent and the answer was lost
+            raise
         if InstanceId not in self.w.instances:
             raise ProviderError("InvalidInstanceID.NotFound")
-        specs = {spec["ResourceType"]: self._tags(spec) for spec in TagSpecifications}
-        image_id, snapshot_id = self.w.new_id("ami"), self.w.new_id("snap")
-        self.w.add_image(image_id, tags=specs["image"], state="pending", age=0, snapshots=(snapshot_id,))
-        self.w.add_snapshot(snapshot_id, tags=specs["snapshot"], age=0)
-        return {"ImageId": image_id}
+        if self._name_taken(Name):
+            # EC2 refuses a second image under a name that an image of the account already has.
+            self.w.duplicate_refusals += 1
+            raise ProviderError("InvalidAMIName.Duplicate")
+        return {"ImageId": self._add_image(Name, TagSpecifications)}
 
     def describe_images(self, *, Owners=None, Filters=None, ImageIds=None, NextToken=None):
         self.w.enter("describe_images", dict(Owners=Owners, Filters=Filters, ImageIds=ImageIds, NextToken=NextToken))
         self.w.settle_images()
-        items = list(self.w.images.values())
+        items = [item for item in self.w.images.values() if not self.w.is_hidden(item["ImageId"])]
         if ImageIds is not None:
             items = [item for item in items if item["ImageId"] in ImageIds]
             if not items:
@@ -290,7 +312,7 @@ class WorldEc2:
         self.w.enter(
             "describe_snapshots", dict(OwnerIds=OwnerIds, Filters=Filters, SnapshotIds=SnapshotIds, NextToken=NextToken)
         )
-        items = list(self.w.snapshots.values())
+        items = [item for item in self.w.snapshots.values() if not self.w.is_hidden(item["SnapshotId"])]
         if SnapshotIds is not None:
             items = [item for item in items if item["SnapshotId"] in SnapshotIds]
             if not items:
@@ -450,6 +472,11 @@ class World:
         self.snapshots = {}
         self.image_delay = 90.0
         self.image_final_state = "available"
+        #: A failed ``CreateImage`` still makes the image when set: the request was sent and the answer was lost.
+        self.ghost_image = False
+        #: A new image and its snapshot are not listed for this long, but they already hold their name.
+        self.hide_images_for = 0.0
+        self.duplicate_refusals = 0
         self.templates = {}
         self.versions = {}
         self.version_tokens = {}
@@ -531,7 +558,7 @@ class World:
             "IpPermissions": [dict(INGRESS_RULE) for _ in range(ingress)],
         }
 
-    def add_image(self, image_id, *, tags=None, state="available", age=3 * DAY, snapshots=()):
+    def add_image(self, image_id, *, tags=None, state="available", age=3 * DAY, snapshots=(), name=None):
         item = {
             "ImageId": image_id,
             "State": state,
@@ -539,6 +566,8 @@ class World:
             "BlockDeviceMappings": [{"Ebs": {"SnapshotId": snapshot_id}} for snapshot_id in snapshots],
             "_created": self.clock() - age,
         }
+        if name is not None:
+            item["Name"] = name
         if age is not None:
             item["CreationDate"] = iso(self.clock() - age)
         self.images[image_id] = item
@@ -571,8 +600,9 @@ class World:
             self.hidden_until[instance_id] = now + self.hide_launches_for
         return instance_id
 
-    def is_hidden(self, instance_id):
-        return self.clock() < self.hidden_until.get(instance_id, 0.0)
+    def is_hidden(self, identifier):
+        """Whether an instance, an image or a snapshot exists but is not listed yet."""
+        return self.clock() < self.hidden_until.get(identifier, 0.0)
 
     def set_state(self, instance_id, state):
         self.instances[instance_id]["State"]["Name"] = state
@@ -1881,6 +1911,222 @@ class FailureTests(PipelineCase):
         self.assertEqual(self.world.instances[build.builder_id]["State"]["Name"], "terminated")
         self.assertEqual(self.control().consecutive_failures, 1)
 
+    def marker_with_ten_seconds_left(self):
+        """A build whose next pass starts ten seconds short of the build deadline and reads a finished marker.
+
+        A test then advances the clock by thirty seconds inside one call of that pass: that passes the build
+        deadline and stays inside the pass deadline, so only the build deadline can stop what follows.
+        """
+        self.world.console_plan = [(2_000.0, READY)]
+        return self.expired_build(before=10)
+
+    def assert_no_image_for_a_build_out_of_time(self, result, build):
+        """The build failed ``MARKER_TIMEOUT``, made no image, and the failure path ended its live builder."""
+        self.assert_failed(result, "MARKER_TIMEOUT")
+        self.assertEqual(self.world.arguments("create_image"), [])
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+        self.assertEqual(self.world.instances[build.builder_id]["State"]["Name"], "terminated")
+
+    def test_a_deadline_that_comes_during_the_console_read_creates_no_image(self):
+        build = self.marker_with_ten_seconds_left()
+        self.world.hooks["get_console_output"] = lambda arguments: self.clock.advance(30)
+        result = self.apply()
+        self.assert_no_image_for_a_build_out_of_time(result, build)
+        # The marker is seen when the read ends, so that is the time of its latency.
+        (event,) = self.events("image_marker_seen")
+        self.assertEqual(event["latency_seconds"], build.deadline_at + 20 - build.created_at)
+
+    def test_a_deadline_that_comes_during_the_base_image_read_creates_no_image(self):
+        build = self.marker_with_ten_seconds_left()
+
+        def run_out_of_time(arguments):
+            # The pin and the protected set name the worker template: only the builder's is the base image read.
+            if arguments["LaunchTemplateName"] == BUILDER:
+                self.clock.advance(30)
+
+        self.world.hooks["describe_launch_template_versions"] = run_out_of_time
+        result = self.apply()
+        self.assert_no_image_for_a_build_out_of_time(result, build)
+
+    def test_a_deadline_that_comes_during_the_lookup_of_the_build_image_creates_no_image(self):
+        build = self.marker_with_ten_seconds_left()
+        mark = len(self.world.calls)
+        spent = []
+
+        def run_out_of_time(arguments):
+            # Reconcile lists the images before the console is read: the first listing after it is the lookup.
+            if arguments["ImageIds"] is None and "get_console_output" in self.world.names(mark) and not spent:
+                spent.append(True)
+                self.clock.advance(30)
+
+        self.world.hooks["describe_images"] = run_out_of_time
+        result = self.apply()
+        self.assertEqual(spent, [True])
+        self.assert_no_image_for_a_build_out_of_time(result, build)
+
+    def uncertain_create(self, *, hidden_for=0.0):
+        """The first ``CreateImage`` makes the image and the provider's answer is lost. That pass ends there.
+
+        The image and its snapshot are not listed for ``hidden_for`` seconds. The result is the image's id.
+        """
+        self.world.console_plan = [(30.0, READY)]
+        self.world.ghost_image = True
+        self.world.hide_images_for = hidden_for
+        self.world.fail("create_image", ProviderError("RequestLimitExceeded"), times=1)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("building", None))
+        self.assertIn("create_image:AWS_UNCERTAIN", result["notes"])
+        build = self.only_build()
+        self.assertEqual((build.state, build.image_id), ("building", None))
+        self.assertEqual(self.events("image_created"), [])
+        (ghost,) = self.world.images.keys() - {ami(0xA1)}
+        return ghost
+
+    def test_an_uncertain_create_whose_image_is_listed_by_the_next_pass_is_adopted_and_made_once(self):
+        ghost = self.uncertain_create()
+        # Reconcile lists the image at the start of the next pass and adopts it by its tags.
+        result = self.apply()
+        self.assertTrue(result["reconcile"]["image_adopted"])
+        self.assertEqual(result["decision"], "candidate")
+        self.assertEqual(self.only_build().image_id, ghost)
+        self.assertEqual(len(self.world.arguments("create_image")), 1)
+        self.assertEqual(self.world.duplicate_refusals, 0)
+        self.assertEqual(self.control().consecutive_failures, 0)
+
+    def test_an_image_that_is_listed_only_after_reconcile_is_adopted_before_any_second_create(self):
+        ghost = self.uncertain_create(hidden_for=100.0)
+
+        def time_passes(arguments):
+            # The image is not listed when the next pass reconciles. It is by the time that pass has read the console.
+            del self.world.hooks["get_console_output"]
+            self.clock.advance(100)
+
+        self.world.hooks["get_console_output"] = time_passes
+        result = self.apply()
+        self.assertFalse(result["reconcile"]["image_adopted"])
+        self.assertEqual(len(self.world.arguments("create_image")), 1)
+        self.assertEqual(self.world.duplicate_refusals, 0)
+        self.assertEqual(self.only_build().image_id, ghost)
+        self.assertEqual(result["decision"], "candidate")
+        (event,) = self.events("image_created")
+        self.assertEqual((event["build_id"], event["image_id"]), (self.only_build().id, ghost))
+
+    def test_a_duplicate_name_refusal_is_uncertain_counts_no_failure_and_the_image_is_adopted_once_listed(self):
+        ghost = self.uncertain_create(hidden_for=100.0)
+        # The next pass cannot see the image, so it asks again under the same name. The provider refuses it, and
+        # the SDK reports the refusal as a client error with the code of a duplicate name.
+        _, modules = sdk_client_error("InvalidAMIName.Duplicate")
+        modules["botocore.exceptions"].ClientError = ProviderError
+        with mock.patch.dict(sys.modules, modules):
+            result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("building", None))
+        self.assertIn("create_image:AWS_UNCERTAIN", result["notes"])
+        self.assertEqual(self.world.duplicate_refusals, 1)
+        build = self.only_build()
+        self.assertEqual((build.state, build.image_id), ("building", None))
+        self.assertEqual(self.events("image_build_failed"), [])
+        self.assertEqual(self.control().consecutive_failures, 0)
+        names = [call["Name"] for call in self.world.arguments("create_image")]
+        self.assertEqual(names, [f"ci-burst-{DEPLOYMENT}-{build.id}"] * 2)
+        # Once the image is listed the next pass adopts it, and no third call is made.
+        self.clock.advance(100)
+        result = self.apply()
+        self.assertTrue(result["reconcile"]["image_adopted"])
+        self.assertEqual(result["decision"], "candidate")
+        self.assertEqual(self.only_build().image_id, ghost)
+        self.assertEqual(len(self.world.arguments("create_image")), 2)
+        self.assertEqual(self.world.images.keys() - {ami(0xA1)}, {ghost})
+
+    def test_a_lookup_of_the_build_image_that_the_provider_refuses_is_noted_and_the_image_is_still_created(self):
+        self.world.console_plan = [(300.0, READY)]
+        self.start_build()
+        self.clock.advance(30)
+        mark = len(self.world.calls)
+
+        def refuse_the_lookup(arguments):
+            # Reconcile lists the images before the console is read: the listing after it is the lookup.
+            if arguments["ImageIds"] is None and "get_console_output" in self.world.names(mark):
+                raise ProviderError("RequestLimitExceeded")
+
+        self.world.hooks["describe_images"] = refuse_the_lookup
+        result = self.apply()
+        self.assertIn("image_lookup:AWS_UNCERTAIN", result["notes"])
+        self.assertEqual(len(self.world.arguments("create_image")), 1)
+        self.assertEqual(self.world.duplicate_refusals, 0)
+        self.assertIsNotNone(self.only_build().image_id)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_an_image_that_the_lookup_finds_after_the_deadline_passed_is_adopted_and_not_made_again(self):
+        # A pass loses the answer of CreateImage with 120 seconds to the deadline. The image is listed after 90.
+        self.world.console_plan = [(2_000.0, READY)]
+        self.expired_build(before=120)
+        self.world.ghost_image = True
+        self.world.hide_images_for = 90.0
+        self.world.fail("create_image", ProviderError("RequestLimitExceeded"), times=1)
+        self.assertIn("create_image:AWS_UNCERTAIN", self.apply()["notes"])
+        (ghost,) = self.world.images.keys() - {ami(0xA1)}
+        # The next pass reconciles with 50 seconds left, before the image is listed. The deadline passes inside the
+        # lookup, which finds the image. Adopting an image is no call of CreateImage, so the build goes on from there.
+        self.clock.advance(70)
+        spent = []
+        mark = len(self.world.calls)
+
+        def run_out_of_time(arguments):
+            if arguments["ImageIds"] is None and "get_console_output" in self.world.names(mark) and not spent:
+                spent.append(True)
+                self.clock.advance(60)
+
+        self.world.hooks["describe_images"] = run_out_of_time
+        result = self.apply()
+        self.assertEqual(spent, [True])
+        self.assertFalse(result["reconcile"]["image_adopted"])
+        self.assertEqual(len(self.world.arguments("create_image")), 1)
+        self.assertEqual(self.only_build().image_id, ghost)
+        self.assertEqual(result["decision"], "candidate")
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_an_uncertain_create_that_outlives_the_deadline_fails_the_build_and_the_late_image_is_removed(self):
+        build = self.marker_with_ten_seconds_left()
+        self.world.ghost_image = True
+        self.world.hide_images_for = 100.0
+        self.world.fail("create_image", ProviderError("RequestLimitExceeded"), times=1)
+        self.world.hooks["create_image"] = lambda arguments: self.clock.advance(30)
+        result = self.apply()
+        failed = self.assert_failed(result, "AWS_UNCERTAIN")
+        self.assertIsNone(failed.image_id)
+        self.assertEqual(len(self.world.arguments("create_image")), 1)
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+        (ghost,) = self.world.images.keys() - {ami(0xA1)}
+        self.assert_late_image_removed(ghost, 100)
+
+    def assert_late_image_removed(self, ghost, listed_after):
+        """The image of a failed build, listed late, is no orphan: the deletion rule's failed path removes it.
+
+        The build's row exists and carries the image's build id, so reconcile records nothing, and the image is
+        taken by the failed-build path before anything starts.
+        """
+        self.pin_current()
+        self.clock.advance(listed_after)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["images_recorded"], 0)
+        self.assertEqual(result["reconcile"]["failed_images"]["deregistered"], 1)
+        self.assertEqual(result["reconcile"]["failed_images"]["snapshots_deleted"], 1)
+        self.assertNotIn(ghost, self.world.images)
+        self.assertEqual(self.world.snapshots, {})
+        self.assertEqual(self.metric("ci_burst_image_leaked_resources_total", kind="image"), 0.0)
+
+    def test_a_duplicate_name_refusal_at_every_pass_ends_at_the_deadline_and_the_late_image_is_removed(self):
+        ghost = self.uncertain_create(hidden_for=10 * DAY)
+        result = self.pipeline.run_until_done()
+        # Reconcile ended the builder at the deadline, so the marker that the pass then reads fails the build as
+        # a marker from a builder that is gone. Until then every pass asked again and was refused.
+        self.assert_failed(result, "IMAGE_BUILDER_GONE")
+        self.assertIsNone(self.only_build().image_id)
+        self.assertGreater(self.world.duplicate_refusals, 10)
+        self.assertEqual(len(self.world.arguments("create_image")), self.world.duplicate_refusals + 1)
+        self.assertEqual(self.world.images.keys() - {ami(0xA1)}, {ghost})
+        self.assert_late_image_removed(ghost, 10 * DAY)
+
     def test_a_builder_at_its_deadline_is_ended_by_the_first_call_of_the_pass(self):
         build = self.expired_build()
         mark = len(self.world.calls)
@@ -2271,6 +2517,52 @@ class FailureTests(PipelineCase):
         self.assertEqual(result["decision"], "candidate", result)
         self.assertEqual(self.only_build().id, first.id)
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    def resumed_stage_with_100_seconds_left(self):
+        """A build that waits for its stage to be done again, and the clock 100 seconds short of its deadline.
+
+        The pass that follows advances the clock by 150 seconds inside one call: that passes the build deadline and
+        stays inside the pass deadline, so only the build deadline can stop the launch.
+        """
+        first = self.unstaged_build()
+        self.clock.advance(first.deadline_at - 100 - self.clock())
+        return first
+
+    def assert_nothing_launched_for_a_build_out_of_time(self, result, first, mark):
+        """``mark`` is the call log position before the pass that ran out of time: the first pass deleted its own key."""
+        build = self.assert_failed(result, "CONSOLE_BLIND")
+        self.assertEqual(build.id, first.id)
+        # The archive was staged again, then deleted with the row's end.
+        self.assertEqual(len(self.archive_keys()), 2)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.arguments("terminate_instances"), [])
+        self.assertEqual(self.world.objects, {})
+        deleted = [kwargs for name, kwargs in self.world.calls[mark:] if name == "delete_object"]
+        self.assertEqual(deleted, [{"Bucket": BUCKET, "Key": f"{PREFIX}{first.id}.tar.gz"}])
+        self.assertEqual(self.control().consecutive_failures, 1)
+
+    def test_a_resumed_stage_whose_upload_outlasts_the_build_deadline_launches_nothing_and_deletes_the_archive(self):
+        first = self.resumed_stage_with_100_seconds_left()
+        self.world.hooks["complete_multipart_upload"] = lambda arguments: self.clock.advance(150)
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+
+    def test_a_resumed_stage_whose_last_check_before_the_launch_outlasts_the_deadline_launches_nothing(self):
+        first = self.resumed_stage_with_100_seconds_left()
+        spent = []
+
+        def run_out_of_time(arguments):
+            # The launch lists the builders after it presigned the URL: that listing is the last read before the call.
+            if self.world.arguments("generate_presigned_url") and not spent:
+                spent.append(True)
+                self.clock.advance(150)
+
+        self.world.hooks["describe_instances"] = run_out_of_time
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(spent, [True])
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
 
     def test_a_forge_that_fails_during_the_stage_fails_the_build_by_its_code_alone(self):
         self.source.fail_after_first = ObservationRefusal("FORGEJO_UNAVAILABLE", "token=" + TOKEN)

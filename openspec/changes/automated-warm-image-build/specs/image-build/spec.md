@@ -388,7 +388,7 @@ Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run
 - **THEN** the command refuses with exit 2 and does nothing
 
 ### Requirement: Provider reads are bounded by the pass deadline
-Every provider read of a pass, except the read that confirms a deregistration, MUST be bounded by the pass deadline. A read that would start at or after the deadline MUST NOT be made. Where the pass advances or stages a build, it MUST then note `pass_deadline_exceeded` and leave the row as its last write left it, except that a refused base image read, the deadline included, notes `base_image:<reason>` and only omits the base image tag.
+Every provider read of a pass, except the read that confirms a deregistration, MUST be bounded by the pass deadline. A read that would start at or after the deadline MUST NOT be made. Where the pass advances or stages a build, it MUST then note `pass_deadline_exceeded` and leave the row as its last write left it. A refused read of the base image or of the build's image, the deadline included, MUST NOT delay `CreateImage`: the pass notes `base_image:<reason>` or `image_lookup:<reason>`.
 
 #### Scenario: The deadline arrives while a build is advanced
 - **WHEN** the pass deadline is reached before a read of an advancing build, the image read and the template read-back included
@@ -404,6 +404,11 @@ Every provider read of a pass, except the read that confirms a deregistration, M
 - **WHEN** the provider refuses the read of the base image in the pass that first sees the marker
 - **THEN** `CreateImage` is still called, without the base image tag
 - **AND** the pass notes `base_image:` followed by the reason code of the refusal
+
+#### Scenario: The lookup of the build's image is refused
+- **WHEN** the provider refuses the lookup of the build's image in the pass that first sees the marker, or the pass deadline is reached before it
+- **THEN** `CreateImage` is still called, as if the lookup had found no image
+- **AND** the pass notes `image_lookup:` followed by the reason code of the refusal
 
 #### Scenario: A deletion path meets the deadline
 - **WHEN** the pass deadline is reached before a deletion path, or the deletion plan of `plan`, has read what it needs
@@ -433,7 +438,7 @@ A build MUST succeed only when the console shows `WARM_SOURCE_SHA256` with a dig
 - **THEN** the build fails with `WARM_FAILED`, the builder is terminated and no image is created
 
 ### Requirement: A missing marker fails closed
-When no marker appears by `build_deadline_seconds`, the command MUST terminate the builder, MUST create no image and MUST record `CONSOLE_BLIND` when the console is empty or unreadable, or `MARKER_TIMEOUT` when the console is readable. A marker that a pass first reads at or after that deadline MUST create no image either.
+When no marker appears by `build_deadline_seconds`, the command MUST terminate the builder, MUST create no image and MUST record `CONSOLE_BLIND` when the console is empty or unreadable, or `MARKER_TIMEOUT` when the console is readable. The command MUST NOT call `CreateImage` or launch a builder at or after that deadline, and MUST read the clock after its last read and right before each call.
 
 #### Scenario: The console is blind
 - **WHEN** the console is empty at the deadline
@@ -452,6 +457,21 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **WHEN** the provider refused reconcile's termination of the builder of an overdue build and the pass reads the marker for the first time
 - **THEN** no image is created
 - **AND** the build fails with `MARKER_TIMEOUT` and the pass tries again to end the builder
+
+#### Scenario: The deadline comes during the console read
+- **WHEN** the build deadline passes during the read of the console that shows the marker, and the builder is alive
+- **THEN** no image is created and the build fails with `MARKER_TIMEOUT`
+- **AND** the latency of the marker is the time at the end of the read
+
+#### Scenario: The deadline comes during a read before the call
+- **WHEN** the build deadline passes during the lookup of the build's image, which lists no image, or during the read of the base image, after the pass has read the marker
+- **THEN** no image is created and the build fails with `MARKER_TIMEOUT`
+- **AND** the failure path ends the builder
+
+#### Scenario: A resumed stage outlasts the deadline
+- **WHEN** the build deadline passes during the upload of a resumed stage, or during the reads between the upload and the launch call
+- **THEN** no builder is launched and the build fails with `CONSOLE_BLIND`
+- **AND** the archive that the row names is deleted
 
 #### Scenario: A failed build recovers
 - **WHEN** the basis digest changes or an operator runs `run --apply --force`
@@ -484,6 +504,39 @@ The pass that first sees the marker MUST call `CreateImage` before it does any o
 - **WHEN** the image is not `available` by the deadline
 - **THEN** the build is `failed` with `IMAGE_NOT_AVAILABLE`
 - **AND** the image and its snapshots are removed only under the image deletion rule
+
+### Requirement: An uncertain CreateImage never makes a second image
+A `CreateImage` call that ends with an unknown outcome MUST NOT fail the build before the build deadline and MUST NOT lead to a second image. Before every call the command MUST look for an image that carries the build id, and MUST adopt it instead of calling. Every call for a build MUST use one image name, so that the provider refuses a duplicate, and that refusal MUST count as an unknown outcome. An unknown outcome that lasts to the deadline MUST fail the build.
+
+#### Scenario: The image is listed by the next pass
+- **WHEN** a call ends with an unknown outcome, and the image exists and is listed when the next pass reconciles
+- **THEN** reconcile adopts the image and the build moves to `imaging`
+- **AND** `CreateImage` has been called once
+
+#### Scenario: The image is listed after reconcile
+- **WHEN** the image is not listed when reconcile runs, and is listed when the pass looks for it before its call
+- **THEN** the pass records the image id, moves the build to `imaging` and writes the `image_created` event
+- **AND** the pass does not call `CreateImage` again
+
+#### Scenario: The lookup lists the image after the deadline passed
+- **WHEN** the build deadline passes during the lookup of the build's image, and the lookup lists the image
+- **THEN** the pass adopts the image, because adopting is no call, and the build moves to `imaging`
+- **AND** `CreateImage` is not called
+
+#### Scenario: The image is not listed yet
+- **WHEN** the image exists and is not listed, and a pass calls `CreateImage` under the same name
+- **THEN** the provider refuses the call as a duplicate name, and the refusal is an unknown outcome
+- **AND** the build stays `building`, the pass notes `create_image:` followed by the reason code and no failure is counted
+- **AND** a later pass adopts the image once it is listed, with no further call
+
+#### Scenario: The unknown outcome lasts to the deadline
+- **WHEN** every call ends with an unknown outcome until the build deadline passes
+- **THEN** reconcile ends the builder and the build fails with `IMAGE_BUILDER_GONE`, with no image recorded
+- **AND** an image that is listed later carries the failed build's id, so it is no orphan, and the image deletion rule removes it with its snapshots
+
+#### Scenario: A call outlives the deadline
+- **WHEN** a call ends with an unknown outcome at or after the build deadline
+- **THEN** the build fails with the code of the refusal and the failure path ends the builder
 
 ### Requirement: Reconcile runs first and cleans leaks
 Every pass MUST reconcile before any transition, and its first call MUST end the builder of an active build that is past its build deadline, an `imaging` build included. That builder MUST NOT count as a leak. Reconcile MUST terminate every other builder-tagged instance, MUST delete objects under the prefix that are not the active archive and are older than one hour, and, before any start, MUST clean the images of failed builds only under the image deletion rule.

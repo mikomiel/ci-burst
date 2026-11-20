@@ -30,12 +30,22 @@ A pass holds the state file's writer lock and runs, in this order:
 4. retention: the one deletion rule, then the telemetry files
 
 The pass that first sees the marker calls ``CreateImage`` before it does any
-other step. The builder is terminated only after the image is ``available``,
-or when the build is past its deadline: reconcile then ends it before any other
-step, and the build fails with the code of the deadline. A marker first read at
-or after the deadline never reaches ``CreateImage``: the build fails
-``IMAGE_BUILDER_GONE`` when reconcile ended the builder and ``MARKER_TIMEOUT``
-when the builder is still alive.
+other step that is not a read. The builder is terminated only after the image is
+``available``, or when the build is past its deadline: reconcile then ends it
+before any other step, and the build fails with the code of the deadline. The
+call is never made at or after the deadline, and the pass reads the clock again
+after its last read, right before the call. A marker first read at or after the
+deadline fails the build ``IMAGE_BUILDER_GONE`` when reconcile ended the builder
+and ``MARKER_TIMEOUT`` when the builder is still alive.
+
+A call that ends with an unknown outcome can have made the image. Before the
+deadline the row stays ``building``. Every call is preceded by a lookup of the
+image by the build's id tag: an image that is listed is adopted and no second
+call is made. The image's name is the build's id, so the provider refuses a
+second image under it, and that refusal is an unknown outcome too. At the
+deadline the build fails: with the refusal's code when the call outlived the
+deadline, and with ``IMAGE_BUILDER_GONE`` when reconcile ended the builder
+first. An image that is listed later is removed as the image of a failed build.
 
 A start has two refusals that are no failed build: ``IMAGE_CREDENTIAL_SHORT`` and
 ``IMAGE_BUILD_ALREADY_ACTIVE``. Both are checked before the row and the upload,
@@ -45,7 +55,9 @@ time while it stages the archive does not fail the build either: the row stays
 ``building`` with no builder, and the next pass stages the archive again under
 the same key and launches. The build deadline still ends such a build. That pass
 runs the template check of a start again first: an unsafe template ends the row
-``failed`` and the pass answers ``refused``, like a refused start check.
+``failed`` and the pass answers ``refused``, like a refused start check. The
+launch reads the clock again right before the provider call: at or after the
+build deadline no builder is launched, and the build fails ``CONSOLE_BLIND``.
 
 Secrets. The presigned archive URL and the rendered user data live in local
 variables of ``_Pass._launch`` and nowhere else: not in the state file, not in an
@@ -1066,7 +1078,8 @@ class _Pass:
                 summary["archives_deleted"] += 1
         self.tele.leak("archive", summary["archives_deleted"])
         # Images. One that carries the active build's id and that the row does
-        # not know yet was created by a crash after ``CreateImage``: adopt it.
+        # not know yet was created by a crash after ``CreateImage``, or by a call
+        # that ended with an unknown outcome: adopt it.
         # A tagged image with no row at all is recorded, in whatever state it
         # is, and never verified or pinned. A later pass follows it.
         rows = {build.id: build for build in s.builds(dep)}
@@ -1237,7 +1250,8 @@ class _Pass:
 
         The key is the same, so the new archive replaces whatever the earlier stage left. The build deadline still
         bounds the build: past it the build fails with the code of a console that never showed anything, and
-        ``_fail`` deletes the archive the row names.
+        ``_fail`` deletes the archive the row names. The deadline is checked here on entry and again in ``_launch``,
+        right before the provider call, because the upload and the reads in between take time.
 
         The template check of a start runs again, because the template and the rules of its groups can change
         between two passes. An unsafe template ends the row as a refused start check does: ``failed`` with the
@@ -1312,11 +1326,19 @@ class _Pass:
         The result is the builder's id, or ``None`` when ``RunInstances`` ended
         with an unknown outcome: the builder may exist, and the next pass adopts
         it by its build-id tag or fails the build.
+
+        The clock is read after the last read and right before the call, and no builder is launched at or after
+        the build deadline: the call is refused with ``CONSOLE_BLIND``, the code of a console that never showed
+        anything.
         """
         aws, cfg = self.aws, self.cfg
         url = aws.presign_get(cfg.storage.bucket, upload.key, cfg.source.presign_seconds)
         user_data = image.render_user_data(self.script, image.warm_exports(cfg, url, upload.sha256))
         self._check_no_builder()
+        if self.clock() >= build.deadline_at:
+            # The upload and the reads before this call take time. ``_stage`` ends the build with this code and
+            # ``_fail`` deletes the archive that the row names.
+            raise ImageRefusal(image_console.CONSOLE_BLIND)
         try:
             return aws.run_builder(
                 template_name=cfg.build.launch_template_name,
@@ -1370,6 +1392,8 @@ class _Pass:
             if build.builder_id in self.ended:
                 alive = False  # reconcile ended it at the deadline, whatever the provider still lists
             console = self.aws.console_output([build.builder_id], deadline=self.deadline).get(build.builder_id)
+            # The reads above can take time. Every check below, and the latency, use the time after the last of them.
+            now = self.clock()
             marker = image_console.read_marker(console, build.archive_sha256)
             outcome = marker["outcome"]
             if outcome == image_console.READY:
@@ -1400,7 +1424,20 @@ class _Pass:
                 return build
 
     def _create_image(self, build, console):
-        """``CreateImage`` in the pass that first sees the marker, before any other step."""
+        """``CreateImage`` in the pass that first sees the marker, before any step that is not a read.
+
+        An earlier call can have ended with an unknown outcome and made the image, which the provider may not list
+        yet. So the image is looked up by this build's tags first, and an image that is there is adopted instead of
+        asked for again. The name is the build's id and nothing else, so a call that goes out while the image exists
+        unlisted is refused by the provider as a duplicate name. That refusal is as uncertain as any other, and the
+        next pass looks again: the name is never changed.
+
+        The clock is read after the last read and right before the call, and the call is never made at or after the
+        build deadline. The build then fails as a marker that came too late, and ``_fail`` ends the builder.
+        """
+        found = self._find_image(build)
+        if found is not None:
+            return self._record_image(build, found)
         tags = {
             SOURCE_SHA_TAG: build.source_sha,
             SCRIPT_SHA_TAG: build.script_sha256 or image.script_sha256(self.script),
@@ -1408,6 +1445,8 @@ class _Pass:
         base_image = self._base_image()
         if base_image is not None:
             tags[BASE_IMAGE_TAG] = base_image
+        if self.clock() >= build.deadline_at:
+            return self._fail(build, image_console.MARKER_TIMEOUT, console)
         try:
             image_id = self.aws.create_image(
                 build.builder_id,
@@ -1418,16 +1457,44 @@ class _Pass:
                 extra_tags=tags,
             )
         except ProviderRefusal as refusal:
-            # An unknown outcome may have created the image: the next pass adopts
-            # it by its tags and does not ask again. A definite refusal, or an
-            # unknown one that outlived the deadline, is the build's verdict.
+            # An unknown outcome may have made the image, so before the deadline the row stays as it is. The next
+            # pass adopts the image when the provider lists it, and else asks again under the same name, which the
+            # provider refuses when the image exists. A definite refusal, or an unknown outcome that outlived the
+            # deadline, is the build's verdict, and an image that shows up late carries the failed build's id: the
+            # deletion rule removes it as the image of a failed build.
             if refusal.uncertain and self.clock() < build.deadline_at:
                 self.notes.append(f"create_image:{refusal.reason}")
                 return build
             return self._fail(build, refusal.reason, console)
+        return self._record_image(build, image_id)
+
+    def _record_image(self, build, image_id):
+        """Write down the image of the build, made now or found, and move the build to ``imaging``."""
         build = self.s.advance_build(build.id, image_id=image_id, state="imaging")
         self.tele.event("image_created", build_id=build.id, builder_id=build.builder_id, image_id=image_id)
         return build
+
+    def _find_image(self, build):
+        """The id of the image that already carries this build's tags, or ``None``.
+
+        A refused read, the pass deadline included, never delays ``CreateImage``: the pass notes
+        ``image_lookup:<reason>`` and goes on as if it had found no image. That is safe, because the image's name
+        is the build's and the provider refuses a second image under it.
+        """
+        try:
+            listed = self.aws.images(self.dep, deadline=self.deadline)
+        except Refusal as refusal:
+            self.notes.append(f"image_lookup:{refusal.reason}")
+            return None
+        for found in listed:
+            tags = found.tags
+            if (
+                tags.get(IMAGE_BUILD_TAG) == "true"
+                and tags.get(DEPLOYMENT_TAG) == self.dep
+                and tags.get(BUILD_ID_TAG) == build.id
+            ):
+                return found.image_id
+        return None
 
     def _base_image(self):
         """The cold base image of the builder: the image its (immutable) template version names.

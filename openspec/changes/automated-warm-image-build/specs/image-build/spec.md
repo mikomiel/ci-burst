@@ -564,16 +564,24 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **THEN** the command refuses and does not write
 
 ### Requirement: Every image deletion resolves the protected set
-Every path that deregisters an image or deletes a snapshot (retention, failed-build cleanup, orphan cleanup and the pending-image timeout) MUST first resolve the protected set: the images of every launch-template version that the TOML references, including per-zone pins, the recorded previous pin, the pins of a pending promotion journal row, the current candidate and an active build. It MUST NOT deregister a protected image.
+Every path that deregisters an image or deletes a snapshot (retention, failed-build cleanup, orphan cleanup and the pending-image timeout) MUST first resolve the protected set: the images of every launch-template version that the TOML references, including per-zone pins, the recorded previous pin, the pins of a pending promotion journal row, the current candidate unless its row records `TEMPLATE_DRIFT`, and an active build. It MUST NOT deregister a protected image.
 
 #### Scenario: A protected image
-- **WHEN** an image is the pin's, the previous pin's, a journal pin's or the candidate's
+- **WHEN** an image is the pin's, the previous pin's, a journal pin's, or the candidate's while its row does not record `TEMPLATE_DRIFT`
 - **THEN** every deletion path skips it
 
 #### Scenario: A failed build's image is pinned by hand
 - **WHEN** an operator has pinned a version that names the image of a failed build
 - **THEN** failed-build cleanup skips that image and its snapshots
 - **AND** the build row records that its image is protected
+
+#### Scenario: A made-up protected set or plan
+- **WHEN** a caller passes a protected set that the resolver did not build, an empty set, or a plan item that the planner did not make or that was changed afterwards
+- **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE` before any call
+
+#### Scenario: A drifted candidate
+- **WHEN** the current candidate's row records `TEMPLATE_DRIFT` and no pin names its image
+- **THEN** it is not protected as the candidate, and failed-build cleanup removes its image after the 24-hour hold
 
 #### Scenario: A pending journal pins an image
 - **WHEN** a promotion journal row is pending and names a version whose image would otherwise be removed

@@ -1276,22 +1276,26 @@ def _created_at(value):
 
     EC2 gives an image's ``CreationDate`` as an ISO 8601 string and a
     snapshot's ``StartTime`` as a datetime. Only a time with a UTC offset is
-    understood. A string without one would need a guessed zone, which makes an
-    item look older or younger than it is, so it gives ``None`` like any other
-    value. Nothing is raised: an age that cannot be read must not stop a
-    listing, and the rules that need an age keep the item instead.
+    understood: a naive time, and a time whose zone cannot say its offset
+    (``utcoffset()`` is ``None``, or not a ``timedelta``), would need a guessed
+    zone, which makes an item look older or younger than it is, so each gives
+    ``None`` like any other value. Nothing is raised: an age that cannot be read
+    must not stop a listing, and the rules that need an age keep the item
+    instead.
     """
     if isinstance(value, str):
         try:
             value = datetime.fromisoformat(value)
         except ValueError:
             return None
-    if isinstance(value, datetime) and value.tzinfo is not None:
-        try:
-            return value.timestamp()
-        except (OverflowError, OSError, ValueError):
+    if not isinstance(value, datetime):
+        return None
+    try:
+        if value.utcoffset() is None:
             return None
-    return None
+        return value.timestamp()
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
 
 
 def _credit_specification(data):

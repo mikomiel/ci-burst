@@ -66,7 +66,7 @@ WARM_COMMANDS=${WARM_COMMANDS:-}
 WARM_GATE_COMMAND=${WARM_GATE_COMMAND:-}
 WARM_LIFETIME_SECONDS=${WARM_LIFETIME_SECONDS:-5400}
 WARM_SNAPSHOT_SECONDS=${WARM_SNAPSHOT_SECONDS:-1800}
-WARM_SRC_STRIP_COMPONENTS=${WARM_SRC_STRIP_COMPONENTS:-0}
+WARM_SRC_STRIP_COMPONENTS=${WARM_SRC_STRIP_COMPONENTS-0}
 
 DEFAULT_LIFETIME_SECONDS=5400
 FAIL_HOLD_SECONDS=300
@@ -150,6 +150,7 @@ case $WARM_SRC_URL in
 esac
 case $WARM_SRC_URL in
   *[[:space:]]*) refuse "WARM_SRC_URL must not contain whitespace" ;;
+  *[\"\\]*) refuse "WARM_SRC_URL must not contain a quote or a backslash" ;;
 esac
 warm_commands=()
 while IFS= read -r line; do
@@ -168,8 +169,24 @@ LOG=$(mktemp "$LOG_TEMPLATE")
 # a newline or printable ASCII becomes "?" first, so no consumer byte (a carriage
 # return, a form feed, an escape sequence, a multi-byte line separator) can start
 # a console line of its own. The frame is then the only way a line begins.
+# The archive URL, or its query, shows as "[archive-url]" (ENVIRON is literal).
 print_log_tail() {
-  tail -n "$TAIL_LINES" "$LOG" | LC_ALL=C tr -c '\t\n -~' '?' | awk '{ print "  | " $0 }'
+  tail -n "$TAIL_LINES" "$LOG" | LC_ALL=C tr -c '\t\n -~' '?' |
+    WARM_TAIL_SECRET="$WARM_SRC_URL" LC_ALL=C awk '
+      function cut(s, t,   out, k) {
+        out = ""
+        while (t != "" && (k = index(s, t)) > 0) {
+          out = out substr(s, 1, k - 1) "[archive-url]"
+          s = substr(s, k + length(t))
+        }
+        return out s
+      }
+      BEGIN {
+        url = ENVIRON["WARM_TAIL_SECRET"]
+        k = index(url, "?")
+        query = k ? substr(url, k + 1) : ""
+      }
+      { print "  | " cut(cut($0, url), query) }'
 }
 
 # Run a command as the job account in its own transient unit, with the standard
@@ -259,10 +276,32 @@ assert_clean() {
   fi
 }
 
-# Fetch without credentials; the URL is never echoed. The error text of curl is
-# dropped for the same reason, and --proto keeps a redirect on https.
+# The metadata service serves the user data, and the archive URL in it. Before
+# any consumer code runs, root rejects the metadata addresses for the runner
+# account in the firewall, as the worker bootstrap does, and checks each rule;
+# a rule that is not in place ends the build. Firewall rules are not touched by
+# DHCP renewals, so they hold for the whole window. Without kernel IPv6 there is
+# no IPv6 path to block. Nothing after this needs the service.
+block_metadata() {
+  local rule=(OUTPUT -m owner --uid-owner runner -j REJECT)
+  iptables -I "${rule[@]}" -d 169.254.169.254/32 || return 1
+  iptables -C "${rule[@]}" -d 169.254.169.254/32 || return 1
+  [ -e /proc/net/if_inet6 ] || return 0
+  ip6tables -I "${rule[@]}" -d fd00:ec2::254/128 || return 1
+  ip6tables -C "${rule[@]}" -d fd00:ec2::254/128 || return 1
+}
+if ! block_metadata >>"$LOG" 2>&1; then
+  echo "WARM FAIL the metadata service could not be blocked"
+  exit 1
+fi
+echo "STEP metadata blocked"
+
+# Fetch without credentials. The URL reaches curl on stdin, never in argv;
+# --disable (first) skips every curl config file, all curl output is dropped, and
+# --proto keeps a redirect on https.
 fetch_rc=0
-curl -fsS --proto '=https' --max-time 600 -o "$ARCHIVE" "$WARM_SRC_URL" 2>/dev/null || fetch_rc=$?
+printf 'url = "%s"\n' "$WARM_SRC_URL" |
+  curl --disable -fsS --proto '=https' --max-time 600 -o "$ARCHIVE" --config - >/dev/null 2>&1 || fetch_rc=$?
 if [ "$fetch_rc" -ne 0 ]; then
   echo "WARM FAIL fetch rc=${fetch_rc}"
   exit 1

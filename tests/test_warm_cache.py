@@ -48,8 +48,20 @@ SOURCE_URL = f"https://builder-source.invalid/archive.tar.gz?token={SECRET_URL_T
 #: Commands the script runs that act on the host. Each must resolve to a stub.
 STUBBED = (
     "shutdown", "systemd-run", "systemctl", "runuser", "cloud-init", "curl", "sleep", "sync",
-    "chown", "aws", "tar", "id", "ip",
+    "chown", "aws", "tar", "id", "iptables", "ip6tables",
 )
+
+FIREWALL_STUB = """
+tool=$(basename "$0"); verb=$1; shift
+rule="$tool $*"
+case "$verb" in
+  -I) [ "${STUB_FW_FAIL:-}" = "$tool-I" ] && exit 2
+      echo "$rule" >> "$STUB_DIR/rules" ;;
+  -C) [ "${STUB_FW_FAIL:-}" = "$tool-C" ] && exit 1
+      grep -qxF "$rule" "$STUB_DIR/rules" 2>/dev/null || exit 1 ;;
+esac
+exit 0
+"""
 
 #: What bash itself adds to an empty environment.
 BASH_INTERNAL = {"PWD", "SHLVL", "_", "OLDPWD"}
@@ -101,18 +113,10 @@ STUB_BODIES = {
     "systemd-run": "",
     "sleep": "",
     "sync": "",
-    # Records each route; `show exact` prints a prohibit route for an address that
-    # was replaced, unless STUB_IP_FAIL names the family whose route does not hold.
-    "ip": """
-family=$1; verb=$3
-case "$verb" in
-  replace) [ "${STUB_IP_FAIL:-}" = "$family-replace" ] && exit 2
-           echo "$5" >> "$STUB_DIR/routes" ;;
-  show) [ "${STUB_IP_FAIL:-}" = "$family-show" ] && exit 0
-        grep -qxF "$5" "$STUB_DIR/routes" 2>/dev/null && echo "prohibit $5" ;;
-esac
-exit 0
-""",
+    # Records each inserted rule; `-C` finds a rule that was inserted, unless
+    # STUB_FW_FAIL names the tool and verb that do not hold (e.g. "ip6tables-C").
+    "iptables": FIREWALL_STUB,
+    "ip6tables": FIREWALL_STUB,
     "chown": "",
     "aws": "exit 99",
     "cloud-init": """
@@ -510,29 +514,35 @@ class FetchTests(WarmHarness, unittest.TestCase):
         else:
             marker.unlink(missing_ok=True)
 
-    def test_the_metadata_service_is_blocked_before_the_fetch_and_any_consumer_command(self):
-        for enabled, families in ((True, ["-4", "-6"]), (False, ["-4"])):
+    def test_the_metadata_service_is_rejected_for_the_runner_before_the_fetch_and_any_consumer_command(self):
+        rule = "OUTPUT -m owner --uid-owner runner -j REJECT -d"
+        for enabled, expected in (
+            (True, [f"iptables -I {rule} 169.254.169.254/32", f"ip6tables -I {rule} fd00:ec2::254/128"]),
+            (False, [f"iptables -I {rule} 169.254.169.254/32"]),
+        ):
             with self.subTest(ipv6=enabled):
                 self.events.write_text("", encoding="utf-8")
-                (self.stub / "routes").unlink(missing_ok=True)
+                (self.stub / "rules").unlink(missing_ok=True)
                 self.ipv6(enabled)
                 completed = self.start()
                 self.assertEqual(completed.returncode, 0, self.output)
                 events = self.event_list()
-                routes = [i for i, e in enumerate(events) if e.startswith("ip ") and " replace prohibit " in e]
-                self.assertEqual([events[i].split()[1] for i in routes], families)
+                inserts = [i for i, e in enumerate(events) if re.match(r"ip6?tables -I ", e)]
+                checks = [i for i, e in enumerate(events) if re.match(r"ip6?tables -C ", e)]
+                self.assertEqual([events[i] for i in inserts], expected)
+                self.assertEqual(len(checks), len(expected))
                 first_fetch = next(i for i, e in enumerate(events) if e.startswith("curl"))
                 first_unit = next(i for i, e in enumerate(events) if e.startswith("UNIT "))
-                self.assertLess(max(routes), min(first_fetch, first_unit))
+                self.assertLess(max(inserts + checks), min(first_fetch, first_unit))
                 self.assertIn("STEP metadata blocked", self.lines)
 
-    def test_a_metadata_route_that_does_not_hold_ends_the_build_before_any_consumer_command(self):
+    def test_a_metadata_rule_that_does_not_hold_ends_the_build_before_any_consumer_command(self):
         self.ipv6(True)
-        for failure in ("-4-replace", "-4-show", "-6-replace", "-6-show"):
+        for failure in ("iptables-I", "iptables-C", "ip6tables-I", "ip6tables-C"):
             with self.subTest(failure):
                 self.events.write_text("", encoding="utf-8")
-                (self.stub / "routes").unlink(missing_ok=True)
-                self.extra_env = {"STUB_IP_FAIL": failure}
+                (self.stub / "rules").unlink(missing_ok=True)
+                self.extra_env = {"STUB_FW_FAIL": failure}
                 completed = self.start()
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn("WARM FAIL the metadata service could not be blocked", self.output)

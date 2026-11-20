@@ -95,11 +95,12 @@ group ends with it, so a background process it started dies too.
 1. Arms a lifetime timer (`systemd-run --on-active`) that powers the builder
    off. It is armed first, so no later step can leave a builder running.
 2. Refuses before any fetch or consumer command when the sha256 or the warm
-   commands are missing or malformed. Then routes the instance metadata
-   addresses to `prohibit` and reads the routes back, so no consumer command can
-   read the user data and the archive URL in it; a route that does not hold ends
-   the build. A failure tail also shows the URL, or its query, as
-   `[archive-url]`.
+   commands are missing or malformed. Then adds firewall rules that reject the
+   instance metadata addresses for the `runner` account, as the worker bootstrap
+   does, and checks each rule, so no consumer command can read the user data and
+   the archive URL in it; a rule that is not in place ends the build. DHCP
+   renewals do not change firewall rules. A failure tail also shows the URL, or
+   its query, as `[archive-url]`.
 3. Fetches the archive and compares its sha256 with `WARM_SRC_SHA256`. Only then
    does the `runner` account, never root, extract it into a fresh directory
    outside the runner home. Root feeds the archive on standard input and the
@@ -219,9 +220,9 @@ export WARM_COMMANDS=<warm-commands>
 export WARM_GATE_COMMAND=<gate-command>
 ```
 
-EC2 user data is limited to 16 KB before base64 encoding. The script is about
-13.5 KB and a presigned URL is often 1.5 to 2 KB, which leaves well under 1 KB for
-the commands. Put the command lists in scripts inside the source archive, where
+EC2 user data is limited to 16 KB before base64 encoding. The script travels
+gzip-compressed and base64-encoded, about 8 KB, and a presigned URL is often 1.5
+to 2.5 KB, which leaves about 5 KB for the stub and the commands. Put the command lists in scripts inside the source archive, where
 the digest covers them, and keep the inputs to one line each:
 
 ```sh

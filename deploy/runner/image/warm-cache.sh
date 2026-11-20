@@ -277,16 +277,18 @@ assert_clean() {
 }
 
 # The metadata service serves the user data, and the archive URL in it. Before
-# any consumer code runs, root routes both metadata addresses to "prohibit" and
-# reads the routes back; a route that is not in place ends the build. Routes hold
-# for every process and need no BPF support. Without kernel IPv6 there is no IPv6
-# path to block. Nothing after this needs the service.
+# any consumer code runs, root rejects the metadata addresses for the runner
+# account in the firewall, as the worker bootstrap does, and checks each rule;
+# a rule that is not in place ends the build. Firewall rules are not touched by
+# DHCP renewals, so they hold for the whole window. Without kernel IPv6 there is
+# no IPv6 path to block. Nothing after this needs the service.
 block_metadata() {
-  ip -4 route replace prohibit 169.254.169.254/32 || return 1
-  ip -4 route show exact 169.254.169.254/32 | grep -q '^prohibit ' || return 1
+  local rule=(OUTPUT -m owner --uid-owner runner -j REJECT)
+  iptables -I "${rule[@]}" -d 169.254.169.254/32 || return 1
+  iptables -C "${rule[@]}" -d 169.254.169.254/32 || return 1
   [ -e /proc/net/if_inet6 ] || return 0
-  ip -6 route replace prohibit fd00:ec2::254/128 || return 1
-  ip -6 route show exact fd00:ec2::254/128 | grep -q '^prohibit ' || return 1
+  ip6tables -I "${rule[@]}" -d fd00:ec2::254/128 || return 1
+  ip6tables -C "${rule[@]}" -d fd00:ec2::254/128 || return 1
 }
 if ! block_metadata >>"$LOG" 2>&1; then
   echo "WARM FAIL the metadata service could not be blocked"

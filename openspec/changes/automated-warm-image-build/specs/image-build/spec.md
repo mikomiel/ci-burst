@@ -489,7 +489,7 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **THEN** the build proceeds and the candidate record states that no gate ran
 
 ### Requirement: The image is created in the pass that sees the marker
-The pass that first sees the marker MUST call `CreateImage` before it does any other step, with no reboot, and MUST tag the image and its snapshots with `ci-burst:image-build`, the deployment, the build id, the full basis digest, the source sha, the script sha and the base image. The pass MUST NOT leave the builder running after the image is `available` or after the snapshot window or lifetime timer ends it. Waiting for the image and every later step MAY continue in a later pass.
+The pass that first sees the marker MUST call `CreateImage` before any step that is not a read, with no reboot, and MUST tag the image and its snapshots with `ci-burst:image-build`, the deployment, the build id, the basis digest, the source sha, the script sha and, when read, the base image. The pass MUST NOT leave the builder running after the image is `available` or after the snapshot window or lifetime timer ends it. Waiting for the image and every later step MAY continue in a later pass.
 
 #### Scenario: A slow tick
 - **WHEN** the pass that sees the marker is the last pass inside the snapshot window
@@ -506,7 +506,7 @@ The pass that first sees the marker MUST call `CreateImage` before it does any o
 - **AND** the image and its snapshots are removed only under the image deletion rule
 
 ### Requirement: An uncertain CreateImage never makes a second image
-A `CreateImage` call that ends with an unknown outcome MUST NOT fail the build before the build deadline and MUST NOT lead to a second image. Before every call the command MUST look for an image that carries the build id, and MUST adopt it instead of calling. Every call for a build MUST use one image name, so that the provider refuses a duplicate, and that refusal MUST count as an unknown outcome. An unknown outcome that lasts to the deadline MUST fail the build.
+A `CreateImage` call with an unknown outcome MUST NOT fail the build before the build deadline or lead to a second image. Before every call the command MUST adopt an image that carries the build id instead of calling. Every call for a build MUST use one image name, and the provider's duplicate-name refusal MUST count as an unknown outcome. If the first pass after the deadline lists no image of the build, the build MUST fail.
 
 #### Scenario: The image is listed by the next pass
 - **WHEN** a call ends with an unknown outcome, and the image exists and is listed when the next pass reconciles
@@ -530,9 +530,14 @@ A `CreateImage` call that ends with an unknown outcome MUST NOT fail the build b
 - **AND** a later pass adopts the image once it is listed, with no further call
 
 #### Scenario: The unknown outcome lasts to the deadline
-- **WHEN** every call ends with an unknown outcome until the build deadline passes
+- **WHEN** every call ends with an unknown outcome until the build deadline passes, and the first pass after the deadline lists no image of the build
 - **THEN** reconcile ends the builder and the build fails with `IMAGE_BUILDER_GONE`, with no image recorded
 - **AND** an image that is listed later carries the failed build's id, so it is no orphan, and the image deletion rule removes it with its snapshots
+
+#### Scenario: The image is first listed after the deadline
+- **WHEN** a call before the deadline ended with an unknown outcome, and the image is first listed when the first pass after the deadline reconciles
+- **THEN** reconcile ends the overdue builder and adopts the image, because adopting is no call
+- **AND** the build goes on from `imaging` and `CreateImage` has been called once
 
 #### Scenario: A call outlives the deadline
 - **WHEN** a call ends with an unknown outcome at or after the build deadline

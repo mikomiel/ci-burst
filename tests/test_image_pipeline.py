@@ -1982,6 +1982,22 @@ class FailureTests(PipelineCase):
         (ghost,) = self.world.images.keys() - {ami(0xA1)}
         return ghost
 
+    def test_an_image_first_listed_after_the_deadline_is_adopted_by_reconcile_and_made_once(self):
+        ghost = self.uncertain_create(hidden_for=10 * DAY)
+        build = self.only_build()
+        # The image stays unlisted through every pass before the deadline and is listed at the first one after it.
+        for identifier in list(self.world.hidden_until):
+            self.world.hidden_until[identifier] = build.deadline_at + 1
+        self.clock.advance(build.deadline_at + 5 - self.clock())
+        result = self.apply()
+        # Reconcile ends the overdue builder first, then adopts the image the earlier call made: no second call.
+        self.assertIn({"InstanceIds": [build.builder_id]}, self.world.arguments("terminate_instances"))
+        self.assertTrue(result["reconcile"]["image_adopted"])
+        self.assertEqual(self.only_build().image_id, ghost)
+        self.assertEqual(len(self.world.arguments("create_image")), 1)
+        self.assertEqual(result["decision"], "candidate")
+        self.assertEqual(self.events("image_build_failed"), [])
+
     def test_an_uncertain_create_whose_image_is_listed_by_the_next_pass_is_adopted_and_made_once(self):
         ghost = self.uncertain_create()
         # Reconcile lists the image at the start of the next pass and adopts it by its tags.

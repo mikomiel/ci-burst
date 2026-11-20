@@ -137,7 +137,7 @@ def build_decision(
     failed build (``Control`` has no such field), or ``None``.
 
     Clearing comes first and does not depend on the outcome. ``force`` clears
-    ``blocked`` and the failure cooldown. A basis digest that differs from
+    ``blocked`` and any recorded failure cooldown, an expired one included. A basis digest that differs from
     ``last_failed_digest`` clears ``blocked`` and, with it, the cooldown; with
     no failed digest to compare, ``blocked`` stays. A digest change alone does
     not end a cooldown of a row that is not blocked.
@@ -165,7 +165,8 @@ def build_decision(
     """
     cooling = control.cooldown_until is not None and now < control.cooldown_until
     recovered = control.blocked and last_failed_digest is not None and digest != last_failed_digest
-    clear = (force and (control.blocked or cooling)) or recovered
+    # --force clears any recorded cooldown, an expired one too, so no stale timestamp stays behind.
+    clear = (force and (control.blocked or control.cooldown_until is not None)) or recovered
     blocked = control.blocked and not clear
     cooling = cooling and not clear
     if not force:
@@ -224,9 +225,10 @@ def render_user_data(script_bytes, exports):
     refused with ``IMAGE_USERDATA_TOO_LARGE`` when its UTF-8 size, the size
     EC2 measures before base64, is ``USER_DATA_LIMIT`` or more.
     """
+    for name, value in exports.items():
+        _check_export(name, value)
     lines = ["#!/bin/bash"]
     for name in sorted(exports):
-        _check_export(name, exports[name])
         lines.append(f"export {name}={shlex.quote(exports[name])}")
     payload = base64.b64encode(gzip.compress(script_bytes, compresslevel=9, mtime=0)).decode("ascii")
     text = "\n".join(lines) + "\n" + _STUB_RUN + payload + "\n" + _STUB_END

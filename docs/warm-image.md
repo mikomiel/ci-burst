@@ -95,7 +95,12 @@ group ends with it, so a background process it started dies too.
 1. Arms a lifetime timer (`systemd-run --on-active`) that powers the builder
    off. It is armed first, so no later step can leave a builder running.
 2. Refuses before any fetch or consumer command when the sha256 or the warm
-   commands are missing or malformed.
+   commands are missing or malformed. Then adds firewall rules that reject the
+   instance metadata addresses for the `runner` account, as the worker bootstrap
+   does, and checks each rule, so no consumer command can read the user data and
+   the archive URL in it; a rule that is not in place ends the build. DHCP
+   renewals do not change firewall rules. A failure tail also shows the URL, or
+   its query, as `[archive-url]`.
 3. Fetches the archive and compares its sha256 with `WARM_SRC_SHA256`. Only then
    does the `runner` account, never root, extract it into a fresh directory
    outside the runner home. Root feeds the archive on standard input and the
@@ -165,8 +170,9 @@ removes the saved copy on the builder, and the expiry bounds the rest.
 
 ### 3. Render the user data
 
-Put the inputs in front of the script, keeping `#!/bin/bash` on line 1. The
-`printf '%q'` form quotes any value, including a multi-line command list.
+Put the inputs in front of a short stub that unpacks the script, keeping
+`#!/bin/bash` on line 1. The `printf '%q'` form quotes any value, including a
+multi-line command list. The stub powers the builder off if it cannot unpack.
 
 ```sh
 # The warm commands, one per line, and the optional offline gate. Replace them
@@ -182,7 +188,16 @@ umask 077
   printf 'export WARM_SRC_SHA256=%q\n' "$SRC_SHA256"
   printf 'export WARM_COMMANDS=%q\n' "$WARM_COMMANDS"
   printf 'export WARM_GATE_COMMAND=%q\n' "$WARM_GATE_COMMAND"
-  tail -n +2 deploy/runner/image/warm-cache.sh
+  # The script travels compressed, as in the automated path, to fit the limit.
+  cat <<'STUB'
+d=$(mktemp --directory /run/warm-stub.XXXXXX) || { shutdown -h now; exit 1; }
+base64 --decode <<'WARM_PAYLOAD_END' | gunzip >"$d/warm-cache.sh" || { shutdown -h now; exit 1; }
+STUB
+  gzip -9n < deploy/runner/image/warm-cache.sh | base64
+  cat <<'STUB'
+WARM_PAYLOAD_END
+exec bash "$d/warm-cache.sh"
+STUB
 } > user-data.sh
 bash -n user-data.sh
 # EC2 refuses user data of 16384 bytes or more. An oversized file is removed,
@@ -205,9 +220,9 @@ export WARM_COMMANDS=<warm-commands>
 export WARM_GATE_COMMAND=<gate-command>
 ```
 
-EC2 user data is limited to 16 KB before base64 encoding. The script is about
-13.5 KB and a presigned URL is often 1.5 to 2 KB, which leaves well under 1 KB for
-the commands. Put the command lists in scripts inside the source archive, where
+EC2 user data is limited to 16 KB before base64 encoding. The script travels
+gzip-compressed and base64-encoded, about 8 KB, and a presigned URL is often 1.5
+to 2.5 KB, which leaves about 5 KB for the stub and the commands. Put the command lists in scripts inside the source archive, where
 the digest covers them, and keep the inputs to one line each:
 
 ```sh

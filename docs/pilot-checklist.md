@@ -108,3 +108,85 @@ cleanup bounds.
 - [ ] Abrupt instance loss was reconciled; Forgejo, not ci-burst, decided the
       job result.
 - [ ] No On-Demand fallback, automatic retry or manufactured success occurred.
+
+## 9. Automated warm image build (optional)
+
+Use this section only if you intend to run the `ci-burst image` commands
+([operations.md](operations.md#automated-warm-image-build)). Its items follow
+section 9 of the task list of the `automated-warm-image-build` change, in order.
+Like the rest of this checklist, ticking an item records preparation, not
+authorization: every step that creates cloud resources, changes IAM or network
+configuration, or spends money needs its own operator decision with cost,
+lifetime and cleanup bounds. Keep `[image].enabled` false until the IAM items
+below are done. Record the evidence in your own deployment records, not in this
+repository.
+
+- [ ] A fresh independent reviewer has read the policy file
+      ([deploy/iam/image-build-policy.json](../deploy/iam/image-build-policy.json))
+      and the credential boundaries before anything is applied.
+- [ ] You applied the IAM yourself: the controller applies none of it. The image
+      role has a trust policy with the one source principal, the external-ID
+      condition and a maximum session of 1 hour. The source identity has
+      `sts:AssumeRole` on that one role only. The policy file is attached
+      ([deployment.md](deployment.md#image-build-role-and-source-identity-optional)).
+- [ ] The verification gates are run with the IAM policy simulator or a real dry
+      run, and each result is recorded: G1 (instance-profile Deny), G2
+      (build-template Deny with a user-data override), G3 (request tags on the
+      volume and the network interface), G4 (extra `CreateImage` actions), G5
+      (pass-role for `CreateLaunchTemplateVersion`; add the one scoped statement
+      only if it is needed), G9 (SDK profile with `external_id` and
+      `duration_seconds`, refresh inside the container, and whether a
+      source-identity condition is possible), G10 (effective expiry of a
+      presigned URL that assumed-role credentials signed), G12 (a version that
+      names a pending image) and G13 (read-back normalization). The EC2 and S3
+      API contracts are qualified before `[image]` is enabled.
+- [ ] The private bucket prefix has block public access, default encryption and
+      a 7-day lifecycle rule on the prefix. The build launch template has the
+      cold base image, no instance profile, IMDSv2 required with hop limit 1,
+      terminate on shutdown, and a 20 GiB `gp3` volume that deletes on
+      termination. The build security group has no ingress and minimal egress.
+      The build subnet exists
+      ([deployment.md](deployment.md#the-image-tables-optional)).
+- [ ] A dedicated read-only Forgejo token exists, ideally for a dedicated
+      read-only collaborator account, with its own env file, and its scope is
+      recorded ([deployment.md](deployment.md#the-image-token)).
+- [ ] If you want `promote --write`, the deployment TOML is in its own directory
+      ([deployment.md](deployment.md#the-dedicated-toml-directory-only-for-promote---write)).
+      `[image]` is added with `enabled = false`, and `image plan` reports
+      `disabled` and makes no network call.
+- [ ] Only after the IAM gates above have passed, `[image].enabled = true` is
+      set, as its own approved step. `image plan` then confirms: the token reads
+      the branch, one raw file and the archive; the branch is reported protected;
+      the archive prefix and the `export-ignore` effect (G6); the rendered
+      user-data size; the build template is safe; and the policy gates are
+      recorded.
+- [ ] The first manual build runs as `image run --apply --until-done --force`
+      ([container.md](container.md#run-the-image-commands)). You record the
+      console latency and the blind-probe cause (G7), the build duration,
+      whether terminating at `pending` is safe (G11) and the token scope. You
+      confirm that `CreateImage` ran in the pass that saw the marker and that the
+      run needed no timer.
+- [ ] You reviewed the candidate: `image promote` without `--write` printed its
+      evidence and you read it
+      ([operations.md](operations.md#candidate-and-promotion)). `promote --write`
+      ran in the isolated container, one canary job completed on the new
+      version, and `--rollback` restored the previous pin
+      ([operations.md](operations.md#rolling-back-an-image)). The effect on job
+      duration is measured, as the `warm-worker-image` change already requires
+      (its tasks 6.5 and 6.6).
+- [ ] After the first manual build and about three clean promotions, the timer
+      unit is qualified (G8) and enabled as a separate approved step, and one
+      timer period passes without a leak. A clean promotion is one that you did
+      not roll back and whose first jobs completed on the warm cache. Do not
+      enable the timer earlier. This repository ships no unit or timer for the
+      image build today, so this item applies only once one exists.
+- [ ] When the cold base image or the build launch template changes, you force a
+      rebuild with `image run --apply --until-done --force`, because the basis
+      digest covers neither
+      ([warm-image.md](warm-image.md#triggers)).
+- [ ] You rotate the source key on the schedule that
+      [deployment.md](deployment.md#image-build-role-and-source-identity-optional)
+      states, and record the date.
+- [ ] After the timer period, you decide whether to open a separate
+      automatic-promotion change. Automatic promotion is not part of this
+      feature.

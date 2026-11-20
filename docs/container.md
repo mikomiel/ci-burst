@@ -18,7 +18,10 @@ needs a credential.
 ## What the image is
 
 - One command per process: `plan`, `apply`, `status` or `reap --apply`, with
-  `--config` pointing at the mounted TOML.
+  `--config` pointing at the mounted TOML. The optional warm-image build adds
+  the `image` group (`image plan`, `image run`, `image status`,
+  `image promote`), run the same way as one-off containers; see
+  [Run the image commands](#run-the-image-commands).
 - Non-root: the process runs as UID/GID 10001.
 - No daemon, no published ports, no healthcheck. A run finishes with the
   controller's exit code: `0` completed decision, `2` refusal with nothing
@@ -113,6 +116,16 @@ cleanup credentials.
 | `/etc/ci-burst/aws-scaling` | scaler | read-only directory | scaling credentials, launch-capable profile |
 | `/etc/ci-burst/aws-cleanup` | cleanup | read-only directory | cleanup credentials, describe/terminate only |
 | `/etc/ci-burst/forgejo.env` | scaler | podman env-file, not mounted | Forgejo token |
+| `/var/lib/ci-burst-warm-image` | scaler, image commands only | writable directory | image state file, its lock, the event file, the metrics textfile |
+| `/etc/ci-burst/aws-image` | scaler, image commands only | read-only directory | image role profile: the source identity and the assume-role profile, no scaling or cleanup keys |
+| `/etc/ci-burst/forgejo-image.env` | scaler, image commands only | podman env-file, not mounted | image token, a different variable from the Forgejo token |
+| `/etc/ci-burst-deployment` | scaler, `promote --write` only | writable directory | the dedicated directory of the deployment TOML |
+
+The last four rows are optional and belong to the image commands.
+[deployment.md](deployment.md#the-image-build-paths-optional) shows how to create
+them and [Run the image commands](#run-the-image-commands) mounts them. The image
+state directory is not inside `/var/lib/ci-burst`, so no image container sees the
+scaling ledger.
 
 Prepare the scaler host:
 
@@ -198,6 +211,9 @@ host as token access, keep the file mode `0600`, and rotate the token if that
 access changes hands. A token-file option is a follow-up, not part of this
 change. Do not put AWS keys in this file; cloud credentials are mounted files.
 
+The image commands use a separate read-only token in `forgejo-image.env`, never
+this one; [deployment.md](deployment.md#the-image-token) owns it.
+
 ## Run one command manually
 
 The scheduled units run the same shape with their fixed container name. Run
@@ -251,6 +267,71 @@ source to one container's private category and breaks any other container using
 it at that moment, so do not mix `:z` and `:Z` on one source. Where relabeling
 is not permitted, apply a `container_file_t` label to the paths once with
 `chcon` instead.
+
+## Run the image commands
+
+The `image` commands belong to the optional automated warm-image build.
+[operations.md](operations.md#image-commands) owns their meaning, exit codes and
+reason codes, and [deployment.md](deployment.md#the-image-tables-optional) owns the
+`[image]` tables. No unit or timer runs them: you start each one as a one-off
+container on the scaler host, and the apply, reap and export units stay as they
+are. The reaper host takes none of this. While `[image]` is absent or
+`enabled = false`, each line below answers `disabled` before it opens a state file
+or builds a client.
+
+To build an image, run the build line. A build lasts longer than one pass, so
+`--until-done` repeats passes in the one container until the build ends:
+
+```sh
+podman run --rm --init --network ci-burst --name ci-burst-image-manual \
+  --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+  --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \
+  --volume /var/lib/ci-burst-warm-image:/var/lib/ci-burst-warm-image:rw \
+  --volume /etc/ci-burst/aws-image:/etc/ci-burst/aws:ro \
+  --env-file /etc/ci-burst/forgejo-image.env \
+  localhost/ci-burst:latest image run --apply --until-done --config /etc/ci-burst/deployment.toml
+```
+
+The container gets the configuration read-only, the image role profile directory
+read-only, the image state directory writable at the path `[image].state_directory`
+names, and the image token env-file. It gets no scaling credential, no cleanup
+credential, no scaling ledger and no `forgejo.env`. For `image plan`,
+`image run` without `--apply` and `image status --refresh`, replace the command and
+keep the mounts. `image status` without `--refresh` makes no provider call, so it
+needs neither the profile directory nor the token.
+
+To promote a candidate, or to roll back, run the promotion line. `promote` is local:
+it makes no AWS or forge call and holds no credential, so its container has no
+network, no credential mount and no env-file, and a read-only root filesystem:
+
+```sh
+podman run --rm --init --network none --name ci-burst-promote-manual \
+  --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+  --volume /etc/ci-burst-deployment:/etc/ci-burst-deployment:rw \
+  --volume /var/lib/ci-burst-warm-image:/var/lib/ci-burst-warm-image:rw \
+  localhost/ci-burst:latest image promote --config /etc/ci-burst-deployment/deployment.toml --write
+```
+
+The dedicated TOML directory is writable because `--write` creates a backup, a lock
+file and a temporary file there and replaces the TOML. The image state directory is
+writable because the promotion records its journal row there. Leave out `--write`
+to print the evidence and the one-line diff with the same mounts, and add
+`--rollback` to restore the previous pin. The directory must hold only the TOML,
+its `.bak.*` backups, its lock file and its promote temporary file, or the command
+refuses with `PROMOTE_DIRECTORY_NOT_DEDICATED`
+([deployment.md](deployment.md#the-dedicated-toml-directory-only-for-promote---write)).
+If you moved the deployment TOML into that directory, change only the host side of
+the `--volume` that each unit and build line uses for the file; the container side
+and `--config` stay as they are.
+
+A manual run is named `ci-burst-image-manual` or `ci-burst-promote-manual`. If one
+does not exit after `Ctrl-C`, remove it by name with `podman rm --force`; a
+survivor blocks the next run of the same name and can still be inside a provider
+call. With SELinux enforcing, the rule above holds: a source that two lines mount
+takes the shared `:z`, and only a source that one line uses alone may take `:Z`.
+Both lines mount the image state directory, so it takes `:z`.
 
 ## Scheduled operation with systemd
 
@@ -816,6 +897,10 @@ installed it becomes:
 5. Revert the source change through a reviewed pull request. Do not rewrite
    published history.
 
+The image pin is not part of this order. A bad warm image is undone by moving the
+pin back, not by stopping admission; see
+[operations.md](operations.md#rolling-back-an-image).
+
 ### Retiring the cleanup host
 
 Do not remove the last cleanup scheduler on the strength of one manual
@@ -843,6 +928,8 @@ outlive it. A manual `reap --apply` run does not replace the recurring schedule.
   artifact that outlives the CI job. CI builds the image only to prove it still
   builds.
 - A token-file option; the env-file route is inspect-visible by design today.
+- A unit or timer that runs the `image` commands, and automatic promotion. The
+  image commands are one-off containers that you start.
 - A daemon, published ports, a healthcheck, or readiness probing. One run, one
   exit code.
 - Signal-driven shutdown as the cleanup guarantee. The units force-remove their

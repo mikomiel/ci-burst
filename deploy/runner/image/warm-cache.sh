@@ -264,9 +264,12 @@ assert_clean() {
 # a config line, never as an argument, so it is not in any process listing. The
 # error text of curl is dropped for the same reason, and --proto keeps a
 # redirect on https. The checks above keep a quote and a backslash out of it.
+# --disable (first, as curl requires) ignores every default curl config file, so
+# no host setting can turn on a trace, and curl's stdout is discarded as well: no
+# output of curl can carry the URL to the console.
 fetch_rc=0
 printf 'url = "%s"\n' "$WARM_SRC_URL" |
-  curl -fsS --proto '=https' --max-time 600 -o "$ARCHIVE" --config - 2>/dev/null || fetch_rc=$?
+  curl --disable -fsS --proto '=https' --max-time 600 -o "$ARCHIVE" --config - >/dev/null 2>&1 || fetch_rc=$?
 if [ "$fetch_rc" -ne 0 ]; then
   echo "WARM FAIL fetch rc=${fetch_rc}"
   exit 1

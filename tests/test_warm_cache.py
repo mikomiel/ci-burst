@@ -112,6 +112,7 @@ fi
 exit "${STUB_CLOUD_INIT_RC:-0}"
 """,
     "curl": """
+echo "$STUB_CURL_STDOUT"
 out=
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -377,7 +378,8 @@ class RefusalTests(WarmHarness, unittest.TestCase):
                 self.assertRefused(self.start(**inputs))
 
     def test_a_strip_components_value_other_than_zero_or_one_refuses(self):
-        # Only the exact text 0 or 1 passes; the empty value is the default and is covered below.
+        # Only the exact text 0 or 1 passes; an unset value defaults to 0, and an empty one is refused
+        # with the malformed inputs above.
         for value in ("2", "-1", "1 ", " 1", "x", "01", "1\n", "0x1", "1.0", "10"):
             with self.subTest(value=value):
                 self.events.write_text("", encoding="utf-8")
@@ -483,8 +485,15 @@ class FetchTests(WarmHarness, unittest.TestCase):
         self.assertEqual(len(fetches), 1)
         self.assertNotIn(SECRET_URL_TOKEN, fetches[0])
         self.assertIn("--config -", fetches[0])
+        self.assertTrue(fetches[0].startswith("curl --disable "), "no default curl config may be read")
         config = (self.stub / "curl-config").read_text(encoding="utf-8")
         self.assertEqual(config, f'url = "{SOURCE_URL}"\n')
+        self.assertNotIn(SECRET_URL_TOKEN, self.output)
+
+    def test_nothing_curl_prints_reaches_the_console(self):
+        self.extra_env = {"STUB_CURL_STDOUT": f"> GET /archive.tar.gz?token={SECRET_URL_TOKEN}"}
+        completed = self.start()
+        self.assertEqual(completed.returncode, 0, self.output)
         self.assertNotIn(SECRET_URL_TOKEN, self.output)
 
 

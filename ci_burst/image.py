@@ -107,8 +107,8 @@ def basis_digest(files, warm_commands, gate_command, script_bytes):
     return digest.hexdigest()
 
 
-def _refused(reason):
-    return {"start": False, "decision": "refused", "reason": reason, "clear_control": False}
+def _result(start, decision, reason, clear):
+    return {"start": start, "decision": decision, "reason": reason, "clear_control": clear}
 
 
 def build_decision(
@@ -136,49 +136,52 @@ def build_decision(
     ``ImageConfig``. ``last_failed_digest`` is the basis digest of the last
     failed build (``Control`` has no such field), or ``None``.
 
-    The first failing condition wins, in this order:
+    Clearing comes first and does not depend on the outcome. ``force`` clears
+    ``blocked`` and the failure cooldown. A basis digest that differs from
+    ``last_failed_digest`` clears ``blocked`` and, with it, the cooldown; with
+    no failed digest to compare, ``blocked`` stays. A digest change alone does
+    not end a cooldown of a row that is not blocked.
 
-    1. ``IMAGE_BUILD_ALREADY_ACTIVE``
-    2. ``IMAGE_DAILY_CAP``
-    3. ``IMAGE_BLOCKED``
-    4. ``IMAGE_FAILURE_COOLDOWN``
-    5. the digest equals ``pin_digest``: decision ``digest_unchanged``, which
+    Then the first failing condition wins, in the spec's order:
+
+    1. the digest equals ``pin_digest``: decision ``digest_unchanged``, which
        is an answer and not a refusal
-    6. ``IMAGE_MIN_INTERVAL``
+    2. ``IMAGE_MIN_INTERVAL``
+    3. ``IMAGE_DAILY_CAP``
+    4. ``IMAGE_FAILURE_COOLDOWN``
+    5. ``IMAGE_BLOCKED``
+    6. ``IMAGE_BUILD_ALREADY_ACTIVE``
 
-    ``force`` skips only the digest comparison and the minimum interval, and
-    clears ``blocked`` and the cooldown. It never skips a builder that is
-    already active or the daily cap. ``blocked`` also clears when ``digest``
-    differs from ``last_failed_digest``; with no failed digest to compare it
-    stays blocked. A clearing resets the cooldown with it.
+    ``force`` skips only conditions 1 and 2. It never skips the daily cap or
+    an active builder.
 
     The result is ``{"start", "decision", "reason", "clear_control"}``. The
     decision is ``start``, ``digest_unchanged`` or ``refused``, and ``reason``
-    is the code of a refusal, else ``None``. ``clear_control`` is true only
-    with ``start``, when the caller must clear ``blocked`` and the cooldown
-    (``blocked`` false, ``cooldown_until`` none) as it records the build. A
-    refusal or ``digest_unchanged`` changes nothing, and this function writes
-    no state.
+    is the code of a refusal, else ``None``. ``clear_control`` is true in every
+    outcome in which a clearing applied: the caller then clears ``blocked``
+    and the cooldown (``blocked`` false, ``cooldown_until`` none) when it
+    persists the pass, even if no build starts. ``plan`` and ``run`` without
+    ``--apply`` persist nothing. This function writes no state.
     """
-    if active:
-        return _refused("IMAGE_BUILD_ALREADY_ACTIVE")
-    if builds_last_day >= config.max_builds_per_day:
-        return _refused("IMAGE_DAILY_CAP")
-    clear = False
-    if control.blocked:
-        if not force and (last_failed_digest is None or digest == last_failed_digest):
-            return _refused("IMAGE_BLOCKED")
-        clear = True
-    elif control.cooldown_until is not None and now < control.cooldown_until:
-        if not force:
-            return _refused("IMAGE_FAILURE_COOLDOWN")
-        clear = True
+    cooling = control.cooldown_until is not None and now < control.cooldown_until
+    recovered = control.blocked and last_failed_digest is not None and digest != last_failed_digest
+    clear = (force and (control.blocked or cooling)) or recovered
+    blocked = control.blocked and not clear
+    cooling = cooling and not clear
     if not force:
         if pin_digest is not None and digest == pin_digest:
-            return {"start": False, "decision": "digest_unchanged", "reason": None, "clear_control": False}
+            return _result(False, "digest_unchanged", None, clear)
         if last_build_started_at is not None and now - last_build_started_at < config.min_build_interval_seconds:
-            return _refused("IMAGE_MIN_INTERVAL")
-    return {"start": True, "decision": "start", "reason": None, "clear_control": clear}
+            return _result(False, "refused", "IMAGE_MIN_INTERVAL", clear)
+    if builds_last_day >= config.max_builds_per_day:
+        return _result(False, "refused", "IMAGE_DAILY_CAP", clear)
+    if cooling:
+        return _result(False, "refused", "IMAGE_FAILURE_COOLDOWN", clear)
+    if blocked:
+        return _result(False, "refused", "IMAGE_BLOCKED", clear)
+    if active:
+        return _result(False, "refused", "IMAGE_BUILD_ALREADY_ACTIVE", clear)
+    return _result(True, "start", None, clear)
 
 
 def warm_exports(config, source_url, archive_sha256):

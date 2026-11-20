@@ -167,6 +167,13 @@ class Control:
     last_check_at: float | None
 
 
+@dataclass(frozen=True)
+class PinObservation:
+    pin_version: int
+    image_id: str
+    observed_at: float
+
+
 class ImageState:
     """One durable image state file. Construct, then ``connect`` before use."""
 
@@ -226,6 +233,44 @@ class ImageState:
             raise
         self._connection = connection
         return self
+
+    def connect_readonly(self):
+        """Open the file for reading only and say whether there was a file to read.
+
+        This creates nothing: no directory, no file, no lock file and no schema,
+        so a read-only command leaves the state directory as it found it. An
+        absent or empty file gives ``False`` and no connection, and the readers
+        then refuse as they do on an unopened state; a caller that wants the
+        answers of a new file supplies the defaults itself. A file at another
+        schema version is refused as ``connect`` refuses it. A write through
+        this connection fails in SQLite.
+        """
+        if self._connection is not None:
+            return True
+        if not self.path.is_file():
+            return False
+        connection = None
+        try:
+            connection = sqlite3.connect(
+                self.path.absolute().as_uri() + "?mode=ro", uri=True, timeout=5, isolation_level=None
+            )
+            connection.row_factory = sqlite3.Row
+            version = _user_version(connection)
+            if version == 0:
+                connection.close()
+                return False
+            if version != SCHEMA_VERSION:
+                raise StateRefusal("IMAGE_STATE_VERSION_UNSUPPORTED", f"schema {version}")
+        except sqlite3.DatabaseError as error:
+            if connection is not None:
+                connection.close()
+            raise StateRefusal("IMAGE_STATE_UNREADABLE", type(error).__name__) from None
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            raise
+        self._connection = connection
+        return True
 
     def close(self):
         if self._connection is not None:
@@ -378,6 +423,55 @@ class ImageState:
         """
         return self._newest_build(deployment, "candidate")
 
+    def verified_candidate(self, deployment):
+        """The newest ``candidate`` of ``deployment`` that has a ``verified_at``, or ``None``.
+
+        An orphan image is recorded as a candidate that nobody verified, and it
+        can be the newest one. A caller that needs a candidate that is fit to
+        protect or to promote asks here, not at ``candidate``.
+        """
+        row = (
+            self._require()
+            .execute(
+                "SELECT * FROM image_builds WHERE deployment = ? AND state = 'candidate'"
+                " AND verified_at IS NOT NULL ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (deployment,),
+            )
+            .fetchone()
+        )
+        return _build(row) if row else None
+
+    def insert_orphan(self, *, build_id, deployment, basis_digest, source_sha, image_id, created_at, reason_code):
+        """Record an image that has no build row as a ``candidate`` that nobody verified.
+
+        ``build_id`` is the id the image's tags name, so the same image is never
+        recorded twice. ``created_at`` is the provider's creation time of the
+        image (``0.0`` when it gave none): the row must not look like a build that
+        started now, because the daily cap and the minimum interval count the
+        start times of rows. The row is not active, so it cannot meet the
+        ``one_active`` index, and ``verified_at`` stays empty, so nothing treats
+        it as verified. The client token is derived from the id and cannot meet
+        the token of a real build.
+        """
+        now = self._clock()
+        values = {
+            "id": build_id,
+            "deployment": deployment,
+            "client_token": f"orphan:{build_id}",
+            "basis_digest": basis_digest,
+            "source_sha": source_sha,
+            "image_id": image_id,
+            "state": "candidate",
+            "reason_code": reason_code,
+            "created_at": created_at,
+            "updated_at": now,
+            "deadline_at": created_at,
+        }
+        columns = ", ".join(values)
+        marks = ", ".join("?" for _ in values)
+        self._require().execute(f"INSERT INTO image_builds ({columns}) VALUES ({marks})", tuple(values.values()))
+        return self.build(build_id)
+
     def _newest_build(self, deployment, state=None):
         clause, arguments = ("", (deployment,)) if state is None else (" AND state = ?", (deployment, state))
         row = (
@@ -459,6 +553,37 @@ class ImageState:
         """Every ``pending`` row, oldest first."""
         rows = self._require().execute("SELECT * FROM promotion_journal WHERE status = 'pending' ORDER BY id")
         return [Journal(**dict(row)) for row in rows]
+
+    def journal_last_complete(self):
+        """The newest ``complete`` row of either kind, or ``None``: its ``old_pin`` is the pin it replaced."""
+        row = (
+            self._require()
+            .execute("SELECT * FROM promotion_journal WHERE status = 'complete' ORDER BY id DESC LIMIT 1")
+            .fetchone()
+        )
+        return Journal(**dict(row)) if row else None
+
+    # -- observed pins ----------------------------------------------------
+    def pin_last(self):
+        """The newest pin observation, or ``None`` before the first."""
+        row = self._require().execute("SELECT * FROM pin_log ORDER BY id DESC LIMIT 1").fetchone()
+        return PinObservation(row["pin_version"], row["image_id"], row["observed_at"]) if row else None
+
+    def pin_observe(self, pin_version, image_id):
+        """Log that the pin ``pin_version`` names ``image_id``, unless the newest row already says so.
+
+        The log records changes, not passes, so it stays as short as the pin's
+        history. The result is true when a row was added.
+        """
+        with self.transaction() as connection:
+            last = self.pin_last()
+            if last is not None and (last.pin_version, last.image_id) == (pin_version, image_id):
+                return False
+            connection.execute(
+                "INSERT INTO pin_log (pin_version, image_id, observed_at) VALUES (?, ?, ?)",
+                (pin_version, image_id, self._clock()),
+            )
+            return True
 
     # -- control --------------------------------------------------------
     def control_get(self):

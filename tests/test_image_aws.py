@@ -35,7 +35,7 @@ import traceback
 import types
 import unittest
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from unittest import mock
 
@@ -2680,6 +2680,30 @@ class RealSdkCredentialFailureTests(RealSdkCase):
             self.assertNotIn(sentinel, text)
 
 
+class NoOffsetZone(tzinfo):
+    """A zone that cannot say its offset: ``datetime.utcoffset()`` is ``None``.
+
+    The datetime has a ``tzinfo``, yet it is not aware, and ``timestamp()``
+    raises ``TypeError`` for it.
+    """
+
+    def utcoffset(self, moment):
+        return None
+
+    def dst(self, moment):
+        return None
+
+    def tzname(self, moment):
+        return None
+
+
+class MalformedOffsetZone(NoOffsetZone):
+    """A zone whose offset is not a ``timedelta``: ``utcoffset()`` raises ``TypeError``."""
+
+    def utcoffset(self, moment):
+        return 3600
+
+
 class CreationTimeTests(Base):
     """An image's ``CreationDate`` and a snapshot's ``StartTime`` become ``created_at``.
 
@@ -2744,6 +2768,30 @@ class CreationTimeTests(Base):
                 self.ec2.snapshots_store.clear()
                 self.assertIsNone(self.image_created_at(CreationDate=value))
                 self.assertIsNone(self.snapshot_created_at(StartTime=value))
+
+    def test_a_zone_without_a_usable_offset_is_not_a_proven_time(self):
+        for zone in (NoOffsetZone(), MalformedOffsetZone()):
+            moment = datetime(2026, 1, 2, 3, 4, 5, tzinfo=zone)
+            self.assertIsNotNone(moment.tzinfo)
+            with self.subTest(zone=type(zone).__name__):
+                self.ec2.images_store.clear()
+                self.ec2.snapshots_store.clear()
+                self.assertIsNone(self.image_created_at(CreationDate=moment))
+                self.assertIsNone(self.snapshot_created_at(StartTime=moment))
+
+    def test_a_zone_without_a_usable_offset_does_not_refuse_the_listing(self):
+        for zone in (NoOffsetZone(), MalformedOffsetZone()):
+            with self.subTest(zone=type(zone).__name__):
+                self.ec2.snapshots_store.clear()
+                for snapshot_id, start_time in (
+                    ("snap-0123456789abcdef0", datetime(2026, 1, 2, 3, 4, 5, tzinfo=zone)),
+                    ("snap-0123456789abcdef1", self.MOMENT),
+                ):
+                    self.ec2.snapshots_store.append(
+                        {"SnapshotId": snapshot_id, "State": "completed", "Tags": self.TAGS, "StartTime": start_time}
+                    )
+                snapshots = self.image_aws().snapshots(DEPLOYMENT)
+                self.assertEqual([snapshot.created_at for snapshot in snapshots], [None, self.MOMENT.timestamp()])
 
     def test_a_time_that_cannot_be_read_does_not_refuse_the_listing(self):
         self.ec2.images_store.append(

@@ -20,16 +20,28 @@ and snapshot, and says what each path would remove. ``apply_deletions`` carries
 a plan out only when told to: it deregisters an image, reads the image back, and
 deletes the image's snapshots only once the deregistration is confirmed.
 
+Each step refuses to run on input that did not come from the step before it,
+with the same code. Only ``protected_set`` can build a ``ProtectedSet`` (the
+constructor refuses every other attempt, an empty set included),
+``plan_deletions`` refuses any other value, and ``apply_deletions`` refuses a
+plan item that ``plan_deletions`` did not make or that was changed afterwards.
+These checks stop a caller that skips a step or hands over a made-up result.
+They do not stop code that reaches into this module's private names, or that
+rewrites an object's attributes with ``object.__setattr__``.
+
 A usable build (``candidate`` or ``promoted``) is left to retention unless its
-row records ``TEMPLATE_DRIFT``. An active build (``building`` or ``imaging``) is
-never selected by any path, so a build that timed out is marked failed first and
+row records ``TEMPLATE_DRIFT``. The current candidate is protected by id only
+while its row does not record it, so a drifted candidate is cleaned up like any
+other drifted build. An active build (``building`` or ``imaging``) is never
+selected by any path, so a build that timed out is marked failed first and
 cleaned by the next call.
 
 The module logs nothing and holds no state. A plan and a report carry ids, build
 ids and stable codes, never a tag value other than those or a provider message.
 """
 
-from dataclasses import dataclass
+import copy
+from dataclasses import InitVar, dataclass, field
 
 from .aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
 from .config import load
@@ -75,20 +87,47 @@ SNAPSHOT_KEPT = "snapshot_kept"
 
 _DEREGISTERED_STATE = "deregistered"
 
+#: What only ``protected_set`` hands to ``ProtectedSet``. The constructor checks
+#: it when a set is built and ``plan_deletions`` checks the mark it leaves, so a
+#: set made any other way is refused.
+_PROVENANCE = object()
+
 
 @dataclass(frozen=True)
 class ProtectedSet:
     """The image ids that no deletion path may remove.
 
-    Only ``protected_set`` builds one. ``plan_deletions`` refuses anything else,
-    so a caller cannot plan a deletion after the resolution failed by passing an
-    empty set.
+    Only ``protected_set`` can build one. The constructor refuses, with
+    ``IMAGE_DELETION_UNSAFE``, a set that does not come with the module's own
+    proof and an empty set, so ``ProtectedSet(frozenset())`` and a hand-built set
+    fail, and so does every ``dataclasses.replace`` copy, with or without other
+    images. A resolved set is never empty: it holds at least the image of the
+    ``[aws]`` pin. ``plan_deletions`` checks the mark that a resolved set carries
+    as well, so a set that skipped the constructor (``object.__new__``, or a
+    subclass whose ``__post_init__`` checks nothing) is refused there. So is a
+    ``copy.deepcopy`` or a pickle round trip of a resolved set, which loses the
+    mark; ``copy.copy`` keeps it.
+
+    The proof is an init-only value that is not stored, and the mark is a stored
+    field that takes no part in equality, hash or text.
     """
 
     image_ids: frozenset
+    _proof: InitVar[object] = None
+    _resolved: object = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self, proof):
+        if proof is not _PROVENANCE or not isinstance(self.image_ids, frozenset) or not self.image_ids:
+            raise _unsafe("the protected set was not resolved")
+        object.__setattr__(self, "_resolved", _PROVENANCE)
 
     def __contains__(self, image_id):
         return image_id in self.image_ids
+
+
+def _is_resolved(protected):
+    """Whether ``protected`` is a non-empty set that ``protected_set`` resolved."""
+    return isinstance(protected, ProtectedSet) and protected._resolved is _PROVENANCE and bool(protected.image_ids)
 
 
 def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate, active, deadline=None):
@@ -106,7 +145,12 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
     - the image of ``candidate`` and of ``active``, the current candidate and the
       active build (each a build row or ``None``; a row with no image yet
       protects nothing by id, and ``plan_deletions`` never selects an active
-      build's image either way).
+      build's image either way). A candidate whose row records
+      ``TEMPLATE_DRIFT`` (in ``reason_code`` or ``drift_result``) is the one
+      exception: its version is unusable, so it is not protected by being the
+      candidate, and the ``failed`` path removes its image once the 24-hour hold
+      has passed. Any pin that names the same image still protects it. The
+      active build is protected whatever its row records.
 
     ``config_path`` is the deployment file. Every call loads it again, so a pin
     written after the caller's own load is seen. A pending journal row protects
@@ -120,9 +164,9 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
     exactly the pinned versions, when a version cannot be read, or when a version
     names no literal image (an alias that resolves later says which image is in
     use only at launch). Then no path may delete anything: ``plan_deletions``
-    cannot be called without the result. A refusal of the deadline passes
-    unchanged. The detail names a version number at most, never a provider
-    message.
+    cannot be called without the result, and no other way to make one exists
+    (see ``ProtectedSet``). A refusal of the deadline passes unchanged. The
+    detail names a version number at most, never a provider message.
     """
     try:
         config = load(config_path)
@@ -151,10 +195,11 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
         if not isinstance(image_id, str) or not image_id.startswith("ami-"):
             raise _unsafe(f"version {version.version} does not name a literal image")
         image_ids.add(image_id)
-    for build in (candidate, active):
-        if build is not None and build.image_id is not None:
-            image_ids.add(build.image_id)
-    return ProtectedSet(frozenset(image_ids))
+    if candidate is not None and candidate.image_id is not None and not _drifted(candidate):
+        image_ids.add(candidate.image_id)
+    if active is not None and active.image_id is not None:
+        image_ids.add(active.image_id)
+    return ProtectedSet(frozenset(image_ids), _PROVENANCE)
 
 
 def plan_deletions(images, snapshots, protected, *, deployment, mode, now, config, builds):
@@ -165,7 +210,10 @@ def plan_deletions(images, snapshots, protected, *, deployment, mode, now, confi
     seconds, ``config`` the enabled ``ImageConfig`` (read only for
     ``retention``) and ``builds`` every build row of the deployment
     (``ImageState.builds``). ``mode`` is ``"all"``, one path name or a collection
-    of path names; anything else is a ``ValueError``.
+    of path names; anything else is a ``ValueError``. Any ``protected`` that
+    ``protected_set`` did not resolve (anything that is not a ``ProtectedSet``,
+    an empty set, or one made by hand) is refused with ``IMAGE_DELETION_UNSAFE``
+    before anything is read.
 
     An image or snapshot is the module's to remove only when its tags show the
     image-build marker ``"true"``, this ``deployment`` and a build id. An image in
@@ -203,9 +251,15 @@ def plan_deletions(images, snapshots, protected, *, deployment, mode, now, confi
     ``build_id``, ``action`` (``deregister``, ``delete_snapshot`` or ``skip``),
     ``reason`` (the skip reason, else ``None``), ``snapshot_ids`` (the verified
     snapshots the item covers) and ``skipped_snapshots`` (``snapshot_id`` and
-    ``reason`` of each snapshot of the image that is not verified).
+    ``reason`` of each snapshot of the image that is not verified). An item is a
+    ``dict`` in every use (equality, JSON, text) and also remembers what was
+    decided, so ``apply_deletions`` can refuse an item that was built by hand or
+    changed afterwards. The list itself can be filtered, copied or emptied, and
+    an item survives ``copy.copy`` and ``copy.deepcopy``. ``dict(item)``,
+    ``item.copy()`` and a JSON round trip give plain dicts, which
+    ``apply_deletions`` refuses.
     """
-    if not isinstance(protected, ProtectedSet):
+    if not _is_resolved(protected):
         raise _unsafe("the protected set was not resolved")
     paths = _paths(mode)
     if RETENTION in paths and not _limits(config):
@@ -263,8 +317,16 @@ def apply_deletions(aws, plan, *, apply):
     with the next item. A refused snapshot deletion is reported the same way. Only
     a provider refusal is reported: any other error propagates and stops the run.
 
-    This runs exactly the items it is given. Ownership and protection were
-    decided by ``plan_deletions``, and nothing here checks them again.
+    Ownership and protection were decided by ``plan_deletions``, and nothing
+    here decides them again. Instead, before any call (a dry run included), every
+    item is checked: it must be an item ``plan_deletions`` made, unchanged since
+    (a plain ``dict``, or one that was edited, is not), with one of the actions
+    ``deregister``, ``delete_snapshot`` or ``skip``. If one item fails, or
+    ``plan`` is not an iterable of items, the whole plan is refused with
+    ``IMAGE_DELETION_UNSAFE``, nothing runs, and the detail names no id. An empty
+    plan, a filtered list, a copied list and ``copy.copy`` or ``copy.deepcopy`` of
+    the items are fine. A plain ``dict`` copy of an item (``dict(item)``,
+    ``item.copy()``, or a JSON round trip of the plan) is refused.
 
     The report is a flat list of rows, each with ``path``, ``image_id``,
     ``action`` and ``result``, and ``snapshot_id``, ``reason`` (a skip's) or
@@ -275,10 +337,12 @@ def apply_deletions(aws, plan, *, apply):
     deregistration was not confirmed).
     """
     report = []
-    for item in plan:
+    for item in _decided_items(plan):
         if item["action"] == SKIP:
             report.append(_row(item, SKIP, SKIPPED, reason=item["reason"]))
             continue
+        # What is left is ``deregister`` or ``delete_snapshot`` (a snapshot that no
+        # image references, deleted with no deregistration before it).
         confirmed = True
         if item["action"] == DEREGISTER:
             if apply:
@@ -306,6 +370,45 @@ def _unsafe(detail):
     return ImageRefusal(IMAGE_DELETION_UNSAFE, detail)
 
 
+class _PlanItem(dict):
+    """A plan item: a plain ``dict`` that also keeps a copy of what was decided.
+
+    ``plan_deletions`` makes these and ``apply_deletions`` runs nothing else. The
+    copy is deep, so editing the item, or a list inside it, after the decision
+    makes the item differ from it.
+    """
+
+    __slots__ = ("_decided",)
+
+    def unchanged(self):
+        decided = getattr(self, "_decided", None)
+        return decided is not None and dict(self) == decided
+
+
+#: The actions ``apply_deletions`` knows. A tuple, so an item whose action is an
+#: unhashable value is refused like any other unknown one.
+_ACTIONS = (DEREGISTER, DELETE_SNAPSHOT, SKIP)
+
+
+def _decided_items(plan):
+    """The items of ``plan``, once every one is shown to be as ``plan_deletions`` made it.
+
+    Every item is checked before any is run: one bad item refuses the whole plan.
+    """
+    try:
+        items = list(plan)
+    except TypeError:
+        raise _unsafe("the plan was not made by plan_deletions") from None
+    for item in items:
+        if not isinstance(item, _PlanItem):
+            raise _unsafe("the plan was not made by plan_deletions")
+        if item.get("action") not in _ACTIONS:
+            raise _unsafe("a plan item has an action that is not known")
+        if not item.unchanged():
+            raise _unsafe("a plan item was changed after plan_deletions made it")
+    return items
+
+
 def _paths(mode):
     if mode == "all":
         return set(PATHS)
@@ -330,6 +433,11 @@ def _owner(item, deployment):
     return build_id if owned and isinstance(build_id, str) and build_id else None
 
 
+def _drifted(row):
+    """Whether the build's row records ``TEMPLATE_DRIFT``, in ``reason_code`` or ``drift_result``."""
+    return TEMPLATE_DRIFT in (row.reason_code, row.drift_result)
+
+
 def _target(row, image_state):
     """The path that takes an item of this build and the age it must exceed first.
 
@@ -338,7 +446,7 @@ def _target(row, image_state):
     """
     if row is None:
         return ORPHAN, ORPHAN_AGE_SECONDS
-    if TEMPLATE_DRIFT in (row.reason_code, row.drift_result):
+    if _drifted(row):
         return FAILED, DRIFT_HOLD_SECONDS
     if row.state == "failed":
         return (PENDING_TIMEOUT if image_state == "pending" else FAILED), None
@@ -372,15 +480,17 @@ def _item(path, image_id, build_id, verdict, snapshot_ids, skipped_snapshots, *,
         action = SKIP
     else:
         action = DELETE_SNAPSHOT if lone else DEREGISTER
-    return {
-        "path": path,
-        "image_id": image_id,
-        "build_id": build_id,
-        "action": action,
-        "reason": verdict,
-        "snapshot_ids": snapshot_ids,
-        "skipped_snapshots": skipped_snapshots,
-    }
+    item = _PlanItem(
+        path=path,
+        image_id=image_id,
+        build_id=build_id,
+        action=action,
+        reason=verdict,
+        snapshot_ids=snapshot_ids,
+        skipped_snapshots=skipped_snapshots,
+    )
+    item._decided = copy.deepcopy(dict(item))
+    return item
 
 
 def _deregister(aws, image_id):

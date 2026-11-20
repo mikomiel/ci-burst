@@ -13,6 +13,7 @@ as a call on the fake.
 """
 
 import collections
+import copy
 import dataclasses
 import json
 import tempfile
@@ -129,6 +130,24 @@ def owner_tags(build_id="build-lost", deployment=DEPLOYMENT):
     if build_id is not None:
         tags[BUILD_ID_TAG] = build_id
     return tags
+
+
+#: The two places a build row records ``TEMPLATE_DRIFT``.
+DRIFT_ROWS = ({"reason_code": "TEMPLATE_DRIFT"}, {"drift_result": "TEMPLATE_DRIFT"})
+
+
+def forged_set(image_ids):
+    """A ``ProtectedSet`` that skipped its constructor, as ``object.__new__`` or a copy could make one."""
+    forged = object.__new__(ProtectedSet)
+    object.__setattr__(forged, "image_ids", frozenset(image_ids))
+    return forged
+
+
+class UncheckedSet(ProtectedSet):
+    """A subclass whose constructor checks nothing, so its instances get past ``__post_init__``."""
+
+    def __post_init__(self, _proof):
+        pass
 
 
 class DeletionCase(unittest.TestCase):
@@ -367,10 +386,77 @@ class ProtectedSetTests(DeletionCase):
     def test_a_missing_candidate_or_active_build_is_fine(self):
         self.assertEqual(self.resolve(candidate=None, active=None).image_ids, {PIN_IMAGE})
 
+    def test_a_candidate_whose_row_records_template_drift_protects_nothing_by_itself(self):
+        for row in DRIFT_ROWS:
+            with self.subTest(row=row):
+                drifted = self.make_build("build-cand", "candidate", image_id=CANDIDATE_IMAGE, **row)
+                self.assertNotIn(CANDIDATE_IMAGE, self.resolve(candidate=drifted))
+                self.assertEqual(self.resolve(candidate=drifted).image_ids, {PIN_IMAGE})
+
+    def test_a_candidate_without_drift_still_protects_its_image(self):
+        clean = self.make_build("build-cand", "candidate", image_id=CANDIDATE_IMAGE, drift_result="clean")
+        self.assertIn(CANDIDATE_IMAGE, self.resolve(candidate=clean))
+
+    def test_a_drifted_candidate_leaves_an_image_that_another_source_pins_protected(self):
+        drifted = self.make_build("build-cand", "candidate", image_id=PREVIOUS_IMAGE, drift_result="TEMPLATE_DRIFT")
+        protected = self.resolve(previous_pin=PREVIOUS, candidate=drifted)
+        self.assertEqual(protected.image_ids, {PIN_IMAGE, PREVIOUS_IMAGE})
+
+    def test_only_the_candidate_is_released_by_a_drift_mark(self):
+        drifted = self.make_build("build-active", "imaging", image_id=ACTIVE_IMAGE, reason_code="TEMPLATE_DRIFT")
+        self.assertIn(ACTIVE_IMAGE, self.resolve(active=drifted))
+
     def test_the_set_is_immutable(self):
         protected = self.resolve()
         with self.assertRaises(dataclasses.FrozenInstanceError):
             protected.image_ids = frozenset()
+
+
+class ProtectedSetConstructionTests(DeletionCase):
+    """Only ``protected_set`` can make a set, so no caller can fake a resolution."""
+
+    def refused(self, build):
+        with self.assertRaises(ImageRefusal) as raised:
+            build()
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        return raised.exception
+
+    def test_the_constructor_refuses_a_set_that_protected_set_did_not_resolve(self):
+        for name, build in (
+            ("an empty set", lambda: ProtectedSet(frozenset())),
+            ("a set naming the pinned image", lambda: ProtectedSet(frozenset({PIN_IMAGE}))),
+            ("an empty set with a made-up proof", lambda: ProtectedSet(frozenset(), object())),
+            ("a set with a made-up proof", lambda: ProtectedSet(frozenset({PIN_IMAGE}), object())),
+            ("a set with a proof that is only a name", lambda: ProtectedSet(frozenset({PIN_IMAGE}), "protected_set")),
+            ("a plain set", lambda: ProtectedSet({PIN_IMAGE})),
+            ("nothing", lambda: ProtectedSet(None)),
+        ):
+            with self.subTest(name):
+                refusal = self.refused(build)
+                self.assertNotIn(PIN_IMAGE, refusal.detail)
+
+    def test_the_proof_does_not_make_an_empty_set_valid(self):
+        # White box: with the module's own proof, only the rule against an empty set is left to refuse.
+        for empty in (frozenset(), set(), (), None):
+            with self.subTest(empty=empty):
+                self.refused(lambda: ProtectedSet(empty, image_deletion._PROVENANCE))
+
+    def test_a_resolved_set_cannot_be_rebuilt_with_other_images(self):
+        resolved = self.resolve(previous_pin=PREVIOUS)
+        for name, changes in (
+            ("no image", {"image_ids": frozenset()}),
+            ("another image", {"image_ids": frozenset({ami(0xFF)})}),
+            ("the pinned image dropped", {"image_ids": resolved.image_ids - {PIN_IMAGE}}),
+        ):
+            with self.subTest(name):
+                self.refused(lambda: dataclasses.replace(resolved, **changes))
+
+    def test_a_resolved_set_keeps_its_equality_hash_and_text(self):
+        first, second = self.resolve(), self.resolve()
+        self.assertEqual(first, second)
+        self.assertEqual(hash(first), hash(second))
+        self.assertEqual(repr(first), f"ProtectedSet(image_ids=frozenset({{{PIN_IMAGE!r}}}))")
+        self.assertEqual(self.plan("all", protected=first), [])
 
 
 class ProtectedSetRefusalTests(DeletionCase):
@@ -576,6 +662,10 @@ class FailClosedTests(DeletionCase):
             ("a list of ids", [PIN_IMAGE]),
             ("a mapping", {PIN_IMAGE: True}),
             ("a string", PIN_IMAGE),
+            # Past the constructor's own refusal: only plan_deletions can still stop these.
+            ("an empty set that skipped the constructor", forged_set(())),
+            ("a set naming the pin that skipped the constructor", forged_set({PIN_IMAGE})),
+            ("a subclass whose constructor checks nothing", UncheckedSet(frozenset({PIN_IMAGE}))),
         ):
             with self.subTest(name):
                 with self.assertRaises(ImageRefusal) as raised:
@@ -590,6 +680,43 @@ class FailClosedTests(DeletionCase):
                         builds=self.rows,
                     )
                 self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertEqual(self.mutations(), [])
+
+    def test_a_set_built_by_hand_cannot_reach_a_plan(self):
+        """The set is built inside the call, so the constructor's refusal and the plan's both count."""
+        self.world()
+        resolved = self.resolve()
+        for name, build in (
+            ("ProtectedSet(frozenset())", lambda: ProtectedSet(frozenset())),
+            ("a hand-built set naming the pin", lambda: ProtectedSet(frozenset({PIN_IMAGE}))),
+            ("a hand-built set naming other images", lambda: ProtectedSet(frozenset({ami(0xFE), ami(0xFF)}))),
+            ("a resolved set rebuilt without images", lambda: dataclasses.replace(resolved, image_ids=frozenset())),
+            ("a resolved set rebuilt without the pin", lambda: dataclasses.replace(resolved, image_ids=frozenset({ami(0xFF)}))),
+        ):
+            with self.subTest(name):
+                with self.assertRaises(ImageRefusal) as raised:
+                    plan_deletions(
+                        self.images(),
+                        self.snapshots(),
+                        build(),
+                        deployment=DEPLOYMENT,
+                        mode="all",
+                        now=NOW,
+                        config=self.config,
+                        builds=self.rows,
+                    )
+                self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertEqual(self.mutations(), [])
+
+    def test_a_pinned_image_is_never_planned_for_deregistration_through_a_made_up_set(self):
+        # The harm the guard exists for: an old, tagged image that only its pin protects.
+        self.world()
+        self.add_image(PIN_IMAGE, "build-lost", age=30 * DAY)
+        self.assertEqual(self.summary(self.plan("orphan")), [("orphan", "deregister", ami(3), None), ("orphan", "skip", PIN_IMAGE, "protected")])
+        for forged in (forged_set(()), forged_set({ami(0xFF)}), UncheckedSet(frozenset({ami(0xFF)}))):
+            with self.subTest(forged=type(forged).__name__, ids=sorted(forged.image_ids)):
+                with self.assertRaises(ImageRefusal):
+                    self.plan("orphan", protected=forged)
         self.assertEqual(self.mutations(), [])
 
 
@@ -799,6 +926,48 @@ class FailedPathTests(DeletionCase):
         self.made(14, "candidate", age=20 * DAY, drift_result="TEMPLATE_DRIFT")
         self.assertEqual(self.plan("retention"), [])
         self.assertEqual(self.summary(self.plan("all")), [("failed", "deregister", ami(14), None)])
+
+    def current_candidate(self, made):
+        """The stored row of ``made`` as the state file reports the current candidate: with its image recorded."""
+        (row,) = self.rows
+        return dataclasses.replace(row, image_id=made.image_id)
+
+    def test_the_current_candidate_that_recorded_drift_is_cleaned_up_after_24_hours(self):
+        # The state file reports a drifted build as the current candidate, because its state stays ``candidate``.
+        for row in DRIFT_ROWS:
+            for age, expected in (
+                (HOUR, ("failed", "skip", ami(1), "too_young")),
+                (DAY, ("failed", "skip", ami(1), "too_young")),
+                (DAY + 1, ("failed", "deregister", ami(1), None)),
+                (30 * DAY, ("failed", "deregister", ami(1), None)),
+            ):
+                with self.subTest(row=row, age=age):
+                    self.reset()
+                    made = self.made(1, "candidate", age=age, **row)
+                    current = self.current_candidate(made)
+                    self.assertEqual(current.image_id, made.image_id)
+                    self.assertNotIn(made.image_id, self.resolve(candidate=current))
+                    self.assertEqual(self.summary(self.plan("all", candidate=current)), [expected])
+
+    def test_the_drifted_current_candidate_is_removed_with_its_snapshot_once_it_is_old_enough(self):
+        made = self.made(1, "candidate", age=DAY + 1, drift_result="TEMPLATE_DRIFT")
+        current = self.current_candidate(made)
+        report = apply_deletions(self.aws, self.plan("all", candidate=current), apply=True)
+        self.assertEqual(self.results(report), [("deregister", "deregistered"), ("delete_snapshot", "snapshot_deleted")])
+        self.assertEqual((self.stored_images(), self.stored_snapshots()), (set(), set()))
+
+    def test_the_drifted_current_candidate_is_untouched_while_it_is_held(self):
+        made = self.made(1, "candidate", age=23 * HOUR, reason_code="TEMPLATE_DRIFT")
+        current = self.current_candidate(made)
+        report = self.run_paths("all", candidate=current)
+        self.assertEqual(report, [{"path": "failed", "image_id": made.image_id, "action": "skip", "result": "skipped", "reason": "too_young"}])
+        self.assertEqual(self.mutations(), [])
+
+    def test_the_current_candidate_without_drift_is_never_cleaned_up(self):
+        made = self.made(1, "candidate", age=30 * DAY)
+        current = self.current_candidate(made)
+        self.assertEqual(self.plan("all", candidate=current), [])
+        self.assertIn(made.image_id, self.resolve(candidate=current))
 
 
 class OrphanPathTests(DeletionCase):
@@ -1393,6 +1562,113 @@ class ApplyTests(DeletionCase):
             for marker in SENTINELS:
                 self.assertNotIn(marker, text)
             self.assertNotIn("WARM_FAILED", text)
+
+
+class PlanProvenanceTests(DeletionCase):
+    """``apply_deletions`` runs only what ``plan_deletions`` decided, as decided, and checks that before any call."""
+
+    def world(self):
+        """A new account: two failed builds to remove and an old tagged image that only its pin keeps.
+
+        Returns the plan: the two failed images (indexes 0 and 1), then the skip item for the pinned image (index 2).
+        """
+        self.reset()
+        self.made(1, "failed")
+        self.made(2, "failed")
+        self.add_image(PIN_IMAGE, "build-lost", age=30 * DAY)
+        plan = self.plan("all")
+        self.assertEqual(
+            self.summary(plan),
+            [
+                ("failed", "deregister", ami(1), None),
+                ("failed", "deregister", ami(2), None),
+                ("orphan", "skip", PIN_IMAGE, "protected"),
+            ],
+        )
+        del self.calls[:]
+        return plan
+
+    def refused(self, plan, *, apply):
+        with self.assertRaises(ImageRefusal) as raised:
+            apply_deletions(self.aws, plan, apply=apply)
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertNotIn("ami-", raised.exception.detail)
+        # Nothing ran, not even a read, and nothing was removed.
+        self.assertEqual(self.calls, [])
+        self.assertLessEqual({PIN_IMAGE, ami(1), ami(2), snap(1), snap(2)}, self.stored_images() | self.stored_snapshots())
+
+    def test_a_plan_that_plan_deletions_did_not_make_is_refused_before_any_call(self):
+        decided = self.world()
+        unprotected = dict(decided[2], action="deregister", reason=None)
+        for name, plan in (
+            ("a hand-built item for the pinned image", [unprotected]),
+            ("plain copies of decided items", [dict(item) for item in decided]),
+            ("a decided item, then a hand-built one", [decided[0], decided[1], unprotected]),
+            ("a hand-built item, then decided ones", [unprotected, decided[0], decided[1]]),
+            ("image ids", [ami(1)]),
+            ("a string", "deregister"),
+            ("one item in place of the plan", decided[0]),
+            ("nothing", None),
+        ):
+            for apply in (True, False):
+                with self.subTest(name, apply=apply):
+                    self.refused(plan, apply=apply)
+
+    def test_an_item_edited_after_planning_is_refused_before_any_call(self):
+        for name, edit in (
+            ("a protected skip turned into a deregistration", lambda plan: plan[2].update(action="deregister", reason=None)),
+            ("a decided item pointed at the pinned image", lambda plan: plan[0].update(image_id=PIN_IMAGE)),
+            ("a snapshot added to an item", lambda plan: plan[0]["snapshot_ids"].append(snap(99))),
+            ("a key removed", lambda plan: plan[0].pop("snapshot_ids")),
+            ("a key added", lambda plan: plan[0].update(note="x")),
+            ("a path changed", lambda plan: plan[0].update(path="retention")),
+            ("a skipped snapshot listed", lambda plan: plan[2]["skipped_snapshots"].append({"snapshot_id": snap(99), "reason": "x"})),
+        ):
+            for apply in (True, False):
+                with self.subTest(name, apply=apply):
+                    plan = self.world()
+                    edit(plan)
+                    self.refused(plan, apply=apply)
+
+    def test_an_item_with_an_action_that_is_not_known_is_refused_and_nothing_runs(self):
+        for action in ("purge", "", None, "DEREGISTER", "delete_snapshots", 7, ["deregister"]):
+            for apply in (True, False):
+                with self.subTest(action=action, apply=apply):
+                    plan = self.world()
+                    plan[1]["action"] = action  # not the first item: the item before it must not run either
+                    self.refused(plan, apply=apply)
+        plan = self.world()
+        del plan[1]["action"]
+        self.refused(plan, apply=True)
+
+    def test_an_unknown_action_does_not_fall_through_to_a_snapshot_deletion(self):
+        plan = self.world()
+        plan[0]["action"] = "purge"
+        with self.assertRaises(ImageRefusal):
+            apply_deletions(self.aws, plan, apply=True)
+        self.assertEqual(self.requests("delete_snapshot"), [])
+        self.assertEqual(self.stored_snapshots(), {snap(1), snap(2)})
+
+    def test_a_plan_of_decided_items_is_accepted_whole_filtered_empty_or_copied(self):
+        decided = self.world()
+        only_second = [item for item in decided if item["image_id"] == ami(2)]
+        report = apply_deletions(self.aws, only_second, apply=True)
+        self.assertEqual(self.results(report), [("deregister", "deregistered"), ("delete_snapshot", "snapshot_deleted")])
+        self.assertEqual(self.requests("deregister_image"), [{"ImageId": ami(2)}])
+        for plan in ([], (), iter(())):
+            self.assertEqual(apply_deletions(self.aws, plan, apply=True), [])
+        for name, plan in (("a copy", copy.copy(decided)), ("a deep copy", copy.deepcopy(decided)), ("a tuple", tuple(decided))):
+            with self.subTest(name):
+                self.assertEqual({row["result"] for row in apply_deletions(self.aws, plan, apply=False)}, {"planned", "skipped"})
+
+    def test_a_plan_is_still_a_list_of_dicts_that_serializes_unchanged(self):
+        plan = self.world()
+        self.assertIs(type(plan), list)
+        self.assertTrue(all(isinstance(item, dict) for item in plan))
+        self.assertEqual(plan, [dict(item) for item in plan])
+        self.assertEqual(json.loads(json.dumps(plan)), [dict(item) for item in plan])
+        self.assertEqual(repr(plan), repr([dict(item) for item in plan]))
+        self.assertEqual(set(plan[0]), {"path", "image_id", "build_id", "action", "reason", "snapshot_ids", "skipped_snapshots"})
 
 
 class CodeTests(unittest.TestCase):

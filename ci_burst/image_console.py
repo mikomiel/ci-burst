@@ -10,10 +10,14 @@ marker can be trusted only where it stands alone at column 0.
 ``export``. It splits on a line feed and nothing else (``str.splitlines`` also
 splits on a lone carriage return, form feed, NEL and the Unicode separators, and
 a consumer could use any of them to start a line of its own), strips one
-trailing carriage return, and accepts only a whole line that equals a marker. A
-framed, indented, prefixed or mid-line marker never counts. The script tees its
-output to the serial console, so a line usually appears twice; a repeated line
-changes nothing.
+trailing carriage return, and accepts only a whole line that equals a marker (a
+failure marker may carry detail after it). A framed, indented, prefixed or
+mid-line marker never counts. The script tees its output to the serial console,
+so a line usually appears twice; a repeated line changes nothing.
+
+The console keeps only its last 64 KiB and a read can end inside the last line,
+so a failure line can arrive without its detail. ``WARM FAIL`` alone on a line is
+therefore a failure marker, like ``WARM FAIL`` followed by a space and detail.
 
 Nothing here logs, and nothing here reads or writes state: the caller passes in
 the console text and the staged archive digest and acts on the outcome. No
@@ -49,7 +53,8 @@ DEFAULT_TAIL_BYTES = 4096
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _DIGEST_LINE = re.compile(r"WARM_SOURCE_SHA256 ([0-9a-f]{64})")
 _READY_LINE = "IMAGE_READY"
-_FAILURE_PREFIXES = ("WARM FAIL ", "warm exiting rc=")
+_FAILURE_LINE = "WARM FAIL"
+_FAILURE_PREFIXES = (_FAILURE_LINE + " ", "warm exiting rc=")
 
 _REASONS = {FAILED: WARM_FAILED, MISMATCH: IMAGE_MARKER_DIGEST_MISMATCH}
 
@@ -69,6 +74,11 @@ def _lines(text):
         yield line[:-1] if line.endswith("\r") else line
 
 
+def _is_failure(line):
+    """Whether the line is ``WARM FAIL`` alone, or starts with ``WARM FAIL `` or ``warm exiting rc=``."""
+    return line == _FAILURE_LINE or line.startswith(_FAILURE_PREFIXES)
+
+
 def read_marker(console_text, expected_archive_sha256):
     """Read the console and say what the build has shown so far.
 
@@ -77,8 +87,9 @@ def read_marker(console_text, expected_archive_sha256):
     ``{"outcome", "reason"}``. The outcome is one of:
 
     * ``blind``: no console text at all (``None``, empty, or only whitespace).
-    * ``failed`` (reason ``WARM_FAILED``): a column-0 line starts with
-      ``WARM FAIL `` or ``warm exiting rc=``, anywhere in the console.
+    * ``failed`` (reason ``WARM_FAILED``): a column-0 line is ``WARM FAIL``
+      alone, or starts with ``WARM FAIL `` or ``warm exiting rc=``, anywhere in
+      the console.
     * ``mismatch`` (reason ``IMAGE_MARKER_DIGEST_MISMATCH``): a column-0
       ``WARM_SOURCE_SHA256`` line carries a digest other than the expected one,
       wherever it stands and even when a matching line stands beside it.
@@ -100,7 +111,7 @@ def read_marker(console_text, expected_archive_sha256):
         return _result(BLIND)
     failed = wrong_digest = digest_seen = ready = False
     for line in _lines(text):
-        if line.startswith(_FAILURE_PREFIXES):
+        if _is_failure(line):
             failed = True
             continue
         found = _DIGEST_LINE.fullmatch(line)
@@ -153,6 +164,10 @@ def framed_tail(console_text, max_lines=DEFAULT_TAIL_LINES, max_bytes=DEFAULT_TA
     long is cut short (its start stays, so its frame stays). The lines are
     joined with a line feed; the result is ``""`` when no framed line exists.
 
+    Every returned line is framed. A bound smaller than the frame leaves no room
+    for even the start of a line, and the result is then ``""`` instead of a
+    fragment of the frame.
+
     A framed line is consumer output. A consumer that prints a secret it can see
     puts it into this tail, so the tail goes only into the failed-build event
     that the design allows it in.
@@ -163,4 +178,7 @@ def framed_tail(console_text, max_lines=DEFAULT_TAIL_LINES, max_bytes=DEFAULT_TA
     kept = framed[-max_lines:]
     while len(kept) > 1 and sum(len(line) for line in kept) + len(kept) - 1 > max_bytes:
         kept.pop(0)
-    return "\n".join(kept)[:max_bytes]
+    tail = "\n".join(kept)[:max_bytes]
+    # Whole lines fit by the loop above, so only the cut of a single line can end
+    # inside the frame, and what is left then is not a framed line.
+    return tail if tail.startswith(FRAME) else ""

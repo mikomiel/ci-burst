@@ -361,6 +361,23 @@ class RefusedRequestTests(TemplateCase):
             self.create()
         self.assertTrue(raised.exception.uncertain)
 
+    def test_a_creation_that_answers_with_the_pin_is_refused_before_any_read_back(self):
+        # Through the real adapter: it returns the number it was given, so the module has to refuse it.
+        def answer_with_the_pin(**request):
+            self.ec2._enter("create_launch_template_version", request)
+            return {"LaunchTemplateVersion": {"VersionNumber": PIN}}
+
+        self.ec2.create_launch_template_version = answer_with_the_pin
+        for source_image in (OLD_IMAGE, NEW_IMAGE):
+            with self.subTest(source_image=source_image):
+                self.ec2.versions_store[(NAME, PIN)]["LaunchTemplateData"]["ImageId"] = source_image
+                del self.calls[:]
+                with self.assertRaises(ProviderRefusal) as raised:
+                    self.create()
+                self.assertEqual(raised.exception.reason, "AWS_UNCERTAIN")
+                self.assertTrue(raised.exception.uncertain)
+                self.assertEqual(self.names(), ["create_launch_template_version"])
+
     def test_a_moving_or_malformed_source_is_refused_before_any_request(self):
         for source in ("$Latest", "$Default", "3", 0, -1, None, True, 3.0):
             with self.subTest(source=source):
@@ -446,12 +463,32 @@ class PlumbingTests(unittest.TestCase):
             self.call(stub)
         self.assertIs(raised.exception, refusal)
 
-    def test_a_new_version_that_is_the_pin_itself_cannot_pass_as_clean(self):
-        # A provider answer that names the pin as the new version has not created anything.
-        stub = StubAws(created=PIN, read=[version(PIN, ImageId=OLD_IMAGE, K="v")])
-        result = self.call(stub)
-        self.assertEqual(result, {"version": PIN, "drift": "TEMPLATE_DRIFT", "fields": ["ImageId"]})
-        self.assertEqual(stub.calls[1], ("read", NAME, [PIN]))
+    def test_a_new_version_that_is_the_pin_itself_is_refused_before_any_read_back(self):
+        # A provider answer that names the pin as the new version has not created anything. Read back, the
+        # pin alone would be compared with itself, so the image the pin already names would decide the
+        # verdict: another image is reported as drift and the built image itself as clean.
+        for name, source_image in (("a source with another image", OLD_IMAGE), ("a source with the built image", NEW_IMAGE)):
+            with self.subTest(name):
+                stub = StubAws(created=PIN, read=[version(PIN, ImageId=source_image, K="v")])
+                with self.assertRaises(ProviderRefusal) as raised:
+                    self.call(stub)
+                self.assertEqual(raised.exception.reason, "AWS_UNCERTAIN")
+                self.assertTrue(raised.exception.uncertain)
+                self.assertEqual([call[0] for call in stub.calls], ["create"])
+
+    def test_the_refusal_of_a_new_version_that_is_the_pin_names_no_template_data(self):
+        stub = StubAws(created=PIN, read=[version(PIN, ImageId=NEW_IMAGE, UserData=SENTINEL_USER_DATA)])
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.call(stub)
+        for text in (str(raised.exception), repr(raised.exception), repr(raised.exception.as_dict())):
+            for value in (SENTINEL_USER_DATA, NEW_IMAGE, OLD_IMAGE):
+                self.assertNotIn(value, text)
+
+    def test_a_new_version_that_is_not_the_pin_is_read_back_as_before(self):
+        # The control: any other number goes on to the read-back, and the pin may already carry the built image.
+        stub = StubAws(created=7, read=[version(PIN, ImageId=NEW_IMAGE, K="v"), version(7, ImageId=NEW_IMAGE, K="v")])
+        self.assertEqual(self.call(stub), {"version": 7, "drift": "clean"})
+        self.assertEqual([call[0] for call in stub.calls], ["create", "read"])
 
     def test_a_field_that_exists_in_one_version_only_is_a_difference_even_when_it_is_empty(self):
         stub = StubAws(read=[version(PIN, ImageId=OLD_IMAGE), version(7, ImageId=NEW_IMAGE, Empty=None)])

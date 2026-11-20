@@ -23,17 +23,27 @@ assembled at run time, so no secret-shaped literal sits in this file.
 import copy
 import hashlib
 import json
+import os
 import re
 import shlex
 import sqlite3
 import tempfile
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 from ci_burst import image, image_pipeline
-from ci_burst.aws import BASIS_DIGEST_TAG, BUILD_ID_TAG, DEPLOYMENT_TAG, EXPIRES_TAG, IMAGE_BUILD_TAG, ImageAws
+from ci_burst.aws import (
+    BASIS_DIGEST_TAG,
+    BUILD_ID_TAG,
+    DEPLOYMENT_TAG,
+    EXPIRES_TAG,
+    IMAGE_BUILD_TAG,
+    ImageAws,
+    SecurityGroup,
+)
 from ci_burst.config import load
 from ci_burst.errors import ObservationRefusal, ProviderRefusal, Refusal
 from ci_burst.forgejo import BranchHead
@@ -75,6 +85,7 @@ READS = frozenset(
         "describe_snapshots",
         "describe_launch_templates",
         "describe_launch_template_versions",
+        "describe_security_groups",
         "list_objects_v2",
     }
 )
@@ -86,6 +97,10 @@ def ami(number):
 
 def snap(number):
     return f"snap-{number:017x}"
+
+
+def sg(number):
+    return f"sg-{number:017x}"
 
 
 def iso(epoch):
@@ -101,10 +116,15 @@ READY = console("cloud-init: running user data", f"WARM_SOURCE_SHA256 {ARCHIVE_S
 FAILED = console(f"WARM_SOURCE_SHA256 {ARCHIVE_SHA}", "  | consumer step output line", "WARM FAIL consumer step 2")
 MISMATCH = console("WARM_SOURCE_SHA256 " + "f" * 64, "IMAGE_READY")
 
+BUILD_GROUP = sg(0xB5)
+#: One inbound rule, with no address range: the check counts rules and reads nothing else.
+INGRESS_RULE = {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22}
+
 SAFE_BUILDER = {
     "ImageId": ami(0xB0),
     "InstanceType": "c6i.large",
     "InstanceInitiatedShutdownBehavior": "terminate",
+    "SecurityGroupIds": [BUILD_GROUP],
     "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 1, "HttpEndpoint": "enabled"},
     "BlockDeviceMappings": [
         {"DeviceName": "/dev/xvda", "Ebs": {"VolumeSize": 40, "VolumeType": "gp3", "DeleteOnTermination": True}}
@@ -135,14 +155,14 @@ prefix = "{prefix}"
 GATE = 'gate_command = "bash scripts/example-gate.sh"'
 
 
-def render_toml(*, image_extra="", source_extra="", gate=GATE):
+def render_toml(*, image_extra="", source_extra="", gate=GATE, prefix=PREFIX):
     return IMAGE_TOML.format(
         image_extra=image_extra,
         source_extra=source_extra,
         gate=gate,
         builder=BUILDER,
         bucket=BUCKET,
-        prefix=PREFIX,
+        prefix=prefix,
     )
 
 
@@ -310,6 +330,19 @@ class WorldEc2:
             found.append(copy.deepcopy(item))
         return {"LaunchTemplateVersions": found}
 
+    def describe_security_groups(self, *, GroupIds=None, Filters=None, NextToken=None):
+        self.w.enter("describe_security_groups", dict(GroupIds=GroupIds, Filters=Filters, NextToken=NextToken))
+        groups = list(self.w.groups.values())
+        if GroupIds is not None:
+            if any(group_id not in self.w.groups for group_id in GroupIds):
+                raise ProviderError("InvalidGroup.NotFound")
+            groups = [self.w.groups[group_id] for group_id in GroupIds]
+        for entry in Filters or []:
+            if entry["Name"] != "group-name":
+                raise AssertionError(f"unexpected filter {entry['Name']}")
+            groups = [group for group in groups if group["GroupName"] in entry["Values"]]
+        return {"SecurityGroups": copy.deepcopy(groups)}
+
     def create_launch_template_version(
         self, *, LaunchTemplateName, SourceVersion, LaunchTemplateData, VersionDescription, ClientToken
     ):
@@ -422,6 +455,7 @@ class World:
         self.version_tokens = {}
         self.version_drift = {}
         self.omit_versions_once = set()
+        self.groups = {}
         self.next_version = 5
         self.objects = {}
         self.credential_life = float(HOUR)
@@ -478,6 +512,7 @@ class World:
         pin_data = {"ImageId": ami(0xA1), "InstanceType": "c6i.large", "UserData": "c3ludGhldGlj"}
         self.set_version(WORKER, PIN, pin_data)
         self.set_version(BUILDER, 1, copy.deepcopy(SAFE_BUILDER))
+        self.add_group(BUILD_GROUP, "example-build-group")
         self.add_image(ami(0xA1), tags={BASIS_DIGEST_TAG: OLD_DIGEST}, age=10 * DAY)
 
     def set_version(self, name, number, data, description=""):
@@ -486,6 +521,14 @@ class World:
             "LaunchTemplateId": self.templates[name]["LaunchTemplateId"],
             "VersionDescription": description,
             "LaunchTemplateData": data,
+        }
+
+    def add_group(self, group_id, name, *, ingress=0):
+        """A security group with ``ingress`` inbound rules."""
+        self.groups[group_id] = {
+            "GroupId": group_id,
+            "GroupName": name,
+            "IpPermissions": [dict(INGRESS_RULE) for _ in range(ingress)],
         }
 
     def add_image(self, image_id, *, tags=None, state="available", age=3 * DAY, snapshots=()):
@@ -993,6 +1036,30 @@ class PlanTests(PipelineCase):
     def test_a_pass_without_apply_is_the_plan(self):
         self.assertEqual(self.pipeline.run_pass(apply=False), self.plan())
 
+    def test_plan_reads_a_state_that_the_caller_opened_for_writing_and_leaves_it_open_and_unwritten(self):
+        self.start_build()
+        self.state.connect()
+        self.addCleanup(self.state.close)
+        before = snapshot_tree(self.dir)
+        result = self.plan()
+        self.assertEqual(snapshot_tree(self.dir), before)
+        self.assertTrue(self.state.available)
+        self.assertTrue(result["state"]["present"])
+        self.assertEqual(result["state"]["active_build"]["state"], "building")
+        # It is the caller's connection, still open for writing.
+        self.assertTrue(self.state.control_set(blocked=1).blocked)
+
+    def test_plan_reads_a_state_that_the_caller_opened_read_only_and_leaves_it_open(self):
+        self.start_build()
+        self.assertTrue(self.state.connect_readonly())
+        self.addCleanup(self.state.close)
+        result = self.plan()
+        self.assertTrue(self.state.available)
+        self.assertTrue(result["state"]["present"])
+        self.assertEqual(result["state"]["active_build"]["state"], "building")
+        with self.assertRaises(sqlite3.OperationalError):
+            self.state.control_set(blocked=1)
+
     def test_force_shows_what_a_forced_run_would_decide(self):
         self.pin_current()
         self.assertEqual(self.plan()["decision"], "digest_unchanged")
@@ -1143,6 +1210,122 @@ class BuildTemplateTests(PipelineCase):
         refusal = self.refused(self.pipeline.plan, "IMAGE_BUILD_TEMPLATE_UNSAFE")
         self.assertIn("IamInstanceProfile", refusal.detail)
         self.assertIn("MetadataOptions.HttpTokens", refusal.detail)
+
+    def test_a_template_that_names_no_security_group_is_refused(self):
+        self.use_template(lambda data: data.pop("SecurityGroupIds"))
+        refusal = self.refused(self.pipeline.plan, "IMAGE_BUILD_TEMPLATE_UNSAFE")
+        self.assertEqual(refusal.detail, "unsafe properties: security_groups")
+        # No group is named, so there is none to read.
+        self.assertEqual(self.world.arguments("describe_security_groups"), [])
+        for empty in ([], None, [""], "sg-not-a-list"):
+            with self.subTest(empty=empty):
+                self.use_template(lambda data: data.update(SecurityGroupIds=empty))
+                self.refused(self.pipeline.plan, "IMAGE_BUILD_TEMPLATE_UNSAFE", detail_has=("security_groups",))
+
+    def test_a_group_with_an_ingress_rule_is_refused_by_the_property_name_only(self):
+        self.world.add_group(BUILD_GROUP, "example-build-group", ingress=1)
+        refusal = self.refused(self.pipeline.plan, "IMAGE_BUILD_TEMPLATE_UNSAFE")
+        self.assertEqual(refusal.detail, "unsafe properties: security_groups")
+        for value in (BUILD_GROUP, "example-build-group", "tcp", "22"):
+            self.assertNotIn(value, refusal.detail)
+
+    def test_a_group_without_an_ingress_rule_is_safe_and_is_read_once_by_id(self):
+        self.plan()
+        self.assertEqual(
+            self.world.arguments("describe_security_groups"),
+            [{"GroupIds": [BUILD_GROUP], "Filters": None, "NextToken": None}],
+        )
+
+    def test_every_group_the_template_names_is_checked_in_each_of_the_three_places(self):
+        clean, open_group = sg(0xC1), sg(0xC2)
+        self.world.add_group(clean, "example-clean-group")
+        self.world.add_group(open_group, "example-open-group", ingress=1)
+
+        def top_level(*groups):
+            return lambda data: data.update(SecurityGroupIds=list(groups))
+
+        def by_name(*groups):
+            def change(data):
+                data.pop("SecurityGroupIds")
+                data["SecurityGroups"] = [self.world.groups[group]["GroupName"] for group in groups]
+
+            return change
+
+        def in_interface(*groups):
+            def change(data):
+                data.pop("SecurityGroupIds")
+                data["NetworkInterfaces"] = [{"DeviceIndex": 0, "Groups": list(groups)}]
+
+            return change
+
+        for place, put in (("SecurityGroupIds", top_level), ("SecurityGroups", by_name), ("NetworkInterfaces", in_interface)):
+            with self.subTest(place=place, groups="clean"):
+                self.use_template(put(clean))
+                self.assertEqual(self.plan()["build_template"]["name"], BUILDER)
+            with self.subTest(place=place, groups="open"):
+                self.use_template(put(open_group))
+                self.refused(self.pipeline.plan, "IMAGE_BUILD_TEMPLATE_UNSAFE", detail_has=("security_groups",))
+            with self.subTest(place=place, groups="one clean and one open"):
+                self.use_template(put(clean, open_group))
+                self.refused(self.pipeline.plan, "IMAGE_BUILD_TEMPLATE_UNSAFE", detail_has=("security_groups",))
+
+    def test_groups_named_in_two_places_are_all_checked(self):
+        open_group = sg(0xC2)
+        self.world.add_group(open_group, "example-open-group", ingress=1)
+
+        def mixed(data):
+            data["SecurityGroups"] = ["example-open-group"]
+
+        self.use_template(mixed)
+        self.refused(self.pipeline.plan, "IMAGE_BUILD_TEMPLATE_UNSAFE", detail_has=("security_groups",))
+
+    def test_a_network_interface_without_a_group_is_unsafe(self):
+        # The interface would take the default group of the VPC, which this check never read.
+        for interfaces in (
+            [{"DeviceIndex": 0}],
+            [{"DeviceIndex": 0, "Groups": []}],
+            [{"DeviceIndex": 0, "NetworkInterfaceId": "eni-0123456789abcdef0"}],
+            [{"DeviceIndex": 0, "Groups": [BUILD_GROUP]}, {"DeviceIndex": 1}],
+            ["not-a-mapping"],
+        ):
+            with self.subTest(interfaces=interfaces):
+                self.use_template(lambda data: data.update(NetworkInterfaces=interfaces))
+                self.refused(self.pipeline.plan, "IMAGE_BUILD_TEMPLATE_UNSAFE", detail_has=("security_groups",))
+
+    def test_a_named_group_that_the_account_does_not_list_is_unsafe(self):
+        # A name that matches no group gives an empty answer, and an empty answer is not "no ingress".
+        self.use_template(lambda data: data.update(SecurityGroupIds=[], SecurityGroups=["example-missing-group"]))
+        self.refused(self.pipeline.plan, "IMAGE_BUILD_TEMPLATE_UNSAFE", detail_has=("security_groups",))
+
+    def test_a_group_id_that_the_answer_leaves_out_is_unsafe_even_when_the_provider_raised_no_error(self):
+        # EC2 fails the whole request for an id it does not know, so the fake account cannot answer like this. The
+        # check still reads the answer and not the absence of an error: a group it was not told about is unknown.
+        listed = SecurityGroup(group_id=sg(0xA1), name="example-listed", ingress_rules=0)
+        self.assertFalse(image_pipeline._admits_inbound([sg(0xA1)], [], [listed]))
+        self.assertTrue(image_pipeline._admits_inbound([sg(0xA1), sg(0xA2)], [], [listed]))
+        self.assertTrue(image_pipeline._admits_inbound([sg(0xA2)], [], [listed]))
+        self.assertTrue(image_pipeline._admits_inbound([sg(0xA1)], [], [SecurityGroup(sg(0xA1), "example-listed", 1)]))
+
+    def test_a_describe_that_fails_fails_closed_and_names_no_provider_text(self):
+        for error in (ProviderError("UnauthorizedOperation"), ProviderError("RequestLimitExceeded")):
+            with self.subTest(error=error.response["Error"]["Code"]):
+                self.world.fail("describe_security_groups", error)
+                self.refused(self.pipeline.plan, "AWS_UNCERTAIN", detail_lacks=SENTINELS)
+                self.refused(lambda: self.pipeline.run_pass(apply=True), "AWS_UNCERTAIN", detail_lacks=SENTINELS)
+                self.assertEqual(self.builds(), [])
+        self.world.errors.clear()
+        # An id the provider does not know fails the same way.
+        self.use_template(lambda data: data.update(SecurityGroupIds=[sg(0xFF)]))
+        self.refused(self.pipeline.plan, "AWS_UNCERTAIN")
+
+    def test_an_unsafe_group_stops_a_pass_before_anything_is_staged(self):
+        self.world.add_group(BUILD_GROUP, "example-build-group", ingress=1)
+        self.refused(lambda: self.pipeline.run_pass(apply=True), "IMAGE_BUILD_TEMPLATE_UNSAFE")
+        self.assertEqual(self.builds(), [])
+        names = self.world.names()
+        for forbidden in ("create_multipart_upload", "run_instances", "create_image"):
+            self.assertNotIn(forbidden, names)
+        self.assertFalse(self.world.objects)
 
     def test_a_missing_template_or_version_is_refused(self):
         del self.world.versions[(BUILDER, 1)]
@@ -1377,6 +1560,51 @@ UNFRAMED_URL_CONSOLE = console(
 )
 
 
+class StoragePrefixTests(PipelineCase):
+    """The archive key is the prefix, exactly one slash and the build id, however the prefix is written."""
+
+    def staged_key(self, prefix):
+        self.configure(render_toml(prefix=prefix))
+        self.assertEqual(self.apply()["decision"], "building")
+        (call,) = self.world.arguments("create_multipart_upload")
+        self.assertEqual(call["Bucket"], BUCKET)
+        return call["Key"], self.only_build().id
+
+    def test_a_prefix_without_a_trailing_slash_gets_one(self):
+        key, build_id = self.staged_key("example-prefix")
+        self.assertEqual(key, f"example-prefix/{build_id}.tar.gz")
+
+    def test_a_prefix_with_a_trailing_slash_gets_no_second_one(self):
+        key, build_id = self.staged_key("example-prefix/")
+        self.assertEqual(key, f"example-prefix/{build_id}.tar.gz")
+
+    def test_a_prefix_with_several_trailing_slashes_ends_with_exactly_one(self):
+        key, build_id = self.staged_key("example-prefix//")
+        self.assertEqual(key, f"example-prefix/{build_id}.tar.gz")
+
+    def test_a_nested_prefix_keeps_its_inner_slashes(self):
+        key, build_id = self.staged_key("example/nested-prefix")
+        self.assertEqual(key, f"example/nested-prefix/{build_id}.tar.gz")
+
+    def test_the_archive_that_the_build_names_is_the_one_at_the_key(self):
+        self.configure(render_toml(prefix="example-prefix"))
+        self.apply()
+        build = self.only_build()
+        self.assertEqual(build.archive_key, f"example-prefix/{build.id}.tar.gz")
+        self.assertEqual(list(self.world.objects), [build.archive_key])
+
+    def test_the_stray_listing_stays_inside_the_folder_of_a_prefix_without_a_trailing_slash(self):
+        self.configure(render_toml(prefix="example-prefix"))
+        inside, neighbour = "example-prefix/old.tar.gz", "example-prefix-other/old.tar.gz"
+        for key in (inside, neighbour):
+            self.world.objects[key] = (b"x", NOW - 2 * HOUR)
+        self.pin_current()
+        result = self.apply()
+        self.assertEqual([call["Prefix"] for call in self.world.arguments("list_objects_v2")], ["example-prefix/"])
+        self.assertEqual(result["reconcile"]["archives_deleted"], 1)
+        self.assertEqual(list(self.world.objects), [neighbour])
+
+
 class FailureTests(PipelineCase):
     def assert_failed(self, result, reason):
         self.assertEqual((result["decision"], result["reason"]), ("failed", reason), result)
@@ -1385,6 +1613,20 @@ class FailureTests(PipelineCase):
         (event,) = self.events("image_build_failed")
         self.assertEqual(event["reason"], reason)
         return build
+
+    def assert_refused(self, result, reason, *, control=(0, None, False)):
+        """The pass refused the start: no build in the answer, no failure counted and no failure event.
+
+        ``control`` is the failure count, the cooldown and the block as they were before the pass.
+        """
+        self.assertEqual((result["decision"], result["reason"]), ("refused", reason), result)
+        self.assertIsNone(result["build"])
+        counted = self.control()
+        self.assertEqual((counted.consecutive_failures, counted.cooldown_until, counted.blocked), control)
+        self.assertEqual(self.events("image_build_failed"), [])
+        self.assertEqual(self.events("image_blocked"), [])
+        check = self.events("image_check")[-1]
+        self.assertEqual((check["decision"], check["reason"], check["build_id"]), ("refused", reason, None))
 
     def test_a_consumer_failure_ends_the_build_and_shows_only_its_framed_tail(self):
         self.world.console_plan = [(60.0, UNFRAMED_URL_CONSOLE)]
@@ -1401,6 +1643,77 @@ class FailureTests(PipelineCase):
         self.assertEqual(control.consecutive_failures, 1)
         self.assertEqual(control.cooldown_until, NOW + 60 + 21_600)
         self.assertFalse(control.blocked)
+
+    def failed_with_console_lines(self, *lines):
+        """The values of a launched build, and the tail of its failed-build event after a consumer step printed ``lines``.
+
+        Each line is a format string over the presigned ``{url}`` of the launch, its ``{query}`` string, the
+        build's archive ``{key}`` and the ``{bucket}``. The first pass launches the builder, and the console is
+        set after it.
+        """
+        _, build = self.start_build()
+        url = self.world.urls[-1]
+        values = {"url": url, "query": url.split("?", 1)[1], "key": build.archive_key, "bucket": BUCKET}
+        printed = [line.format(**values) for line in lines]
+        self.world.consoles[build.builder_id] = console(
+            f"WARM_SOURCE_SHA256 {ARCHIVE_SHA}", *printed, "WARM FAIL consumer step 2"
+        )
+        self.assert_failed(self.apply(), "WARM_FAILED")
+        (event,) = self.events("image_build_failed")
+        return values, event["framed_tail"]
+
+    def events_text(self):
+        return (self.state_dir / image_pipeline.EVENTS_FILE).read_text(encoding="utf-8")
+
+    def test_a_framed_line_with_the_presigned_url_shows_it_as_the_archive_url(self):
+        values, tail = self.failed_with_console_lines("  | WARM_SRC_URL={url}", "  | fetching {url} now")
+        self.assertEqual(tail, "  | WARM_SRC_URL=[archive-url]\n  | fetching [archive-url] now")
+        text = self.written_text()
+        for secret in (values["url"], values["query"], SIGNATURE, "X-Amz-Signature", "X-Amz-Expires"):
+            self.assertNotIn(secret, text)
+        self.assertNotIn(values["key"], self.events_text())
+
+    def test_a_framed_line_with_the_archive_url_that_has_no_query_string_shows_it_as_the_archive_url(self):
+        values, tail = self.failed_with_console_lines("  | https://{bucket}.s3.example.invalid/{key}", "  | GET s3://{bucket}/{key}")
+        self.assertEqual(tail, "  | [archive-url]\n  | GET [archive-url]")
+        self.assertNotIn(values["key"], self.events_text())
+
+    def test_a_framed_line_with_only_the_query_string_of_the_url_shows_it_as_the_archive_url(self):
+        values, tail = self.failed_with_console_lines(
+            "  | query {query}", "  | ?{query}", "  | &X-Amz-Signature=" + SIGNATURE, "  | x-amz-security-token=abc"
+        )
+        self.assertEqual(
+            tail, "  | query [archive-url]\n  | [archive-url]\n  | [archive-url]\n  | [archive-url]"
+        )
+        self.assertNotIn(SIGNATURE, self.written_text())
+
+    def test_a_framed_line_with_only_the_object_key_shows_it_as_the_archive_url(self):
+        values, tail = self.failed_with_console_lines("  | NoSuchKey {key}", "  | key={key}.part")
+        self.assertEqual(tail, "  | NoSuchKey [archive-url]\n  | key=[archive-url].part")
+        self.assertNotIn(values["key"], self.events_text())
+
+    def test_a_framed_line_with_another_url_shows_no_url_either(self):
+        # The presigned URL is not kept after the launch, so the pass cannot tell the archive's from a consumer's,
+        # and an event never holds ``://``.
+        _, tail = self.failed_with_console_lines(
+            "  | git clone https://oauth2:" + TOKEN + "@forge.example.invalid/example.git",
+            "  | printed " + CONSUMER_URL,
+            "  | step 2 failed: see output",
+        )
+        self.assertEqual(tail, "  | git clone [archive-url]\n  | printed [archive-url]\n  | step 2 failed: see output")
+        text = self.written_text()
+        for secret in (TOKEN, CONSUMER_URL, "consumer.example.invalid", "oauth2"):
+            self.assertNotIn(secret, text)
+        self.assertNotIn("://", self.events_text())
+
+    def test_a_tail_without_a_url_or_a_key_is_written_as_it_was_framed(self):
+        _, tail = self.failed_with_console_lines("  | error: step 2 failed (rc=2): see output", "  |   at line 7")
+        self.assertEqual(tail, "  | error: step 2 failed (rc=2): see output\n  |   at line 7")
+
+    def test_the_mask_is_the_text_the_builder_script_prints_for_the_same_things(self):
+        script = Path(__file__).resolve().parents[1] / "deploy" / "runner" / "image" / "warm-cache.sh"
+        self.assertEqual(image_pipeline.ARCHIVE_URL_MASK, "[archive-url]")
+        self.assertIn(image_pipeline.ARCHIVE_URL_MASK, script.read_text(encoding="utf-8"))
 
     def test_a_marker_for_another_archive_ends_the_build_and_creates_no_image(self):
         self.world.console_plan = [(30.0, MISMATCH)]
@@ -1429,6 +1742,125 @@ class FailureTests(PipelineCase):
         result = self.apply()
         self.assert_failed(result, "CONSOLE_BLIND")
         self.assertEqual(self.sleeps, [30] * 7)
+
+    def expired_build(self, *, before=0):
+        """A build whose first pass is over, with the clock ``before`` seconds short of its deadline."""
+        _, build = self.start_build()
+        self.clock.advance(build.deadline_at - before - self.clock())
+        return build
+
+    def test_an_expired_builder_is_ended_before_any_read_that_can_fail(self):
+        build = self.expired_build()
+        self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"))
+        self.refused(self.apply, "AWS_UNCERTAIN")
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+        self.assertEqual(self.world.instances[build.builder_id]["State"]["Name"], "terminated")
+        # The pass that raised changed no row. The next pass ends the build with the deadline code.
+        self.assertEqual(self.only_build().state, "building")
+        del self.world.errors["describe_instances"]
+        self.assert_failed(self.apply(), "CONSOLE_BLIND")
+        self.assertEqual(self.metric("ci_burst_image_leaked_resources_total", kind="builder"), 0.0)
+
+    def test_an_expired_imaging_builder_is_ended_before_any_read_that_can_fail(self):
+        self.world.console_plan = [(30.0, READY)]
+        self.world.image_final_state = "pending"
+        self.assertEqual(self.apply()["decision"], "imaging")
+        build = self.only_build()
+        self.clock.advance(build.deadline_at - self.clock())
+        self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"))
+        self.refused(self.apply, "AWS_UNCERTAIN")
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+
+    def test_a_builder_adopted_for_an_expired_build_is_ended_before_the_later_reads(self):
+        self.world.ghost_launch = True
+        self.world.fail("run_instances", ProviderError("RequestLimitExceeded"), times=1)
+        self.assertIn("run_builder:uncertain", self.apply()["notes"])
+        (ghost,) = self.world.instances
+        self.clock.advance(BUILD_DEADLINE)
+        self.world.fail("list_objects_v2", ProviderError("RequestLimitExceeded"))
+        self.refused(self.apply, "AWS_UNCERTAIN")
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [ghost]}])
+        self.assertEqual(self.only_build().builder_id, ghost)
+
+    def test_a_blind_console_at_the_deadline_ends_the_build_with_one_termination_and_the_blind_code(self):
+        build = self.expired_build()
+        result = self.apply()
+        self.assert_failed(result, "CONSOLE_BLIND")
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+        self.assertEqual(self.world.arguments("create_image"), [])
+        self.assertEqual(result["reconcile"]["builders_terminated"], 1)
+        (event,) = self.events("image_reconciled")
+        self.assertEqual((event["builders_terminated"], event["build_id"]), (1, build.id))
+        # The builder of the build is not a leak: it reached its own deadline.
+        self.assertEqual(self.metric("ci_burst_image_leaked_resources_total", kind="builder"), 0.0)
+
+    def test_a_readable_console_at_the_deadline_ends_the_build_with_one_termination_and_the_timeout_code(self):
+        self.world.console_plan = [(10.0, WAITING)]
+        build = self.expired_build()
+        result = self.apply()
+        self.assert_failed(result, "MARKER_TIMEOUT")
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+
+    def test_a_marker_first_seen_after_the_deadline_creates_no_image(self):
+        self.world.console_plan = [(2_000.0, READY)]
+        build = self.expired_build()
+        result = self.apply()
+        self.assert_failed(result, "IMAGE_BUILDER_GONE")
+        self.assertEqual(self.world.arguments("create_image"), [])
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+        self.assertEqual(len(self.events("image_marker_seen")), 1)
+
+    def test_a_builder_that_the_provider_still_lists_after_the_termination_is_not_imaged(self):
+        self.world.console_plan = [(2_000.0, READY)]
+        self.world.ignore_terminate = True
+        build = self.expired_build()
+        result = self.apply()
+        self.assert_failed(result, "IMAGE_BUILDER_GONE")
+        self.assertEqual(self.world.arguments("create_image"), [])
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+
+    def test_a_builder_at_its_deadline_is_ended_by_the_first_call_of_the_pass(self):
+        build = self.expired_build()
+        mark = len(self.world.calls)
+        self.apply()
+        self.assertEqual(self.world.names(mark)[0], "terminate_instances")
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+
+    def test_a_builder_one_second_short_of_its_deadline_is_left_to_the_state_machine(self):
+        build = self.expired_build(before=1)
+        mark = len(self.world.calls)
+        result = self.apply()
+        names = self.world.names(mark)
+        self.assertEqual(result["reconcile"]["builders_terminated"], 0)
+        self.assertLess(names.index("describe_instances"), names.index("terminate_instances"))
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+        self.assert_failed(result, "CONSOLE_BLIND")
+
+    def test_an_image_that_became_available_past_the_deadline_still_completes_with_one_termination(self):
+        self.world.console_plan = [(30.0, READY)]
+        self.world.image_delay = 100_000.0
+        self.assertEqual(self.apply()["decision"], "imaging")
+        build = self.only_build()
+        self.clock.advance(build.deadline_at - self.clock())
+        self.world.image_delay = 90.0
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate")
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+
+    def test_a_refused_early_termination_is_reported_and_the_failure_path_asks_again(self):
+        build = self.expired_build()
+        self.world.refusals["terminate"] = ProviderRefusal("AWS_UNCERTAIN", "ProviderError", uncertain=True)
+        result = self.apply()
+        self.assert_failed(result, "CONSOLE_BLIND")
+        self.assertEqual(result["reconcile"]["failures"], ["AWS_UNCERTAIN"])
+        self.assertEqual(result["reconcile"]["builders_terminated"], 0)
+        self.assertIn("terminate:failed", result["notes"])
+        self.assertEqual(self.world.instances[build.builder_id]["State"]["Name"], "running")
+        # The build is over, so the builder belongs to no build and the next pass ends it.
+        del self.world.refusals["terminate"]
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["builders_terminated"], 1)
+        self.assertEqual(self.world.instances[build.builder_id]["State"]["Name"], "terminated")
 
     def test_a_builder_that_vanished_before_the_marker_ends_the_build(self):
         _, build = self.start_build()
@@ -1522,15 +1954,36 @@ class FailureTests(PipelineCase):
         self.assertEqual(len(self.world.arguments("abort_multipart_upload")), 1)
         self.assertEqual(self.world.arguments("run_instances"), [])
 
-    def test_credentials_that_will_not_outlive_the_url_fail_the_build_and_drop_the_archive(self):
+    def test_credentials_that_will_not_outlive_the_url_refuse_the_start_before_the_row_and_the_upload(self):
         self.world.credential_life = 600.0
         result = self.apply()
-        build = self.assert_failed(result, "IMAGE_CREDENTIAL_SHORT")
+        self.assert_refused(result, "IMAGE_CREDENTIAL_SHORT")
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.urls, [])
+
+    def test_a_refused_start_leaves_the_failures_of_earlier_builds_as_they_were(self):
+        self.set_control(consecutive_failures=2, cooldown_until=NOW - 1)
+        self.world.credential_life = 600.0
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_CREDENTIAL_SHORT", control=(2, NOW - 1, False))
+
+    def test_a_session_that_runs_short_during_the_upload_ends_the_row_and_the_archive_without_a_failure(self):
+        # Enough life for the check before the upload, too little once the upload is done.
+        self.world.credential_life = 1850.0
+        self.source.on_chunk = lambda: self.clock.advance(100)
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_CREDENTIAL_SHORT")
+        build = self.only_build()
+        self.assertEqual((build.state, build.reason_code), ("failed", "IMAGE_CREDENTIAL_SHORT"))
         self.assertEqual(build.archive_sha256, ARCHIVE_SHA)
         self.assertEqual(self.world.objects, {})
         self.assertIn("delete_object", self.world.names())
         self.assertEqual(self.world.arguments("run_instances"), [])
         self.assertEqual(self.world.urls, [])
+        self.assertEqual(self.sleeps, [])
 
     def test_user_data_over_the_limit_fails_the_build_before_the_launch(self):
         self.world.url_padding = 20_000
@@ -1539,29 +1992,155 @@ class FailureTests(PipelineCase):
         self.assertEqual(self.world.arguments("run_instances"), [])
         self.assertEqual(self.world.objects, {})
 
-    def test_a_builder_that_appears_before_the_launch_fails_the_build_and_is_ended_next_pass(self):
+    def appearing_builder(self, call):
+        """Make a builder that no build owns appear when the fake provider first sees ``call``."""
         appeared = []
 
         def appear(arguments):
             if not appeared:
                 appeared.append(self.world.add_instance(foreign_builder_tags()))
 
-        self.world.hooks["generate_presigned_url"] = appear
+        self.world.hooks[call] = appear
+        return appeared
+
+    def test_a_builder_that_appears_before_the_row_refuses_the_start_and_is_ended_next_pass(self):
+        # The last read before the check of the start: the builder is there after reconcile has looked.
+        appeared = self.appearing_builder("describe_security_groups")
         result = self.apply()
-        self.assert_failed(result, "IMAGE_BUILD_ALREADY_ACTIVE")
+        self.assert_refused(result, "IMAGE_BUILD_ALREADY_ACTIVE")
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.arguments("terminate_instances"), [])
+        self.assertEqual(self.world.urls, [])
+        self.apply()
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": appeared}])
+
+    def test_a_builder_that_appears_before_the_launch_ends_the_row_without_a_failure_and_is_ended_next_pass(self):
+        appeared = self.appearing_builder("generate_presigned_url")
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_BUILD_ALREADY_ACTIVE")
+        build = self.only_build()
+        self.assertEqual((build.state, build.reason_code), ("failed", "IMAGE_BUILD_ALREADY_ACTIVE"))
         self.assertEqual(self.world.arguments("run_instances"), [])
         self.assertEqual(self.world.objects, {})
+        self.assertIn("delete_object", self.world.names())
         self.assertEqual(self.world.arguments("terminate_instances"), [])
         self.apply()
         self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": appeared}])
 
-    def test_a_stage_that_outlasts_the_pass_fails_the_build_with_the_deadline_code(self):
+    def test_an_archive_that_cannot_be_deleted_after_a_refused_start_is_a_note_and_not_a_failure(self):
+        self.appearing_builder("generate_presigned_url")
+        self.world.fail("delete_object", ProviderError("RequestLimitExceeded"), times=1)
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_BUILD_ALREADY_ACTIVE")
+        self.assertIn("archive:delete_failed", result["notes"])
+        self.assertEqual(len(self.world.objects), 1)
+
+    def assert_unstaged(self, build):
+        """A build that waits for the next pass to stage its archive: no builder, no archive hash, no failure."""
+        self.assertEqual((build.state, build.builder_id, build.archive_sha256), ("building", None, None))
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.events("image_build_failed"), [])
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+
+    def archive_keys(self):
+        return [call["Key"] for call in self.world.arguments("create_multipart_upload")]
+
+    def test_a_stage_that_outlasts_the_pass_leaves_the_build_for_the_next_pass_to_stage_again(self):
         self.source.on_chunk = lambda: self.clock.advance(400)
         result = self.apply()
-        self.assert_failed(result, "pass_deadline_exceeded")
+        self.assertEqual((result["decision"], result["reason"]), ("building", None))
+        self.assertIn("pass_deadline_exceeded", result["notes"])
         self.assertEqual(result["retention"], {"refused": "pass_deadline_exceeded"})
+        first = self.only_build()
+        self.assert_unstaged(first)
+        self.assertEqual(self.world.objects, {})
+        # The next pass stages the same archive under the same key and launches.
+        self.source.on_chunk = None
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(self.archive_keys(), [f"{PREFIX}{first.id}.tar.gz"] * 2)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.events("image_build_failed"), [])
+        self.assertEqual(len(self.events("image_build_started")), 1)
+
+    def test_a_pass_deadline_after_the_upload_leaves_the_build_for_the_next_pass_to_stage_again(self):
+        # The pass runs out of time between the end of the upload and the launch.
+        self.world.hooks["generate_presigned_url"] = lambda arguments: self.clock.advance(400)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("building", None))
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        first = self.only_build()
+        self.assert_unstaged(first)
+        self.assertEqual(first.archive_key, f"{PREFIX}{first.id}.tar.gz")
+        self.assertEqual(list(self.world.objects), [first.archive_key])
+        # The row is not an uncertain launch, so the next pass stages again and launches.
+        del self.world.hooks["generate_presigned_url"]
+        result = self.apply()
+        self.assertEqual(result["decision"], "building", result)
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assertIsNotNone(build.builder_id)
+        self.assertEqual(build.archive_sha256, ARCHIVE_SHA)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(list(self.world.objects), [first.archive_key])
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def unstaged_build(self):
+        """A build whose first pass ran out of time during the stage. That pass is over."""
+        self.source.on_chunk = lambda: self.clock.advance(400)
+        self.apply()
+        self.source.on_chunk = None
+        return self.only_build()
+
+    def test_a_build_that_was_never_staged_fails_at_its_deadline_with_the_blind_code(self):
+        build = self.unstaged_build()
+        self.clock.advance(build.deadline_at - self.clock())
+        result = self.apply()
+        self.assert_failed(result, "CONSOLE_BLIND")
+        # No second upload, no launch and no builder to end.
+        self.assertEqual(len(self.archive_keys()), 1)
         self.assertEqual(self.world.objects, {})
         self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.arguments("terminate_instances"), [])
+        self.assertEqual(self.control().consecutive_failures, 1)
+
+    def test_a_staged_archive_is_deleted_when_the_build_fails_at_its_deadline_unlaunched(self):
+        self.world.hooks["generate_presigned_url"] = lambda arguments: self.clock.advance(400)
+        self.apply()
+        build = self.only_build()
+        self.assertEqual(list(self.world.objects), [build.archive_key])
+        del self.world.hooks["generate_presigned_url"]
+        self.clock.advance(BUILD_DEADLINE)
+        result = self.apply()
+        self.assert_failed(result, "CONSOLE_BLIND")
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": build.archive_key}])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
+    def test_a_build_one_second_short_of_its_deadline_is_staged_again(self):
+        build = self.unstaged_build()
+        self.clock.advance(build.deadline_at - 1 - self.clock())
+        self.apply()
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(len(self.archive_keys()), 2)
+
+    def test_a_resumed_stage_that_is_refused_ends_the_row_without_a_failure(self):
+        self.unstaged_build()
+        self.world.credential_life = 600.0
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_CREDENTIAL_SHORT")
+        build = self.only_build()
+        self.assertEqual((build.state, build.reason_code), ("failed", "IMAGE_CREDENTIAL_SHORT"))
+        # The check comes before the second upload: only the first pass opened one.
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.objects, {})
 
     def test_a_forge_that_fails_during_the_stage_fails_the_build_by_its_code_alone(self):
         self.source.fail_after_first = ObservationRefusal("FORGEJO_UNAVAILABLE", "token=" + TOKEN)
@@ -1691,6 +2270,75 @@ class FailureTests(PipelineCase):
         result = self.apply()
         self.assertEqual(result["reconcile"]["builders_terminated"], 1)
         self.assertEqual(self.world.instances[build.builder_id]["State"]["Name"], "terminated")
+
+
+class ReadDeadlineTests(PipelineCase):
+    """A read of the provider that follows a mutation or a wait does not start once the pass deadline is over.
+
+    Each test makes the pass run out of time inside the call just before the read, because that is the only
+    place a read can start late: the poll loops stop on their own.
+    """
+
+    def by_id_reads(self, image_id, mark=0):
+        return [
+            kwargs
+            for name, kwargs in self.world.calls[mark:]
+            if name == "describe_images" and kwargs["ImageIds"] == [image_id]
+        ]
+
+    def test_the_image_read_of_an_imaging_build_does_not_start_past_the_pass_deadline(self):
+        self.world.console_plan = [(30.0, READY)]
+        self.world.image_delay = 100_000.0
+        self.assertEqual(self.apply()["decision"], "imaging")
+        build = self.only_build()
+        mark = len(self.world.calls)
+
+        def run_out_of_time(arguments):
+            # The read of the pin's image is the last read of the pass before the build's own.
+            if arguments["ImageIds"] == [ami(0xA1)]:
+                self.clock.advance(400)
+
+        self.world.hooks["describe_images"] = run_out_of_time
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("imaging", None))
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        self.assertEqual(self.by_id_reads(build.image_id, mark), [])
+        self.assertEqual(self.only_build().state, "imaging")
+        # Nothing is lost: the next pass reads the image and completes the build.
+        del self.world.hooks["describe_images"]
+        self.world.image_delay = 90.0
+        self.assertEqual(self.apply()["decision"], "candidate")
+        self.assertEqual(len(self.by_id_reads(build.image_id, mark)), 1)
+
+    def test_the_read_back_of_a_new_version_does_not_start_past_the_pass_deadline(self):
+        self.world.console_plan = [(30.0, READY)]
+        self.world.hooks["create_launch_template_version"] = lambda arguments: self.clock.advance(400)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("imaging", None))
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        # The version exists, and nothing read it back.
+        self.assertEqual(self.world.next_version, 6)
+        reads = [kwargs for kwargs in self.world.arguments("describe_launch_template_versions") if "5" in kwargs["Versions"]]
+        self.assertEqual(reads, [])
+        build = self.only_build()
+        self.assertEqual((build.state, build.template_version), ("imaging", None))
+        self.assertEqual(self.events("image_build_failed"), [])
+        # The next pass asks with the same token, gets the same version and gives the verdict.
+        del self.world.hooks["create_launch_template_version"]
+        self.assertEqual(self.apply()["decision"], "candidate")
+        build = self.only_build()
+        self.assertEqual(build.template_version, 5)
+        attempts = self.world.arguments("create_launch_template_version")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual({attempt["ClientToken"] for attempt in attempts}, {f"{build.client_token}-v"})
+        self.assertEqual(self.world.next_version, 6)
+        self.assertEqual(len([key for key in self.world.versions if key[0] == WORKER]), 2)
+
+    def test_the_read_of_the_pin_image_does_not_start_past_the_pass_deadline(self):
+        # ``plan`` reads the pin before any other provider read, so the first read of a template version is its.
+        self.world.hooks["describe_launch_template_versions"] = lambda arguments: self.clock.advance(400)
+        self.refused(self.plan, "pass_deadline_exceeded")
+        self.assertEqual(self.by_id_reads(ami(0xA1)), [])
 
 
 class ControlTests(PipelineCase):
@@ -1842,6 +2490,21 @@ class ResumeTests(PipelineCase):
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
         self.assertEqual(len(self.events("image_reconciled")), 1)
 
+    def test_a_crash_after_the_upload_is_staged_again_under_the_same_key_and_launched(self):
+        self.crash_after("archive_key")
+        build = self.only_build()
+        self.assertEqual((build.state, build.archive_key, build.archive_sha256, build.builder_id), ("building", None, None, None))
+        (key,) = self.world.objects
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.world.console_plan = [(30.0, READY)]
+        result = self.pipeline.run_until_done()
+        self.assertEqual(result["decision"], "candidate")
+        self.assertEqual(self.only_build().id, build.id)
+        self.assertEqual([call["Key"] for call in self.world.arguments("create_multipart_upload")], [key, key])
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.events("image_build_failed"), [])
+
     def test_a_crash_after_the_image_was_created_is_adopted_and_no_second_image_is_made(self):
         self.world.console_plan = [(30.0, READY)]
         self.crash_after("image_id")
@@ -1945,7 +2608,7 @@ class ReconcileTests(PipelineCase):
         self.assertEqual(self.apply()["reconcile"]["archives_deleted"], 1)
         self.assertNotIn(key, self.world.objects)
 
-    def test_the_images_of_a_failed_build_go_and_the_neighbours_stay(self):
+    def test_the_images_of_a_failed_build_go_in_reconcile_and_the_neighbours_stay(self):
         self.pin_current()
         self.add_build("failed-one", "failed", image_id=ami(0xD1))
         self.world.add_image(ami(0xD1), tags=owned("failed-one"), snapshots=(snap(0xD1),))
@@ -1954,25 +2617,57 @@ class ReconcileTests(PipelineCase):
         self.world.add_snapshot(snap(0xD2), tags=owned("failed-one", deployment="other-deployment"))
         self.world.add_image(ami(0xD3), tags={"team": "synthetic"}, snapshots=(snap(0xD3),))
         result = self.apply()
-        self.assertEqual(result["retention"]["deregistered"], 1)
+        self.assertEqual(result["reconcile"]["failed_images"]["deregistered"], 1)
+        self.assertEqual(result["reconcile"]["failed_images"]["snapshots_deleted"], 1)
+        # Reconcile took them, so the rule at the end of the pass has nothing left to remove.
+        self.assertEqual(result["retention"]["deregistered"], 0)
         self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xD2), ami(0xD3)})
         self.assertEqual(set(self.world.snapshots), {snap(0xD2)})
         (event,) = self.events("image_pruned")
         self.assertEqual((event["deregistered"], event["snapshots_deleted"]), (1, 1))
         self.assertEqual(self.metric("ci_burst_image_leaked_resources_total", kind="image"), 0.0)
 
-    def test_an_old_image_with_no_row_that_is_not_usable_is_removed_and_counted_as_leaked(self):
+    def test_the_images_of_a_failed_build_are_removed_before_a_new_build_starts(self):
+        self.add_build("failed-one", "failed", image_id=ami(0xD1))
+        self.world.add_image(ami(0xD1), tags=owned("failed-one"), snapshots=(snap(0xD1),))
+        self.world.add_snapshot(snap(0xD1), tags=owned("failed-one"))
+        result = self.apply()
+        self.assertEqual(result["decision"], "building")
+        self.assertEqual(result["reconcile"]["failed_images"]["deregistered"], 1)
+        names = self.world.names()
+        self.assertLess(names.index("deregister_image"), names.index("create_multipart_upload"))
+        self.assertLess(names.index("delete_snapshot"), names.index("run_instances"))
+
+    def test_reconcile_runs_the_failed_build_path_only_and_retention_keeps_the_others(self):
+        self.configure(render_toml(image_extra="retain = 2\nretain_min_age_seconds = 3600\n"))
+        self.pin_current()
+        for number, (name, age) in enumerate((("oldest", 6 * DAY), ("older", 4 * DAY), ("old", 2 * DAY)), start=0xF1):
+            self.add_build(name, "candidate", age=age, image_id=ami(number), verified_at=NOW - age + HOUR)
+            self.world.add_image(ami(number), tags=owned(name), age=age)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["failed_images"]["deregistered"], 0)
+        self.assertEqual(result["retention"]["deregistered"], 1)
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xF2), ami(0xF3)})
+
+    def test_an_old_image_with_no_row_that_is_not_usable_is_recorded_removed_and_counted_as_leaked(self):
         self.pin_current()
         self.world.add_image(
             ami(0xE1), tags=owned("nobody"), state="failed", age=2 * DAY, snapshots=(snap(0xE1),)
         )
         self.world.add_snapshot(snap(0xE1), tags=owned("nobody"), age=2 * DAY)
-        self.apply()
+        result = self.apply()
         self.assertNotIn(ami(0xE1), self.world.images)
         self.assertEqual(self.world.snapshots, {})
         self.assertEqual(self.metric("ci_burst_image_leaked_resources_total", kind="image"), 1.0)
         self.assertEqual(self.metric("ci_burst_image_leaked_resources_total", kind="snapshot"), 1.0)
-        self.assertEqual(self.builds(), [])
+        self.assertEqual(result["reconcile"]["images_recorded"], 1)
+        # It had a row first, so the rule took it as a failed image. It is no build of ours that failed.
+        row = self.query(lambda state: state.build("nobody"))
+        self.assertEqual((row.state, row.reason_code, row.image_state), ("failed", "IMAGE_ORPHAN_RECORDED", "failed"))
+        self.assertIsNone(row.verified_at)
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+        self.assertEqual(self.events("image_build_failed"), [])
 
     def test_an_available_image_with_no_row_is_recorded_as_an_unverified_candidate_and_never_pinned(self):
         self.pin_current()
@@ -1998,13 +2693,89 @@ class ReconcileTests(PipelineCase):
         self.assertIn(ami(0xC1), self.world.images)
         self.assertEqual(self.metric("ci_burst_image_candidate_waiting_seconds"), 0.0)
 
-    def test_an_image_that_is_not_available_yet_and_has_no_row_is_not_recorded(self):
+    def test_an_image_that_is_not_available_and_has_no_row_is_recorded_with_its_state(self):
+        self.pin_current()
+        self.world.image_final_state = "pending"
+        before = self.config_path.read_bytes()
+        states = {"orphan-pending": "pending", "orphan-failed": "failed", "orphan-error": "error", "orphan-busy": "transient"}
+        for number, (name, state) in enumerate(states.items(), start=0xC2):
+            self.world.add_image(ami(number), tags=owned(name), state=state, age=HOUR)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["images_recorded"], len(states))
+        for number, (name, state) in enumerate(states.items(), start=0xC2):
+            row = self.query(lambda current, name=name: current.build(name))
+            self.assertEqual((row.state, row.reason_code, row.image_state), ("candidate", "IMAGE_ORPHAN_RECORDED", state))
+            self.assertEqual((row.image_id, row.verified_at, row.template_version), (ami(number), None, None))
+            self.assertIn(ami(number), self.world.images)
+        self.assertIsNone(self.query(lambda state: state.verified_candidate(DEPLOYMENT)))
+        self.assertEqual(self.world.arguments("create_launch_template_version"), [])
+        self.assertEqual(self.config_path.read_bytes(), before)
+        (event,) = self.events("image_reconciled")
+        self.assertEqual(event["images_recorded"], len(states))
+        # Recorded once, and the hold of a day still keeps all of them.
+        self.assertEqual(self.apply()["reconcile"]["images_recorded"], 0)
+        self.assertEqual(len(self.builds()), len(states))
+
+    def test_a_recorded_orphan_that_becomes_available_is_noted_and_stays_unverified(self):
         self.pin_current()
         self.world.image_final_state = "pending"
         self.world.add_image(ami(0xC2), tags=owned("orphan-pending"), state="pending", age=HOUR)
-        self.apply()
-        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.apply()["reconcile"]["images_recorded"], 1)
+        row = self.query(lambda state: state.build("orphan-pending"))
+        self.assertEqual((row.state, row.image_state), ("candidate", "pending"))
+        self.world.image_final_state = "available"
+        self.assertEqual(self.apply()["reconcile"]["images_recorded"], 0)
+        row = self.query(lambda state: state.build("orphan-pending"))
+        self.assertEqual((row.state, row.image_state, row.verified_at), ("candidate", "available", None))
+        self.assertIsNone(self.query(lambda state: state.verified_candidate(DEPLOYMENT)))
+        self.assertEqual(len(self.builds()), 1)
         self.assertIn(ami(0xC2), self.world.images)
+
+    def test_a_recorded_orphan_that_turns_failed_is_removed_once_the_orphan_hold_has_passed(self):
+        self.pin_current()
+        self.world.image_final_state = "pending"
+        self.world.add_image(ami(0xC3), tags=owned("orphan-late"), state="pending", age=HOUR, snapshots=(snap(0xC3),))
+        self.world.add_snapshot(snap(0xC3), tags=owned("orphan-late"), age=HOUR)
+        self.apply()
+        self.world.image_final_state = "failed"
+        self.clock.advance(2 * HOUR)
+        self.apply()
+        row = self.query(lambda state: state.build("orphan-late"))
+        self.assertEqual((row.state, row.image_state), ("candidate", "failed"))
+        self.assertIn(ami(0xC3), self.world.images)
+        self.clock.advance(DAY)
+        result = self.apply()
+        row = self.query(lambda state: state.build("orphan-late"))
+        self.assertEqual((row.state, row.reason_code, row.image_state), ("failed", "IMAGE_ORPHAN_RECORDED", "failed"))
+        self.assertEqual(result["reconcile"]["failed_images"]["deregistered"], 1)
+        self.assertNotIn(ami(0xC3), self.world.images)
+        self.assertEqual(self.world.snapshots, {})
+        self.assertEqual(self.control().consecutive_failures, 0)
+
+    def test_a_recorded_orphan_that_stays_pending_is_removed_after_the_orphan_hold(self):
+        self.pin_current()
+        self.world.image_final_state = "pending"
+        self.world.add_image(ami(0xC4), tags=owned("orphan-stuck"), state="pending", age=DAY + HOUR)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["images_recorded"], 1)
+        # A failed build whose image never left pending is the pending path's, which runs at the end of the pass.
+        self.assertEqual(result["reconcile"]["failed_images"]["deregistered"], 0)
+        self.assertEqual(result["retention"]["deregistered"], 1)
+        self.assertNotIn(ami(0xC4), self.world.images)
+        row = self.query(lambda state: state.build("orphan-stuck"))
+        self.assertEqual((row.state, row.image_state), ("failed", "pending"))
+        self.assertEqual(self.metric("ci_burst_image_leaked_resources_total", kind="image"), 1.0)
+
+    def test_a_failed_orphan_row_is_not_a_failed_build_and_does_not_clear_a_block(self):
+        self.add_build("earlier", "failed", age=5 * DAY, digest=self.digest())
+        self.set_control(consecutive_failures=3, blocked=True)
+        tags = owned("nobody", **{BASIS_DIGEST_TAG: "9" * 64})
+        self.world.add_image(ami(0xE2), tags=tags, state="failed", age=2 * DAY)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_BLOCKED"))
+        self.assertTrue(self.control().blocked)
+        self.assertEqual(self.query(lambda state: state.build("nobody")).state, "failed")
+        self.assertEqual(self.world.arguments("run_instances"), [])
 
     def test_a_lost_state_file_ends_the_builder_and_cannot_start_a_second_build(self):
         self.start_build()
@@ -2070,6 +2841,27 @@ class RetentionTests(PipelineCase):
         control = self.control()
         self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
 
+    def test_reconcile_deletes_nothing_when_the_protected_set_cannot_be_resolved_and_the_pass_goes_on(self):
+        self.stale_failed_build("failed-one", 0xD1)
+        self.add_journal(old_pin=99, new_pin=PIN)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["failed_images"], {"refused": "IMAGE_DELETION_UNSAFE"})
+        self.assertEqual(result["retention"], {"refused": "IMAGE_DELETION_UNSAFE"})
+        self.assertEqual(result["decision"], "building")
+        self.assertIn(ami(0xD1), self.world.images)
+        self.assertEqual(self.world.arguments("deregister_image"), [])
+        self.assertEqual(self.events("image_pruned"), [])
+
+    def test_reconcile_deletes_nothing_when_the_plan_cannot_be_made_and_the_pass_goes_on(self):
+        self.stale_failed_build("failed-one", 0xD1)
+        self.world.fail("describe_snapshots", ProviderError("RequestLimitExceeded"))
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["failed_images"], {"refused": "AWS_UNCERTAIN"})
+        self.assertEqual(result["retention"], {"refused": "AWS_UNCERTAIN"})
+        self.assertEqual(result["decision"], "building")
+        self.assertIn(ami(0xD1), self.world.images)
+        self.assertEqual(self.world.arguments("deregister_image"), [])
+
     def test_the_previous_pin_protects_its_image(self):
         self.pin_current()
         self.stale_failed_build("kept", 0xD1)
@@ -2077,7 +2869,7 @@ class RetentionTests(PipelineCase):
         self.world.set_version(WORKER, PREVIOUS, {"ImageId": ami(0xD1)})
         self.add_journal(old_pin=PREVIOUS, new_pin=PIN)
         result = self.apply()
-        self.assertEqual(result["retention"]["deregistered"], 1)
+        self.assertEqual(result["reconcile"]["failed_images"]["deregistered"], 1)
         self.assertIn(ami(0xD1), self.world.images)
         self.assertNotIn(ami(0xD2), self.world.images)
 
@@ -2090,7 +2882,7 @@ class RetentionTests(PipelineCase):
         self.world.set_version(WORKER, 4, {"ImageId": ami(0xD2)})
         self.add_journal(old_pin=PREVIOUS, new_pin=4, status="pending")
         result = self.apply()
-        self.assertEqual(result["retention"]["deregistered"], 1)
+        self.assertEqual(result["reconcile"]["failed_images"]["deregistered"], 1)
         self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xD1), ami(0xD2)})
 
     def test_the_newest_verified_candidate_is_protected_and_an_orphan_is_not_the_current_candidate(self):
@@ -2238,7 +3030,7 @@ class TelemetryTests(PipelineCase):
         self.assertEqual(self.metric("ci_burst_image_consecutive_failures"), 1.0)
         self.assertIsNone(self.metric("ci_burst_image_console_latency_seconds"))
 
-    def test_the_first_metrics_of_a_new_deployment_have_no_build_series(self):
+    def test_the_first_metrics_of_a_new_deployment_count_zero_builds_and_have_no_duration_or_timestamp_series(self):
         self.pin_current()
         self.apply()
         self.assertEqual(self.metric("ci_burst_image_builds", state="building"), 0.0)
@@ -2303,6 +3095,174 @@ class TelemetryTests(PipelineCase):
         self.assertEqual(event["framed_tail"], tail)
         with self.assertRaises(ValueError):
             telemetry.event("image_blocked", build_id="b-1", framed_tail=tail)
+
+    def test_the_event_whitelist_refuses_a_url_that_has_no_query_string(self):
+        # Every character of these is one an id or a code may hold: only the scheme separator gives them away.
+        telemetry = image_pipeline._Telemetry(self.state_dir, DEPLOYMENT, self.clock)
+        urls = (
+            "https://example.invalid/path",
+            f"https://{BUCKET}.s3.example.invalid/{PREFIX}build-0001.tar.gz",
+            f"s3://{BUCKET}/{PREFIX}build-0001.tar.gz",
+            "build-0001 https://example.invalid",
+            "a://b",
+            "://",
+        )
+        for value in urls:
+            for field in ("decision", "reason", "build_id", "digest", "source_sha"):
+                with self.assertRaises(ValueError, msg=f"{field}={value!r}"):
+                    telemetry.event("image_check", **{field: value})
+            with self.assertRaises(ValueError, msg=repr(value)):
+                telemetry.event("image_build_failed", build_id="b-1", reason=value)
+        self.assertFalse((self.state_dir / image_pipeline.EVENTS_FILE).exists())
+
+    def test_the_event_whitelist_still_takes_a_value_with_a_colon_or_a_slash_that_is_no_url(self):
+        telemetry = image_pipeline._Telemetry(self.state_dir, DEPLOYMENT, self.clock)
+        telemetry.event("image_check", decision="start", reason="AWS:UNCERTAIN/x", build_id=f"{PREFIX}b-1")
+        (event,) = self.events("image_check")
+        self.assertEqual((event["reason"], event["build_id"]), ("AWS:UNCERTAIN/x", f"{PREFIX}b-1"))
+
+    def test_the_failed_build_event_refuses_a_tail_that_still_holds_a_url(self):
+        telemetry = image_pipeline._Telemetry(self.state_dir, DEPLOYMENT, self.clock)
+        for tail in ("  | see https://example.invalid/path", "  | s3://example-bucket/key", "  | ://"):
+            with self.assertRaises(ValueError, msg=tail):
+                telemetry.event("image_build_failed", build_id="b-1", reason="WARM_FAILED", framed_tail=tail)
+        self.assertFalse((self.state_dir / image_pipeline.EVENTS_FILE).exists())
+
+
+class AppendLineTests(unittest.TestCase):
+    """The event file takes a line with one write on an append descriptor, and a write that falls short is an error."""
+
+    LINE = '{"event": "image_check"}\n'
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.dir = Path(directory.name)
+        self.path = self.dir / image_pipeline.EVENTS_FILE
+
+    @contextmanager
+    def spied(self, *, short=None):
+        """Record the flags of every ``os.open`` and the data of every ``os.write``; ``short`` caps what a write takes.
+
+        A second write ends the test with an error instead of looping, so a retry is a failure and never a hang.
+        """
+        record = {"flags": [], "writes": []}
+        real_open, real_write = os.open, os.write
+
+        def spy_open(path, flags, *arguments):
+            record["flags"].append(flags)
+            return real_open(path, flags, *arguments)
+
+        def spy_write(descriptor, data):
+            record["writes"].append(bytes(data))
+            if len(record["writes"]) > 1:
+                raise AssertionError("the line was written in more than one write")
+            return real_write(descriptor, bytes(data) if short is None else bytes(data)[:short])
+
+        with mock.patch.object(os, "open", spy_open), mock.patch.object(os, "write", spy_write):
+            yield record
+
+    def test_a_line_is_written_whole_with_one_write_on_an_append_descriptor(self):
+        with self.spied() as record:
+            image_pipeline._append_line(self.path, self.LINE)
+        self.assertEqual(record["writes"], [self.LINE.encode("utf-8")])
+        self.assertTrue(record["flags"][0] & os.O_APPEND)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), self.LINE)
+
+    def test_the_next_line_goes_behind_the_first(self):
+        image_pipeline._append_line(self.path, self.LINE)
+        image_pipeline._append_line(self.path, "second line\n")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), self.LINE + "second line\n")
+
+    def test_a_line_with_characters_beyond_ascii_is_written_whole_in_bytes(self):
+        line = '{"note": "\u017c\u00f3\u0142w"}\n'
+        with self.spied() as record:
+            image_pipeline._append_line(self.path, line)
+        self.assertEqual(record["writes"], [line.encode("utf-8")])
+        self.assertEqual(self.path.read_bytes(), line.encode("utf-8"))
+
+    def test_a_write_that_falls_short_is_an_error_and_is_not_retried(self):
+        for short in (5, 0):
+            with self.subTest(short=short):
+                with self.spied(short=short) as record:
+                    with self.assertRaises(OSError):
+                        image_pipeline._append_line(self.path, self.LINE)
+                self.assertEqual(record["writes"], [self.LINE.encode("utf-8")])
+
+    def test_a_short_write_reaches_the_caller_of_the_event_writer(self):
+        telemetry = image_pipeline._Telemetry(self.dir, DEPLOYMENT, Clock(NOW))
+        with self.spied(short=5):
+            with self.assertRaises(OSError):
+                telemetry.event("image_check", decision="start")
+
+    def test_the_descriptor_is_closed_after_a_short_write(self):
+        closed = []
+        real_close = os.close
+
+        def spy_close(descriptor):
+            closed.append(descriptor)
+            return real_close(descriptor)
+
+        with self.spied(short=5), mock.patch.object(os, "close", spy_close):
+            with self.assertRaises(OSError):
+                image_pipeline._append_line(self.path, self.LINE)
+        self.assertEqual(len(closed), 1)
+
+
+class ArchiveMaskTests(unittest.TestCase):
+    """The mask of the tail, on its own: what it leaves behind has no URL separator, whatever the input."""
+
+    KEY = f"{PREFIX}build-0001.tar.gz"
+
+    def mask(self, tail, key=KEY):
+        return image_pipeline._mask_archive(tail, key)
+
+    def test_the_result_never_holds_a_url_separator(self):
+        awkward = (
+            "://",
+            "  | ://x",
+            "  | (https://example.invalid/a)",
+            "  | a=b://c",
+            "  | x:///y",
+            "  | https://",
+            "  | HTTPS://example.invalid/UPPER?Q=1",
+            "  | one https://a.invalid two s3://b/c three ftp://d",
+            "  | git+ssh://git@example.invalid/x.git",
+            "  | " + "a" * 4000 + "://x",
+            "  | " + "https://example.invalid/" + "p" * 4000,
+        )
+        for tail in awkward:
+            masked = self.mask(tail)
+            self.assertNotIn("://", masked, tail[:80])
+            self.assertEqual(self.mask(masked), masked, "masking again changes nothing")
+
+    def test_a_url_goes_from_its_scheme_to_the_next_space_and_the_rest_of_the_line_stays(self):
+        self.assertEqual(
+            self.mask("  | WARM_SRC_URL=https://example.invalid/a?b=c&d=e after"), "  | WARM_SRC_URL=[archive-url] after"
+        )
+        self.assertEqual(self.mask("  | fetch s3://example-bucket/key done"), "  | fetch [archive-url] done")
+        self.assertEqual(self.mask("  | a https://x.invalid b https://y.invalid c"), "  | a [archive-url] b [archive-url] c")
+
+    def test_the_lines_stay_lines(self):
+        masked = self.mask("  | one https://x.invalid\n  | two\n  | three ?X-Amz-Signature=abc\n  | four")
+        self.assertEqual(masked, "  | one [archive-url]\n  | two\n  | three [archive-url]\n  | four")
+
+    def test_the_presign_parameters_of_a_query_string_that_stands_alone_are_masked(self):
+        for text in ("?X-Amz-Signature=abc", "&X-Amz-Date=20260101T000000Z", "x-amz-security-token=abc", "X-AMZ-Expires=1800"):
+            self.assertEqual(self.mask("  | " + text + " end"), "  | [archive-url] end", text)
+        # Other parameters are not the archive's.
+        self.assertEqual(self.mask("  | retries=3 mode=fast"), "  | retries=3 mode=fast")
+
+    def test_the_object_key_is_masked_wherever_it_stands(self):
+        key = self.KEY
+        self.assertEqual(self.mask(f"  | NoSuchKey {key}"), "  | NoSuchKey [archive-url]")
+        self.assertEqual(self.mask(f"  | {key} {key}"), "  | [archive-url] [archive-url]")
+        self.assertEqual(self.mask("  | NoSuchKey other/key.tar.gz"), "  | NoSuchKey other/key.tar.gz")
+
+    def test_a_build_with_no_key_masks_no_key(self):
+        for key in (None, ""):
+            self.assertEqual(self.mask("  | a b", key), "  | a b")
+            self.assertEqual(self.mask("", key), "")
 
 
 class SecretTests(PipelineCase):

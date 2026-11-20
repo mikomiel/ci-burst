@@ -7,6 +7,8 @@ version are unchanged by all of them, which ``SchemaVersionTests`` pins.
 
 import sqlite3
 import unittest
+from contextlib import contextmanager
+from unittest import mock
 
 from ci_burst.errors import StateRefusal
 from ci_burst.image_state import SCHEMA_VERSION, STATE_FILE, ImageState, PinObservation
@@ -89,10 +91,50 @@ class ReadOnlyOpenTests(ImageStateCase):
         self.assertTrue(reader.connect_readonly())
         self.assertIs(reader._connection, connection)
 
-    def test_it_reads_while_another_process_holds_the_writer_lock(self):
+    def test_a_state_that_is_open_for_writing_is_refused_not_returned_as_read_only(self):
+        # ``self.state`` holds a read-write connection. Answering ``True`` would call that connection read-only
+        # while it writes, so the call is refused and the connection stays as it was.
+        with self.assertRaises(StateRefusal) as raised:
+            self.state.connect_readonly()
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_OPEN_FOR_WRITE")
+        self.assertTrue(self.state.available)
+        self.assertTrue(self.state.control_set(blocked=1).blocked)
+
+    def test_the_refusal_keeps_the_writer_lock_of_the_state_it_refused(self):
+        self.state.acquire_writer()
+        with self.assertRaises(StateRefusal):
+            self.state.connect_readonly()
+        with self.assertRaises(StateRefusal) as raised:
+            self.reader().acquire_writer()
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_LOCKED")
+
+    def test_a_state_that_was_read_only_and_is_opened_for_writing_is_refused_the_next_time(self):
+        self.state.close()
+        reader = self.reader()
+        self.assertTrue(reader.connect_readonly())
+        reader.close()
+        reader.connect()
+        with self.assertRaises(StateRefusal) as raised:
+            reader.connect_readonly()
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_OPEN_FOR_WRITE")
+        self.assertTrue(reader.control_set(blocked=1).blocked)
+
+    def test_a_state_that_is_open_read_only_stays_so_for_the_next_call(self):
+        self.state.close()
+        reader = self.reader()
+        reader.connect_readonly()
+        self.assertTrue(reader.connect_readonly())
+        with self.assertRaises(sqlite3.OperationalError):
+            reader.control_set(blocked=1)
+
+    def test_it_reads_while_a_second_state_object_holds_the_writer_lock(self):
         self.add_build()
         self.state.acquire_writer()
         reader = self.reader()
+        # The lock is held: a third object cannot take it. The read-only open does not need it.
+        with self.assertRaises(StateRefusal) as raised:
+            self.reader().acquire_writer()
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_LOCKED")
         self.assertTrue(reader.connect_readonly())
         self.assertEqual(len(reader.builds(DEPLOYMENT)), 1)
 
@@ -174,7 +216,7 @@ class PinLogTests(ImageStateCase):
 
 
 class OrphanAndCandidateTests(ImageStateCase):
-    def orphan(self, build_id="build-orphan", **overrides):
+    def orphan_values(self, build_id="build-orphan", **overrides):
         values = dict(
             build_id=build_id,
             deployment=DEPLOYMENT,
@@ -185,8 +227,22 @@ class OrphanAndCandidateTests(ImageStateCase):
             reason_code="IMAGE_ORPHAN_RECORDED",
         )
         values.update(overrides)
+        return values
+
+    def orphan(self, build_id="build-orphan", **overrides):
         with self.state.transaction():
-            return self.state.insert_orphan(**values)
+            return self.state.insert_orphan(**self.orphan_values(build_id, **overrides))
+
+    def statements_of(self, call):
+        """The SQL statements that ``call`` makes on the state's connection, in order."""
+        connection = self.state._connection
+        statements = []
+        connection.set_trace_callback(statements.append)
+        try:
+            call()
+        finally:
+            connection.set_trace_callback(None)
+        return statements
 
     def verified(self, build_id, **overrides):
         self.add_build(build_id)
@@ -218,9 +274,73 @@ class OrphanAndCandidateTests(ImageStateCase):
         self.assertEqual(self.state.builds_started_since(DEPLOYMENT, self.clock.now - 86_400), 0)
 
     def test_the_same_image_is_not_recorded_twice(self):
-        self.orphan()
-        with self.assertRaises(sqlite3.IntegrityError):
+        first = self.orphan()
+        with self.assertRaises(StateRefusal) as raised:
             self.orphan()
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("IMAGE_BUILD_EXISTS", "build-orphan"))
+        self.assertEqual(self.state.builds(DEPLOYMENT), [first])
+
+    def test_a_row_of_a_real_build_with_that_id_is_not_recorded_over(self):
+        real = self.add_build("build-orphan")
+        with self.assertRaises(StateRefusal) as raised:
+            self.orphan()
+        self.assertEqual(raised.exception.reason, "IMAGE_BUILD_EXISTS")
+        self.assertEqual(self.state.builds(DEPLOYMENT), [real])
+
+    def test_a_refused_orphan_on_its_own_leaves_no_transaction_open(self):
+        first = self.state.insert_orphan(**self.orphan_values())
+        with self.assertRaises(StateRefusal):
+            self.state.insert_orphan(**self.orphan_values())
+        # Another connection can take the write lock at once, and this state takes its next write as before.
+        other = sqlite3.connect(self.state.path, timeout=0.2, isolation_level=None)
+        self.addCleanup(other.close)
+        other.execute("BEGIN IMMEDIATE")
+        other.execute("ROLLBACK")
+        second = self.state.insert_orphan(**self.orphan_values("build-orphan-2", image_id="ami-0123456789abcdef8"))
+        self.assertEqual(self.state.builds(DEPLOYMENT), [first, second])
+
+    def test_an_orphan_on_its_own_is_one_explicit_transaction(self):
+        statements = self.statements_of(lambda: self.state.insert_orphan(**self.orphan_values()))
+        words = [statement.split()[0].upper() for statement in statements]
+        self.assertEqual((words[0], words[-1]), ("BEGIN", "COMMIT"))
+        self.assertEqual((words.count("BEGIN"), words.count("INSERT"), words.count("COMMIT")), (1, 1, 1))
+        self.assertNotIn("ROLLBACK", words)
+
+    def test_an_orphan_is_written_under_the_same_guard_as_the_other_writers(self):
+        entered = []
+        guard = self.state._write_active_guard
+
+        @contextmanager
+        def recording():
+            entered.append(True)
+            with guard():
+                yield
+
+        with mock.patch.object(self.state, "_write_active_guard", recording):
+            self.orphan()
+        self.assertEqual(entered, [True])
+
+    def test_a_refused_orphan_on_its_own_is_rolled_back(self):
+        self.orphan()
+
+        def refused():
+            with self.assertRaises(StateRefusal):
+                self.state.insert_orphan(**self.orphan_values())
+
+        words = [statement.split()[0].upper() for statement in self.statements_of(refused)]
+        self.assertEqual((words[0], words[-1]), ("BEGIN", "ROLLBACK"))
+        self.assertNotIn("COMMIT", words)
+
+    def test_an_orphan_inside_a_caller_transaction_joins_it_and_leaves_with_it(self):
+        with self.assertRaises(RuntimeError):
+            with self.state.transaction():
+                self.state.insert_orphan(**self.orphan_values())
+                self.assertEqual(len(self.state.builds(DEPLOYMENT)), 1)
+                raise RuntimeError("stop")
+        self.assertEqual(self.state.builds(DEPLOYMENT), [])
+        statements = self.statements_of(lambda: self.orphan("build-orphan-2"))
+        words = [statement.split()[0].upper() for statement in statements]
+        self.assertEqual((words.count("BEGIN"), words.count("COMMIT")), (1, 1))
 
     def test_the_verified_candidate_skips_an_orphan_even_when_the_orphan_is_newer(self):
         verified = self.verified("build-verified", )

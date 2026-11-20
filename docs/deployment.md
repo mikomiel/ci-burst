@@ -159,6 +159,15 @@ has no IAM action at all, no `ec2:ModifyLaunchTemplate`, no
 and outside the build launch template. IAM cannot restrict what a launch-template
 version contains, so a person still reads and pins every candidate.
 
+The policy lets the role describe security groups (`ec2:DescribeSecurityGroups`).
+It sits in the describe-only statement, because a describe action cannot be
+limited to one resource. Before a build starts, the controller reads the groups
+that the build launch template names. It refuses to start unless the template
+names at least one group and no named group has an inbound rule. Apply this
+action together with the rest of the policy: a role without it makes `plan` and
+every pass that would start a build fail with the provider's refusal, and no
+build starts.
+
 The policy conditions `ec2:GetConsoleOutput` on the `ci-burst:image-build` tag
 of the instance. This guide does not establish that the provider evaluates a
 tag condition for that action, and none of the verification gates G1 to G13 in

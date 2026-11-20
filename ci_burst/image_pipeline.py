@@ -20,24 +20,37 @@ Three entry points make up the Python API (the command line is task 6.1):
 
 A pass holds the state file's writer lock and runs, in this order:
 
-1. reconcile: terminate every builder that is not the active build's, delete
-   stray archives, adopt what a crash left behind, record an image that has no
-   row as an unverified candidate
+1. reconcile: terminate every builder that is not the active build's, and the
+   active build's own once its deadline has come; delete stray archives; adopt
+   what a crash left behind; record every tagged image that has no row as an
+   unverified candidate and follow it; remove the images of failed builds
 2. observe the configured pin
 3. with no active build, decide and, when a build is due, start it; with one,
    advance it (``building`` to ``imaging`` to ``candidate`` or ``failed``)
 4. retention: the one deletion rule, then the telemetry files
 
 The pass that first sees the marker calls ``CreateImage`` before it does any
-other step. The builder is terminated only after the image is ``available``.
+other step. The builder is terminated only after the image is ``available``,
+or when the build is past its deadline: reconcile then ends it before any other
+step, and the build fails with the code of the deadline.
+
+A start has two refusals that are no failed build: ``IMAGE_CREDENTIAL_SHORT`` and
+``IMAGE_BUILD_ALREADY_ACTIVE``. Both are checked before the row and the upload,
+and again before the launch, when either can have changed. The pass answers
+``refused``, drops the archive and counts no failure. A pass that runs out of
+time while it stages the archive does not fail the build either: the row stays
+``building`` with no builder, and the next pass stages the archive again under
+the same key and launches. The build deadline still ends such a build.
 
 Secrets. The presigned archive URL and the rendered user data live in local
 variables of ``_Pass._launch`` and nowhere else: not in the state file, not in an
 event, not in the metrics, not in an exception detail. Events pass through a
 whitelist of fields and values (``_Telemetry.event``), so a value that is not an
-id, a short digest, a count or a reason code is refused instead of written. Only
-the failed-build event carries console text, and only the framed, sanitized tail
-that ``image_console.framed_tail`` returns.
+id, a short digest, a count or a reason code is refused instead of written, and
+no value holds ``://``. Only the failed-build event carries console text, and
+only the framed, sanitized tail that ``image_console.framed_tail`` returns, with
+every URL, every presigned query string and the archive's object key shown as
+``[archive-url]``.
 
 Files written into the state directory besides ``image-state.sqlite``:
 ``image-events.ndjson`` (append-only), ``image-metrics.prom`` (replaced
@@ -45,6 +58,7 @@ atomically) and ``image-telemetry.json`` (the counters that cannot be derived
 from the state file, replaced atomically).
 """
 
+import errno
 import json
 import math
 import os
@@ -97,6 +111,11 @@ IMAGE_BUILDER_GONE = "IMAGE_BUILDER_GONE"
 IMAGE_NOT_AVAILABLE = "IMAGE_NOT_AVAILABLE"
 IMAGE_ORPHAN_RECORDED = "IMAGE_ORPHAN_RECORDED"
 IMAGE_BUILD_ALREADY_ACTIVE = "IMAGE_BUILD_ALREADY_ACTIVE"
+IMAGE_CREDENTIAL_SHORT = "IMAGE_CREDENTIAL_SHORT"
+
+#: The refusals that end a start without a failed build. Both are checked before anything is staged and again
+#: once the archive is up, because either can change in between. Neither counts toward the cooldown or the block.
+START_REFUSALS = (IMAGE_CREDENTIAL_SHORT, IMAGE_BUILD_ALREADY_ACTIVE)
 
 #: Tag keys that ``CreateImage`` adds to the ones the adapter sets. The build
 #: policy (``deploy/iam/image-build-policy.json``) allows exactly these keys, and
@@ -135,6 +154,15 @@ def _hex12(value):
 def _safe_name(value):
     """The deployment name as an image name accepts it (no ``:``)."""
     return re.sub(r"[^A-Za-z0-9._-]", "-", value)
+
+
+def _archive_prefix(prefix):
+    """The storage prefix as a folder: exactly one ``/`` at the end, whether the configuration has none or several.
+
+    Every archive key and the listing of strays use it, so a key is ``<prefix>/<build-id>.tar.gz`` and a listing
+    never reaches a neighbour such as ``<prefix>-other/``.
+    """
+    return prefix.rstrip("/") + "/"
 
 
 def _summary(build):
@@ -198,10 +226,16 @@ def _read_facts(state, deployment, now):
     if not state.available:
         return _Facts(Control(0, None, False, None), None, None, 0, None, None, None, [], [])
     journal = state.journal_last_complete()
+    builds = state.builds(deployment)
     return _Facts(
         control=state.control_get(),
         last_build=state.last_build(deployment),
-        last_failed=state.last_failed_build(deployment),
+        # The newest build of ours that failed. An orphan image that was recorded and then failed is no build
+        # of ours: counting it would let a stranger's digest clear a block.
+        last_failed=next(
+            (row for row in reversed(builds) if row.state == "failed" and row.reason_code != IMAGE_ORPHAN_RECORDED),
+            None,
+        ),
         builds_last_day=state.builds_started_since(deployment, now - DAY_SECONDS),
         active=state.active_build(deployment),
         # The newest candidate that was verified, not the newest candidate: an
@@ -209,12 +243,15 @@ def _read_facts(state, deployment, now):
         candidate=state.verified_candidate(deployment),
         previous_pin=journal.old_pin if journal is not None else None,
         pending=state.pending_journal(),
-        builds=state.builds(deployment),
+        builds=builds,
     )
 
 
-def _template_problems(data):
-    """The names of the properties of a build template that are not safe. Names only, never values."""
+def _template_problems(data, groups):
+    """The names of the properties of a build template that are not safe. Names only, never values.
+
+    ``groups`` are the security groups the template names, as ``ImageAws.security_groups`` read them.
+    """
     problems = []
     if data.get("IamInstanceProfile"):
         problems.append("IamInstanceProfile")
@@ -243,7 +280,57 @@ def _template_problems(data):
         problems.append("BlockDeviceMappings.Ebs.VolumeType")
     if any(device.get("DeleteOnTermination") is not True for device in devices):
         problems.append("BlockDeviceMappings.Ebs.DeleteOnTermination")
+    ids, names, complete = _security_group_refs(data)
+    if not complete or not (ids or names) or _admits_inbound(ids, names, groups):
+        problems.append("security_groups")
     return problems
+
+
+def _strings(value):
+    """A list-valued template property as a list of strings, or ``None`` when it is anything else."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        return None
+    return value
+
+
+def _security_group_refs(data):
+    """The security groups a build template version names: ``(ids, names, complete)``.
+
+    Ids come from ``SecurityGroupIds`` and from the ``Groups`` of every network interface, names from
+    ``SecurityGroups``. ``complete`` is False when a property is not a list of strings, or when a network
+    interface names no group: a launch would then give that interface the default group of the VPC, which
+    this check never reads.
+    """
+    ids, names, complete = [], [], True
+    for key, found in (("SecurityGroupIds", ids), ("SecurityGroups", names)):
+        listed = _strings(data.get(key))
+        if listed is None:
+            complete = False
+        else:
+            found.extend(listed)
+    interfaces = data.get("NetworkInterfaces")
+    if interfaces is None:
+        interfaces = []
+    elif not isinstance(interfaces, list):
+        complete, interfaces = False, []
+    for interface in interfaces:
+        listed = _strings(interface.get("Groups")) if isinstance(interface, Mapping) else None
+        if listed:
+            ids.extend(listed)
+        else:
+            complete = False
+    return sorted(set(ids)), sorted(set(names)), complete
+
+
+def _admits_inbound(ids, names, groups):
+    """Whether a named group is missing from what was read, or has an inbound rule.
+
+    A name matches the group of that name in every VPC of the Region, and each match counts.
+    """
+    read_ids, read_names = {group.group_id for group in groups}, {group.name for group in groups}
+    return not read_ids.issuperset(ids) or not read_names.issuperset(names) or any(g.ingress_rules for g in groups)
 
 
 def _ebs_devices(data):
@@ -262,18 +349,27 @@ def _volume_gib(data):
     return None
 
 
-def _deletion_counts(report):
-    """Counts of a deletion report, and the resources that the ``orphan`` path removed."""
+def _deletion_counts(report, orphans=frozenset()):
+    """Counts of a deletion report, and the leaked resources that it removed.
+
+    A resource is leaked when the ``orphan`` path removed it, or when the failed or the pending path removed
+    the image of a recorded orphan (``orphans`` holds those image ids) or one of that image's snapshots.
+    Reconcile records every tagged image that has no row, so an image nobody built here reaches the failed
+    or the pending path before the orphan path can see it.
+    """
     counts = {"deregistered": 0, "snapshots_deleted": 0, "failed": 0, "skipped": 0, "planned": 0}
     leaked = {"image": 0, "snapshot": 0}
     for row in report:
         result = row["result"]
+        leak = row["path"] == image_deletion.ORPHAN or (
+            row["image_id"] in orphans and row["path"] in (image_deletion.FAILED, image_deletion.PENDING_TIMEOUT)
+        )
         if result == image_deletion.DEREGISTERED:
             counts["deregistered"] += 1
-            leaked["image"] += row["path"] == image_deletion.ORPHAN
+            leaked["image"] += leak
         elif result == image_deletion.SNAPSHOT_DELETED:
             counts["snapshots_deleted"] += 1
-            leaked["snapshot"] += row["path"] == image_deletion.ORPHAN
+            leaked["snapshot"] += leak
         elif result in (
             image_deletion.DEREGISTER_FAILED,
             image_deletion.DEREGISTER_UNCONFIRMED,
@@ -311,11 +407,31 @@ _EVENT_FIELDS = {
     "image_blocked": frozenset({"consecutive_failures", "build_id"}),
 }
 
-#: An ordinary event value is an id, a digest, a code or a short list of names. A
-#: URL has characters outside this set, so one cannot be written by accident.
+#: An ordinary event value is an id, a digest, a code or a short list of names. The set holds ``:`` and ``/``,
+#: so a URL without a query string fits it: ``_check_event_value`` refuses ``://`` on its own.
 _PLAIN_VALUE = re.compile(r"[A-Za-z0-9._:,/ -]{0,200}")
+_URL_SEPARATOR = "://"
 _TAIL_FIELD = "framed_tail"
 _TAIL_EVENT = "image_build_failed"
+
+#: What stands in the tail of a failed build where the archive's URL, its query string or its object key was. The
+#: builder script (``warm-cache.sh``) prints the same text for the URL and the query it knows.
+ARCHIVE_URL_MASK = "[archive-url]"
+#: A URL with its query string, from its scheme (if it has one) to the next space. The presigned URL is not kept
+#: after the launch, so a pass cannot match it as text: it matches the shape. A URL that is not the archive's goes
+#: with it, because the pass cannot tell them apart and no event value holds ``://``.
+_URL = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]{0,31})?://\S*")
+#: A presigned query string that stands on its own, from its first parameter to the next space.
+_PRESIGN_QUERY = re.compile(r"[?&]?X-Amz-[A-Za-z0-9-]+=\S*", re.IGNORECASE)
+
+
+def _mask_archive(tail, archive_key):
+    """``tail`` with every URL, every presigned query string and the archive's object key shown as ``[archive-url]``.
+
+    The result holds no ``://``, so the event allowlist takes it.
+    """
+    tail = _PRESIGN_QUERY.sub(ARCHIVE_URL_MASK, _URL.sub(ARCHIVE_URL_MASK, tail))
+    return tail.replace(archive_key, ARCHIVE_URL_MASK) if archive_key else tail
 
 
 def _count(value):
@@ -327,22 +443,30 @@ def _number(value):
 
 
 def _check_event_value(name, key, value):
+    """Refuse a value that is not an id, a digest, a count or a code. No value of any field holds ``://``."""
     if value is None or isinstance(value, (bool, int, float)):
         return
-    if key == _TAIL_FIELD and name == _TAIL_EVENT and isinstance(value, str):
-        return
-    if isinstance(value, str) and _PLAIN_VALUE.fullmatch(value):
-        return
+    if isinstance(value, str) and _URL_SEPARATOR not in value:
+        if key == _TAIL_FIELD and name == _TAIL_EVENT or _PLAIN_VALUE.fullmatch(value):
+            return
     raise ValueError(f"event {name}: field {key} holds a value that is not an id, a digest, a count or a code")
 
 
 def _append_line(path, line):
-    """Append one line with one write, so a reader never sees half of it."""
-    data = memoryview(line.encode("utf-8"))
+    """Append one line with one ``write`` on an ``O_APPEND`` descriptor, so a reader never sees half of it.
+
+    The kernel puts a single write at the end of the file, whole, behind any other writer's line. A write that
+    falls short is raised as ``OSError`` and is never continued: a second write could land behind another
+    writer's line and tear both. The bytes of the short write stay in the file, because cutting them off could
+    cut a line that someone else added in the meantime, so a reader may find one line without its newline
+    after such an error.
+    """
+    data = line.encode("utf-8")
     descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        while data:
-            data = data[os.write(descriptor, data) :]
+        written = os.write(descriptor, data)
+        if written != len(data):
+            raise OSError(errno.EIO, f"short write of an event line: {written} of {len(data)} bytes", str(path))
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -510,10 +634,11 @@ class ImagePipeline:
     ``IMAGE_SOURCE_FORBIDDEN``, ``IMAGE_BRANCH_UNPROTECTED``,
     ``IMAGE_BASIS_PATH_MISSING``, ``IMAGE_BUILD_TEMPLATE_UNSAFE``,
     ``IMAGE_USERDATA_TOO_LARGE`` in ``plan``, ``IMAGE_STATE_LOCKED`` and every
-    provider read that fails) are raised. The answers of the trigger rules are
-    returned as the decision ``refused`` with a ``reason``. A build that ends
-    badly is returned as the decision ``failed`` with the reason code of the
-    failure. A result holds ids, 12-character digests, counts and codes only.
+    provider read that fails) are raised. The answers of the trigger rules, and
+    the two refusals of a start (``START_REFUSALS``), are returned as the
+    decision ``refused`` with a ``reason``. A build that ends badly is returned
+    as the decision ``failed`` with the reason code of the failure. A result
+    holds ids, 12-character digests, counts and codes only.
     """
 
     def __init__(
@@ -572,15 +697,16 @@ class ImagePipeline:
         image_id = read[0].data.get("ImageId")
         if not isinstance(image_id, str) or not image_id.startswith("ami-"):
             return _Pin(version, None, None, None)
-        found = aws.image(image_id)
+        found = aws.image(image_id, deadline=deadline)
         if found is None:
             return _Pin(version, image_id, None, None)
         return _Pin(version, image_id, found.tags.get(BASIS_DIGEST_TAG), found.created_at)
 
     def _check_build_template(self, aws, deadline):
-        """Read the build launch template version and refuse unless it is safe.
+        """Read the build launch template version and its security groups, and refuse unless it is safe.
 
-        The detail of a refusal names the failing properties, never a value.
+        The detail of a refusal names the failing properties, never a value. A read of the security groups
+        that fails is raised as the provider's refusal and never passes the check.
         """
         build = self._image.build
         found = aws.launch_templates([build.launch_template_name], deadline=deadline)
@@ -590,7 +716,9 @@ class ImagePipeline:
         if len(read) != 1 or read[0].version != build.launch_template_version:
             raise ImageRefusal(IMAGE_BUILD_TEMPLATE_UNSAFE, "the build launch template version was not found")
         data = read[0].data
-        problems = _template_problems(data)
+        ids, names, _ = _security_group_refs(data)
+        groups = aws.security_groups(group_ids=ids, group_names=names, deadline=deadline)
+        problems = _template_problems(data, groups)
         if problems:
             raise ImageRefusal(IMAGE_BUILD_TEMPLATE_UNSAFE, "unsafe properties: " + ", ".join(problems))
         return {
@@ -624,7 +752,9 @@ class ImagePipeline:
         gate and the script (no network), then the forge (a 401 or 403 is
         ``IMAGE_SOURCE_FORBIDDEN`` before any provider call), then the provider.
         The state file is opened for reading only, and a missing file answers as a
-        new one. ``force`` shows what a forced run would decide.
+        new one. A state that the caller opened is read as it is and left open:
+        ``plan`` itself only reads, whichever way that connection was opened.
+        ``force`` shows what a forced run would decide.
         """
         if not self._image.enabled:
             return {"decision": DISABLED}
@@ -642,7 +772,8 @@ class ImagePipeline:
         size = self._user_data_bytes(script)
         builders = aws.builders(self._config.deployment, deadline=deadline)
         opened = not self._state.available
-        present = self._state.connect_readonly()
+        # ``connect_readonly`` refuses a connection that is open for writing, and the caller's is read as it is.
+        present = self._state.connect_readonly() if opened else True
         try:
             facts = _read_facts(self._state, self._config.deployment, now)
             decision = self._decision(facts, digest, pin, now, force, facts.active is not None or bool(builders))
@@ -692,29 +823,36 @@ class ImagePipeline:
         text = image.render_user_data(script, image.warm_exports(self._image, url, "0" * 64))
         return len(text.encode("utf-8"))
 
+    def _deletion_items(self, aws, facts, now, deadline, mode):
+        """What the deletion rule selects for ``mode`` (the ``plan_deletions`` argument), from the state file's facts.
+
+        The protected set is resolved first, and a refusal of any read or of the rule passes unchanged.
+        """
+        protected = image_deletion.protected_set(
+            aws,
+            self._config_path,
+            previous_pin=facts.previous_pin,
+            pending_journal=facts.pending,
+            candidate=facts.candidate,
+            active=facts.active,
+            deadline=deadline,
+        )
+        deployment = self._config.deployment
+        return image_deletion.plan_deletions(
+            aws.images(deployment, deadline=deadline),
+            aws.snapshots(deployment, deadline=deadline),
+            protected,
+            deployment=deployment,
+            mode=mode,
+            now=now,
+            config=self._image,
+            builds=facts.builds,
+        )
+
     def _deletion_plan(self, aws, facts, now, deadline):
         """What the deletion rule would remove now, as a dry run: nothing is called."""
         try:
-            protected = image_deletion.protected_set(
-                aws,
-                self._config_path,
-                previous_pin=facts.previous_pin,
-                pending_journal=facts.pending,
-                candidate=facts.candidate,
-                active=facts.active,
-                deadline=deadline,
-            )
-            deployment = self._config.deployment
-            plan = image_deletion.plan_deletions(
-                aws.images(deployment, deadline=deadline),
-                aws.snapshots(deployment, deadline=deadline),
-                protected,
-                deployment=deployment,
-                mode="all",
-                now=now,
-                config=self._image,
-                builds=facts.builds,
-            )
+            plan = self._deletion_items(aws, facts, now, deadline, "all")
         except Refusal as refusal:
             return {"refused": refusal.reason}
         report = image_deletion.apply_deletions(aws, plan, apply=False)
@@ -788,8 +926,13 @@ class _Pass:
         self.source = None
         self.notes = []
         self.terminated_foreign = 0
-        #: True after a launch whose outcome is unknown: the build waits for the next pass.
+        #: The builders that reconcile ended because their build is past its deadline.
+        self.ended = set()
+        #: True when the build must wait for the next pass: a launch whose outcome is unknown, or a stage that
+        #: the pass deadline ended.
         self.hold = False
+        #: The reason a check refused the start of a build, else ``None``. The pass then answers ``refused``.
+        self.refused = None
         self.check = {}
 
     def run(self):
@@ -828,6 +971,9 @@ class _Pass:
         if build is not None and build.state in ACTIVE_STATES and not self.hold:
             build = self._advance(build)
         retention = self._retention()
+        if self.refused is not None:
+            # A check refused the start, which is no build and no failure: the answer is the refusal.
+            build, verdict = None, {"decision": REFUSED, "reason": self.refused}
         if build is not None:
             decision = build.state
             reason = build.reason_code or None if build.state == "failed" else None
@@ -872,10 +1018,13 @@ class _Pass:
             "failures": [],
         }
         active = s.active_build(dep)
-        # Builders. The state machine owns the active build's builder, its
-        # deadline included. Every other builder is terminated. A builder tagged
-        # with the active build's id that the row does not know yet is the one a
-        # crash between ``RunInstances`` and the state write left behind: adopt it.
+        # The first step of the pass, before any read that can fail: the builder of a build that is past its
+        # deadline goes. The state machine below ends the build itself, with the code of the deadline.
+        self._end_overdue(active, now, summary)
+        # Builders. The state machine owns the active build's builder. Every
+        # other builder is terminated. A builder tagged with the active build's
+        # id that the row does not know yet is the one a crash between
+        # ``RunInstances`` and the state write left behind: adopt it.
         foreign = []
         for builder in aws.builders(dep, deadline=self.deadline):
             owned = (
@@ -888,15 +1037,16 @@ class _Pass:
             elif active.builder_id is None:
                 active = s.advance_build(active.id, builder_id=builder.instance_id)
                 summary["builder_adopted"] = True
+                self._end_overdue(active, now, summary)
         if foreign:
             aws.terminate(foreign)
-            summary["builders_terminated"] = len(foreign)
+            summary["builders_terminated"] += len(foreign)
             self.terminated_foreign = len(foreign)
             self.tele.leak("builder", len(foreign))
         # Stray archives: not the active archive, and older than an hour.
         storage = self.cfg.storage
         keep = {active.archive_key} if active is not None and active.archive_key else set()
-        for stored in aws.list_objects(storage.bucket, storage.prefix, deadline=self.deadline):
+        for stored in aws.list_objects(storage.bucket, _archive_prefix(storage.prefix), deadline=self.deadline):
             if stored.key in keep or stored.last_modified is None:
                 continue
             if now - stored.last_modified <= STRAY_ARCHIVE_AGE_SECONDS:
@@ -910,8 +1060,9 @@ class _Pass:
         self.tele.leak("archive", summary["archives_deleted"])
         # Images. One that carries the active build's id and that the row does
         # not know yet was created by a crash after ``CreateImage``: adopt it.
-        # An available image with no row at all is recorded and never pinned.
-        rows = {build.id for build in s.builds(dep)}
+        # A tagged image with no row at all is recorded, in whatever state it
+        # is, and never verified or pinned. A later pass follows it.
+        rows = {build.id: build for build in s.builds(dep)}
         for found in aws.images(dep, deadline=self.deadline):
             tags = found.tags
             build_id = tags.get(BUILD_ID_TAG)
@@ -922,19 +1073,23 @@ class _Pass:
                     active = s.advance_build(active.id, image_id=found.image_id, state="imaging")
                     summary["image_adopted"] = True
                 continue
-            if build_id in rows or found.state != "available":
-                continue
-            s.insert_orphan(
-                build_id=build_id,
-                deployment=dep,
-                basis_digest=tags.get(BASIS_DIGEST_TAG) or "",
-                source_sha=tags.get(SOURCE_SHA_TAG) or "",
-                image_id=found.image_id,
-                created_at=found.created_at if found.created_at is not None else 0.0,
-                reason_code=IMAGE_ORPHAN_RECORDED,
-            )
-            rows.add(build_id)
-            summary["images_recorded"] += 1
+            row = rows.get(build_id)
+            if row is None:
+                row = rows[build_id] = s.insert_orphan(
+                    build_id=build_id,
+                    deployment=dep,
+                    basis_digest=tags.get(BASIS_DIGEST_TAG) or "",
+                    source_sha=tags.get(SOURCE_SHA_TAG) or "",
+                    image_id=found.image_id,
+                    created_at=found.created_at if found.created_at is not None else 0.0,
+                    reason_code=IMAGE_ORPHAN_RECORDED,
+                )
+                summary["images_recorded"] += 1
+            if row.reason_code == IMAGE_ORPHAN_RECORDED:
+                self._settle_orphan(row, found, now)
+        # The images of failed builds, under the deletion rule: after the rows above are current and before
+        # anything starts. The other paths run at the end of the pass.
+        summary["failed_images"] = self._delete((image_deletion.FAILED,))
         if (
             summary["builders_terminated"]
             or summary["archives_deleted"]
@@ -952,6 +1107,42 @@ class _Pass:
                 build_id=active.id if active is not None else None,
             )
         return summary
+
+    def _end_overdue(self, build, now, summary):
+        """Terminate the builder of an active build whose deadline has come, once per pass.
+
+        A refusal is reported and the pass goes on: ``_fail`` asks again when the state machine ends the build.
+        """
+        if build is None or build.builder_id is None or build.builder_id in self.ended or now < build.deadline_at:
+            return
+        try:
+            self.aws.terminate([build.builder_id])
+        except ProviderRefusal as refusal:
+            summary["failures"].append(refusal.reason)
+            return
+        self.ended.add(build.builder_id)
+        summary["builders_terminated"] += 1
+
+    def _settle_orphan(self, row, found, now):
+        """Follow a recorded orphan image after it was recorded.
+
+        An image that is ``available`` is noted as such and stays an unverified candidate. One that is not
+        available, once it is older than the orphan hold (it failed, or it stayed pending), is marked failed,
+        so that the failed-build path removes it: the orphan path did that before every tagged image had a
+        row. A younger image, or one with no known age, is kept and only its state is noted. The reason code
+        stays, so the row is never taken for a build of ours that failed.
+        """
+        if row.state != "candidate":
+            return
+        if found.state == "available":
+            if row.image_state != "available":
+                self.s.advance_build(row.id, image_state="available")
+            return
+        held = found.created_at is None or now - found.created_at <= image_deletion.ORPHAN_AGE_SECONDS
+        if not held:
+            self.s.advance_build(row.id, state="failed", image_state=found.state)
+        elif row.image_state != found.state:
+            self.s.advance_build(row.id, image_state=found.state)
 
     # -- decide and start --------------------------------------------------------
     def _source(self):
@@ -977,9 +1168,16 @@ class _Pass:
         return decision, self._start(sha, digest)
 
     def _start(self, sha, digest):
-        """The start sequence. The row is written before any provider call that costs something."""
+        """The start sequence. The checks that can refuse come first and the row before any provider call that costs.
+
+        The result is the build, or ``None`` when a check refused the start: nothing was written then.
+        """
         s, aws, cfg = self.s, self.aws, self.cfg
         self.p._check_build_template(aws, self.deadline)
+        reason = self._start_refusal()
+        if reason is not None:
+            self.refused = reason
+            return None
         now = self.clock()
         build_id, token = str(uuid.uuid4()), str(uuid.uuid4())
         build = s.insert_build(
@@ -992,16 +1190,69 @@ class _Pass:
             script_sha256=image.script_sha256(self.script),
             gate_configured=int(bool(cfg.warm.gate_command)),
         )
+        return self._stage(build)
+
+    def _start_refusal(self):
+        """The reason a start is refused now, or ``None``. Neither check reads the forge or spends anything."""
+        try:
+            self.aws.check_credential_life(self.cfg.source.presign_seconds)
+            self._check_no_builder()
+        except Refusal as refusal:
+            if refusal.reason in START_REFUSALS:
+                return refusal.reason
+            raise
+        return None
+
+    def _check_no_builder(self):
+        """Single-flight at the provider: refuse while any builder of this deployment exists."""
+        if self.aws.builders(self.dep, deadline=self.deadline):
+            raise ImageRefusal(IMAGE_BUILD_ALREADY_ACTIVE)
+
+    def _stage(self, build):
+        """Stage the archive and launch the builder, and settle every way that can end short of a launch."""
         try:
             return self._stage_and_launch(build)
+        except DeadlineRefusal:
+            # The pass ran out of time, not the build. The row stays ``building`` with no builder and no staged
+            # archive, and the next pass stages it again (``_restage``).
+            self.notes.append("pass_deadline_exceeded")
+            self.hold = True
+            return self.s.build(build.id)
         except Refusal as refusal:
-            # Nothing was launched: a launch whose outcome is unknown is handled
-            # inside ``_stage_and_launch`` and does not come here.
+            if refusal.reason in START_REFUSALS:
+                return self._end_refused(build, refusal.reason)
+            # Nothing was launched: a launch whose outcome is unknown is handled inside ``_stage_and_launch`` and
+            # does not come here.
             return self._fail(build, refusal.reason, builder_alive=False)
+
+    def _restage(self, build):
+        """Stage again a build that has no builder and no staged archive, because the pass deadline ended its stage.
+
+        The key is the same, so the new archive replaces whatever the earlier stage left. The build deadline still
+        bounds the build: past it the build fails with the code of a console that never showed anything, and
+        ``_fail`` deletes the archive the row names.
+        """
+        if self.clock() >= build.deadline_at:
+            return self._fail(build, image_console.CONSOLE_BLIND, builder_alive=False)
+        reason = self._start_refusal()
+        if reason is not None:
+            return self._end_refused(build, reason)
+        return self._stage(build)
+
+    def _end_refused(self, build, reason):
+        """End a build whose start a check refused: drop its archive and count no failure.
+
+        Nothing was launched, so the row is no failed build: the cooldown, the failure count and the block stay as
+        they were. The row ends as ``failed`` with the refusal's code, because the one-active index needs it to end.
+        """
+        build = self.s.advance_build(build.id, state="failed", reason_code=reason)
+        self._delete_archive(build)
+        self.refused = reason
+        return build
 
     def _stage_and_launch(self, build):
         s, aws, cfg = self.s, self.aws, self.cfg
-        key = f"{cfg.storage.prefix}{build.id}.tar.gz"
+        key = f"{_archive_prefix(cfg.storage.prefix)}{build.id}.tar.gz"
         chunks = self._source().archive(build.source_sha, cfg.source.max_archive_bytes, deadline=self.deadline)
         try:
             upload = aws.put_archive(
@@ -1012,7 +1263,13 @@ class _Pass:
             if close is not None:
                 close()
         build = s.advance_build(build.id, archive_key=upload.key, archive_sha256=upload.sha256)
-        instance_id = self._launch(build, upload)
+        try:
+            instance_id = self._launch(build, upload)
+        except DeadlineRefusal:
+            # The pass ran out of time before the launch call, so no builder was launched: the row goes back to
+            # "not staged" and the next pass stages again. The key stays, so the end of the build deletes the object.
+            s.advance_build(build.id, archive_sha256=None)
+            raise
         if instance_id is None:
             self.notes.append("run_builder:uncertain")
             self.hold = True
@@ -1039,8 +1296,7 @@ class _Pass:
         aws, cfg = self.aws, self.cfg
         url = aws.presign_get(cfg.storage.bucket, upload.key, cfg.source.presign_seconds)
         user_data = image.render_user_data(self.script, image.warm_exports(cfg, url, upload.sha256))
-        if aws.builders(self.dep, deadline=self.deadline):
-            raise ImageRefusal(IMAGE_BUILD_ALREADY_ACTIVE)
+        self._check_no_builder()
         try:
             return aws.run_builder(
                 template_name=cfg.build.launch_template_name,
@@ -1078,6 +1334,11 @@ class _Pass:
         return True
 
     def _building(self, build):
+        if build.builder_id is None and build.archive_sha256 is None:
+            # The pass deadline ended the stage before a builder was launched: stage it again.
+            build = self._restage(build)
+            if build.state != "building" or build.builder_id is None:
+                return build
         if build.builder_id is None or build.archive_sha256 is None:
             return self._fail(build, IMAGE_BUILDER_GONE, builder_alive=False)
         while True:
@@ -1086,6 +1347,8 @@ class _Pass:
             alive = any(item.instance_id == build.builder_id and item.state in BUILDER_STATES for item in found)
             if not alive and now - build.updated_at < BUILDER_VISIBILITY_GRACE_SECONDS:
                 alive = True  # a builder that was just recorded may not be listed yet
+            if build.builder_id in self.ended:
+                alive = False  # reconcile ended it at the deadline, whatever the provider still lists
             console = self.aws.console_output([build.builder_id], deadline=self.deadline).get(build.builder_id)
             marker = image_console.read_marker(console, build.archive_sha256)
             outcome = marker["outcome"]
@@ -1102,10 +1365,12 @@ class _Pass:
                 return self._create_image(build, console)
             if outcome in (image_console.FAILED, image_console.MISMATCH):
                 return self._fail(build, marker["reason"], console)
-            if not alive:
-                return self._fail(build, IMAGE_BUILDER_GONE, console, builder_alive=False)
+            # A build past its deadline ends with the deadline code, whatever became of its builder:
+            # reconcile ends an overdue builder first.
             if now >= build.deadline_at:
                 return self._fail(build, image_console.deadline_reason(outcome), console)
+            if not alive:
+                return self._fail(build, IMAGE_BUILDER_GONE, console, builder_alive=False)
             if not self._wait():
                 return build
 
@@ -1154,7 +1419,7 @@ class _Pass:
     def _imaging(self, build):
         while True:
             now = self.clock()
-            found = self.aws.image(build.image_id)
+            found = self.aws.image(build.image_id, deadline=self.deadline)
             name = found.state if found is not None else None
             if name == "available":
                 return self._complete(build)
@@ -1180,6 +1445,7 @@ class _Pass:
                 build_id=build.id,
                 basis_digest=build.basis_digest,
                 client_token=f"{build.client_token}-v",
+                deadline=self.deadline,
             )
         except ProviderRefusal as refusal:
             # The version may exist already. The next pass asks again with the
@@ -1237,7 +1503,7 @@ class _Pass:
         template fields that drifted and goes into the event only.
         """
         s, now = self.s, self.clock()
-        if builder_alive and build.builder_id is not None:
+        if builder_alive and build.builder_id is not None and build.builder_id not in self.ended:
             try:
                 self.aws.terminate([build.builder_id])
             except ProviderRefusal:
@@ -1258,7 +1524,7 @@ class _Pass:
             digest=_hex12(build.basis_digest),
             duration_seconds=max(0.0, now - build.created_at),
             drift_fields=drift_fields,
-            framed_tail=image_console.framed_tail(console),
+            framed_tail=_mask_archive(image_console.framed_tail(console), build.archive_key),
         )
         if recorded["newly_blocked"]:
             self.tele.event(
@@ -1284,32 +1550,20 @@ class _Pass:
 
     # -- retention -----------------------------------------------------------------
     def _retention(self):
-        """The one deletion rule, at the end of the pass. A refusal deletes nothing and is reported."""
-        facts = _read_facts(self.s, self.dep, self.clock())
+        """The one deletion rule with every path, at the end of the pass."""
+        return self._delete("all")
+
+    def _delete(self, mode):
+        """Apply the one deletion rule for ``mode``. A refusal deletes nothing and is the result."""
+        now = self.clock()
+        facts = _read_facts(self.s, self.dep, now)
         try:
-            protected = image_deletion.protected_set(
-                self.aws,
-                self.p._config_path,
-                previous_pin=facts.previous_pin,
-                pending_journal=facts.pending,
-                candidate=facts.candidate,
-                active=facts.active,
-                deadline=self.deadline,
-            )
-            plan = image_deletion.plan_deletions(
-                self.aws.images(self.dep, deadline=self.deadline),
-                self.aws.snapshots(self.dep, deadline=self.deadline),
-                protected,
-                deployment=self.dep,
-                mode="all",
-                now=self.clock(),
-                config=self.cfg,
-                builds=facts.builds,
-            )
+            plan = self.p._deletion_items(self.aws, facts, now, self.deadline, mode)
         except Refusal as refusal:
             return {"refused": refusal.reason}
         report = image_deletion.apply_deletions(self.aws, plan, apply=True)
-        counts, leaked = _deletion_counts(report)
+        orphans = {row.image_id for row in facts.builds if row.reason_code == IMAGE_ORPHAN_RECORDED and row.image_id}
+        counts, leaked = _deletion_counts(report, orphans)
         for kind, count in leaked.items():
             self.tele.leak(kind, count)
         if counts["deregistered"] or counts["snapshots_deleted"] or counts["failed"]:

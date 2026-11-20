@@ -649,8 +649,9 @@ After the image is `available`, the command MUST create a new launch-template ve
 - **THEN** the command emits `TEMPLATE_DRIFT`, marks the version unusable and keeps the image for 24 hours
 
 #### Scenario: Version creation fails
-- **WHEN** the call fails or the pass ends before the response
+- **WHEN** the call fails or the pass ends before the response, before the build deadline
 - **THEN** the next pass retries with the same client token and does not rebuild
+- **AND** a failure observed at or after the build deadline fails the build with the refusal's code
 
 ### Requirement: Versions are never moved or removed
 The command MUST NOT set the default launch-template version and MUST NOT delete a launch-template version. Documentation MUST state that a hand-edited pin bypasses the drift check.
@@ -675,7 +676,7 @@ No timer and no process that holds AWS credentials MUST write the deployment TOM
 - **THEN** it finds the TOML mounted read-only and no `promote` command
 
 ### Requirement: Promotion is pure local
-`image promote` MUST be pure local: it MUST make no AWS call, hold no AWS credentials and read only the image state file and the deployment TOML. Without `--write` it MUST print the evidence block, the diff of the one pin line, the previous pin and the rollback target.
+`image promote` MUST be pure local: it MUST make no AWS call, build no AWS client, hold no AWS credentials and read only local files (the image state file, the deployment TOML and the backup that a journal row names). Without `--write` it MUST print the evidence block, the diff of the one pin line, the previous pin and the rollback target.
 
 #### Scenario: Print only
 - **WHEN** an operator runs `promote` without `--write`
@@ -737,7 +738,7 @@ Before the rename, `promote --write` MUST commit a pending-promotion journal row
 - **AND** the state file is not changed except for the check timestamp
 
 ### Requirement: A pending promotion is resolved from the file hash
-The next `promote`, `promote --rollback` or `image run --apply` MUST resolve a pending row from the file hash: the old hash marks it aborted, the new hash completes it, and any other hash refuses with `PROMOTION_JOURNAL_DIVERGED`. While a row is pending or diverged, both of its pins MUST be protected from deletion.
+The next `promote --write`, `promote --rollback --write` or `image run --apply` MUST resolve a pending row from the file hash: the old hash marks it aborted, the new hash completes it, and any other hash refuses with `PROMOTION_JOURNAL_DIVERGED`. A `promote` without `--write` MUST report the resolution that the hash implies and write nothing. While a row is pending or diverged, both of its pins MUST be protected from deletion.
 
 #### Scenario: A crash before the rename
 - **WHEN** the process stops after the journal commit and before the rename
@@ -754,6 +755,11 @@ The next `promote`, `promote --rollback` or `image run --apply` MUST resolve a p
 - **THEN** the command refuses with `PROMOTION_JOURNAL_DIVERGED` and writes nothing
 - **AND** retention protects both pins until an operator resolves the divergence
 
+#### Scenario: A plain promote meets a pending row
+- **WHEN** an operator runs `promote` without `--write` while a row is pending
+- **THEN** the preview names the row and the resolution that the file hash implies
+- **AND** the row, the state file and the TOML are unchanged
+
 ### Requirement: Promotion keeps a backup and refuses a changed file
 Before the rename, `promote --write` MUST write a timestamped backup and MUST refuse with `PROMOTE_FILE_CHANGED` when the file differs from the bytes it read.
 
@@ -766,14 +772,14 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **THEN** the command refuses with `PROMOTE_FILE_CHANGED` and writes nothing
 
 ### Requirement: Promotion runs in an isolated operator container
-`promote` MUST run only as an operator-invoked one-off. The shipped documentation MUST give a container line that has no network, no AWS credential directory and no forge token. `promote --write` MUST refuse with `PROMOTE_DIRECTORY_NOT_DEDICATED` when the directory of the TOML holds anything other than the TOML, its `.bak.*` files and a lock file. A test MUST assert that `promote` constructs no AWS client.
+`promote` MUST run only as an operator-invoked one-off. The shipped documentation MUST give a container line that has no network, no AWS credential directory and no forge token. `promote --write` MUST refuse with `PROMOTE_DIRECTORY_NOT_DEDICATED` when the directory of the TOML holds anything other than the TOML, its `.bak.*` files, its lock file and its promote temporary file. A test MUST assert that `promote` constructs no AWS client.
 
 #### Scenario: The directory holds credentials
 - **WHEN** the mounted directory contains a credential directory or an env file
 - **THEN** `promote --write` refuses with `PROMOTE_DIRECTORY_NOT_DEDICATED` and writes nothing
 
 #### Scenario: A dedicated directory
-- **WHEN** the directory holds only the TOML and its backups
+- **WHEN** the directory holds only the TOML, its backups, its lock file and its promote temporary file
 - **THEN** `promote --write` MAY proceed
 
 #### Scenario: Print only needs no directory write

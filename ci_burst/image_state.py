@@ -27,6 +27,12 @@ BUILD_STATES = ("building", "imaging", "candidate", "failed", "promoted")
 ACTIVE_STATES = ("building", "imaging")
 JOURNAL_KINDS = ("promotion", "rollback")
 JOURNAL_STATUSES = ("pending", "complete", "aborted")
+#: A pin record is a ``promoted`` build row that owns a launch-template version
+#: no build made (a pin an operator set by hand). It keeps the evidence that the
+#: version and its image exist, so a rollback can verify its target. Its id is
+#: ``pin-<version>``.
+PIN_RECORD_PREFIX = "pin-"
+PIN_RECORD_REASON = "IMAGE_PIN_RECORDED"
 
 _ACTIVE_SQL = ", ".join(repr(state) for state in ACTIVE_STATES)
 
@@ -496,6 +502,71 @@ class ImageState:
                 )
             return self.build(build_id)
 
+    def version_owner(self, deployment, version):
+        """The newest ``candidate`` or ``promoted`` row that owns launch-template ``version``, or ``None``.
+
+        A failed build never owns a version: a drifted version is unusable. A pin
+        record (see ``insert_pin_record``) owns the version of a hand-set pin.
+        """
+        row = (
+            self._require()
+            .execute(
+                "SELECT * FROM image_builds WHERE deployment = ? AND template_version = ?"
+                " AND state IN ('candidate', 'promoted') ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (deployment, version),
+            )
+            .fetchone()
+        )
+        return _build(row) if row else None
+
+    def insert_pin_record(self, *, deployment, version, image_id):
+        """Record the image behind a pin that no build owns, as a ``promoted`` row; return the row.
+
+        The row is ``pin-<version>``. It starts with no verification, so it
+        proves nothing until ``record_verification`` stamps it. ``created_at`` is
+        ``0.0``, so the daily cap and the minimum interval never count it (as
+        with an orphan), and it is not active, so it cannot meet the
+        ``one_active`` index. A second call for the same version returns the row
+        that exists.
+        """
+        build_id = f"{PIN_RECORD_PREFIX}{version}"
+        existing = self.build(build_id)
+        if existing is not None:
+            return existing
+        values = {
+            "id": build_id,
+            "deployment": deployment,
+            "client_token": f"pin:{version}",
+            "basis_digest": "",
+            "source_sha": "",
+            "image_id": image_id,
+            "template_version": version,
+            "state": "promoted",
+            "reason_code": PIN_RECORD_REASON,
+            "created_at": 0.0,
+            "updated_at": self._clock(),
+            "deadline_at": 0.0,
+        }
+        columns = ", ".join(values)
+        marks = ", ".join("?" for _ in values)
+        self._require().execute(f"INSERT INTO image_builds ({columns}) VALUES ({marks})", tuple(values.values()))
+        return self.build(build_id)
+
+    def record_verification(self, build_id, *, image_state, template_version_exists, drift_result, verified_at):
+        """Replace the verification evidence of one row and nothing else.
+
+        ``updated_at`` stays as it was: for a candidate it is the moment the
+        build ended, which ``promote`` reports as the build duration.
+        """
+        cursor = self._require().execute(
+            "UPDATE image_builds SET image_state = ?, template_version_exists = ?, drift_result = ?,"
+            " verified_at = ? WHERE id = ?",
+            (image_state, template_version_exists, drift_result, verified_at, build_id),
+        )
+        if cursor.rowcount != 1:
+            raise StateRefusal("IMAGE_BUILD_UNKNOWN", build_id)
+        return self.build(build_id)
+
     def _newest_build(self, deployment, state=None):
         clause, arguments = ("", (deployment,)) if state is None else (" AND state = ?", (deployment, state))
         row = (
@@ -578,11 +649,19 @@ class ImageState:
         rows = self._require().execute("SELECT * FROM promotion_journal WHERE status = 'pending' ORDER BY id")
         return [Journal(**dict(row)) for row in rows]
 
-    def journal_last_complete(self):
-        """The newest ``complete`` row of either kind, or ``None``: its ``old_pin`` is the pin it replaced."""
+    def journal_last_complete(self, kind=None):
+        """The newest ``complete`` row, or ``None``: its ``old_pin`` is the pin it replaced.
+
+        Without ``kind`` the row is of either kind, which is what the deletion
+        rule needs. A rollback asks for ``kind="promotion"``.
+        """
+        clause, arguments = ("", ()) if kind is None else (" AND kind = ?", (kind,))
         row = (
             self._require()
-            .execute("SELECT * FROM promotion_journal WHERE status = 'complete' ORDER BY id DESC LIMIT 1")
+            .execute(
+                f"SELECT * FROM promotion_journal WHERE status = 'complete'{clause} ORDER BY id DESC LIMIT 1",
+                arguments,
+            )
             .fetchone()
         )
         return Journal(**dict(row)) if row else None
@@ -591,6 +670,15 @@ class ImageState:
     def pin_last(self):
         """The newest pin observation, or ``None`` before the first."""
         row = self._require().execute("SELECT * FROM pin_log ORDER BY id DESC LIMIT 1").fetchone()
+        return PinObservation(row["pin_version"], row["image_id"], row["observed_at"]) if row else None
+
+    def pin_for_version(self, pin_version):
+        """The newest observation of ``pin_version``, or ``None`` when it was never observed."""
+        row = (
+            self._require()
+            .execute("SELECT * FROM pin_log WHERE pin_version = ? ORDER BY id DESC LIMIT 1", (pin_version,))
+            .fetchone()
+        )
         return PinObservation(row["pin_version"], row["image_id"], row["observed_at"]) if row else None
 
     def pin_observe(self, pin_version, image_id):

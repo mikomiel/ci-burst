@@ -43,6 +43,12 @@ def create_candidate_version(aws, *, template_name, source_pin, image_id, build_
     does not carry ``image_id``). A key that exists in one version only is a
     difference. Names only, never values.
 
+    A creation that answers with ``source_pin`` itself created nothing the
+    comparison could use, so it is refused before any read-back, with
+    ``AWS_UNCERTAIN`` and no verdict. Read back, the pin would be compared with
+    itself and the image the pin already names would decide the result, so a pin
+    that names the built image would pass as ``clean``.
+
     A read-back that does not return exactly the pin and the new version is
     refused with the provider's ``AWS_INVENTORY_INCOMPLETE`` and no verdict. The
     version may then exist already, so the caller retries on the next pass with
@@ -52,7 +58,11 @@ def create_candidate_version(aws, *, template_name, source_pin, image_id, build_
     """
     description = f"ci-burst {build_id} {basis_digest[:12]}"
     version = aws.create_template_version(template_name, source_pin, image_id, description, client_token)
-    versions = list(dict.fromkeys([source_pin, version]))
+    if version == source_pin:
+        raise ProviderRefusal(
+            "AWS_UNCERTAIN", f"version creation returned the source version {source_pin}", uncertain=True
+        )
+    versions = [source_pin, version]
     read = aws.template_versions(template_name, versions)
     by_number = {item.version: item for item in read}
     if len(by_number) != len(read) or set(by_number) != set(versions):

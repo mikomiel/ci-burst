@@ -198,7 +198,7 @@ class FailureTests(unittest.TestCase):
             "warm FAIL x",
             "Warm Fail x",
             "WARM FAILED x",
-            "WARM FAIL",
+            "WARM FAILED",
             "WARM  FAIL x",
             "Warm exiting rc=1",
             "warm exiting rc",
@@ -210,6 +210,61 @@ class FailureTests(unittest.TestCase):
 
     def test_a_failure_line_alone_is_a_failure_with_crlf_too(self):
         self.assertEqual(outcome("WARM FAIL x", eol="\r\n"), "failed")
+
+    def test_a_bare_warm_fail_line_fails_the_build(self):
+        failed = {"outcome": "failed", "reason": "WARM_FAILED"}
+        for lines in (
+            ("WARM FAIL",),
+            ("STEP fetch", "WARM FAIL"),
+            ("WARM FAIL", "STEP clean"),
+            (DIGEST_LINE, READY_LINE, "WARM FAIL"),
+            ("WARM FAIL", DIGEST_LINE, READY_LINE),
+            (f"WARM_SOURCE_SHA256 {OTHER}", "WARM FAIL"),
+        ):
+            with self.subTest(lines=lines):
+                self.assertEqual(read(*lines), failed)
+        self.assertEqual(outcome("WARM FAIL", eol="\r\n"), "failed")
+        self.assertEqual(console.read_marker("WARM FAIL", DIGEST), failed)  # no line end after it
+
+    def test_a_console_cut_inside_the_failure_line_fails_once_the_marker_is_whole(self):
+        # The console is a window of the builder's output, so it can end anywhere in the last line.
+        consoled = text("STEP fetch", "WARM FAIL fetch rc=22")
+        marker_start = consoled.index("WARM FAIL")
+        marker_end = marker_start + len("WARM FAIL")
+        for end in range(marker_start, marker_end):
+            with self.subTest(end=end, shows=consoled[marker_start:end]):
+                self.assertEqual(console.read_marker(consoled[:end], DIGEST)["outcome"], "waiting")
+        for end in range(marker_end, len(consoled) + 1):
+            with self.subTest(end=end, shows=consoled[marker_start:end]):
+                self.assertEqual(console.read_marker(consoled[:end], DIGEST)["outcome"], "failed")
+
+    def test_a_console_cut_at_64_kib_that_ends_in_the_bare_marker_fails_the_build(self):
+        limit = 64 * 1024
+        cut = ("STEP noise\n" * 7000 + "WARM FAIL")[-limit:]
+        self.assertEqual(len(cut), limit)
+        self.assertEqual(console.read_marker(cut, DIGEST), {"outcome": "failed", "reason": "WARM_FAILED"})
+        # The same window without the marker shows noise only.
+        self.assertEqual(console.read_marker(cut[: -len("WARM FAIL")], DIGEST)["outcome"], "waiting")
+
+    def test_a_bare_warm_fail_line_counts_only_alone_at_column_0(self):
+        for line in (
+            "  | WARM FAIL",
+            " WARM FAIL",
+            "\tWARM FAIL",
+            "x WARM FAIL",
+            "# WARM FAIL",
+            "WARM FAIL\t",
+            "WARM  FAIL",
+            "warm fail",
+            "WARM FAILED",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(outcome(line), "waiting")
+                self.assertEqual(outcome(line, DIGEST_LINE, READY_LINE), "ready")
+        # Only one trailing carriage return is part of the line end.
+        self.assertEqual(console.read_marker("WARM FAIL\r\r\n", DIGEST)["outcome"], "waiting")
+        # Another separator does not start a line of its own.
+        self.assertEqual(console.read_marker("noise\x0bWARM FAIL", DIGEST)["outcome"], "waiting")
 
 
 class MismatchTests(unittest.TestCase):
@@ -385,6 +440,28 @@ class FramedTailTests(unittest.TestCase):
                     tail = console.framed_tail(consoled, max_lines=max_lines, max_bytes=max_bytes)
                     self.assertLessEqual(len(tail.encode("ascii")), max_bytes)
                     self.assertLessEqual(len(tail.split("\n")), max_lines)
+
+    def test_every_returned_line_is_framed_whatever_the_bounds(self):
+        # A cut that falls inside the frame would leave a fragment, and a fragment is not a framed line.
+        consoled = text(
+            *(f"  | line {number} " + "y" * number for number in range(30)), "unframed", " | lookalike", "  |"
+        )
+        for max_lines in (1, 2, 5, 40):
+            for max_bytes in range(1, 90):
+                with self.subTest(max_lines=max_lines, max_bytes=max_bytes):
+                    tail = console.framed_tail(consoled, max_lines=max_lines, max_bytes=max_bytes)
+                    for line in tail.split("\n") if tail else ():
+                        self.assertTrue(line.startswith(console.FRAME), repr(line))
+
+    def test_a_bound_smaller_than_the_frame_returns_nothing_instead_of_a_fragment(self):
+        for consoled in (text("  | x"), text("  | " + "x" * 50), text("  | one", "  | two")):
+            for max_bytes in range(1, len(console.FRAME)):
+                with self.subTest(consoled=consoled, max_bytes=max_bytes):
+                    self.assertEqual(console.framed_tail(consoled, max_bytes=max_bytes), "")
+
+    def test_a_bound_of_exactly_the_frame_keeps_the_bare_frame(self):
+        tail = console.framed_tail(text("  | " + "x" * 50), max_bytes=len(console.FRAME))
+        self.assertEqual(tail, console.FRAME)
 
     def test_the_defaults_bound_a_flood(self):
         flood = text(*("  | " + "z" * 300 for _ in range(500)))

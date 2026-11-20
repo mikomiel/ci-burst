@@ -9,7 +9,8 @@
         "ec2:DescribeImages",
         "ec2:DescribeSnapshots",
         "ec2:DescribeLaunchTemplates",
-        "ec2:DescribeLaunchTemplateVersions"
+        "ec2:DescribeLaunchTemplateVersions",
+        "ec2:DescribeSecurityGroups"
       ],
       "Resource": "*"
     },

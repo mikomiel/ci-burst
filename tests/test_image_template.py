@@ -19,7 +19,7 @@ import hashlib
 import unittest
 
 from ci_burst.aws import ImageAws, TemplateVersion
-from ci_burst.errors import ProviderRefusal
+from ci_burst.errors import DeadlineRefusal, ProviderRefusal
 from ci_burst.image_template import create_candidate_version, differing_fields
 
 from support import Clock
@@ -302,6 +302,35 @@ class RetryTests(TemplateCase):
         self.assertEqual(self.create(client_token="example-token-0002")["version"], 6)
 
 
+class DeadlineTests(TemplateCase):
+    """The read-back is a read of the provider, so the pass deadline bounds it. The creation is one call."""
+
+    def test_a_read_back_that_would_start_past_the_deadline_is_refused_and_not_made(self):
+        with self.assertRaises(DeadlineRefusal):
+            self.create(deadline=NOW)
+        self.assertEqual(self.names(), ["create_launch_template_version"])
+        self.assertIn((NAME, 5), self.ec2.versions_store, "the version exists, and the retry finds it by its token")
+
+    def test_a_retry_after_the_deadline_refusal_gets_the_same_version_and_the_verdict(self):
+        with self.assertRaises(DeadlineRefusal):
+            self.create(deadline=NOW)
+        self.assertEqual(self.create(deadline=NOW + 240), {"version": 5, "drift": "clean"})
+        created = sorted(number for (name, number) in self.ec2.versions_store if name == NAME)
+        self.assertEqual(created, [PIN, 5], "the retry must not create a second version")
+        first, second = self.requests("create_launch_template_version")
+        self.assertEqual(first, second)
+
+    def test_a_deadline_that_has_not_passed_changes_nothing(self):
+        self.assertEqual(self.create(deadline=NOW + 240), {"version": 5, "drift": "clean"})
+        self.assertEqual(self.names(), ["create_launch_template_version", "describe_launch_template_versions"])
+
+    def test_a_drift_is_still_found_when_a_deadline_is_given(self):
+        self.ec2.change = lambda data: data.update(InstanceType="t4g.large")
+        self.assertEqual(
+            self.create(deadline=NOW + 240), {"version": 5, "drift": "TEMPLATE_DRIFT", "fields": ["InstanceType"]}
+        )
+
+
 class IncompleteReadBackTests(TemplateCase):
     def refused(self):
         with self.assertRaises(ProviderRefusal) as raised:
@@ -398,6 +427,7 @@ class StubAws:
 
     def __init__(self, *, created=7, read=(), create_error=None, read_error=None):
         self.calls = []
+        self.deadlines = []
         self.created = created
         self.read = list(read)
         self.create_error = create_error
@@ -409,8 +439,9 @@ class StubAws:
             raise self.create_error
         return self.created
 
-    def template_versions(self, name, versions):
+    def template_versions(self, name, versions, *, deadline=None):
         self.calls.append(("read", name, list(versions)))
+        self.deadlines.append(deadline)
         if self.read_error is not None:
             raise self.read_error
         return self.read
@@ -443,6 +474,17 @@ class PlumbingTests(unittest.TestCase):
         self.assertIn(DIGEST[:12], create[4])
         self.assertNotIn(DIGEST[:13], create[4])
         self.assertEqual(read, ("read", NAME, [PIN, 7]))
+
+    def test_the_deadline_goes_to_the_read_back_and_none_goes_when_there_is_none(self):
+        versions = [version(PIN, ImageId=OLD_IMAGE, K="v"), version(7, ImageId=NEW_IMAGE, K="v")]
+        stub = StubAws(read=versions)
+        self.assertEqual(self.call(stub, deadline=NOW + 240), {"version": 7, "drift": "clean"})
+        self.assertEqual(stub.deadlines, [NOW + 240])
+        stub = StubAws(read=versions)
+        self.assertEqual(self.call(stub), {"version": 7, "drift": "clean"})
+        self.assertEqual(stub.deadlines, [None])
+        # The creation is one call: the deadline is not an argument of it.
+        self.assertEqual(stub.calls[0][:4], ("create", NAME, PIN, NEW_IMAGE))
 
     def test_the_read_back_order_does_not_matter(self):
         stub = StubAws(read=[version(7, ImageId=NEW_IMAGE, K="v"), version(PIN, ImageId=OLD_IMAGE, K="v")])

@@ -188,6 +188,8 @@ class ImageState:
         self.path = self.directory / STATE_FILE
         self._clock = clock
         self._connection = None
+        #: How the open connection was made: ``connect_readonly`` says ``True``, ``connect`` says ``False``.
+        self._read_only = False
         self._lock_fd = None
         self._in_transaction = False
 
@@ -238,6 +240,7 @@ class ImageState:
                 connection.close()
             raise
         self._connection = connection
+        self._read_only = False
         return self
 
     def connect_readonly(self):
@@ -250,8 +253,17 @@ class ImageState:
         answers of a new file supplies the defaults itself. A file at another
         schema version is refused as ``connect`` refuses it. A write through
         this connection fails in SQLite.
+
+        A state that is already open read-only keeps its connection and answers
+        ``True``. A state that is open for writing is refused as
+        ``IMAGE_STATE_OPEN_FOR_WRITE``: its connection would write, so it is not
+        handed back as a read-only one, and closing it here would also drop the
+        writer lock of its owner. Check ``available`` first to read through a
+        connection that is open already.
         """
         if self._connection is not None:
+            if not self._read_only:
+                raise StateRefusal("IMAGE_STATE_OPEN_FOR_WRITE", "the state is open for writing")
             return True
         if not self.path.is_file():
             return False
@@ -276,6 +288,7 @@ class ImageState:
                 connection.close()
             raise
         self._connection = connection
+        self._read_only = True
         return True
 
     def close(self):
@@ -458,6 +471,11 @@ class ImageState:
         ``one_active`` index, and ``verified_at`` stays empty, so nothing treats
         it as verified. The client token is derived from the id and cannot meet
         the token of a real build.
+
+        The check for an existing row and the insert run in one transaction, which
+        joins the caller's when there is one, and the insert goes through the guard
+        of the other writers. A row with that id already there, an orphan or a real
+        build, is refused as ``IMAGE_BUILD_EXISTS`` and nothing is written.
         """
         now = self._clock()
         values = {
@@ -475,8 +493,14 @@ class ImageState:
         }
         columns = ", ".join(values)
         marks = ", ".join("?" for _ in values)
-        self._require().execute(f"INSERT INTO image_builds ({columns}) VALUES ({marks})", tuple(values.values()))
-        return self.build(build_id)
+        with self.transaction():
+            if self.build(build_id) is not None:
+                raise StateRefusal("IMAGE_BUILD_EXISTS", build_id)
+            with self._write_active_guard():
+                self._require().execute(
+                    f"INSERT INTO image_builds ({columns}) VALUES ({marks})", tuple(values.values())
+                )
+            return self.build(build_id)
 
     def version_owner(self, deployment, version):
         """The newest ``candidate`` or ``promoted`` row that owns launch-template ``version``, or ``None``.

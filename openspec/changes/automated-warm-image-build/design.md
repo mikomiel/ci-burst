@@ -189,10 +189,10 @@ manual pin are the controls.
 ## Source archive and user data
 
 1. Resolve the sha with the branch endpoint. Everything below uses that one sha.
-2. Stream the archive endpoint for that sha through a hashing wrapper into a multipart upload at `s3://<bucket>/<prefix>/<build-id>.tar.gz`, with the bucket's default encryption. `source.max_archive_bytes` aborts the upload and deletes the object on overrun. The archive is never written to disk.
+2. Stream the archive endpoint for that sha through a hashing wrapper into a multipart upload at `s3://<bucket>/<prefix>/<build-id>.tar.gz`, with the bucket's default encryption. The prefix and the build id are joined by exactly one `/`, whether the configured prefix ends with no slash, one or several. The listing of stray archives in reconcile uses the same slash-ended prefix, so it never reaches a sibling such as `<prefix>-other/`. `source.max_archive_bytes` aborts the upload and deletes the object on overrun. The archive is never written to disk.
 3. Archive layout: a forge archive has one top-level directory. `warm-cache.sh` gains one optional input `WARM_SRC_STRIP_COMPONENTS` (0 or 1, default 0, anything else refused before any consumer command), which is passed to `tar`. Gate G6 confirms the prefix and whether `export-ignore` removes files that the warm commands need.
 4. Presign a GET URL locally. The URL appears only in the rendered user data in memory. It is never logged, never stored in the state file and never in an event.
-5. The presigned URL dies with the role session, whichever comes first. With a 1-hour session and the default `presign_seconds = 1800` the design relies on a fresh session per pass: each pass is a new process that assumes the role anew and presigns at once before the launch. The `--until-done` supervisor creates a fresh SDK session (it re-reads the assumed-role profile) for every pass, so no pass runs on an expiring session. The code MUST NOT presign when the session has less than `presign_seconds` left, and MUST refuse with `IMAGE_CREDENTIAL_SHORT`. Gate G10 measures the real expiry of a URL signed with assumed-role credentials.
+5. The presigned URL dies with the role session, whichever comes first. With a 1-hour session and the default `presign_seconds = 1800` the design relies on a fresh session per pass: each pass is a new process that assumes the role anew and presigns at once before the launch. The `--until-done` supervisor creates a fresh SDK session (it re-reads the assumed-role profile) for every pass, so no pass runs on an expiring session. The code MUST NOT presign when the session has less than `presign_seconds` left, and MUST refuse with `IMAGE_CREDENTIAL_SHORT`. The check, like the single-flight check, runs before the build row is written and again once the archive is staged, because either can change in between: the session ages during an upload and another builder can appear. A refusal before the row writes no row and no archive. A refusal after it ends the row as `failed` with the refusal code, deletes the archive and counts no failure (a refused start is not a failed build: see Failure behavior). Gate G10 measures the real expiry of a URL signed with assumed-role credentials.
 6. User data size: `warm-cache.sh` is about 15.6 KB, and its gzip and base64 payload about 8.2 KB, against the 16,384 byte limit for EC2 user data (before base64). The rendered user data is a short `#!/bin/bash` stub with quoted `WARM_*` exports and a gzip and base64 payload of the script, which the stub decodes and runs. A test renders the largest allowed `WARM_COMMANDS` and asserts the size is below 16,384 bytes. A larger rendering is refused before `RunInstances` with `IMAGE_USERDATA_TOO_LARGE`. This is decided now, not at runtime.
 7. The controller container copies `warm-cache.sh`, because the image today holds only the Python package. A test asserts that the copy in the build context equals `deploy/runner/image/warm-cache.sh`, byte for byte.
 8. Every exported value comes from configuration, never from the archive. Values are shell-quoted and refused when they contain control characters.
@@ -201,7 +201,7 @@ manual pin are the controls.
 ## The builder
 
 - `RunInstances` from the build launch template at a pinned version, count 1, `ClientToken` taken from the state file. The state row is written before the call. On-demand only.
-- The build launch template is operator-owned: a cold base image (a build never chains from the warm image), no instance profile, IMDSv2 required with hop limit 1, instance-initiated shutdown set to terminate, 20 GiB gp3 storage that deletes on termination, and a build security group with no ingress and minimal egress. `plan` and `run` read the template and refuse with `IMAGE_BUILD_TEMPLATE_UNSAFE` when any property differs.
+- The build launch template is operator-owned: a cold base image (a build never chains from the warm image), no instance profile, IMDSv2 required with hop limit 1, instance-initiated shutdown set to terminate, 20 GiB gp3 storage that deletes on termination, and a build security group with no ingress and minimal egress. `plan` and a `run` pass that is about to start a build read the template and the security groups it names (`SecurityGroupIds`, `SecurityGroups` and the `Groups` of each network interface, through `DescribeSecurityGroups`), and refuse with `IMAGE_BUILD_TEMPLATE_UNSAFE` when any property differs. The detail names the failing properties and never a value. For the groups the property is `security_groups`. It fails when no group is named, when a network interface names none (a launch would give it the default group of the VPC, which the check never reads), when a named group name matches no group (a name matches the group of that name in every VPC of the Region, and each match counts), and when any matched group has an inbound rule. A group id that does not exist, or a role without `ec2:DescribeSecurityGroups`, makes the describe fail: the pass then refuses with the provider's refusal and starts nothing. A pass that only advances or ends a build does not run the check and does not read the groups. A pass that stages a build again, after the pass deadline ended its first stage, runs the check again before it uploads anything, because the rules of the groups can change between the two passes (see Supervising a manual build).
 - Builders carry `ci-burst:image-build=true`, the deployment tag, `ci-burst:build-id` and `ci-burst:expires-at`. They never carry `ci-burst:managed=true`. `Aws.owned_instances` selects on that tag, so a managed builder would count against `controller.max_instances` and be reaped by `reap`. A test asserts that `owned_instances` never returns a builder.
 - The builder runs consumer code at the protected-branch sha, with the archive available to it for the whole window. That is accepted: the consumer already holds the same source. The builder has no credential of its own. The presigned URL in user data is the only secret on it. Before any fetch or consumer command, `warm-cache.sh` adds firewall rules that reject the IPv4 and IPv6 metadata addresses for the `runner` account and checks each rule, so consumer commands cannot read the user data; a rule that is not in place ends the build. Firewall rules, unlike the DHCP-managed metadata route, hold for the whole window. A failure tail masks the URL and its query.
 - The script arms its own lifetime timer first. `terminate` on shutdown plus that timer is the leak backstop that does not depend on the controller image being current.
@@ -216,13 +216,27 @@ manual pin are the controls.
 
 ## CreateImage in the same pass
 
-When a pass first sees the marker it calls `CreateImage` in that pass, before it does anything else. `NoReboot` is true: a reboot would rerun user data after `cloud-init clean`, and the manual path used no-reboot. The builder-side snapshot window (`WARM_SNAPSHOT_SECONDS`, default 1800 in the script) is longer than the timer period, so a slow tick leaves a good build with an image. The pass polls the console every 30 seconds inside a pass deadline of 240 seconds. Waiting for the image to become `available` and every later step continue in later passes.
+When a pass first sees the marker it calls `CreateImage` in that pass, before it does any step that is not a read. The reads are the lookup of the build's image and the read of the base image. `NoReboot` is true: a reboot would rerun user data after `cloud-init clean`, and the manual path used no-reboot. The builder-side snapshot window (`WARM_SNAPSHOT_SECONDS`, default 1800 in the script) is longer than the timer period, so a slow tick leaves a good build with an image. The pass polls the console every 30 seconds inside a pass deadline of 240 seconds. Waiting for the image to become `available` and every later step continue in later passes.
+
+The call is never made at or after the build deadline. The reads before it take time, so the pass reads the clock again right before the call, and a build that is out of time at that point fails `MARKER_TIMEOUT` and has its live builder ended.
+
+### A CreateImage call with an unknown outcome
+
+A call can make the image and lose the provider's answer. Its outcome is then unknown, and three rules keep that from costing a second image or a failed build.
+
+- The name is the build's: `ci-burst-<deployment>-<build id>`, the same on every call. EC2 refuses a second image under a name that is taken, with `InvalidAMIName.Duplicate`. The provider layer maps every code that is not a definite launch error to an unknown outcome (`AWS_UNCERTAIN`), so this refusal is an unknown outcome and is never a definite one. The pass never changes the name to get past it: an image under another name is the duplicate that the name prevents.
+- Before it calls, the pass lists the images that carry the build's id. An image that is listed is adopted: the row records its id and moves to `imaging`, the `image_created` event is written and the pass makes no call. Adopting is no call, so it holds even when the build deadline passed during the lookup: the image exists, and the build goes on. Reconcile adopts such an image too, at the start of the next pass, by the same tags, even when that pass runs after the build deadline: it ends the overdue builder first, and the image came from a call made before the deadline. It records the id and the state and writes no `image_created` event. A lookup that the provider refuses, the pass deadline included, does not stop the call: the pass notes `image_lookup:<reason>` and goes on as if it had found no image. That is safe because of the name.
+- Before the build deadline, an unknown outcome leaves the row `building`, notes `create_image:<reason>` and counts no failure. The next pass adopts the image when it is listed, and else asks again under the same name, which the provider refuses while the image exists. At or after the build deadline the build fails: with the code of the refusal when the call itself outlived the deadline, and with `IMAGE_BUILDER_GONE` when reconcile ended the builder first and listed no image of the build. An image that is listed after that has a row and carries the failed build's id, so it is no orphan. The deletion rule removes it and its snapshots with no age wait: the `failed` path takes an image that has settled, and the `pending_timeout` path takes one that is still `pending`. The leak count stays at zero.
 
 ### Supervising a manual build
 
 A pass is bounded to 240 seconds, and a build takes 10 to 15 minutes, so one pass cannot finish a build. In phase 1 the operator runs `image run --apply --until-done`. The supervisor repeats bounded passes with a fixed 30-second sleep between them until the build is `candidate` or `failed`, or the build deadline passes. Each pass reconciles first and resumes from the state file, so killing the supervisor loses nothing: rerunning the same command resumes the same build, and the single-flight rules refuse a second builder. Without `--until-done`, `run --apply` is one pass, which is what the phase 2 timer runs. The supervisor is a loop in the CLI, not a daemon, and does not outlive the command.
 
-The builder is terminated when the image is `available`, or when the snapshot window or the lifetime timer ends it. Whether it may be terminated while the image is still `pending` is gate G11. Until the gate is met the code waits for `available`.
+Every provider read of a pass takes the pass deadline, the image read and the template read-back included, and a read that would start at or after the deadline is not made. What follows depends on where it happened. An advancing or staging pass notes `pass_deadline_exceeded` and leaves the row as its last write left it. A deletion path, and the deletion dry run of `plan`, delete nothing and report `pass_deadline_exceeded` as their result. The other reads of `plan`, reconcile, the pin read and the template check of a start end with the refusal. One read escapes the rule: the read that confirms a deregistration takes no pass deadline. It is one call for each image, and the SDK's connect and read timeouts bound it. A confirmation that the deadline refused would leave the deregistration unconfirmed and keep the snapshots. The lookup of the build's image and the read of the base image before `CreateImage` take the pass deadline. A refusal of either, the deadline included, never delays `CreateImage`. A refused base image read notes `base_image:<reason>` (`base_image:pass_deadline_exceeded` for the deadline) and the image is created without the base image tag. A refused lookup notes `image_lookup:<reason>` and the call is made as if the lookup had found no image.
+
+Staging has the same bound. A pass deadline in the upload, or after it and before the launch call, leaves the row `building` with no builder and no `archive_sha256`, and counts no failure. The next pass stages again under the same key, which replaces whatever the first stage left. Before it uploads anything, that pass runs the template check of a start again, because the rules of the build security groups can change between the two passes. An unsafe template ends the row `failed` with `IMAGE_BUILD_TEMPLATE_UNSAFE`, deletes the archive that the row names and answers `refused` with no failure counted, as any refusal of a start does once the row exists. A pass deadline in the check leaves the row as it was and notes `pass_deadline_exceeded`. A read that the provider refuses ends the pass with that refusal and leaves the row for the next pass. Past the build deadline a build that is still unstaged fails with `CONSOLE_BLIND`, counts as a failure, and the archive that its row names is deleted. The pass checks that deadline when the stage begins, and again right before the launch call, because the upload and the reads in between take time. A stage that crosses the deadline in between launches no builder: the build fails with `CONSOLE_BLIND` and the archive is deleted. The check sits in the launch that every stage uses, so it covers the first stage of a build too. The first stage would reach it only if the one read before the launch call lasted until the build deadline, at least 900 seconds after the build started. The pass deadline stops no read that has begun, but the SDK's connect and read timeouts bound that read to well under 900 seconds. So in practice only a resumed stage reaches the check.
+
+The builder is terminated when the image is `available`, or when the snapshot window or the lifetime timer ends it. Whether the controller may terminate it earlier, while the image is still `pending`, is gate G11, and until the gate is met the controller waits for `available`. The build deadline is the one limit that does not wait. As the first call of a pass, reconcile ends the builder of an active build that is past its deadline, an `imaging` build whose image is still `pending` included. That mirrors the builder's own lifetime timer, so it is not a decision about G11, and the builder is not counted as a leak. The build then ends `IMAGE_NOT_AVAILABLE`, or `candidate` when the image is `available` when the pass reads it. A marker that a pass reads for the first time at or after the build deadline never leads to `CreateImage`. The pass takes that time from the clock after its console read, because the reads take time, and the latency of the marker is that time too. The build fails with `IMAGE_BUILDER_GONE` when reconcile ended the builder, and with `MARKER_TIMEOUT` when the builder is still alive, for example because reconcile's termination was refused or because the deadline came during the pass: the failure path then asks to end it.
 
 ## State
 
@@ -233,7 +247,7 @@ Tables:
 - `image_builds`: id, deployment, client_token, basis_digest, source_sha, archive_key, archive_sha256, builder_id, image_id, template_version, state, reason_code, created_at, updated_at, deadline_at, and the verification record (gate seen, drift result, `verified_at`, `source_pin`).
 - `pin_log`: one row per observed pin: pin version, image id, observed_at.
 - `promotion_journal`: one row per promotion or rollback: previous pin, new pin, previous and new file sha256, candidate id, kind (`promotion` or `rollback`), backup file name, the sha256 of that backup, the pin that the backup contains, status (`pending`, `complete` or `aborted`) and timestamps.
-- `control`: one row with the consecutive failure count, the failure cooldown end, the `blocked` flag and the last check time.
+- `control`: one row with the consecutive failure count (a refused start is not a failure and never moves it), the failure cooldown end, the `blocked` flag and the last check time.
 
 States: `building`, `imaging`, `candidate`, `failed`, `promoted`. No more.
 
@@ -244,11 +258,12 @@ Single-flight has two layers:
 
 Reconcile runs first in every pass, before any transition:
 
-- terminate builder-tagged instances that are not the active build's builder, or are past the deadline;
+- as the first call of the pass, end the builder of an active build that is past its build deadline, an `imaging` build whose image is still `pending` included. This mirrors the builder's own lifetime timer, is not counted as a leak, and the state machine then ends the build. A refused termination is reported and the pass goes on, and the state machine asks again when it ends the build;
+- terminate every other builder-tagged instance, that is, every one that is not the active build's builder;
 - delete objects under the prefix that are not the active archive and are older than 1 hour;
-- clean the images and snapshots of failed builds, but only under the image deletion rule (see Retention);
+- clean the images and snapshots of failed builds before any start, but only under the image deletion rule (see Retention). This is the rule's `failed` path and its result is `reconcile.failed_images`. The end of the pass runs every path of the rule and reports it as `retention`, so the image of a failed build that is still `pending` goes at the end of the pass by the pending-image path;
 - resolve a pending promotion journal row from the file hash (see `image promote`);
-- record a tagged image with no state row as a `candidate` that is not verified, and never pin it.
+- record a tagged image with no state row as a `candidate` that is not verified, in whatever state the image is, and never pin it. An orphan that is not `available` and is older than the 24-hour hold is marked `failed`, so that the rule removes it as the image of a failed build. Its row keeps `IMAGE_ORPHAN_RECORDED`: it never starts a cooldown, changes the failure count or clears `blocked`, and it counts toward `max_builds_per_day` and `min_build_interval_seconds` by the creation time of its image.
 
 ## Launch-template version and promotion
 
@@ -331,7 +346,7 @@ One deletion rule covers every path that deregisters an image or deletes a snaps
 - Retention adds one more condition: only images older than `retain_min_age_seconds` are eligible, down to `retain` images.
 - Older launch-template versions that reference deregistered images become unlaunchable. They are never deleted here. The previous pin stays valid because it is protected.
 - Retention runs inside `image run`. It only reports what it would remove unless `--apply` is given.
-- Orphans (tagged images or snapshots with no state row, older than 24 hours) are handled after that grace period.
+- Orphans (tagged images or snapshots with no state row, older than 24 hours) are handled after that grace period. A pass records a tagged image that has no row before the rule runs (see Reconcile), so an orphan image that is not `available` reaches the rule as the image of a failed build.
 
 ## Configuration
 
@@ -372,7 +387,7 @@ launch_template_version = 1
 
 [image.storage]
 bucket = "example-ci-burst-staging"
-prefix = "warm-archives/"
+prefix = "warm-archives"              # no "..", no leading "/"; one "/" joins it to the build id
 ```
 
 The `[aws]` and `[forgejo]` tables are unchanged. Region, deployment identity and the worker template come from the existing keys.
@@ -392,7 +407,7 @@ The `blocked` state clears only with a basis digest change or `image run --apply
 
 The image unit writes an append-only `image-events.ndjson` and a Prometheus textfile into the image state directory, written atomically. Events: `image_check`, `image_build_started`, `image_marker_seen`, `image_created`, `image_candidate_ready`, `image_build_failed` (reason code and a framed, byte-sanitized console tail), `image_reconciled`, `image_pruned`, `image_blocked` and `image_promoted` (written by promote). Metrics: build state, last build timestamp by outcome, build duration, console latency, consecutive failures, candidate waiting, stale, and leaked resources by kind.
 
-Events carry ids, 12-character digests, counts and reason codes. The presigned URL, tokens, user data and raw provider payloads never appear. Example alert rules go in the documentation and are not shipped: failures at 2 or more or `blocked`; a candidate waiting over 48 hours; leaked resources increasing; stale over 7 days (information). A failed unit also reaches the host's existing unit-failed alerts. How the host's collector reads the textfile is operator-specific.
+Events carry ids, 12-character digests, counts and reason codes. The presigned URL, tokens, user data and raw provider payloads never appear. No event value holds `://`. The console tail of `image_build_failed` shows every URL, every presigned query string and the archive key as `[archive-url]`, the text that `warm-cache.sh` prints for the archive URL (the script masks only that URL and its query, the pass masks every URL it finds). An event line is written with one `write` on an `O_APPEND` descriptor, so it lands whole behind any other writer's line. A short write is raised as an error and is never continued or retried, because a second write could land behind another writer's line and tear both. Example alert rules go in the documentation and are not shipped: failures at 2 or more or `blocked`; a candidate waiting over 48 hours; leaked resources increasing; stale over 7 days (information). A failed unit also reaches the host's existing unit-failed alerts. How the host's collector reads the textfile is operator-specific.
 
 ## Credential boundaries
 
@@ -419,21 +434,31 @@ Events carry ids, 12-character digests, counts and reason codes. The presigned U
 | Branch not protected | `IMAGE_BRANCH_UNPROTECTED`, exit 2 |
 | Basis path missing at the sha | `IMAGE_BASIS_PATH_MISSING`, exit 2 |
 | Archive over the size cap, or the upload fails | Abort the multipart upload, delete the key, build `failed`, no builder |
-| Session has too little life for the presigned URL | `IMAGE_CREDENTIAL_SHORT`, exit 2, no launch |
+| Session has too little life for the presigned URL | `IMAGE_CREDENTIAL_SHORT`, answered `refused` (exit 2), no launch, no failure counted. Before the row exists no row and no archive is written. After the archive is staged the row ends `failed` with the code and the archive is deleted |
 | Role cannot be assumed | Provider refusal on the first call, exit 1, scaling unaffected |
 | User data too large | `IMAGE_USERDATA_TOO_LARGE`, before `RunInstances` |
-| Build template unsafe | `IMAGE_BUILD_TEMPLATE_UNSAFE`, exit 2 |
+| Build template unsafe | `IMAGE_BUILD_TEMPLATE_UNSAFE`, exit 2, before the row is written: no row, no archive, no failure. When a pass resumes the stage of a build that already has a row, the row ends `failed` with the code, its archive is deleted, the pass answers `refused` (exit 2) and no failure is counted. The detail names the property (`security_groups` for the groups) and no value |
+| Security groups cannot be described (unknown id, or no `ec2:DescribeSecurityGroups`) | The provider's refusal before the row is written, no build starts |
+| Start refused after the trigger decision cleared `blocked` or the cooldown (a forced run, a changed digest) | The clearing stays. The refusal adds no failure and starts no cooldown |
 | No gate command and no `allow_no_gate` | `IMAGE_GATE_REQUIRED`, exit 2 |
-| Another builder exists | `IMAGE_BUILD_ALREADY_ACTIVE`, exit 2 |
+| Another builder exists | `IMAGE_BUILD_ALREADY_ACTIVE`, answered `refused` (exit 2), no failure counted. A builder that appears after the archive is staged ends the row `failed` with the code and deletes the archive, and the next pass's reconcile ends that builder |
 | Daily cap reached | `IMAGE_DAILY_CAP`, exit 2 |
 | `RunInstances` fails | Build `failed`, counts toward cooldown and `blocked` |
 | Warm command or gate fails | `WARM_FAILED`, builder terminated, no image |
 | Console blind, or no marker | `CONSOLE_BLIND` or `MARKER_TIMEOUT`, builder terminated, no image |
 | Marker digest differs from the staged archive | `IMAGE_MARKER_DIGEST_MISMATCH`, no image |
-| Builder gone before `CreateImage` | `IMAGE_BUILDER_GONE`, cooldown |
-| Image fails or stays pending | Poll to the deadline, then clean up only under the deletion rule |
+| Builder gone before `CreateImage` | `IMAGE_BUILDER_GONE`, cooldown. A marker that a pass reads for the first time after reconcile ended an overdue builder is this case |
+| Marker first read at or after the build deadline, builder still alive | `MARKER_TIMEOUT`, no image, and the failure path asks to end the builder. A refused termination in reconcile is one way to get here. A deadline that passes during the console read, during a lookup of the build's image that lists no image, or during the read of the base image is another |
+| Image fails or stays pending | Poll to the build deadline. Reconcile ends an overdue builder first, and the build ends `IMAGE_NOT_AVAILABLE` (or `candidate` when the image is `available` at the read). The image is cleaned up only under the deletion rule |
+| Pass deadline reached | An advancing or staging pass notes `pass_deadline_exceeded` and leaves the row as it was. A deletion path, and the deletion dry run of `plan`, delete nothing and report it as their result. The other reads of `plan`, reconcile, the pin read and the template check of a start end with the refusal |
+| Base image read refused, the pass deadline included | `CreateImage` is still called, without the base image tag, and the pass notes `base_image:<reason>` |
+| Lookup of the build's image refused, the pass deadline included | `CreateImage` is still called, as if the lookup had found no image, and the pass notes `image_lookup:<reason>` |
+| `CreateImage` ends with an unknown outcome before the build deadline, a duplicate name included | The row stays `building`, the pass notes `create_image:<reason>` and no failure is counted. The next pass adopts the image by its build id tag once it is listed, and else asks again under the same name |
+| `CreateImage` ends with an unknown outcome at or after the build deadline | The build fails: with the refusal's code when the call outlived the deadline, with `IMAGE_BUILDER_GONE` when reconcile ended the builder first. An image that is listed later is removed as the image of a failed build and is no orphan |
+| Pass deadline reached during staging | The row stays `building` with no builder and no `archive_sha256`, no failure. The same holds for a pass deadline in the template check that comes before a resumed stage. The next pass stages again under the same key |
+| Build still unstaged at the build deadline, or the deadline passes during the stage | `CONSOLE_BLIND`, no builder is launched, the archive that the row names is deleted, counts as a failure. The clock is read again right before the launch call |
 | New version differs beyond `ImageId` | `TEMPLATE_DRIFT`, version unusable, image kept 24 hours |
-| Version creation fails | Retry with the same client token, no rebuild |
+| Version creation fails | Before the build deadline, retry with the same client token, no rebuild; at or after it, the build fails with the refusal's code |
 | Crash after a state write | Idempotent retry. Reconcile terminates an unmatched builder. |
 | State file lost or restored | Reconcile from tags. The tag precheck blocks a second builder. |
 | Image credentials absent or expired | Provider refusal. Scaling unaffected. |
@@ -449,7 +474,7 @@ Events carry ids, 12-character digests, counts and reason codes. The presigned U
 | Failed build's image is pinned by hand | Skipped as protected. |
 | Supervisor interrupted | Rerun the same command to resume. |
 | Promoted image bad | `promote --rollback`. No rebuild. |
-| Image pass fails repeatedly | `blocked` after `max_consecutive_failures`. Clears with a digest change or `--force`. |
+| Image pass fails repeatedly | `blocked` after `max_consecutive_failures`. A refusal is not a failure and is not counted. Clears with a digest change or `--force`. |
 
 ## Alternatives considered
 

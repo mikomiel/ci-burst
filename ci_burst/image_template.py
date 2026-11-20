@@ -26,7 +26,9 @@ _IMAGE_FIELD = "ImageId"
 _MISSING = object()
 
 
-def create_candidate_version(aws, *, template_name, source_pin, image_id, build_id, basis_digest, client_token):
+def create_candidate_version(
+    aws, *, template_name, source_pin, image_id, build_id, basis_digest, client_token, deadline=None
+):
     """Create the candidate's launch-template version and compare it with the pin.
 
     ``aws`` is an ``ImageAws``. ``source_pin`` is the numeric version the
@@ -55,6 +57,11 @@ def create_candidate_version(aws, *, template_name, source_pin, image_id, build_
     the same ``client_token``: the provider returns the same version number for
     the same token, so a crash between creating and recording the version never
     creates a second one. A refusal of the provider passes unchanged.
+
+    ``deadline`` bounds the read-back, which is a read like any other of the pass: one that would start at or
+    after it raises ``DeadlineRefusal`` before any request. The creation is one call and cannot be bounded, so a
+    pass that ran out of time during it ends here with the version in place, and the retry with the same
+    ``client_token`` finds that version instead of creating another.
     """
     description = f"ci-burst {build_id} {basis_digest[:12]}"
     version = aws.create_template_version(template_name, source_pin, image_id, description, client_token)
@@ -63,7 +70,7 @@ def create_candidate_version(aws, *, template_name, source_pin, image_id, build_
             "AWS_UNCERTAIN", f"version creation returned the source version {source_pin}", uncertain=True
         )
     versions = [source_pin, version]
-    read = aws.template_versions(template_name, versions)
+    read = aws.template_versions(template_name, versions, deadline=deadline)
     by_number = {item.version: item for item in read}
     if len(by_number) != len(read) or set(by_number) != set(versions):
         raise ProviderRefusal(

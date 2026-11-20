@@ -89,8 +89,10 @@ podman build --network=host --tag localhost/ci-burst:latest .
 ```
 
 The build context is default-deny: only `pyproject.toml`, `README.md`,
-`LICENSE` and `ci_burst/` enter it, and `pip install .` installs the CLI. The
-tag stays local; nothing is pushed.
+`LICENSE`, `ci_burst/` and `deploy/runner/image/warm-cache.sh` enter it.
+`pip install .` installs the CLI, and the warm script is copied to
+`/srv/ci-burst/share/warm-cache.sh` for automated image builds. The tag stays
+local; nothing is pushed.
 
 Both hosts run the same local tag. Build it on each host, or build once and
 copy it with `podman save` and `podman load`. No registry is involved.
@@ -621,8 +623,10 @@ The image-keyed record is authoritative, and its attestation list is
 append-only. One image ID can come from more than one source commit: a commit
 that changes only `docs/`, `tests/` or `deploy/` files is excluded by
 `.dockerignore`, and the Dockerfile copies only the application and packaging
-inputs, so a build of it returns the bytes already recorded under a different
-source. When the build inputs match, the run appends an attestation with the
+inputs and the one warm script, so a build of it returns the bytes already
+recorded under a different source. The exception is
+`deploy/runner/image/warm-cache.sh`: the image ships it for automated image
+builds, so a commit that changes only that file changes the image. When the build inputs match, the run appends an attestation with the
 new source SHA, tree SHA, engine version and timestamp and promotes normally;
 the identical source and tree is a no-op that leaves the file byte-for-byte
 unchanged. When the recorded build inputs differ — the `Dockerfile` sha256, the

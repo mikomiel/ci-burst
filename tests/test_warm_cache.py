@@ -48,8 +48,20 @@ SOURCE_URL = f"https://builder-source.invalid/archive.tar.gz?token={SECRET_URL_T
 #: Commands the script runs that act on the host. Each must resolve to a stub.
 STUBBED = (
     "shutdown", "systemd-run", "systemctl", "runuser", "cloud-init", "curl", "sleep", "sync",
-    "chown", "aws", "tar", "id",
+    "chown", "aws", "tar", "id", "iptables", "ip6tables",
 )
+
+FIREWALL_STUB = """
+tool=$(basename "$0"); verb=$1; shift
+rule="$tool $*"
+case "$verb" in
+  -I) [ "${STUB_FW_FAIL:-}" = "$tool-I" ] && exit 2
+      echo "$rule" >> "$STUB_DIR/rules" ;;
+  -C) [ "${STUB_FW_FAIL:-}" = "$tool-C" ] && exit 1
+      grep -qxF "$rule" "$STUB_DIR/rules" 2>/dev/null || exit 1 ;;
+esac
+exit 0
+"""
 
 #: What bash itself adds to an empty environment.
 BASH_INTERNAL = {"PWD", "SHLVL", "_", "OLDPWD"}
@@ -79,11 +91,32 @@ def make_archive(directory, files=None):
     return archive, sha256(archive.read_bytes()).hexdigest()
 
 
+def make_wrapped_archive(directory, prefix="example-repo", files=None):
+    """A .tar.gz whose members all sit under one top-level directory, as a forge archive does."""
+    files = files or {"lock.txt": "locked\n"}
+    source = Path(directory) / "wrapped-source"
+    source.mkdir(exist_ok=True)
+    archive = Path(directory) / "wrapped.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        top = tarfile.TarInfo(prefix)
+        top.type = tarfile.DIRTYPE
+        top.mode = 0o755
+        tar.addfile(top)
+        for name, content in files.items():
+            (source / name).write_text(content, encoding="utf-8")
+            tar.add(source / name, arcname=f"{prefix}/{name}")
+    return archive, sha256(archive.read_bytes()).hexdigest()
+
+
 STUB_BODIES = {
     "shutdown": "",
     "systemd-run": "",
     "sleep": "",
     "sync": "",
+    # Records each inserted rule; `-C` finds a rule that was inserted, unless
+    # STUB_FW_FAIL names the tool and verb that do not hold (e.g. "ip6tables-C").
+    "iptables": FIREWALL_STUB,
+    "ip6tables": FIREWALL_STUB,
     "chown": "",
     "aws": "exit 99",
     "cloud-init": """
@@ -95,10 +128,12 @@ fi
 exit "${STUB_CLOUD_INIT_RC:-0}"
 """,
     "curl": """
+echo "$STUB_CURL_STDOUT"
 out=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -o) out=$2; shift 2 ;;
+    --config) [ "$2" = - ] && cat > "$STUB_DIR/curl-config"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -345,6 +380,9 @@ class RefusalTests(WarmHarness, unittest.TestCase):
             "a missing URL": {"WARM_SRC_URL": ""},
             "a URL that is not https": {"WARM_SRC_URL": "http://builder-source.invalid/a.tar.gz"},
             "a URL with whitespace": {"WARM_SRC_URL": "https://builder-source.invalid/a b"},
+            "a URL with a quote": {"WARM_SRC_URL": 'https://builder-source.invalid/a"b'},
+            "a URL with a backslash": {"WARM_SRC_URL": "https://builder-source.invalid/a\\b"},
+            "an empty strip setting": {"WARM_SRC_STRIP_COMPONENTS": ""},
             "a lifetime below the bound": {"WARM_LIFETIME_SECONDS": "10"},
             "a lifetime above the bound": {"WARM_LIFETIME_SECONDS": "99999"},
             "a lifetime that is not a number": {"WARM_LIFETIME_SECONDS": "soon"},
@@ -354,6 +392,16 @@ class RefusalTests(WarmHarness, unittest.TestCase):
             with self.subTest(label):
                 self.events.write_text("", encoding="utf-8")
                 self.assertRefused(self.start(**inputs))
+
+    def test_a_strip_components_value_other_than_zero_or_one_refuses(self):
+        # Only the exact text 0 or 1 passes; an unset value defaults to 0, and an empty one is refused
+        # with the malformed inputs above.
+        for value in ("2", "-1", "1 ", " 1", "x", "01", "1\n", "0x1", "1.0", "10"):
+            with self.subTest(value=value):
+                self.events.write_text("", encoding="utf-8")
+                self.assertRefused(self.start(WARM_SRC_STRIP_COMPONENTS=value))
+                self.assertIn("WARM_SRC_STRIP_COMPONENTS must be 0 or 1", self.output)
+                self.assertFalse([e for e in self.event_list() if e.startswith("EXTRACT")])
 
     def test_an_invalid_lifetime_still_arms_the_default_timer(self):
         self.start(WARM_LIFETIME_SECONDS="soon")
@@ -397,6 +445,119 @@ class SourceTests(WarmHarness, unittest.TestCase):
         self.assertNotIn(str(self.home), str(self.vartmp / "warm-src"))
 
 
+class StripComponentsTests(WarmHarness, unittest.TestCase):
+    """WARM_SRC_STRIP_COMPONENTS is the only thing that decides how many components extraction drops."""
+
+    def extraction(self):
+        return [e for e in self.event_list() if e.startswith("EXTRACT ")]
+
+    def argv(self, strip):
+        return f"EXTRACT tar -xzf - -C {self.vartmp / 'warm-src'} --no-same-owner --no-same-permissions {strip}"
+
+    def test_unset_and_zero_keep_every_path_component(self):
+        self.archive, self.digest = make_wrapped_archive(self.root)
+        kept = self.root / "kept.txt"
+        cases = (
+            ("unset", {}),
+            ("zero", {"WARM_SRC_STRIP_COMPONENTS": "0"}),
+        )
+        for label, inputs in cases:
+            with self.subTest(label):
+                self.events.write_text("", encoding="utf-8")
+                kept.unlink(missing_ok=True)
+                completed = self.start(WARM_COMMANDS=f"cat example-repo/lock.txt > {kept}", **inputs)
+                self.assertEqual(completed.returncode, 0, self.output)
+                self.assertEqual(kept.read_text(encoding="utf-8"), "locked\n")
+                self.assertEqual(self.extraction(), [self.argv("--strip-components=0")])
+
+    def test_one_drops_the_leading_directory_so_commands_run_from_the_source_root(self):
+        self.archive, self.digest = make_wrapped_archive(self.root)
+        seen = self.root / "seen.txt"
+        completed = self.start(
+            WARM_SRC_STRIP_COMPONENTS="1",
+            WARM_COMMANDS=f"cat lock.txt > {seen}\ntest ! -e example-repo",
+        )
+        self.assertEqual(completed.returncode, 0, self.output)
+        self.assertEqual(seen.read_text(encoding="utf-8"), "locked\n")
+        self.assertEqual(self.extraction(), [self.argv("--strip-components=1")])
+        self.assertEqual(self.lines[-1], MARKER)
+
+    def test_a_wrapped_archive_stays_wrapped_without_the_input(self):
+        # The counterpart of the test above: the flag is what moves the files.
+        self.archive, self.digest = make_wrapped_archive(self.root)
+        completed = self.start(WARM_COMMANDS="cat lock.txt")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("WARM FAIL warm 1/1 rc=1", self.output)
+        self.assertEqual(self.unframed_markers(), [])
+
+
+class FetchTests(WarmHarness, unittest.TestCase):
+    """The presigned URL reaches curl on stdin, never as an argument."""
+
+    def test_the_url_is_never_a_process_argument(self):
+        completed = self.start()
+        self.assertEqual(completed.returncode, 0, self.output)
+        fetches = [e for e in self.event_list() if e.startswith("curl")]
+        self.assertEqual(len(fetches), 1)
+        self.assertNotIn(SECRET_URL_TOKEN, fetches[0])
+        self.assertIn("--config -", fetches[0])
+        self.assertTrue(fetches[0].startswith("curl --disable "), "no default curl config may be read")
+        config = (self.stub / "curl-config").read_text(encoding="utf-8")
+        self.assertEqual(config, f'url = "{SOURCE_URL}"\n')
+        self.assertNotIn(SECRET_URL_TOKEN, self.output)
+
+    def ipv6(self, enabled):
+        marker = self.proc / "net" / "if_inet6"
+        if enabled:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("", encoding="utf-8")
+        else:
+            marker.unlink(missing_ok=True)
+
+    def test_the_metadata_service_is_rejected_for_the_runner_before_the_fetch_and_any_consumer_command(self):
+        rule = "OUTPUT -m owner --uid-owner runner -j REJECT -d"
+        for enabled, expected in (
+            (True, [f"iptables -I {rule} 169.254.169.254/32", f"ip6tables -I {rule} fd00:ec2::254/128"]),
+            (False, [f"iptables -I {rule} 169.254.169.254/32"]),
+        ):
+            with self.subTest(ipv6=enabled):
+                self.events.write_text("", encoding="utf-8")
+                (self.stub / "rules").unlink(missing_ok=True)
+                self.ipv6(enabled)
+                completed = self.start()
+                self.assertEqual(completed.returncode, 0, self.output)
+                events = self.event_list()
+                inserts = [i for i, e in enumerate(events) if re.match(r"ip6?tables -I ", e)]
+                checks = [i for i, e in enumerate(events) if re.match(r"ip6?tables -C ", e)]
+                self.assertEqual([events[i] for i in inserts], expected)
+                self.assertEqual(len(checks), len(expected))
+                first_fetch = next(i for i, e in enumerate(events) if e.startswith("curl"))
+                first_unit = next(i for i, e in enumerate(events) if e.startswith("UNIT "))
+                self.assertLess(max(inserts + checks), min(first_fetch, first_unit))
+                self.assertIn("STEP metadata blocked", self.lines)
+
+    def test_a_metadata_rule_that_does_not_hold_ends_the_build_before_any_consumer_command(self):
+        self.ipv6(True)
+        for failure in ("iptables-I", "iptables-C", "ip6tables-I", "ip6tables-C"):
+            with self.subTest(failure):
+                self.events.write_text("", encoding="utf-8")
+                (self.stub / "rules").unlink(missing_ok=True)
+                self.extra_env = {"STUB_FW_FAIL": failure}
+                completed = self.start()
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("WARM FAIL the metadata service could not be blocked", self.output)
+                events = self.event_list()
+                self.assertFalse([e for e in events if e.startswith("curl")])
+                self.assertNotIn("CONSUMER", events)
+                self.assertEqual(self.unframed_markers(), [])
+
+    def test_nothing_curl_prints_reaches_the_console(self):
+        self.extra_env = {"STUB_CURL_STDOUT": f"> GET /archive.tar.gz?token={SECRET_URL_TOKEN}"}
+        completed = self.start()
+        self.assertEqual(completed.returncode, 0, self.output)
+        self.assertNotIn(SECRET_URL_TOKEN, self.output)
+
+
 class FailureTests(WarmHarness, unittest.TestCase):
     def assertFailedBuild(self, completed):
         self.assertNotEqual(completed.returncode, 0)
@@ -424,6 +585,14 @@ class FailureTests(WarmHarness, unittest.TestCase):
         self.assertIn(f"{FRAME}cause-visible", self.lines)
         self.assertIn(f"{FRAME}second-line", self.lines)
         self.assertNotIn("cause-visible", [line for line in self.lines if not line.startswith(FRAME)])
+
+    def test_a_failure_tail_never_shows_the_archive_url_or_its_query(self):
+        query = SOURCE_URL.split("?", 1)[1]
+        completed = self.start(WARM_COMMANDS=f"echo 'data {SOURCE_URL} end'; echo 'q={query};'; exit 1")
+        self.assertFailedBuild(completed)
+        self.assertNotIn(SECRET_URL_TOKEN, self.output)
+        self.assertIn(f"{FRAME}data [archive-url] end", self.lines)
+        self.assertIn(f"{FRAME}q=[archive-url];", self.lines)
 
     def test_the_tail_is_bounded_to_the_last_lines_of_the_log(self):
         completed = self.start(WARM_COMMANDS="seq 1 500; exit 1")
@@ -538,6 +707,8 @@ class SuccessTests(WarmHarness, unittest.TestCase):
         self.assertFalse([e for e in self.event_list() if e.startswith("aws")])
         text = SCRIPT.read_text(encoding="utf-8")
         executable = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+        # The IPv6 metadata address is the one "ec2" the script may hold: it blocks it.
+        executable = [l.replace("fd00:ec2::254", "") for l in executable]
         self.assertFalse([l for l in executable if re.search(r"\baws\b|ec2|create-image", l)])
 
     def test_each_command_runs_in_order_and_the_gate_runs_last(self):
@@ -723,7 +894,7 @@ class ExtractionTests(WarmHarness, unittest.TestCase):
         extract = [e for e in events if e.startswith("EXTRACT ")]
         self.assertEqual(
             extract,
-            [f"EXTRACT tar -xzf - -C {self.vartmp / 'warm-src'} --no-same-owner --no-same-permissions"],
+            [f"EXTRACT tar -xzf - -C {self.vartmp / 'warm-src'} --no-same-owner --no-same-permissions --strip-components=0"],
         )
         # The unit that ran it is the first one, and it ran before any warm command.
         self.assertLess(events.index("UNIT warm-job-1"), events.index("CONSUMER"))
@@ -733,7 +904,7 @@ class ExtractionTests(WarmHarness, unittest.TestCase):
         text = SCRIPT.read_text(encoding="utf-8")
         executable = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
         self.assertEqual([l.strip() for l in executable if re.search(r"(?<![\w./=-])tar\s", l)],
-                         ["run_in_unit extract \"$ARCHIVE\" tar -xzf - -C \"$SRC_DIR\" --no-same-owner --no-same-permissions"])
+                         ["run_in_unit extract \"$ARCHIVE\" tar -xzf - -C \"$SRC_DIR\" --no-same-owner --no-same-permissions --strip-components=\"$WARM_SRC_STRIP_COMPONENTS\""])
         self.assertFalse([l for l in executable if re.search(r"\bchown\s+-\w*R", l)])
         self.assertFalse([l for l in executable if re.search(r"\brunuser\b", l)])
 
@@ -932,7 +1103,8 @@ class PublicContentTests(unittest.TestCase):
     def test_the_script_has_no_credential_cloud_identifier_or_host(self):
         text = SCRIPT.read_text(encoding="utf-8")
         self.assertEqual(self.CLOUD_IDENTIFIER.findall(text), [])
-        self.assertNotRegex(text, r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+        # The well-known metadata address is the one address the script may name: it blocks it.
+        self.assertNotRegex(text.replace("169.254.169.254", ""), r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
         self.assertNotRegex(text, r"(?i)\b(?:token|secret|password|passwd)\s*=\s*['\"]?\w")
         self.assertNotIn("set -x", text)
 

@@ -778,6 +778,17 @@ class RefreshTests(CliCase):
         self.assertEqual((record["image_state"], record["template_version_exists"]), ("available", 1))
         self.assertIsNone(record["drift_result"])
 
+    def test_refresh_with_no_state_file_records_a_pin_that_the_account_does_not_list(self):
+        self.assertFalse(self.state_dir.exists())
+        del self.world.versions[(WORKER, PIN)]  # no image id to read, and no state file to look for an observed one in
+        code, payload = self.invoke("image", "status", "--refresh")
+        self.assertEqual((code, payload["pin_records_created"], payload["missing_versions"]), (0, [PIN], [PIN]))
+        self.assertFalse(payload["pin_observed"])
+        record = self.row(f"pin-{PIN}")
+        found = (record["image_id"], record["image_state"], record["template_version_exists"])
+        self.assertEqual(found, (None, None, 0))
+        self.assertEqual(self.table("pin_log"), [])
+
     def test_refresh_records_a_missing_image(self):
         build = self.build_candidate()
         del self.world.images[build.image_id]
@@ -829,6 +840,20 @@ class RefreshTests(CliCase):
                 self.assertEqual((code, payload["error"]["reason"]), (1, "AWS_UNCERTAIN"))
                 self.assertEqual(self.dump(), before)
                 del self.world.errors[method]
+
+    def test_a_refused_read_with_no_state_file_records_no_row(self):
+        self.assertFalse(self.state_dir.exists())
+        for method in ("describe_launch_template_versions", "describe_images"):
+            with self.subTest(method=method):
+                self.world.fail(method, ProviderError("RequestLimitExceeded"))
+                try:
+                    code, payload = self.invoke("image", "status", "--refresh")
+                finally:
+                    del self.world.errors[method]
+                self.assertEqual((code, payload["error"]["reason"]), (1, "AWS_UNCERTAIN"))
+                self.assertEqual(self.table("image_builds"), [])
+        self.assertEqual(self.invoke("image", "status", "--refresh")[0], 0)  # the same command works once the reads do
+        self.assertEqual([row["id"] for row in self.table("image_builds")], [f"pin-{PIN}"])
 
     def test_only_the_newest_retain_candidates_are_refreshed(self):
         self.configure(self.image_toml(image_extra="retain = 2\n"))

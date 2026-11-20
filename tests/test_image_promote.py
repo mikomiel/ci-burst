@@ -140,6 +140,27 @@ class PromoteCase(CliCase):
             yield
 
     @contextlib.contextmanager
+    def flush_fails(self, error, *, directory, after=0):
+        """``os.fsync`` raises ``error`` once ``after`` flushes of one kind have worked; every other flush works.
+
+        A write flushes the temporary file, then the backup and, after the rename, the directory: ``directory``
+        picks the kind of flush that fails, and ``after`` how many of that kind work first.
+        """
+        real = os.fsync
+        worked = 0
+
+        def fsync(descriptor):
+            nonlocal worked
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode) == directory:
+                worked += 1
+                if worked > after:
+                    raise error
+            return real(descriptor)
+
+        with mock.patch("os.fsync", fsync):
+            yield
+
+    @contextlib.contextmanager
     def completion_crashes(self):
         """The process dies after the rename, as the journal row is about to be marked complete."""
         with mock.patch.object(ImageState, "journal_complete", side_effect=Crash("after the rename")):
@@ -402,6 +423,81 @@ class PreviewTests(PromoteCase):
         self.assertEqual(payload["write_check"], {"ok": True})
         self.assertTrue(payload["rollback"]["available"])
         self.assertEqual(snapshot_tree(self.dir), before)
+
+    def test_a_rollback_preview_reports_a_pin_line_that_the_edit_refuses_as_the_write_does(self):
+        self.seed()
+        self.refresh()
+        self.promoted()
+        # The strict loader reads 0x5 as 5, so the pin, the backup and the plan all hold: only the edit refuses.
+        self.edit_file(b"launch_template_version = 5", b"launch_template_version = 0x5")
+        self.assertEqual(load(self.config_path).aws.launch_template_version, 5)
+        code, payload = self.show("--rollback")
+        self.assertEqual((code, payload["action"], payload["rollback"]["available"]), (0, "rollback", True))
+        self.assertIsNone(payload["pin_change"])
+        self.assertEqual(payload["write_check"].get("reason"), "PROMOTE_PIN_LINE_AMBIGUOUS")
+        error = self.refusal(("--rollback",), "PROMOTE_PIN_LINE_AMBIGUOUS")
+        self.assertEqual(payload["write_check"]["reason"], error["reason"])
+
+    def test_a_rollback_preview_reports_a_diverged_pending_row_as_the_write_refuses_it(self):
+        self.seed()
+        self.refresh()
+        self.promoted()
+        self.seed("build-c", 6, 0xC1, age=300, source_pin=5)
+        self.clock.advance(60)
+        self.crash_before_rename("--version", "6")  # row 2 stays pending; the file still holds the pin of row 1
+        self.edit_file(b"region = ", b"# hand edit\nregion = ")  # a hash that is neither of row 2
+        code, payload = self.show("--rollback")
+        self.assertEqual((code, payload["action"], payload["rollback"]["available"]), (0, "rollback", True))
+        self.assertEqual([item["implied_resolution"] for item in payload["pending_journal"]], ["diverged"])
+        self.assertEqual(payload["write_check"].get("reason"), "PROMOTION_JOURNAL_DIVERGED")
+        error = self.refusal(("--rollback",), "PROMOTION_JOURNAL_DIVERGED")
+        self.assertEqual(payload["write_check"]["reason"], error["reason"])
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["complete", "pending"])
+
+    def test_a_rollback_preview_names_the_refusal_that_the_write_reaches_first(self):
+        self.seed()
+        self.refresh()
+        self.promoted()
+        self.seed("build-c", 6, 0xC1, age=300, source_pin=5)
+        self.clock.advance(60)
+        self.crash_before_rename("--version", "6")
+        promotion_backup = self.config_dir / self.journal_rows()[0]["backup_name"]
+        # Refusals pile up, and the preview names the one that the write meets first: the directory, then a
+        # diverged row, then the plan, then the edit.
+        for label, damage, reason in (
+            (
+                "a diverged row, which the hand edit makes and which also breaks the pin line for the edit",
+                lambda: self.edit_file(b"launch_template_version = 5", b"launch_template_version = 0x5"),
+                "PROMOTION_JOURNAL_DIVERGED",
+            ),
+            (
+                "a refused plan as well: the diverged row still comes first",
+                promotion_backup.unlink,
+                "PROMOTION_JOURNAL_DIVERGED",
+            ),
+            (
+                "a foreign file as well: the directory comes first",
+                lambda: (self.config_dir / "runner.env").write_text("synthetic\n", encoding="utf-8"),
+                "PROMOTE_DIRECTORY_NOT_DEDICATED",
+            ),
+        ):
+            with self.subTest(case=label):
+                damage()
+                payload = self.show("--rollback")[1]
+                self.assertEqual(payload["write_check"].get("reason"), reason)
+                self.assertEqual(self.refusal(("--rollback",), reason)["reason"], reason)
+        self.assertEqual(payload["rollback"]["reason"], "PIN_RECORD_DIVERGED")
+
+    def test_a_rollback_preview_names_a_refused_plan_before_a_refused_edit(self):
+        self.seed()
+        self.refresh()
+        self.promoted()
+        self.edit_file(b"launch_template_version = 5", b"launch_template_version = 0x5")
+        (self.config_dir / self.journal_rows()[0]["backup_name"]).unlink()  # the plan refuses, and so does the edit
+        payload = self.show("--rollback")[1]
+        self.assertEqual(payload["rollback"]["reason"], "PIN_RECORD_DIVERGED")
+        self.assertEqual(payload["write_check"].get("reason"), "PIN_RECORD_DIVERGED")
+        self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
 
 
 # -- 6.3: what a write refuses ---------------------------------------------------------
@@ -875,6 +971,46 @@ class EditTests(PromoteCase):
         self.assertEqual(len(self.backups()), 1)
         self.assertEqual([path.name for path in link_directory.iterdir()], ["deployment.toml"])
 
+    def test_a_link_that_leads_to_another_file_by_the_second_read_is_refused_before_anything_is_written(self):
+        # The command checks and locks the file that the link led to at the first read. A link that was
+        # moved since then must not make it write into another directory under that lock.
+        self.seed()
+        link_directory = self.dir / "link"
+        link_directory.mkdir()
+        link = link_directory / "deployment.toml"
+        link.symlink_to(self.config_path)
+        elsewhere = self.dir / "elsewhere"
+        elsewhere.mkdir()
+        moved = elsewhere / "deployment.toml"
+        moved.write_bytes(self.config_path.read_bytes())  # the same bytes in a clean directory: only the place differs
+        real = image_promote.file_lock
+
+        @contextlib.contextmanager
+        def moved_once_locked(target):
+            with real(target):
+                link.unlink()
+                link.symlink_to(moved)  # the lock is held, the second read has not happened yet
+                yield
+
+        before = self.fingerprint(), snapshot_tree(elsewhere)
+        with mock.patch.object(image_promote, "file_lock", moved_once_locked):
+            code, payload = self.invoke("image", "promote", "--write", "--config", str(link), config=False)
+        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_FILE_CHANGED"), payload)
+        for directory in (self.config_dir, elsewhere):
+            self.assertNotIn(str(directory), payload["error"]["detail"])
+        self.assertEqual((self.fingerprint(), snapshot_tree(elsewhere)), before)
+        self.assertEqual([path.name for path in elsewhere.iterdir()], ["deployment.toml"], "nothing was added there")
+        self.assertEqual(self.backups(), [])
+        self.assertFalse(self.temporary().exists())
+        self.assertEqual(self.journal_rows(), [])
+        self.assertEqual(self.promoted_events(), [])
+        self.assertEqual(self.row("build-b")["state"], "candidate")
+        # Nothing stays locked: the same command now works on the file that the link leads to.
+        code, payload = self.invoke("image", "promote", "--write", "--config", str(link), config=False)
+        self.assertEqual((code, payload["decision"]), (0, "promoted"), payload)
+        self.assertEqual(self.pin_in_file(), PIN, "the file of the first read was never the target")
+        self.assertEqual(len(list(elsewhere.glob("deployment.toml.bak.*"))), 1)
+
     def test_a_backup_never_replaces_a_file_of_the_same_name(self):
         self.seed()
         taken = self.config_dir / f"deployment.toml.bak.{stamp(self.clock())}"
@@ -944,6 +1080,66 @@ class EditTests(PromoteCase):
         self.assertEqual(self.row("build-b")["state"], "candidate")
         self.clock.advance(60)
         self.promoted()
+
+    def test_a_file_system_error_before_the_rename_is_refused_by_its_errno_and_leaves_nothing_behind(self):
+        self.seed()
+        before = self.fingerprint()
+        for step, worked in (("the temporary file", 0), ("the backup", 1)):
+            with self.subTest(step=step):
+                error = OSError(errno.ENOSPC, "No space left on device", "/synthetic/deployment.toml.promote-tmp")
+                with self.flush_fails(error, directory=False, after=worked):
+                    code, payload = self.write_pin()
+                self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_WRITE_FAILED"), payload)
+                detail = payload["error"]["detail"]
+                self.assertIn("ENOSPC", detail)
+                for leak in ("No space", "/synthetic", "promote-tmp"):
+                    self.assertNotIn(leak, detail, "the errno name only: no message of the error and no path")
+                self.assertEqual(self.fingerprint(), before, "the file, the rows and the events are as they were")
+                self.assertEqual(self.backups(), [], "no backup that no row names")
+                self.assertFalse(self.temporary().exists())
+        self.promoted()  # the same command works once the disk does
+
+    def test_an_error_that_is_not_the_file_systems_is_not_mapped_and_the_cleanup_still_runs(self):
+        self.seed()
+        before = self.fingerprint()
+        with self.flush_fails(RuntimeError("a defect"), directory=False, after=1):
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]), (1, {"reason": "UNEXPECTED", "detail": "RuntimeError"}))
+        self.assertEqual(self.fingerprint(), before)
+        self.assertFalse(self.temporary().exists())
+
+    def test_a_file_system_error_after_the_rename_leaves_the_row_pending_and_the_next_command_resolves_it(self):
+        self.seed()
+        before = self.config_path.read_bytes()
+        error = OSError(errno.EIO, "Input/output error", "/synthetic/config")
+        with self.flush_fails(error, directory=True):
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_WRITE_FAILED"), payload)
+        detail = payload["error"]["detail"]
+        self.assertIn("EIO", detail)
+        self.assertIn("pin may have moved", detail)
+        self.assertIn("pending", detail)
+        for command in ("promote --write", "promote --rollback --write", "image run --apply"):
+            self.assertIn(command, detail)
+        for leak in ("Input/output", "/synthetic"):
+            self.assertNotIn(leak, detail, "the errno name only: no message of the error and no path")
+        after = self.config_path.read_bytes()
+        self.assertNotEqual(after, before, "the rename had happened")
+        (row,) = self.journal_rows()
+        hashes = (row["status"], row["old_file_sha256"], row["new_file_sha256"])
+        self.assertEqual(hashes, ("pending", sha(before), sha(after)))
+        (backup,) = self.backups()
+        self.assertEqual((backup.name, backup.read_bytes()), (row["backup_name"], before), "the row names the backup")
+        self.assertFalse(self.temporary().exists())
+        self.assertEqual(self.row("build-b")["state"], "candidate")
+        self.assertEqual(self.promoted_events(), [], "the promotion is not complete, so no event")
+        # The file holds the new pin, so the next command resolves the row from the hash and has nothing left to
+        # promote: it refuses, and the resolution it made first stays.
+        code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_NO_CANDIDATE"))
+        self.assertEqual([item["status"] for item in self.journal_rows()], ["complete"])
+        self.assertEqual(self.row("build-b")["state"], "promoted")
+        self.assertEqual(self.config_path.read_bytes(), after)
 
     def test_another_promotion_holding_the_file_lock_is_refused_without_waiting(self):
         self.seed()

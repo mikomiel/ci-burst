@@ -302,7 +302,7 @@ It then edits only the `launch_template_version` key of the `[aws]` table:
 7. Rename atomically and flush the directory.
 8. Mark the row `complete` and commit.
 
-The order is journal, rename, complete, so a crash never leaves a new pin without a record. The next `promote`, `promote --rollback` or `image run --apply` resolves any `pending` row from the sha256 of the file:
+The order is journal, rename, complete, so a crash never leaves a new pin without a record. The next `promote --write`, `promote --rollback --write` or `image run --apply` resolves any `pending` row from the sha256 of the file:
 
 | File hash | Resolution |
 |---|---|
@@ -310,7 +310,7 @@ The order is journal, rename, complete, so a crash never leaves a new pin withou
 | the recorded new hash | the rename happened: mark the row `complete` |
 | any other hash | refuse with `PROMOTION_JOURNAL_DIVERGED`, write nothing, and leave the row `pending` |
 
-`image status` reports a pending row and the resolution that the hash implies, but writes nothing (plain status writes only the check timestamp). While a row is `pending`, both of its pins are in the protected set, so no deletion path can remove either image. A diverged row stays until an operator resolves it by hand, for example by restoring the file from the backup, and then reruns a resolving command.
+`image status` and a `promote` without `--write` report a pending row and the resolution that the hash implies, but write nothing (plain status writes only the check timestamp). While a row is `pending`, both of its pins are in the protected set, so no deletion path can remove either image. A diverged row stays until an operator resolves it by hand, for example by restoring the file from the backup, and then reruns a resolving command.
 
 `--rollback` writes the recorded previous pin with the same journaled procedure, after it resolves a pending row. It uses the backup that the newest completed `promotion` row names, never the globally newest `.bak` file. It refuses with `PIN_RECORD_DIVERGED` unless that row's new pin equals the TOML's pin, the named backup exists with the recorded sha256, and it contains the recorded previous pin. It also refuses unless the previous version and its image are recorded as existing at a fresh `verified_at`. Retention protects the previous pin's image, so a rollback needs no rebuild. The TOML owns the current pin and the journal owns the previous pin. Rollback verifies both against the named backup, so they cannot diverge silently.
 
@@ -322,7 +322,7 @@ Promotion needs no restart: the apply unit reads the TOML on each pass, and a wo
 
 An atomic rename needs write access to the directory of the TOML. Today the TOML sits in a directory that also holds the credential directories and the token env files. Mounting that directory writable into the promote container would defeat "no AWS credentials". The rule:
 
-- `promote --write` refuses with `PROMOTE_DIRECTORY_NOT_DEDICATED` when its target directory holds anything other than the TOML, its `.bak.*` files and a lock file.
+- `promote --write` refuses with `PROMOTE_DIRECTORY_NOT_DEDICATED` when its target directory holds anything other than the TOML, its `.bak.*` files, its lock file and its promote temporary file (a crashed promotion can leave that one).
 - The operator therefore keeps the deployment TOML in a dedicated directory (documented in the deployment guide) before using `--write`. Without it, `promote` without `--write` still works and the operator edits the pin by hand.
 - The container runs with `--network none`, read-only root, the dedicated TOML directory writable and the image state directory writable. Whether the shipped apply, export and reap units should move to the dedicated directory in this change is open question 2.
 

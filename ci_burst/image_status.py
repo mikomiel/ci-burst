@@ -1,7 +1,8 @@
 """``image status``: what is recorded, and the describe-only read that refreshes the evidence.
 
-Plain ``status`` reads the image state file and the deployment TOML and makes no
-provider call, so it builds no AWS client. It writes one thing, the check time
+Plain ``status`` reads only local files (the image state file, the deployment
+TOML and the backup that a journal row names) and makes no provider call, so it
+builds no AWS client. It writes one thing, the check time
 (``control.last_check_at``), and only when a state file exists and no pass
 holds its writer lock: a status never creates the state file.
 
@@ -13,8 +14,11 @@ with: ``image_state``, ``template_version_exists``, ``drift_result`` and
 hand, or the first pin before any candidate) has no row to carry that
 evidence, so the refresh records a pin record for it (see
 ``ImageState.insert_pin_record``). That row is what lets a rollback verify its
-target. All the reads come first and the writes are one transaction, so a read
-that fails leaves the state file as it was.
+target. The refresh holds the writer lock from before the first read to after the
+last write, so no pass writes between what it read and what it records. All the
+reads come before the writes, which are one transaction, so a read that fails
+changes no row. The state file and its lock are created before the reads when
+they are absent, because the lock must be held across them.
 """
 
 from . import image
@@ -52,7 +56,10 @@ class _NoControl:
 
 
 def status(config, *, state, clock):
-    """Report what the state file and the deployment file record. No provider call is made."""
+    """Report what the state file, the deployment file and the backup that a journal row names record.
+
+    Only local files are read and no provider call is made.
+    """
     now = clock()
     snapshot = read_snapshot(config)
     deployment = snapshot.config.deployment
@@ -187,8 +194,9 @@ def refresh(config, *, state, aws, clock, candidates=True):
     so a rollback to it refuses with the evidence instead of for want of a
     record. ``image run --apply`` refreshes the pins only (``candidates=False``),
     so a pin that a run observed is a usable rollback target without a separate
-    command. A refusal of a read is raised and nothing is persisted. The state
-    file is opened here (and created when absent), and closed.
+    command. A refusal of a read is raised and no row is changed. The state file
+    is opened here (and created with its lock when absent, before the reads),
+    locked for the whole refresh, and closed.
     """
     now = clock()
     snapshot = read_snapshot(config)

@@ -1,9 +1,10 @@
 """Promotion: the one edit that moves the pin, and its way back.
 
-``promote`` is pure local. It reads the image state file and the deployment
-TOML, and it writes only the TOML (its backup and one temporary file), the state
-file, one lock file next to the TOML and, once a write is done, one line of the
-event file in the state directory. It makes no AWS or forge call and holds no
+``promote`` is pure local. It reads only local files: the image state file, the
+deployment TOML and the backup that a journal row names. It writes only the TOML
+(its backup and one temporary file), the state file, one lock file next to the
+TOML and, once a write is done, one line of the event file in the state
+directory. It makes no AWS or forge call, builds no client and holds no
 credential: the module imports neither adapter, and a test pins that. Its
 verification comes from the record that a pass or ``image status --refresh``
 left in the state file.
@@ -31,9 +32,11 @@ what it holds and what a failure of that write does). The event is a notice and
 the journal row is the record: a crash after the rename loses the event and
 never the promotion.
 
-A crash between two of these steps leaves a state that the next command resolves
-from the file hash (``resolve_pending``). Nothing here deletes a backup that a
-journal row names.
+A crash between two of these steps leaves a state that the next write form
+(``--write``, ``--rollback --write``) or ``image run --apply`` resolves from the
+file hash (``resolve_pending``). Without ``--write`` a command only reports the
+resolution that the hash implies. Nothing here deletes a backup that a journal
+row names.
 """
 
 import errno
@@ -43,7 +46,7 @@ import os
 import re
 import stat
 import tomllib
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -205,9 +208,7 @@ def file_lock(target):
     try:
         descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     except OSError as error:
-        raise ImageRefusal(
-            PROMOTE_WRITE_FAILED, f"cannot open the lock file: {errno.errorcode.get(error.errno, 'OSError')}"
-        ) from None
+        raise ImageRefusal(PROMOTE_WRITE_FAILED, f"cannot open the lock file: {_errno_name(error)}") from None
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -473,6 +474,17 @@ def _remove(path):
         pass
 
 
+def _discard(path):
+    """Remove ``path`` if that works. For the way out of a failure: a second error must not replace the first."""
+    with suppress(OSError):
+        os.unlink(path)
+
+
+def _errno_name(error):
+    """The errno name of an ``OSError`` (``ENOSPC``), or ``OSError`` when it has none. A detail says no more of it."""
+    return errno.errorcode.get(error.errno, "OSError")
+
+
 def _create_backup(snapshot, now):
     stamp = datetime.fromtimestamp(now, UTC).strftime("%Y%m%dT%H%M%SZ")
     base = snapshot.target.name + _BACKUP_INFIX + stamp
@@ -495,17 +507,24 @@ def _flush_directory(directory):
 
 
 def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock):
-    """Steps 4 to 8 of the design for one pin change. The caller holds both locks."""
+    """Steps 4 to 8 of the design for one pin change. The caller holds both locks.
+
+    An ``OSError`` of a local file step is the refusal ``PROMOTE_WRITE_FAILED``, and its detail names the errno and
+    nothing else (never ``str(error)``, which holds a path). Before the rename the deployment file is unchanged and
+    the temporary file and the backup are removed again. A rename that fails aborts the row and keeps the backup.
+    After the rename the pin may have moved, so the row stays ``pending`` and the next command that resolves it
+    decides from the file hash. Any other exception is not mapped.
+    """
     new_text, change = plan_edit(snapshot.text, new_pin)
     check_reparse(snapshot, new_text, new_pin)
     new_data = new_text.encode("utf-8")
     new_sha = sha256_of(new_data)
     target = snapshot.target
     temporary = target.parent / (target.name + _TEMPORARY_SUFFIX)
-    _remove(temporary)  # a crashed run left it; this run holds the lock
     backup = None
     committed = False
     try:
+        _remove(temporary)  # a crashed run left it; this run holds the lock
         _create(temporary, new_data, snapshot)
         backup = _create_backup(snapshot, clock())
         if sha256_of(target.read_bytes()) != snapshot.sha256:
@@ -525,23 +544,36 @@ def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock):
                 candidate_id=candidate_id,
             )
         committed = True
-    except BaseException:
+    except BaseException as error:
         if not committed:
-            _remove(temporary)
+            _discard(temporary)
             if backup is not None:
-                _remove(backup)
+                _discard(backup)
+        if isinstance(error, OSError):
+            raise ImageRefusal(
+                PROMOTE_WRITE_FAILED,
+                f"a local file step failed ({_errno_name(error)}); the deployment file was not changed",
+            ) from None
         raise
     try:
         os.replace(temporary, target)
     except OSError as error:
         with state.transaction():
             state.journal_abort(row.id)
-        _remove(temporary)
+        _discard(temporary)
         raise ImageRefusal(
             PROMOTE_WRITE_FAILED,
-            f"the rename failed ({errno.errorcode.get(error.errno, 'OSError')}); the backup {backup.name} is kept",
+            f"the rename failed ({_errno_name(error)}); the backup {backup.name} is kept",
         ) from None
-    _flush_directory(target.parent)
+    try:
+        _flush_directory(target.parent)
+    except OSError as error:
+        raise ImageRefusal(
+            PROMOTE_WRITE_FAILED,
+            f"the directory flush after the rename failed ({_errno_name(error)}): the pin may have moved and the "
+            "journal row stays pending. The next image promote --write, image promote --rollback --write or "
+            "image run --apply resolves it from the file hash",
+        ) from None
     with state.transaction():
         state.journal_complete(row.id)
         if kind == "promotion":
@@ -666,10 +698,16 @@ def promote(config, *, state, clock, events, version=None, rollback=False, write
     """Print the evidence of a promotion or a rollback, or write it.
 
     ``state`` is an ``ImageState`` that is not connected; this function opens
-    it as the form needs and closes it. Without ``write`` the state is opened
-    for reading only: nothing is created or written, and a pending journal row
-    is reported with the resolution that the file hash implies, not resolved.
-    A refusal is raised.
+    it as the form needs and closes it. Without ``write`` the command reads only
+    local files (the state file, the deployment TOML and the backup that a
+    journal row names) and builds no client. The state is opened for reading
+    only: nothing is created or written, and a pending journal row is reported
+    with the resolution that the file hash implies, not resolved. A refusal is
+    raised.
+
+    A local file-system error in the write path is the refusal
+    ``PROMOTE_WRITE_FAILED``, and its detail names the errno and no path.
+    ``_write_pin`` says what each failure leaves behind.
 
     A write appends one ``image_promoted`` event through ``events``, a function
     of the event name and its fields. The command line hands in the writer of
@@ -720,6 +758,12 @@ def _check_no_divergence(pending):
         raise StateRefusal(PROMOTION_JOURNAL_DIVERGED, "the file matches neither hash of a pending journal row")
 
 
+def _check_plan(refusal):
+    """Raise the refusal that planning the rollback met, if it met one (``try_rollback_plan`` caught it)."""
+    if refusal is not None:
+        raise refusal
+
+
 def _write_check(refusal):
     return {"ok": refusal is None, **(refusal.as_dict() if refusal is not None else {})}
 
@@ -744,14 +788,20 @@ def _preview(snapshot, state, clock, version, rollback):
             row = state.journal_last_complete(kind="promotion")
             if row is None:
                 raise refusal
-            refusal = refusal or _first_refusal(
-                lambda: check_directory(snapshot.target), lambda: check_zone_pins(snapshot.raw)
+            # The checks of ``--rollback --write``, in the order it runs them. It writes the previous pin
+            # of the row that the plan chose, so that is the pin whose edit is checked.
+            first = _first_refusal(
+                lambda: check_directory(snapshot.target),
+                lambda: check_zone_pins(snapshot.raw),
+                lambda: _check_no_divergence(pending),
+                lambda: _check_plan(refusal),
+                lambda: _check_edit(snapshot, row.old_pin),
             )
             return {
                 "decision": "preview",
                 "action": "rollback",
                 "pin_change": _try_change(snapshot, row.old_pin),
-                "write_check": _write_check(refusal),
+                "write_check": _write_check(first),
                 **report,
             }
         build = select_candidate(state, config.deployment, version)
@@ -807,7 +857,7 @@ def _announce(events, done, *, build_id, image_id, rollback):
             file_digest=_short(done["file_sha256_after"]),
         )
     except (OSError, ValueError) as error:
-        code = errno.errorcode.get(error.errno, "OSError") if isinstance(error, OSError) else type(error).__name__
+        code = _errno_name(error) if isinstance(error, OSError) else type(error).__name__
         return [f"event_write:{code}"]
     return []
 
@@ -826,7 +876,16 @@ def _write(snapshot, state, clock, events, version, rollback):
             # The first read decided only the two refusals above. Every other fact comes from bytes
             # read now, with both locks held: a promotion that finished after the first read must
             # not make its own pending row look aborted.
+            checked = snapshot.target
             snapshot = read_snapshot(snapshot.config)
+            if snapshot.target != checked:
+                # The path was followed to another file: the directory that was checked and the lock
+                # that is held belong to the first one, so nothing may be written to this one.
+                raise ImageRefusal(
+                    PROMOTE_FILE_CHANGED,
+                    "the deployment path leads to another file than the one that was checked and locked; "
+                    "nothing was written",
+                )
             check_zone_pins(snapshot.raw)
             config = snapshot.config
             resolved = resolve_pending(state, snapshot.sha256)

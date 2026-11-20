@@ -2680,5 +2680,116 @@ class RealSdkCredentialFailureTests(RealSdkCase):
             self.assertNotIn(sentinel, text)
 
 
+class CreationTimeTests(Base):
+    """An image's ``CreationDate`` and a snapshot's ``StartTime`` become ``created_at``.
+
+    The deletion rule's age checks (retention, orphans and the drift hold)
+    read them. The adapter must give a time only when it can prove one.
+    """
+
+    TAGS = tag_list({IMAGE_BUILD_TAG: "true", DEPLOYMENT_TAG: DEPLOYMENT, BUILD_ID_TAG: "build-0001"})
+    MOMENT = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    def image_created_at(self, **item):
+        self.ec2.images_store.append(
+            {"ImageId": "ami-0123456789abcdef0", "State": "available", "Tags": self.TAGS, **item}
+        )
+        (image,) = self.image_aws().images(DEPLOYMENT)
+        return image.created_at
+
+    def snapshot_created_at(self, **item):
+        self.ec2.snapshots_store.append(
+            {"SnapshotId": "snap-0123456789abcdef0", "State": "completed", "Tags": self.TAGS, **item}
+        )
+        (snapshot,) = self.image_aws().snapshots(DEPLOYMENT)
+        return snapshot.created_at
+
+    def test_an_iso_creation_date_of_an_image_is_read_as_epoch_seconds(self):
+        for text in ("2026-01-02T03:04:05.000Z", "2026-01-02T03:04:05Z", "2026-01-02T03:04:05+00:00"):
+            with self.subTest(text=text):
+                self.ec2.images_store.clear()
+                self.assertEqual(self.image_created_at(CreationDate=text), self.MOMENT.timestamp())
+
+    def test_an_offset_other_than_utc_is_converted(self):
+        self.assertEqual(self.image_created_at(CreationDate="2026-01-02T05:04:05+02:00"), self.MOMENT.timestamp())
+
+    def test_the_start_time_of_a_snapshot_is_read_as_epoch_seconds(self):
+        self.assertEqual(self.snapshot_created_at(StartTime=self.MOMENT), self.MOMENT.timestamp())
+
+    def test_a_snapshot_start_time_may_also_be_an_iso_string(self):
+        self.assertEqual(self.snapshot_created_at(StartTime="2026-01-02T03:04:05.000Z"), self.MOMENT.timestamp())
+
+    def test_a_missing_time_is_none(self):
+        self.assertIsNone(self.image_created_at())
+        self.assertIsNone(self.snapshot_created_at())
+
+    def test_a_time_that_is_not_proven_is_none(self):
+        naive = datetime(2026, 1, 2, 3, 4, 5)
+        for value in (
+            "",
+            "yesterday",
+            "2026-01-02",
+            "2026-01-02T03:04:05",
+            "2026-13-45T03:04:05Z",
+            naive,
+            naive.isoformat(),
+            1_767_323_045,
+            1_767_323_045.0,
+            True,
+            [],
+            {"Z": 1},
+        ):
+            with self.subTest(value=repr(value)):
+                self.ec2.images_store.clear()
+                self.ec2.snapshots_store.clear()
+                self.assertIsNone(self.image_created_at(CreationDate=value))
+                self.assertIsNone(self.snapshot_created_at(StartTime=value))
+
+    def test_a_time_that_cannot_be_read_does_not_refuse_the_listing(self):
+        self.ec2.images_store.append(
+            {"ImageId": "ami-0123456789abcdef0", "State": "available", "Tags": self.TAGS, "CreationDate": "garbage"}
+        )
+        self.ec2.images_store.append(
+            {
+                "ImageId": "ami-0123456789abcdef1",
+                "State": "available",
+                "Tags": self.TAGS,
+                "CreationDate": "2026-01-02T03:04:05.000Z",
+            }
+        )
+        images = self.image_aws().images(DEPLOYMENT)
+        self.assertEqual([image.created_at for image in images], [None, self.MOMENT.timestamp()])
+
+    def test_a_single_read_carries_the_time_too(self):
+        self.ec2.images_store.append(
+            {
+                "ImageId": "ami-0123456789abcdef0",
+                "State": "available",
+                "Tags": self.TAGS,
+                "CreationDate": "2026-01-02T03:04:05.000Z",
+            }
+        )
+        self.ec2.snapshots_store.append(
+            {"SnapshotId": "snap-0123456789abcdef0", "State": "completed", "Tags": self.TAGS, "StartTime": self.MOMENT}
+        )
+        aws = self.image_aws()
+        self.assertEqual(aws.image("ami-0123456789abcdef0").created_at, self.MOMENT.timestamp())
+        self.assertEqual(aws.snapshot("snap-0123456789abcdef0").created_at, self.MOMENT.timestamp())
+
+    def test_the_time_is_not_part_of_the_status_output(self):
+        self.ec2.images_store.append(
+            {
+                "ImageId": "ami-0123456789abcdef0",
+                "State": "available",
+                "Tags": self.TAGS,
+                "CreationDate": "2026-01-02T03:04:05.000Z",
+            }
+        )
+        (image,) = self.image_aws().images(DEPLOYMENT)
+        self.assertEqual(
+            image.as_dict(), {"image_id": "ami-0123456789abcdef0", "state": "available", "snapshot_ids": []}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

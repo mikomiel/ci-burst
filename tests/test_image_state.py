@@ -594,5 +594,140 @@ class ScalingPathIgnoresImageStateTests(unittest.TestCase):
             self.assertNotIn("from ." + forbidden, source)
 
 
+class BuildReadTests(ImageStateCase):
+    """The read-only questions that the build and deletion passes ask of the builds."""
+
+    DEPLOYMENT = "example-deployment"
+    OTHER = "example-other-deployment"
+    T0 = 1_800_000_000.0
+
+    def started(self, build_id, at, *, state=None, deployment=None):
+        """Insert a build that started at ``at``, then move it to ``state`` when one is given."""
+        self.clock.now = at
+        build = self.add_build(build_id, deployment=deployment or self.DEPLOYMENT)
+        if state is not None:
+            with self.state.transaction():
+                build = self.state.advance_build(build_id, state=state)
+        return build
+
+    def ids(self, builds):
+        return [build.id for build in builds]
+
+    def test_builds_are_listed_oldest_first_for_one_deployment(self):
+        self.started("b-new", self.T0 + 200, state="failed")
+        self.started("b-old", self.T0, state="failed")
+        self.started("b-mid", self.T0 + 100, state="candidate")
+        self.started("o-1", self.T0 + 50, state="failed", deployment=self.OTHER)
+        self.assertEqual(self.ids(self.state.builds(self.DEPLOYMENT)), ["b-old", "b-mid", "b-new"])
+        self.assertEqual(self.ids(self.state.builds(self.OTHER)), ["o-1"])
+        self.assertEqual(self.state.builds("example-unknown-deployment"), [])
+
+    def test_builds_that_started_together_keep_their_insertion_order(self):
+        self.started("b-first", self.T0, state="failed")
+        self.started("b-second", self.T0, state="failed")
+        self.assertEqual(self.ids(self.state.builds(self.DEPLOYMENT)), ["b-first", "b-second"])
+        self.assertEqual(self.state.last_build(self.DEPLOYMENT).id, "b-second")
+        self.assertEqual(self.state.last_failed_build(self.DEPLOYMENT).id, "b-second")
+
+    def test_builds_started_since_counts_strictly_after_the_bound(self):
+        self.started("b-1", self.T0 - 10, state="failed")
+        self.started("b-2", self.T0, state="failed")
+        self.started("b-3", self.T0 + 10, state="candidate")
+        counts = {
+            since: self.state.builds_started_since(self.DEPLOYMENT, since)
+            for since in (self.T0 - 11, self.T0 - 10, self.T0 - 1, self.T0, self.T0 + 10)
+        }
+        self.assertEqual(counts, {self.T0 - 11: 3, self.T0 - 10: 2, self.T0 - 1: 2, self.T0: 1, self.T0 + 10: 0})
+
+    def test_builds_started_since_counts_every_state(self):
+        for number, state in enumerate(("failed", "candidate", "promoted")):
+            self.started(f"b-{number}", self.T0 + number, state=state)
+        self.assertEqual(self.state.builds_started_since(self.DEPLOYMENT, self.T0 - 1), 3)
+        self.started("b-3", self.T0 + 3)
+        self.assertEqual(self.state.builds(self.DEPLOYMENT)[-1].state, "building")
+        self.assertEqual(self.state.builds_started_since(self.DEPLOYMENT, self.T0 - 1), 4)
+
+    def test_builds_started_since_counts_one_deployment(self):
+        self.started("b-1", self.T0, state="failed")
+        self.started("o-1", self.T0, state="failed", deployment=self.OTHER)
+        self.started("o-2", self.T0 + 1, state="candidate", deployment=self.OTHER)
+        self.assertEqual(self.state.builds_started_since(self.DEPLOYMENT, self.T0 - 1), 1)
+        self.assertEqual(self.state.builds_started_since(self.OTHER, self.T0 - 1), 2)
+        self.assertEqual(self.state.builds_started_since("example-unknown-deployment", self.T0 - 1), 0)
+
+    def test_the_last_build_is_the_newest_by_start_time_in_any_state(self):
+        self.assertIsNone(self.state.last_build(self.DEPLOYMENT))
+        # Inserted newest first, so the start time and not the insertion order decides.
+        newest = self.started("b-newest", self.T0 + 100, state="promoted")
+        self.started("b-older", self.T0 + 50, state="failed")
+        self.started("o-1", self.T0 + 900, state="failed", deployment=self.OTHER)
+        self.assertEqual(self.state.last_build(self.DEPLOYMENT), newest)
+        self.assertEqual(self.state.last_build(self.OTHER).id, "o-1")
+        self.assertIsNone(self.state.last_build("example-unknown-deployment"))
+
+    def test_the_last_failed_build_skips_newer_builds_in_other_states(self):
+        self.assertIsNone(self.state.last_failed_build(self.DEPLOYMENT))
+        self.started("b-old-failed", self.T0, state="failed")
+        failed = self.started("b-new-failed", self.T0 + 10, state="failed")
+        self.started("b-candidate", self.T0 + 20, state="candidate")
+        self.started("b-promoted", self.T0 + 30, state="promoted")
+        self.started("b-building", self.T0 + 40)
+        self.started("o-1", self.T0 + 50, state="failed", deployment=self.OTHER)
+        self.assertEqual(self.state.last_failed_build(self.DEPLOYMENT), failed)
+        self.assertEqual(self.state.last_build(self.DEPLOYMENT).id, "b-building")
+
+    def test_no_failed_build_gives_none_even_with_other_builds(self):
+        self.started("b-candidate", self.T0, state="candidate")
+        self.started("b-promoted", self.T0 + 10, state="promoted")
+        self.assertIsNone(self.state.last_failed_build(self.DEPLOYMENT))
+
+    def test_the_candidate_is_the_newest_build_in_state_candidate(self):
+        self.assertIsNone(self.state.candidate(self.DEPLOYMENT))
+        self.started("b-old-candidate", self.T0, state="candidate")
+        newest = self.started("b-new-candidate", self.T0 + 10, state="candidate")
+        self.started("b-failed", self.T0 + 20, state="failed")
+        self.started("b-promoted", self.T0 + 30, state="promoted")
+        self.started("b-building", self.T0 + 40)
+        self.started("o-1", self.T0 + 50, state="candidate", deployment=self.OTHER)
+        self.assertEqual(self.state.candidate(self.DEPLOYMENT), newest)
+        self.assertEqual(self.state.candidate(self.OTHER).id, "o-1")
+
+    def test_only_builds_in_other_states_give_no_candidate(self):
+        self.started("b-failed", self.T0, state="failed")
+        self.started("b-promoted", self.T0 + 10, state="promoted")
+        self.started("b-building", self.T0 + 20)
+        self.assertIsNone(self.state.candidate(self.DEPLOYMENT))
+
+    def test_the_reads_write_nothing(self):
+        self.started("b-1", self.T0, state="failed")
+        self.started("b-2", self.T0 + 10, state="candidate")
+        self.started("b-3", self.T0 + 20)
+        self.add_journal()
+        before = self.state.path.read_bytes()
+        self.state.builds(self.DEPLOYMENT)
+        self.state.builds_started_since(self.DEPLOYMENT, self.T0)
+        self.state.last_build(self.DEPLOYMENT)
+        self.state.last_failed_build(self.DEPLOYMENT)
+        self.state.candidate(self.DEPLOYMENT)
+        self.assertEqual(self.state.path.read_bytes(), before)
+        self.assertEqual(self.state.builds(self.DEPLOYMENT)[0].updated_at, self.T0)
+
+    def test_the_reads_refuse_a_state_file_that_is_not_connected(self):
+        unconnected = ImageState(self.root / "unconnected", clock=self.clock)
+        reads = (
+            lambda: unconnected.builds(self.DEPLOYMENT),
+            lambda: unconnected.builds_started_since(self.DEPLOYMENT, self.T0),
+            lambda: unconnected.last_build(self.DEPLOYMENT),
+            lambda: unconnected.last_failed_build(self.DEPLOYMENT),
+            lambda: unconnected.candidate(self.DEPLOYMENT),
+        )
+        for read in reads:
+            with self.subTest(read=read):
+                with self.assertRaises(StateRefusal) as raised:
+                    read()
+                self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNAVAILABLE")
+        self.assertFalse((self.root / "unconnected").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

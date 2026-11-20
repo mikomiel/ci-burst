@@ -472,6 +472,10 @@ class Image:
     state: str
     tags: dict
     snapshot_ids: tuple
+    #: Epoch seconds from ``CreationDate``; ``None`` when the response gave no
+    #: time that carries a UTC offset. The deletion rule treats ``None`` as an
+    #: age it cannot prove and keeps the image.
+    created_at: float | None = None
 
     def as_dict(self):
         return {"image_id": self.image_id, "state": self.state, "snapshot_ids": list(self.snapshot_ids)}
@@ -482,6 +486,8 @@ class Snapshot:
     snapshot_id: str
     state: str
     tags: dict
+    #: Epoch seconds from ``StartTime``, with the same ``None`` rule as ``Image``.
+    created_at: float | None = None
 
     def as_dict(self):
         return {"snapshot_id": self.snapshot_id, "state": self.state}
@@ -1265,6 +1271,29 @@ def _timestamp(value):
     return None
 
 
+def _created_at(value):
+    """Epoch seconds of an image or snapshot creation time, or ``None``.
+
+    EC2 gives an image's ``CreationDate`` as an ISO 8601 string and a
+    snapshot's ``StartTime`` as a datetime. Only a time with a UTC offset is
+    understood. A string without one would need a guessed zone, which makes an
+    item look older or younger than it is, so it gives ``None`` like any other
+    value. Nothing is raised: an age that cannot be read must not stop a
+    listing, and the rules that need an age keep the item instead.
+    """
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        try:
+            return value.timestamp()
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
 def _credit_specification(data):
     """Return the template's CPU-credit choice, preserving presence.
 
@@ -1404,6 +1433,7 @@ def _images(response):
                 state=str(item.get("State") or "unknown"),
                 tags=_tag_map(item),
                 snapshot_ids=tuple(snapshots),
+                created_at=_created_at(item.get("CreationDate")),
             )
         )
     return result
@@ -1415,7 +1445,14 @@ def _snapshots(response):
         snapshot_id = item.get("SnapshotId")
         if not isinstance(snapshot_id, str) or not snapshot_id:
             raise _incomplete_inventory("DescribeSnapshots returned a snapshot without a SnapshotId")
-        result.append(Snapshot(snapshot_id=snapshot_id, state=str(item.get("State") or "unknown"), tags=_tag_map(item)))
+        result.append(
+            Snapshot(
+                snapshot_id=snapshot_id,
+                state=str(item.get("State") or "unknown"),
+                tags=_tag_map(item),
+                created_at=_created_at(item.get("StartTime")),
+            )
+        )
     return result
 
 

@@ -854,12 +854,13 @@ class EditTests(PromoteCase):
         )
 
     def test_the_mode_of_the_file_and_of_its_backup_is_preserved(self):
-        os.chmod(self.config_path, 0o640)
+        # Not the default mode of a new file (0o644 under the usual umask), so a lost mode shows.
+        os.chmod(self.config_path, 0o600)
         self.seed()
         self.promoted()
-        self.assertEqual(stat.S_IMODE(self.config_path.stat().st_mode), 0o640)
+        self.assertEqual(stat.S_IMODE(self.config_path.stat().st_mode), 0o600)
         (backup,) = self.backups()
-        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o640)
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
 
     def test_a_symbolic_link_to_the_file_is_followed_and_kept(self):
         link_directory = self.dir / "link"

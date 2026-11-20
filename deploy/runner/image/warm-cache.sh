@@ -169,12 +169,30 @@ LOG=$(mktemp "$LOG_TEMPLATE")
 # a newline or printable ASCII becomes "?" first, so no consumer byte (a carriage
 # return, a form feed, an escape sequence, a multi-byte line separator) can start
 # a console line of its own. The frame is then the only way a line begins.
+# The archive URL, or its query, shows as "[archive-url]" (ENVIRON is literal).
 print_log_tail() {
-  tail -n "$TAIL_LINES" "$LOG" | LC_ALL=C tr -c '\t\n -~' '?' | awk '{ print "  | " $0 }'
+  tail -n "$TAIL_LINES" "$LOG" | LC_ALL=C tr -c '\t\n -~' '?' |
+    WARM_TAIL_SECRET="$WARM_SRC_URL" LC_ALL=C awk '
+      function cut(s, t,   out, k) {
+        out = ""
+        while (t != "" && (k = index(s, t)) > 0) {
+          out = out substr(s, 1, k - 1) "[archive-url]"
+          s = substr(s, k + length(t))
+        }
+        return out s
+      }
+      BEGIN {
+        url = ENVIRON["WARM_TAIL_SECRET"]
+        k = index(url, "?")
+        query = k ? substr(url, k + 1) : ""
+      }
+      { print "  | " cut(cut($0, url), query) }'
 }
 
 # Run a command as the job account in its own transient unit, with the standard
-# input taken from $2 and the output sent to the log. A unit that ends takes every
+# input taken from $2 and the output sent to the log. No link-local address is
+# reachable, so no command can read the user data (the IPv6 metadata endpoint
+# stays disabled in the build template). A unit that ends takes every
 # process in its control group with it. On failure the framed tail of the log is
 # the only consumer text this script prints.
 unit_count=0
@@ -186,6 +204,7 @@ run_in_unit() {
   systemd-run --wait --pipe --collect --quiet --expand-environment=no \
     --unit="warm-job-${unit_count}" --uid=runner --gid=runner \
     --property=KillMode=control-group --property=TimeoutStopSec=10 \
+    --property=IPAddressDeny=link-local \
     env -i \
     HOME="$RUNNER_HOME" \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -260,13 +279,9 @@ assert_clean() {
   fi
 }
 
-# Fetch without credentials; the URL is never echoed. It reaches curl on stdin as
-# a config line, never as an argument, so it is not in any process listing. The
-# error text of curl is dropped for the same reason, and --proto keeps a
-# redirect on https. The checks above keep a quote and a backslash out of it.
-# --disable (first, as curl requires) ignores every default curl config file, so
-# no host setting can turn on a trace, and curl's stdout is discarded as well: no
-# output of curl can carry the URL to the console.
+# Fetch without credentials. The URL reaches curl on stdin, never in argv;
+# --disable (first) skips every curl config file, all curl output is dropped, and
+# --proto keeps a redirect on https.
 fetch_rc=0
 printf 'url = "%s"\n' "$WARM_SRC_URL" |
   curl --disable -fsS --proto '=https' --max-time 600 -o "$ARCHIVE" --config - >/dev/null 2>&1 || fetch_rc=$?

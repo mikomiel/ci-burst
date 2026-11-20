@@ -525,6 +525,14 @@ class FailureTests(WarmHarness, unittest.TestCase):
         self.assertIn(f"{FRAME}second-line", self.lines)
         self.assertNotIn("cause-visible", [line for line in self.lines if not line.startswith(FRAME)])
 
+    def test_a_failure_tail_never_shows_the_archive_url_or_its_query(self):
+        query = SOURCE_URL.split("?", 1)[1]
+        completed = self.start(WARM_COMMANDS=f"echo 'data {SOURCE_URL} end'; echo 'q={query};'; exit 1")
+        self.assertFailedBuild(completed)
+        self.assertNotIn(SECRET_URL_TOKEN, self.output)
+        self.assertIn(f"{FRAME}data [archive-url] end", self.lines)
+        self.assertIn(f"{FRAME}q=[archive-url];", self.lines)
+
     def test_the_tail_is_bounded_to_the_last_lines_of_the_log(self):
         completed = self.start(WARM_COMMANDS="seq 1 500; exit 1")
         self.assertFailedBuild(completed)
@@ -856,6 +864,7 @@ class ExtractionTests(WarmHarness, unittest.TestCase):
             for option in (
                 "--wait", "--pipe", "--collect", "--quiet", "--uid=runner", "--gid=runner",
                 "--property=KillMode=control-group", "--expand-environment=no",
+                "--property=IPAddressDeny=link-local",
             ):
                 self.assertIn(option, line.split())
 

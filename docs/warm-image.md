@@ -95,7 +95,11 @@ group ends with it, so a background process it started dies too.
 1. Arms a lifetime timer (`systemd-run --on-active`) that powers the builder
    off. It is armed first, so no later step can leave a builder running.
 2. Refuses before any fetch or consumer command when the sha256 or the warm
-   commands are missing or malformed.
+   commands are missing or malformed. Then routes the instance metadata
+   addresses to `prohibit` and reads the routes back, so no consumer command can
+   read the user data and the archive URL in it; a route that does not hold ends
+   the build. A failure tail also shows the URL, or its query, as
+   `[archive-url]`.
 3. Fetches the archive and compares its sha256 with `WARM_SRC_SHA256`. Only then
    does the `runner` account, never root, extract it into a fresh directory
    outside the runner home. Root feeds the archive on standard input and the
@@ -165,8 +169,9 @@ removes the saved copy on the builder, and the expiry bounds the rest.
 
 ### 3. Render the user data
 
-Put the inputs in front of the script, keeping `#!/bin/bash` on line 1. The
-`printf '%q'` form quotes any value, including a multi-line command list.
+Put the inputs in front of a short stub that unpacks the script, keeping
+`#!/bin/bash` on line 1. The `printf '%q'` form quotes any value, including a
+multi-line command list. The stub powers the builder off if it cannot unpack.
 
 ```sh
 # The warm commands, one per line, and the optional offline gate. Replace them
@@ -182,7 +187,16 @@ umask 077
   printf 'export WARM_SRC_SHA256=%q\n' "$SRC_SHA256"
   printf 'export WARM_COMMANDS=%q\n' "$WARM_COMMANDS"
   printf 'export WARM_GATE_COMMAND=%q\n' "$WARM_GATE_COMMAND"
-  tail -n +2 deploy/runner/image/warm-cache.sh
+  # The script travels compressed, as in the automated path, to fit the limit.
+  cat <<'STUB'
+d=$(mktemp --directory /run/warm-stub.XXXXXX) || { shutdown -h now; exit 1; }
+base64 --decode <<'WARM_PAYLOAD_END' | gunzip >"$d/warm-cache.sh" || { shutdown -h now; exit 1; }
+STUB
+  gzip -9n < deploy/runner/image/warm-cache.sh | base64
+  cat <<'STUB'
+WARM_PAYLOAD_END
+exec bash "$d/warm-cache.sh"
+STUB
 } > user-data.sh
 bash -n user-data.sh
 # EC2 refuses user data of 16384 bytes or more. An oversized file is removed,

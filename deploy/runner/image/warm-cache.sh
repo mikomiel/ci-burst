@@ -190,9 +190,7 @@ print_log_tail() {
 }
 
 # Run a command as the job account in its own transient unit, with the standard
-# input taken from $2 and the output sent to the log. No link-local address is
-# reachable, so no command can read the user data (the IPv6 metadata endpoint
-# stays disabled in the build template). A unit that ends takes every
+# input taken from $2 and the output sent to the log. A unit that ends takes every
 # process in its control group with it. On failure the framed tail of the log is
 # the only consumer text this script prints.
 unit_count=0
@@ -204,7 +202,6 @@ run_in_unit() {
   systemd-run --wait --pipe --collect --quiet --expand-environment=no \
     --unit="warm-job-${unit_count}" --uid=runner --gid=runner \
     --property=KillMode=control-group --property=TimeoutStopSec=10 \
-    --property=IPAddressDeny=link-local \
     env -i \
     HOME="$RUNNER_HOME" \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -278,6 +275,24 @@ assert_clean() {
     exit 1
   fi
 }
+
+# The metadata service serves the user data, and the archive URL in it. Before
+# any consumer code runs, root routes both metadata addresses to "prohibit" and
+# reads the routes back; a route that is not in place ends the build. Routes hold
+# for every process and need no BPF support. Without kernel IPv6 there is no IPv6
+# path to block. Nothing after this needs the service.
+block_metadata() {
+  ip -4 route replace prohibit 169.254.169.254/32 || return 1
+  ip -4 route show exact 169.254.169.254/32 | grep -q '^prohibit ' || return 1
+  [ -e /proc/net/if_inet6 ] || return 0
+  ip -6 route replace prohibit fd00:ec2::254/128 || return 1
+  ip -6 route show exact fd00:ec2::254/128 | grep -q '^prohibit ' || return 1
+}
+if ! block_metadata >>"$LOG" 2>&1; then
+  echo "WARM FAIL the metadata service could not be blocked"
+  exit 1
+fi
+echo "STEP metadata blocked"
 
 # Fetch without credentials. The URL reaches curl on stdin, never in argv;
 # --disable (first) skips every curl config file, all curl output is dropped, and

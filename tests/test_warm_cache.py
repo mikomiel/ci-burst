@@ -48,7 +48,7 @@ SOURCE_URL = f"https://builder-source.invalid/archive.tar.gz?token={SECRET_URL_T
 #: Commands the script runs that act on the host. Each must resolve to a stub.
 STUBBED = (
     "shutdown", "systemd-run", "systemctl", "runuser", "cloud-init", "curl", "sleep", "sync",
-    "chown", "aws", "tar", "id",
+    "chown", "aws", "tar", "id", "ip",
 )
 
 #: What bash itself adds to an empty environment.
@@ -101,6 +101,18 @@ STUB_BODIES = {
     "systemd-run": "",
     "sleep": "",
     "sync": "",
+    # Records each route; `show exact` prints a prohibit route for an address that
+    # was replaced, unless STUB_IP_FAIL names the family whose route does not hold.
+    "ip": """
+family=$1; verb=$3
+case "$verb" in
+  replace) [ "${STUB_IP_FAIL:-}" = "$family-replace" ] && exit 2
+           echo "$5" >> "$STUB_DIR/routes" ;;
+  show) [ "${STUB_IP_FAIL:-}" = "$family-show" ] && exit 0
+        grep -qxF "$5" "$STUB_DIR/routes" 2>/dev/null && echo "prohibit $5" ;;
+esac
+exit 0
+""",
     "chown": "",
     "aws": "exit 99",
     "cloud-init": """
@@ -490,6 +502,45 @@ class FetchTests(WarmHarness, unittest.TestCase):
         self.assertEqual(config, f'url = "{SOURCE_URL}"\n')
         self.assertNotIn(SECRET_URL_TOKEN, self.output)
 
+    def ipv6(self, enabled):
+        marker = self.proc / "net" / "if_inet6"
+        if enabled:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("", encoding="utf-8")
+        else:
+            marker.unlink(missing_ok=True)
+
+    def test_the_metadata_service_is_blocked_before_the_fetch_and_any_consumer_command(self):
+        for enabled, families in ((True, ["-4", "-6"]), (False, ["-4"])):
+            with self.subTest(ipv6=enabled):
+                self.events.write_text("", encoding="utf-8")
+                (self.stub / "routes").unlink(missing_ok=True)
+                self.ipv6(enabled)
+                completed = self.start()
+                self.assertEqual(completed.returncode, 0, self.output)
+                events = self.event_list()
+                routes = [i for i, e in enumerate(events) if e.startswith("ip ") and " replace prohibit " in e]
+                self.assertEqual([events[i].split()[1] for i in routes], families)
+                first_fetch = next(i for i, e in enumerate(events) if e.startswith("curl"))
+                first_unit = next(i for i, e in enumerate(events) if e.startswith("UNIT "))
+                self.assertLess(max(routes), min(first_fetch, first_unit))
+                self.assertIn("STEP metadata blocked", self.lines)
+
+    def test_a_metadata_route_that_does_not_hold_ends_the_build_before_any_consumer_command(self):
+        self.ipv6(True)
+        for failure in ("-4-replace", "-4-show", "-6-replace", "-6-show"):
+            with self.subTest(failure):
+                self.events.write_text("", encoding="utf-8")
+                (self.stub / "routes").unlink(missing_ok=True)
+                self.extra_env = {"STUB_IP_FAIL": failure}
+                completed = self.start()
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("WARM FAIL the metadata service could not be blocked", self.output)
+                events = self.event_list()
+                self.assertFalse([e for e in events if e.startswith("curl")])
+                self.assertNotIn("CONSUMER", events)
+                self.assertEqual(self.unframed_markers(), [])
+
     def test_nothing_curl_prints_reaches_the_console(self):
         self.extra_env = {"STUB_CURL_STDOUT": f"> GET /archive.tar.gz?token={SECRET_URL_TOKEN}"}
         completed = self.start()
@@ -646,6 +697,8 @@ class SuccessTests(WarmHarness, unittest.TestCase):
         self.assertFalse([e for e in self.event_list() if e.startswith("aws")])
         text = SCRIPT.read_text(encoding="utf-8")
         executable = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+        # The IPv6 metadata address is the one "ec2" the script may hold: it blocks it.
+        executable = [l.replace("fd00:ec2::254", "") for l in executable]
         self.assertFalse([l for l in executable if re.search(r"\baws\b|ec2|create-image", l)])
 
     def test_each_command_runs_in_order_and_the_gate_runs_last(self):
@@ -864,7 +917,6 @@ class ExtractionTests(WarmHarness, unittest.TestCase):
             for option in (
                 "--wait", "--pipe", "--collect", "--quiet", "--uid=runner", "--gid=runner",
                 "--property=KillMode=control-group", "--expand-environment=no",
-                "--property=IPAddressDeny=link-local",
             ):
                 self.assertIn(option, line.split())
 
@@ -1041,7 +1093,8 @@ class PublicContentTests(unittest.TestCase):
     def test_the_script_has_no_credential_cloud_identifier_or_host(self):
         text = SCRIPT.read_text(encoding="utf-8")
         self.assertEqual(self.CLOUD_IDENTIFIER.findall(text), [])
-        self.assertNotRegex(text, r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+        # The well-known metadata address is the one address the script may name: it blocks it.
+        self.assertNotRegex(text.replace("169.254.169.254", ""), r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
         self.assertNotRegex(text, r"(?i)\b(?:token|secret|password|passwd)\s*=\s*['\"]?\w")
         self.assertNotIn("set -x", text)
 

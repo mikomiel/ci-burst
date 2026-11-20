@@ -330,10 +330,16 @@ class BuildDecisionTests(unittest.TestCase):
                 self.assertEqual(self.decide(force=True, control=row), CLEARING)
 
     def test_force_has_nothing_to_clear_on_a_row_that_is_already_clear(self):
-        rows = (control(), control(consecutive_failures=1), control(cooldown_until=NOW - 1))
+        rows = (control(), control(consecutive_failures=1))
         for row in rows:
             with self.subTest(row=row):
                 self.assertEqual(self.decide(force=True, control=row), START)
+
+    def test_force_clears_an_expired_cooldown_timestamp_even_when_refused(self):
+        row = control(consecutive_failures=1, cooldown_until=NOW - 1)
+        self.assertEqual(self.decide(force=True, control=row), CLEARING)
+        self.assertEqual(self.decide(force=True, control=row, builds_last_day=2), refused("IMAGE_DAILY_CAP", clear=True))
+        self.assertEqual(self.decide(control=row), START, "without --force an expired cooldown is only over")
 
     def test_a_clearing_applies_even_when_the_start_is_refused(self):
         # The spec: --force and a digest change clear blocked and the cooldown, whatever else refuses the start.

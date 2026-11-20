@@ -153,7 +153,7 @@ The command MUST resolve the head sha of `source.branch` through the forge's bra
 - **THEN** the pass still builds the resolved sha and records it
 
 ### Requirement: The basis digest decides whether a build is due
-The command MUST compute the basis digest over the sorted lines of each basis path and its content hash, the hash of the rendered warm and gate commands and the hash of the shipped `warm-cache.sh`. It MUST NOT use the archive hash as the digest. A build is due when the digest differs from the `ci-burst:basis-digest` tag of the image behind the configured pin.
+The command MUST compute the basis digest over the sorted lines of each basis path and its content hash, the hash of the rendered warm commands, gate command and `source.strip_components` value, and the hash of the shipped `warm-cache.sh`. It MUST NOT use the archive hash as the digest. A build is due when the digest differs from the `ci-burst:basis-digest` tag of the image behind the configured pin.
 
 #### Scenario: A lockfile changes
 - **WHEN** a basis file changes

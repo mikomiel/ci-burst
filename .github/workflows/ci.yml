@@ -98,3 +98,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Build the image from the repository root
         run: docker build --tag ci-burst:ci .
+      - name: Fail unless the image ships the repository's warm-cache.sh byte for byte
+        shell: bash
+        run: docker run --rm --network none --entrypoint cat ci-burst:ci /srv/ci-burst/share/warm-cache.sh | cmp - deploy/runner/image/warm-cache.sh

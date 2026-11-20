@@ -898,7 +898,8 @@ class PipelineCase(unittest.TestCase):
     # -- the build -------------------------------------------------------------
     def digest(self, files=None):
         warm = self.config.image.warm
-        return image.basis_digest(files or self.source.files, warm.commands, warm.gate_command, SCRIPT)
+        strip = self.config.image.source.strip_components
+        return image.basis_digest(files or self.source.files, warm.commands, warm.gate_command, strip, SCRIPT)
 
     def start_build(self, **keywords):
         """Run the first pass. It starts a build and polls a blind console until its time is up."""
@@ -1104,6 +1105,15 @@ class PlanTests(PipelineCase):
     def test_the_first_failing_condition_is_reported(self):
         self.pin_current()
         self.assertEqual((self.plan()["decision"], self.plan()["reason"]), ("digest_unchanged", None))
+
+    def test_a_changed_strip_components_makes_a_build_due(self):
+        # The pin's image was built under strip_components 0, so its tag holds the digest of that layout.
+        self.configure(render_toml(source_extra="strip_components = 0"))
+        self.pin_current()
+        self.assertEqual(self.plan()["decision"], "digest_unchanged")
+        self.configure(render_toml(source_extra="strip_components = 1"))
+        result = self.plan()
+        self.assertEqual((result["decision"], result["reason"]), ("start", None))
 
     def test_a_recent_build_is_a_minimum_interval_refusal(self):
         self.add_build("recent", "failed", age=600)

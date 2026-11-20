@@ -32,7 +32,10 @@ A pass holds the state file's writer lock and runs, in this order:
 The pass that first sees the marker calls ``CreateImage`` before it does any
 other step. The builder is terminated only after the image is ``available``,
 or when the build is past its deadline: reconcile then ends it before any other
-step, and the build fails with the code of the deadline.
+step, and the build fails with the code of the deadline. A marker first read at
+or after the deadline never reaches ``CreateImage``: the build fails
+``IMAGE_BUILDER_GONE`` when reconcile ended the builder and ``MARKER_TIMEOUT``
+when the builder is still alive.
 
 A start has two refusals that are no failed build: ``IMAGE_CREDENTIAL_SHORT`` and
 ``IMAGE_BUILD_ALREADY_ACTIVE``. Both are checked before the row and the upload,
@@ -40,7 +43,9 @@ and again before the launch, when either can have changed. The pass answers
 ``refused``, drops the archive and counts no failure. A pass that runs out of
 time while it stages the archive does not fail the build either: the row stays
 ``building`` with no builder, and the next pass stages the archive again under
-the same key and launches. The build deadline still ends such a build.
+the same key and launches. The build deadline still ends such a build. That pass
+runs the template check of a start again first: an unsafe template ends the row
+``failed`` and the pass answers ``refused``, like a refused start check.
 
 Secrets. The presigned archive URL and the rendered user data live in local
 variables of ``_Pass._launch`` and nowhere else: not in the state file, not in an
@@ -636,7 +641,9 @@ class ImagePipeline:
     ``IMAGE_USERDATA_TOO_LARGE`` in ``plan``, ``IMAGE_STATE_LOCKED`` and every
     provider read that fails) are raised. The answers of the trigger rules, and
     the two refusals of a start (``START_REFUSALS``), are returned as the
-    decision ``refused`` with a ``reason``. A build that ends badly is returned
+    decision ``refused`` with a ``reason``. So is ``IMAGE_BUILD_TEMPLATE_UNSAFE``
+    when a pass stages again a build that has a row: the row ends and counts no
+    failure. A build that ends badly is returned
     as the decision ``failed`` with the reason code of the failure. A result
     holds ids, 12-character digests, counts and codes only.
     """
@@ -1231,9 +1238,22 @@ class _Pass:
         The key is the same, so the new archive replaces whatever the earlier stage left. The build deadline still
         bounds the build: past it the build fails with the code of a console that never showed anything, and
         ``_fail`` deletes the archive the row names.
+
+        The template check of a start runs again, because the template and the rules of its groups can change
+        between two passes. An unsafe template ends the row as a refused start check does: ``failed`` with the
+        refusal's code, and the pass answers ``refused``. The pass deadline inside the check leaves the row as it is
+        for the next pass.
         """
         if self.clock() >= build.deadline_at:
             return self._fail(build, image_console.CONSOLE_BLIND, builder_alive=False)
+        try:
+            self.p._check_build_template(self.aws, self.deadline)
+        except DeadlineRefusal:
+            self.notes.append("pass_deadline_exceeded")
+            self.hold = True
+            return self.s.build(build.id)
+        except ImageRefusal as refusal:
+            return self._end_refused(build, refusal.reason)
         reason = self._start_refusal()
         if reason is not None:
             return self._end_refused(build, reason)
@@ -1362,6 +1382,11 @@ class _Pass:
                 )
                 if not alive:
                     return self._fail(build, IMAGE_BUILDER_GONE, console, builder_alive=False)
+                if now >= build.deadline_at:
+                    # Reconcile ends an overdue builder first, so a builder that is alive here is one it could not
+                    # end, or one that the deadline overtook during this pass. The build is out of time and
+                    # ``CreateImage`` is never called past the deadline. ``_fail`` ends the builder.
+                    return self._fail(build, image_console.MARKER_TIMEOUT, console)
                 return self._create_image(build, console)
             if outcome in (image_console.FAILED, image_console.MISMATCH):
                 return self._fail(build, marker["reason"], console)
@@ -1405,13 +1430,18 @@ class _Pass:
         return build
 
     def _base_image(self):
-        """The cold base image of the builder: the image its (immutable) template version names."""
+        """The cold base image of the builder: the image its (immutable) template version names.
+
+        A refused read, the pass deadline included, never delays ``CreateImage``: the image is created without the
+        tag and the pass notes ``base_image:<reason>``.
+        """
         settings = self.cfg.build
         try:
             read = self.aws.template_versions(
                 settings.launch_template_name, [settings.launch_template_version], deadline=self.deadline
             )
-        except Refusal:
+        except Refusal as refusal:
+            self.notes.append(f"base_image:{refusal.reason}")
             return None
         image_id = read[0].data.get("ImageId") if len(read) == 1 else None
         return image_id if isinstance(image_id, str) and image_id.startswith("ami-") else None

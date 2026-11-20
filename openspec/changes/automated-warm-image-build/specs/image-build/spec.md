@@ -195,6 +195,21 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 - **WHEN** a build reaches `candidate` or `failed`
 - **THEN** its archive object is deleted
 
+### Requirement: The archive key joins the prefix and the build id with one slash
+The archive key MUST be the configured prefix, exactly one `/` and `<build-id>.tar.gz`, whether the configured prefix ends with no slash, one slash or several. The listing of stray archives MUST use the same prefix with its one slash, so that it never reaches a sibling prefix.
+
+#### Scenario: A prefix without a trailing slash
+- **WHEN** the prefix is `example-prefix`
+- **THEN** the archive key is `example-prefix/<build-id>.tar.gz`
+
+#### Scenario: A prefix with trailing slashes
+- **WHEN** the prefix is `example-prefix//`
+- **THEN** the archive key is `example-prefix/<build-id>.tar.gz`
+
+#### Scenario: A sibling prefix
+- **WHEN** an object older than one hour sits under `example-prefix-other/` and the prefix is `example-prefix`
+- **THEN** reconcile does not list or delete it
+
 ### Requirement: Credentials and URLs are not persisted
 The presigned archive URL, tokens, rendered user data and raw provider payloads MUST NOT appear in logs, events, the state file, command output or error messages. The command MUST NOT presign when the credential session has less remaining life than `source.presign_seconds` and MUST refuse with `IMAGE_CREDENTIAL_SHORT`. The URL MUST exist only in the rendered user data in memory.
 
@@ -237,11 +252,34 @@ The controller container MUST include `warm-cache.sh`, and a repository test MUS
 - **THEN** `image plan` refuses and a repository test fails
 
 ### Requirement: The builder is launched only from the safe build template
-The builder MUST launch only from the configured build launch template at its pinned version, with no instance profile, IMDSv2 required with hop limit 1, terminate on instance-initiated shutdown, delete-on-termination storage, and a security group with no ingress. `plan` and `run` MUST read the template and MUST refuse with `IMAGE_BUILD_TEMPLATE_UNSAFE` when any property differs. A builder MUST be on-demand and MUST NOT chain from the warm image.
+The builder MUST launch only from the build launch template at its pinned version, with no instance profile, IMDSv2 required with hop limit 1, terminate on instance-initiated shutdown, delete-on-termination storage, and security groups with no inbound rule. `plan` and a `run` pass about to start a build MUST read the template and its security groups, and MUST refuse with `IMAGE_BUILD_TEMPLATE_UNSAFE` when any property differs. A builder MUST be on-demand and MUST NOT chain from the warm image.
 
 #### Scenario: An unsafe template
-- **WHEN** the build template carries an instance profile or allows IMDSv1 or has an ingress rule
+- **WHEN** the build template carries an instance profile or allows IMDSv1, or a security group that it names has an inbound rule
 - **THEN** the command refuses with `IMAGE_BUILD_TEMPLATE_UNSAFE` and launches nothing
+
+#### Scenario: No safe group is named
+- **WHEN** the template names no security group, a network interface names none, or a named group name matches no group
+- **THEN** the command refuses with `IMAGE_BUILD_TEMPLATE_UNSAFE` and launches nothing
+- **AND** the detail names `security_groups` and no group id, name or rule
+
+#### Scenario: Groups are read wherever the template names them
+- **WHEN** the template names groups in `SecurityGroupIds`, in `SecurityGroups` or in the `Groups` of a network interface
+- **THEN** the precheck reads every one of them and refuses when any has an inbound rule
+
+#### Scenario: The groups cannot be read
+- **WHEN** a named group id is unknown, or the image role lacks `ec2:DescribeSecurityGroups`
+- **THEN** the read fails and the command refuses with the provider's refusal
+- **AND** no build starts
+
+#### Scenario: A pass that only advances a build
+- **WHEN** a pass advances or ends an active build and does not stage its archive again
+- **THEN** it does not run the precheck and does not read the security groups
+
+#### Scenario: A pass that stages a build again
+- **WHEN** a pass stages again a build that has no builder and no staged archive
+- **THEN** it runs the precheck again before it uploads anything
+- **AND** an unsafe template ends the row as `failed` with `IMAGE_BUILD_TEMPLATE_UNSAFE`, deletes its archive, answers `refused` and counts no failure
 
 #### Scenario: A profile is attached at launch
 - **WHEN** a request would attach an instance profile to a builder
@@ -267,8 +305,14 @@ Builders MUST carry `ci-burst:image-build=true`, the deployment tag, `ci-burst:b
 At most one builder MUST exist for a deployment. A unique index keyed on the deployment over the `building` and `imaging` states MUST enforce this in the state file, and before any launch the command MUST find no instance with the image-build tag and the deployment tag in the states pending, running, stopping or stopped. A second launch MUST be refused with `IMAGE_BUILD_ALREADY_ACTIVE`.
 
 #### Scenario: A concurrent run
-- **WHEN** a second pass starts while a build is `building`
-- **THEN** it refuses with `IMAGE_BUILD_ALREADY_ACTIVE` and exits 2
+- **WHEN** a pass starts while another pass still holds the state file's writer lock
+- **THEN** it refuses with `IMAGE_STATE_LOCKED` and exits 2
+- **AND** it makes no provider call and starts no second builder
+
+#### Scenario: A pass finds an active build
+- **WHEN** a pass starts after the earlier pass ended and a build is `building` or `imaging`
+- **THEN** it reconciles and advances that build instead of deciding on a new one
+- **AND** it starts no second builder
 
 #### Scenario: Two active rows
 - **WHEN** a test inserts a second active row for the deployment
@@ -277,6 +321,42 @@ At most one builder MUST exist for a deployment. A unique index keyed on the dep
 #### Scenario: The state file lacks the running builder
 - **WHEN** a tagged builder exists and the state file has no active row
 - **THEN** the AWS precheck refuses the launch
+
+### Requirement: A refused start is not a failed build
+A refused start MUST NOT count as a failed build. The refusal itself MUST add no failure, start no cooldown and set no `blocked`, and a clearing that the trigger decision already made MUST stay. A refusal before the build row exists MUST write no row and no archive. A refusal once the row exists MUST end the row as `failed` with the refusal code and MUST delete its archive. Such a row MUST still count toward `max_builds_per_day` and `min_build_interval_seconds`.
+
+#### Scenario: A check refuses before the row exists
+- **WHEN** the session has less life than `presign_seconds`, or a builder of the deployment exists, before the build row is written
+- **THEN** the pass answers `refused` with `IMAGE_CREDENTIAL_SHORT` or `IMAGE_BUILD_ALREADY_ACTIVE`
+- **AND** it writes no build row and no archive and counts no failure
+
+#### Scenario: The template precheck refuses
+- **WHEN** the template precheck refuses a start
+- **THEN** the pass ends with that refusal, writes no build row and no archive and counts no failure
+
+#### Scenario: A clearing comes before the refusal
+- **WHEN** a forced run, or a changed digest, clears `blocked` and the cooldown and the start is then refused
+- **THEN** the clearing stays
+- **AND** the refusal adds no failure and starts no cooldown
+
+#### Scenario: The session runs short during the upload
+- **WHEN** the build row exists and the session has less life than `presign_seconds` once the archive is staged
+- **THEN** the row ends `failed` with `IMAGE_CREDENTIAL_SHORT`, its archive is deleted and no builder is launched
+- **AND** the pass answers `refused` and counts no failure
+
+#### Scenario: A builder appears before the launch
+- **WHEN** a builder of the deployment exists at the check before the launch call
+- **THEN** the row ends `failed` with `IMAGE_BUILD_ALREADY_ACTIVE`, its archive is deleted and no builder is launched
+- **AND** the pass answers `refused`, counts no failure and leaves that builder to the next pass's reconcile
+
+#### Scenario: A resumed stage is refused
+- **WHEN** a pass stages again a build that has no builder and no staged archive, and the check before the upload refuses
+- **THEN** the row ends `failed` with the refusal code and any archive that the row names is deleted
+- **AND** no new upload is made and no failure is counted
+
+#### Scenario: A refused row counts toward the limits
+- **WHEN** a build row has ended by a refusal
+- **THEN** it counts toward `max_builds_per_day` and `min_build_interval_seconds` like any other row
 
 ### Requirement: A run can supervise a build to completion
 Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run --apply --until-done` MUST repeat bounded passes with a fixed sleep between them until the build reaches `candidate` or `failed`, or the build deadline passes. Without `--until-done`, `run --apply` MUST run one pass. Rerunning the same command MUST resume an interrupted supervisor from the state file. `--until-done` MUST be refused without `--apply`.
@@ -293,9 +373,45 @@ Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run
 - **WHEN** the build deadline passes with no marker
 - **THEN** the supervisor ends the build with `MARKER_TIMEOUT` or `CONSOLE_BLIND`
 
+#### Scenario: The pass deadline ends the staging
+- **WHEN** the pass deadline passes during the template precheck of a resumed stage, during the upload or before the launch call
+- **THEN** the row stays `building` with no builder and no `archive_sha256`
+- **AND** the next pass stages again under the same archive key and no failure is counted
+
+#### Scenario: An unstaged build reaches its deadline
+- **WHEN** the build deadline has passed and the row has no builder and no `archive_sha256`
+- **THEN** the build fails with `CONSOLE_BLIND` and no builder is launched
+- **AND** any archive that the row names is deleted
+
 #### Scenario: Until-done without apply
 - **WHEN** an operator passes `--until-done` without `--apply`
 - **THEN** the command refuses with exit 2 and does nothing
+
+### Requirement: Provider reads are bounded by the pass deadline
+Every provider read of a pass, except the read that confirms a deregistration, MUST be bounded by the pass deadline. A read that would start at or after the deadline MUST NOT be made. Where the pass advances or stages a build, it MUST then note `pass_deadline_exceeded` and leave the row as its last write left it, except that a refused base image read, the deadline included, notes `base_image:<reason>` and only omits the base image tag.
+
+#### Scenario: The deadline arrives while a build is advanced
+- **WHEN** the pass deadline is reached before a read of an advancing build, the image read and the template read-back included
+- **THEN** the read is not made and the pass notes `pass_deadline_exceeded`
+- **AND** a later pass resumes from the row
+
+#### Scenario: The base image cannot be read in time
+- **WHEN** the pass deadline is reached before the read of the base image in the pass that first sees the marker
+- **THEN** `CreateImage` is still called, without the base image tag
+- **AND** the pass notes `base_image:pass_deadline_exceeded`
+
+#### Scenario: The base image read is refused
+- **WHEN** the provider refuses the read of the base image in the pass that first sees the marker
+- **THEN** `CreateImage` is still called, without the base image tag
+- **AND** the pass notes `base_image:` followed by the reason code of the refusal
+
+#### Scenario: A deletion path meets the deadline
+- **WHEN** the pass deadline is reached before a deletion path, or the deletion plan of `plan`, has read what it needs
+- **THEN** it deletes nothing and its result is `refused` with `pass_deadline_exceeded`
+
+#### Scenario: A read before the build is reached meets the deadline
+- **WHEN** a read of `plan` before its deletion plan, or a reconcile read or the pin read of a `run` pass, would start at or after the deadline
+- **THEN** the command refuses with `pass_deadline_exceeded`
 
 ### Requirement: Success requires the framed marker and the staged digest
 A build MUST succeed only when the console shows `WARM_SOURCE_SHA256` with a digest equal to the archive sha256 held in the state file, followed by the whole line `IMAGE_READY`, read through the existing framed-line discipline. A `WARM FAIL` line or a `warm exiting rc=` line MUST fail the build. The command MUST NOT guess success.
@@ -317,7 +433,7 @@ A build MUST succeed only when the console shows `WARM_SOURCE_SHA256` with a dig
 - **THEN** the build fails with `WARM_FAILED`, the builder is terminated and no image is created
 
 ### Requirement: A missing marker fails closed
-When no marker appears by `build_deadline_seconds`, the command MUST terminate the builder, MUST create no image and MUST record `CONSOLE_BLIND` when the console is empty or unreadable, or `MARKER_TIMEOUT` when the console is readable.
+When no marker appears by `build_deadline_seconds`, the command MUST terminate the builder, MUST create no image and MUST record `CONSOLE_BLIND` when the console is empty or unreadable, or `MARKER_TIMEOUT` when the console is readable. A marker that a pass first reads at or after that deadline MUST create no image either.
 
 #### Scenario: The console is blind
 - **WHEN** the console is empty at the deadline
@@ -326,6 +442,16 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 #### Scenario: The console is readable but has no marker
 - **WHEN** the console has output and no marker at the deadline
 - **THEN** the builder is terminated and the reason is `MARKER_TIMEOUT`
+
+#### Scenario: A marker first read after the deadline, the builder ended
+- **WHEN** reconcile ended the builder of an overdue build and the pass reads the marker for the first time
+- **THEN** no image is created
+- **AND** the build fails with `IMAGE_BUILDER_GONE`
+
+#### Scenario: A marker first read after the deadline, the builder alive
+- **WHEN** the provider refused reconcile's termination of the builder of an overdue build and the pass reads the marker for the first time
+- **THEN** no image is created
+- **AND** the build fails with `MARKER_TIMEOUT` and the pass tries again to end the builder
 
 #### Scenario: A failed build recovers
 - **WHEN** the basis digest changes or an operator runs `run --apply --force`
@@ -356,11 +482,11 @@ The pass that first sees the marker MUST call `CreateImage` before it does any o
 
 #### Scenario: The image stays pending
 - **WHEN** the image is not `available` by the deadline
-- **THEN** the build is `failed`
+- **THEN** the build is `failed` with `IMAGE_NOT_AVAILABLE`
 - **AND** the image and its snapshots are removed only under the image deletion rule
 
 ### Requirement: Reconcile runs first and cleans leaks
-Every pass MUST reconcile before any transition. Reconcile MUST terminate builder-tagged instances that are not the active build's builder or are past the deadline, MUST delete objects under the prefix that are not the active archive and are older than one hour, and MUST clean the images of failed builds only under the image deletion rule.
+Every pass MUST reconcile before any transition, and its first call MUST end the builder of an active build that is past its build deadline, an `imaging` build included. That builder MUST NOT count as a leak. Reconcile MUST terminate every other builder-tagged instance, MUST delete objects under the prefix that are not the active archive and are older than one hour, and, before any start, MUST clean the images of failed builds only under the image deletion rule.
 
 #### Scenario: A leaked builder
 - **WHEN** a builder is tagged for the deployment and the state file has no matching active build
@@ -370,24 +496,80 @@ Every pass MUST reconcile before any transition. Reconcile MUST terminate builde
 - **WHEN** an object older than one hour sits under the prefix and is not the active archive
 - **THEN** reconcile deletes it
 
+#### Scenario: An overdue builder
+- **WHEN** the build deadline has passed and the active build has a builder
+- **THEN** the first provider call of the pass terminates that builder
+- **AND** the leaked-resource metric for `builder` does not increase
+
+#### Scenario: An overdue imaging builder
+- **WHEN** the build is `imaging`, its image is still `pending` and the build deadline has passed
+- **THEN** reconcile terminates the builder, as the builder's own lifetime timer would
+- **AND** the build ends `failed` with `IMAGE_NOT_AVAILABLE`, or `candidate` when the image is `available` when the pass reads it
+
+#### Scenario: The early termination is refused
+- **WHEN** the termination of an overdue builder is refused
+- **THEN** reconcile reports the refusal and the pass goes on
+- **AND** the state machine asks for the termination again when it ends the build
+
+#### Scenario: A failed build's image
+- **WHEN** a build has failed and its image is not `pending`, not protected and not inside the 24-hour hold of a `TEMPLATE_DRIFT`
+- **THEN** reconcile removes the image under the image deletion rule before any build starts
+- **AND** the pass result reports the counts as `reconcile.failed_images`
+
+#### Scenario: The end of the pass
+- **WHEN** the image of a failed build is still `pending` after reconcile and is not protected
+- **THEN** the deletion rule removes it at the end of the pass under its pending-image path
+- **AND** the pass result reports that run as `retention`
+
 ### Requirement: Orphans are recorded and the builder has its own backstop
-A tagged image that has no state row MUST be recorded as an unverified `candidate` and MUST NOT be pinned. The builder's lifetime timer and terminate-on-shutdown setting MUST remain the leak backstop that does not depend on the controller.
+A tagged image that has no state row MUST be recorded as an unverified `candidate`, in whatever state the image is, and MUST NOT be pinned. The builder's lifetime timer and terminate-on-shutdown setting MUST remain the leak backstop that does not depend on the controller.
 
 #### Scenario: An orphan image
-- **WHEN** a tagged image has no state row
+- **WHEN** a tagged image has no state row, whether it is `available`, `pending` or `failed`
 - **THEN** it is recorded as an unverified candidate and is never selected for promotion
 
 #### Scenario: The controller is not running
 - **WHEN** no pass runs after a builder starts
 - **THEN** the builder's lifetime timer powers it off and terminate-on-shutdown removes it
 
+### Requirement: A recorded orphan is not a failed build of ours
+A recorded orphan image that is not `available` and is older than the 24-hour hold MUST be marked `failed`, and the image deletion rule MUST then remove it as the image of a failed build. Its row MUST keep `IMAGE_ORPHAN_RECORDED`, so it MUST NOT start a cooldown, change the failure count or clear `blocked`. It MUST still count toward `max_builds_per_day` and `min_build_interval_seconds`.
+
+#### Scenario: An old orphan that is not available
+- **WHEN** a recorded orphan image is `pending` or `failed` and is older than 24 hours
+- **THEN** its row is marked `failed` and keeps `IMAGE_ORPHAN_RECORDED`
+- **AND** the image deletion rule removes the image and its snapshots in the same pass
+
+#### Scenario: A young orphan
+- **WHEN** a recorded orphan image is not `available` and is 24 hours old or younger, or its age is unknown
+- **THEN** its row stays a `candidate` and only the state of the image is noted
+
+#### Scenario: An available orphan
+- **WHEN** a recorded orphan image is `available`
+- **THEN** its row stays an unverified `candidate` and is never pinned
+
+#### Scenario: An orphan does not move the failure bounds
+- **WHEN** a recorded orphan is marked `failed`
+- **THEN** the failure count, the cooldown and `blocked` do not change
+- **AND** its basis digest does not clear `blocked`
+
+#### Scenario: An orphan counts toward the limits
+- **WHEN** an orphan row exists
+- **THEN** it counts toward `max_builds_per_day` and `min_build_interval_seconds` by the creation time of its image
+
 ### Requirement: Failures are bounded
-Each build MUST be bounded by `build_deadline_seconds`, the builder's lifetime timer, `min_build_interval_seconds`, `max_builds_per_day`, a failure cooldown, and a `blocked` state that begins after `max_consecutive_failures` consecutive failures. `blocked` MUST clear only with a basis digest change or `image run --apply --force`, and `image status` MUST say so and show how.
+Each build MUST be bounded by `build_deadline_seconds`, the builder's lifetime timer, `min_build_interval_seconds`, `max_builds_per_day`, a failure cooldown, and a `blocked` state that begins after `max_consecutive_failures` consecutive failures. A refusal MUST NOT count as a failure. `blocked` MUST clear only with a basis digest change or `image run --apply --force`, and `image status` MUST say so and show how.
 
 #### Scenario: The failure limit is reached
-- **WHEN** consecutive failures reach `max_consecutive_failures`
+- **WHEN** consecutive failed builds reach `max_consecutive_failures`
 - **THEN** the control state becomes `blocked` and every later `run --apply` refuses until it clears
 - **AND** an `image_blocked` event is written
+
+#### Scenario: Refusals are not failures
+- **WHEN** a start is refused, before or after the build row exists
+- **THEN** the refusal adds no failure, starts no cooldown and sets no `blocked`
+- **AND** a clearing that the trigger decision already made stays
+- **AND** no `image_build_failed` or `image_blocked` event is written
 
 #### Scenario: Recovery from blocked
 - **WHEN** the basis digest changes or an operator runs `run --apply --force`
@@ -636,6 +818,22 @@ The image path MUST write an append-only event file and an atomically written Pr
 - **WHEN** reconcile removes a leaked resource
 - **THEN** the leaked-resource metric for that kind increases
 
+### Requirement: Event lines are whole and hold no URL
+An event value MUST NOT hold `://`. The console tail of a failed-build event MUST show every URL, every presigned query string and the archive key as `[archive-url]`, the text that `warm-cache.sh` prints for the archive URL. The command MUST write an event line with one write on an append-only descriptor, MUST treat a short write as an error and MUST NOT retry it.
+
+#### Scenario: The tail holds URLs
+- **WHEN** the console tail of a failed build holds a URL, a presigned query string or the archive key
+- **THEN** the event shows each of them as `[archive-url]`
+- **AND** no value of the event holds `://`
+
+#### Scenario: A value would hold a URL separator
+- **WHEN** an event field holds a value with `://`
+- **THEN** the event is refused and no line is written
+
+#### Scenario: A write falls short
+- **WHEN** the write of an event line stores fewer bytes than the line
+- **THEN** the write is an error and is neither continued nor retried
+
 ### Requirement: Image configuration is strict
 The `[image]` tables MUST refuse unknown keys and out-of-range values with `CONFIG_INVALID` before any call. A phase 2 key MUST be accepted only when the code that uses it is present. Examples and tests MUST use synthetic names only.
 
@@ -664,4 +862,4 @@ The shipped `ci-burst-image` timer unit MUST be a one-shot container that mounts
 
 #### Scenario: The timer fires during an active build
 - **WHEN** a build is active
-- **THEN** the pass advances it or refuses with `IMAGE_BUILD_ALREADY_ACTIVE` and starts no second builder
+- **THEN** the pass advances it, or refuses with `IMAGE_STATE_LOCKED` while an earlier pass still runs, and starts no second builder

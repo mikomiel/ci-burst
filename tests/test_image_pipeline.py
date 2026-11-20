@@ -1439,6 +1439,51 @@ class BuildFlowTests(PipelineCase):
         self.assertEqual(result["decision"], "candidate")
         self.assertEqual(row.state, "candidate")
 
+    def tags_without_the_base_image(self, build):
+        expected = owned(
+            build.id,
+            **{
+                BASIS_DIGEST_TAG: build.basis_digest,
+                image_pipeline.SOURCE_SHA_TAG: SOURCE_SHA,
+                image_pipeline.SCRIPT_SHA_TAG: image.script_sha256(SCRIPT),
+            },
+        )
+        return {"image": expected, "snapshot": expected}
+
+    def test_a_base_image_read_that_the_provider_refuses_is_noted_and_the_image_is_created_without_the_tag(self):
+        self.world.console_plan = [(300.0, READY)]
+        _, build = self.start_build()
+        self.clock.advance(30)
+
+        def refuse_the_builder_template(arguments):
+            # The pin read and the protected-set reads name the worker template: only the builder's is refused.
+            if arguments["LaunchTemplateName"] == BUILDER:
+                raise ProviderError("RequestLimitExceeded")
+
+        self.world.hooks["describe_launch_template_versions"] = refuse_the_builder_template
+        result = self.apply()
+        self.assertIn("base_image:AWS_UNCERTAIN", result["notes"])
+        self.assertEqual(len(self.world.arguments("create_image")), 1)
+        self.assertEqual(self.image_tags(), self.tags_without_the_base_image(build))
+        self.assertEqual(result["decision"], "candidate")
+        self.assertEqual(self.only_build().state, "candidate")
+
+    def test_a_base_image_read_that_runs_out_of_the_pass_time_is_noted_and_the_image_is_still_created(self):
+        self.world.console_plan = [(300.0, READY)]
+        _, build = self.start_build()
+        self.clock.advance(30)
+        # The marker read returns in time and ends the pass deadline: the base image read is the next call.
+        self.world.hooks["get_console_output"] = lambda arguments: self.clock.advance(400)
+        result = self.apply()
+        self.assertIn("base_image:pass_deadline_exceeded", result["notes"])
+        self.assertEqual(len(self.world.arguments("create_image")), 1)
+        self.assertEqual(self.image_tags(), self.tags_without_the_base_image(build))
+        # The image exists and the row says so: the next pass reads it and goes on from there.
+        self.assertEqual(result["decision"], "imaging")
+        row = self.only_build()
+        self.assertEqual(row.state, "imaging")
+        self.assertIsNotNone(row.image_id)
+
     def test_the_candidate_is_created_after_the_builder_ends_and_is_verified(self):
         self.world.console_plan = [(300.0, READY)]
         before = self.config_path.read_bytes()
@@ -1819,6 +1864,23 @@ class FailureTests(PipelineCase):
         self.assertEqual(self.world.arguments("create_image"), [])
         self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
 
+    def test_a_marker_first_read_past_the_deadline_creates_no_image_when_the_early_termination_was_refused(self):
+        # Reconcile's termination of the overdue builder is refused once, so the builder is still listed
+        # and alive when the marker is read: the deadline, not the builder, ends the build.
+        self.world.console_plan = [(2_000.0, READY)]
+        build = self.expired_build()
+        self.world.fail("terminate_instances", ProviderError("RequestLimitExceeded"), times=1)
+        result = self.apply()
+        self.assert_failed(result, "MARKER_TIMEOUT")
+        self.assertEqual(self.world.arguments("create_image"), [])
+        self.assertEqual(len(self.events("image_marker_seen")), 1)
+        # The refused attempt was reconcile's. The failure path asked again, and that one ended the builder.
+        self.assertEqual(result["reconcile"]["failures"], ["AWS_UNCERTAIN"])
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}] * 2)
+        self.assertNotIn("terminate:failed", result["notes"])
+        self.assertEqual(self.world.instances[build.builder_id]["State"]["Name"], "terminated")
+        self.assertEqual(self.control().consecutive_failures, 1)
+
     def test_a_builder_at_its_deadline_is_ended_by_the_first_call_of_the_pass(self):
         build = self.expired_build()
         mark = len(self.world.calls)
@@ -2141,6 +2203,74 @@ class FailureTests(PipelineCase):
         self.assertEqual(len(self.archive_keys()), 1)
         self.assertEqual(self.world.arguments("run_instances"), [])
         self.assertEqual(self.world.objects, {})
+
+    def test_a_resumed_stage_reads_the_build_template_again_and_an_unsafe_one_ends_the_row_without_a_failure(self):
+        first = self.unstaged_build()
+        # The template was safe when the build started. A group of it has since gained an inbound rule.
+        self.world.add_group(BUILD_GROUP, "example-build-group", ingress=1)
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_BUILD_TEMPLATE_UNSAFE")
+        build = self.only_build()
+        self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "IMAGE_BUILD_TEMPLATE_UNSAFE"))
+        # The check comes before the second upload: only the first pass opened one.
+        self.assertNotIn("create_multipart_upload", self.world.names(mark))
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.objects, {})
+
+    def test_a_resumed_stage_that_finds_the_template_unsafe_deletes_the_archive_the_row_names(self):
+        self.world.hooks["generate_presigned_url"] = lambda arguments: self.clock.advance(400)
+        self.apply()
+        first = self.only_build()
+        self.assertEqual(list(self.world.objects), [first.archive_key])
+        del self.world.hooks["generate_presigned_url"]
+        self.world.add_group(BUILD_GROUP, "example-build-group", ingress=1)
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_BUILD_TEMPLATE_UNSAFE")
+        build = self.only_build()
+        self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "IMAGE_BUILD_TEMPLATE_UNSAFE"))
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
+    def test_a_resumed_stage_whose_template_check_runs_out_of_time_leaves_the_build_for_the_next_pass(self):
+        first = self.unstaged_build()
+        # The pass runs out of time inside the first read of the template check.
+        self.world.hooks["describe_launch_templates"] = lambda arguments: self.clock.advance(400)
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("building", None))
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        self.assert_unstaged(self.only_build())
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertNotIn("create_multipart_upload", self.world.names(mark))
+        self.assertEqual(len(self.archive_keys()), 1)
+        # Nothing is lost: the next pass reads the template again, stages the archive and launches.
+        del self.world.hooks["describe_launch_templates"]
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(len(self.archive_keys()), 2)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_a_resumed_stage_whose_template_read_the_provider_refuses_raises_and_leaves_the_row_unstaged(self):
+        first = self.unstaged_build()
+        self.world.fail("describe_launch_templates", ProviderError("RequestLimitExceeded"), times=1)
+        mark = len(self.world.calls)
+        self.refused(self.apply, "AWS_UNCERTAIN")
+        self.assertNotIn("create_multipart_upload", self.world.names(mark))
+        self.assert_unstaged(self.only_build())
+        self.assertEqual(self.only_build().id, first.id)
+        # The refusal is neither a refused start nor a failure: the next pass reads again and stages.
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
 
     def test_a_forge_that_fails_during_the_stage_fails_the_build_by_its_code_alone(self):
         self.source.fail_after_first = ObservationRefusal("FORGEJO_UNAVAILABLE", "token=" + TOKEN)

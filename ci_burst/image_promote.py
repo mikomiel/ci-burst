@@ -105,6 +105,7 @@ class Snapshot:
     mode: int
     uid: int
     gid: int
+    identity: tuple  # (device, inode) of the file the bytes were read from
 
     @property
     def pin(self):
@@ -123,8 +124,9 @@ def read_snapshot(config):
     """
     target = Path(config.path).resolve()
     try:
-        data = target.read_bytes()
-        metadata = target.stat()
+        with open(target, "rb") as handle:  # the metadata and the bytes of one open file
+            metadata = os.fstat(handle.fileno())
+            data = handle.read()
         text = data.decode("utf-8")
     except FileNotFoundError:
         raise ConfigRefusal("CONFIG_MISSING", str(config.path)) from None
@@ -144,6 +146,27 @@ def read_snapshot(config):
         mode=stat.S_IMODE(metadata.st_mode),
         uid=metadata.st_uid,
         gid=metadata.st_gid,
+        identity=(metadata.st_dev, metadata.st_ino),
+    )
+
+
+def _is_unchanged(snapshot):
+    """Whether the deployment path still leads to the same file with the same bytes. It parses nothing.
+
+    The identity tells two atomic replacements that restored the same bytes (a promotion, then a rollback) from an
+    unchanged file; the hash tells an edit in place. Any error reading the file is a change.
+    """
+    try:
+        target = Path(snapshot.config.path).resolve()
+        with open(target, "rb") as handle:
+            metadata = os.fstat(handle.fileno())
+            data = handle.read()
+    except OSError:
+        return False
+    return (
+        target == snapshot.target
+        and (metadata.st_dev, metadata.st_ino) == snapshot.identity
+        and sha256_of(data) == snapshot.sha256
     )
 
 
@@ -843,10 +866,10 @@ def _preview(snapshot, state, clock, version, rollback):
     finally:
         state.close()
     # The file was read before the copy. A promotion that renamed the file in between would leave the preview
-    # resolving its row against the old hash, so the file is read again: the copy lies between two equal reads, or
-    # the preview refuses. Nothing is locked for this.
-    again = read_snapshot(config)
-    if again.target != snapshot.target or again.sha256 != snapshot.sha256:
+    # resolving its row against the old hash, so the file is checked again: the copy lies between two reads of the
+    # same file with the same bytes, or the preview refuses. Nothing is locked for this.
+    if not _is_unchanged(snapshot):
+        planned.close()
         raise ImageRefusal(
             PROMOTE_FILE_CHANGED, "the file changed while the preview read it and the state; run the preview again"
         )

@@ -41,8 +41,11 @@ from test_image_cli import CliCase
 from test_image_pipeline import (
     DAY,
     DEPLOYMENT,
+    GATE,
+    NO_GATE,
     NOW,
     PIN,
+    READY,
     SCRIPT,
     SOURCE_SHA,
     WORKER,
@@ -239,6 +242,16 @@ class PromoteCase(CliCase):
             connection.execute(
                 f"UPDATE promotion_journal SET {assignments} WHERE id = ?", (*fields.values(), journal_id)
             )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def corrupt_build(self, build_id, **fields):
+        """A change of a build row that only damage or a hand edit of the state file could make."""
+        connection = sqlite3.connect(self.state_dir / "image-state.sqlite")
+        try:
+            assignments = ", ".join(f"{column} = ?" for column in fields)
+            connection.execute(f"UPDATE image_builds SET {assignments} WHERE id = ?", (*fields.values(), build_id))
             connection.commit()
         finally:
             connection.close()
@@ -942,6 +955,84 @@ class VerificationTests(PromoteCase):
         self.assertEqual([zone.launch_template_version for zone in zones], [5, 5])
 
 
+class LaunchedGateTests(PromoteCase):
+    """A write reads the gate evidence of the build that was launched, not the gate that the file holds when it ends.
+
+    The builds here are real: a pass launches the builder under one deployment file, the file changes, and the pass
+    that sees the marker ends the build.
+    """
+
+    def build_across_an_edit(self, launched, edited):
+        """A build launched under the gate setting ``launched``, ended by a pass that reads the file as ``edited``."""
+        self.configure(self.image_toml(gate=launched))
+        self.world.console_plan = [(300.0, READY)]
+        self.start_build()
+        self.configure(self.image_toml(gate=edited))
+        self.clock.advance(30)
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        return self.only_build()
+
+    def test_a_build_launched_without_a_gate_is_refused_when_the_file_gains_a_gate_before_the_build_ends(self):
+        build = self.build_across_an_edit(NO_GATE, GATE)
+        self.assertEqual((build.gate_configured, build.gate_passed), (0, 0))
+        code, payload = self.show()
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["evidence"]["gate"], {"configured": False, "passed": False})
+        self.assertEqual(payload["write_check"]["reason"], "PROMOTE_GATE_NOT_PASSED")
+        error = self.refusal((), "PROMOTE_GATE_NOT_PASSED")
+        self.assertEqual(self.pin_in_file(), PIN)
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(error["detail"], "the record shows gate configured 0 and passed 0")
+
+    def test_a_build_launched_with_a_gate_is_promoted_with_its_evidence_when_the_file_drops_the_gate(self):
+        build = self.build_across_an_edit(GATE, NO_GATE)
+        self.assertEqual((build.gate_configured, build.gate_passed), (1, 1))
+        payload = self.promoted()
+        self.assertEqual(payload["evidence"]["gate"], {"configured": True, "passed": True})
+        self.assertEqual(self.pin_in_file(), build.template_version)
+
+    def build_with_a_damaged_gate_record(self, value):
+        """A build launched without a gate, whose row was damaged to ``value`` before the pass that ends it.
+
+        The file gains a gate command before that pass, so the file is no witness either: a gate that is required
+        but was not run is the case that the write must refuse.
+        """
+        self.configure(self.image_toml(gate=NO_GATE))
+        self.world.console_plan = [(300.0, READY)]
+        _, launched = self.start_build()
+        self.assertEqual(launched.gate_configured, 0)
+        self.corrupt_build(launched.id, gate_configured=value)
+        self.configure(self.image_toml(gate=GATE))
+        self.clock.advance(30)
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        return self.only_build()
+
+    def test_a_record_with_a_gate_value_other_than_one_is_refused_as_a_build_without_a_gate(self):
+        # Only an exact recorded 1 shows that a gate ran. A damaged value of 2 would read as "true" under a cast.
+        build = self.build_with_a_damaged_gate_record(2)
+        self.assertEqual((build.gate_configured, build.gate_passed), (0, 0))
+        error = self.refusal((), "PROMOTE_GATE_NOT_PASSED")
+        self.assertEqual(error["detail"], "the record shows gate configured 0 and passed 0")
+        self.assertEqual(self.pin_in_file(), PIN)
+        self.assertEqual(self.backups(), [])
+
+    def test_a_record_that_shows_the_gate_with_an_exact_one_is_still_promoted(self):
+        # The control for the test above: the same flow, with the row left as the launch wrote it, under a file that
+        # holds a gate command, promotes.
+        self.configure(self.image_toml(gate=GATE))
+        self.world.console_plan = [(300.0, READY)]
+        _, launched = self.start_build()
+        self.assertEqual(launched.gate_configured, 1)
+        self.clock.advance(30)
+        self.assertEqual(self.apply()["decision"], "candidate")
+        build = self.only_build()
+        self.assertEqual((build.gate_configured, build.gate_passed), (1, 1))
+        self.promoted()
+        self.assertEqual(self.pin_in_file(), build.template_version)
+
+
 # -- 6.4: the edit ---------------------------------------------------------------------
 
 
@@ -1584,6 +1675,64 @@ class ReparseTests(PromoteCase):
         with self.assertRaises(ImageRefusal) as raised:
             image_promote.check_reparse(snapshot, text, 10_001)
         self.assertEqual(raised.exception.reason, "PROMOTE_REPARSE_FAILED")
+
+
+class StaleViewTests(PromoteCase):
+    """A container that mounted the file itself keeps the inode that a rename elsewhere replaced."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+
+    def test_an_open_file_that_a_rename_replaced_is_refused_as_stale(self):
+        target = Path(self.config.path).resolve()
+        descriptor = os.open(target, os.O_RDONLY)
+        try:
+            replacement = target.parent / "replacement.tmp"
+            replacement.write_bytes(target.read_bytes())
+            os.replace(replacement, target)
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote._read_open_file(self.config, target, descriptor)
+        finally:
+            os.close(descriptor)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
+
+    def test_the_same_file_still_linked_is_read(self):
+        # The control: nothing but the rename separates this read from the one above.
+        target = Path(self.config.path).resolve()
+        descriptor = os.open(target, os.O_RDONLY)
+        try:
+            snapshot = image_promote._read_open_file(self.config, target, descriptor)
+        finally:
+            os.close(descriptor)
+        self.assertEqual(snapshot.data, target.read_bytes())
+
+    @contextlib.contextmanager
+    def stale_view(self):
+        """Every ``fstat`` of the deployment file reports no link left, as the stale mount does."""
+        real = os.fstat
+        inode = os.stat(Path(self.config.path).resolve()).st_ino
+
+        def fstat(descriptor):
+            result = real(descriptor)
+            if result.st_ino != inode:
+                return result
+            values = list(result[:10])
+            values[stat.ST_NLINK] = 0
+            return os.stat_result(values)
+
+        with mock.patch("os.fstat", fstat):
+            yield
+
+    def test_promote_write_through_a_stale_view_is_refused_and_nothing_is_written(self):
+        with self.stale_view():
+            self.refusal((), "PROMOTE_FILE_STALE")
+        self.assertEqual(self.backups(), [])
+
+    def test_a_rollback_and_a_preview_through_a_stale_view_are_refused(self):
+        with self.stale_view():
+            self.refusal(("--rollback",), "PROMOTE_FILE_STALE")
+            self.refusal((), "PROMOTE_FILE_STALE", write=False)
 
 
 class FreshnessTests(unittest.TestCase):

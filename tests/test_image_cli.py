@@ -484,6 +484,42 @@ class RunApplyTests(CliCase):
         self.assertFalse(self.state_dir.exists())
         self.assertEqual(self.sessions, [])
 
+    # The gate requirement guards a new launch. The command opens the state for writing before the pass starts, so
+    # the pass looks for a build in flight through that connection.
+
+    def test_a_configuration_refusal_with_no_build_in_flight_builds_no_client_and_writes_nothing(self):
+        self.add_build("earlier", "failed", age=3 * DAY)
+        self.configure(self.image_toml(gate=""))
+        self.forbid_clients()
+        before = self.dump()
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_GATE_REQUIRED"))
+        self.assertEqual(self.dump(), before)
+        self.assertEqual((self.sessions, self.source_sessions), ([], 0))
+
+    def test_a_pass_settles_a_build_whose_file_lost_the_gate_and_has_no_opt_out(self):
+        # The pass ran out of time after the upload, so the row names an archive and has no builder. The file then
+        # loses its gate, and the command still ends the row and deletes the archive instead of refusing to run.
+        self.world.hooks["generate_presigned_url"] = lambda arguments: self.clock.advance(400)
+        self.assertEqual(self.pipeline.run_pass(apply=True)["decision"], "building")
+        del self.world.hooks["generate_presigned_url"]
+        (first,) = self.builds()
+        self.assertEqual(list(self.world.objects), [first.archive_key])
+        self.configure(self.image_toml(gate=""))
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertNotIn("error", payload)
+        self.assertEqual((code, payload["decision"], payload["reason"]), (2, "refused", "IMAGE_INPUTS_CHANGED"))
+        self.assertEqual(self.row(first.id)["state"], "failed")
+        self.assertEqual(self.row(first.id)["reason_code"], "IMAGE_INPUTS_CHANGED")
+        self.assertEqual(len(self.builds()), 1)
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.control().consecutive_failures, 0)
+        # The next command has no build in flight, so it is a new launch and the requirement refuses it.
+        self.forbid_clients()
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_GATE_REQUIRED"))
+
     def test_a_pass_that_is_locked_out_exits_two(self):
         other = ImageState(self.state_dir, clock=self.clock)
         other.connect()
@@ -586,6 +622,46 @@ class RunApplyJournalTests(CliCase):
         self.add_build("earlier", "failed", age=3 * DAY)
         code, payload = self.invoke("image", "run", "--apply")
         self.assertEqual((code, payload["journal_resolved"]), (0, []))
+
+    # -- the image of a promotion that this run resolves as aborted -------------------
+    # A promotion to version 5 replaced the deployment file and stopped before it completed its row. A container
+    # whose bind mount keeps the old inode runs this command: it reads the old file, so the row is resolved as
+    # aborted. After that, no pending row and no completed row names version 5, and the file this run reads does not.
+
+    def three_usable_images_with_version_5_the_oldest(self):
+        """Three usable images against ``retain = 2``: retention takes the oldest unless something protects it.
+
+        The oldest is the image of version 5. The newest of the other two is protected as the current candidate.
+        """
+        self.configure(self.image_toml(image_extra="retain = 2\nretain_min_age_seconds = 3600\n"))
+        self.pin_current()
+        self.add_world_candidate("build-b", 5, 0xB1, age=9 * DAY)
+        self.add_world_candidate("build-c", 6, 0xC1, age=3 * DAY)
+        self.add_world_candidate("build-d", 7, 0xD1, age=2 * DAY)
+
+    def test_the_image_of_a_promotion_that_this_run_resolves_as_aborted_survives_retention_in_the_same_pass(self):
+        self.three_usable_images_with_version_5_the_oldest()
+        row = self.pending(old_sha=self.file_sha(), candidate_id="build-b")
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            payload["journal_resolved"], [{"journal_id": row.id, "kind": "promotion", "resolution": "aborted"}]
+        )
+        self.assertEqual(self.journal_rows()[0]["status"], "aborted")
+        self.assertEqual(self.pin_in_file(), PIN)
+        self.assertEqual(payload["retention"]["deregistered"], 1)
+        # The oldest image that nothing protects goes instead of version 5's.
+        self.assertEqual(self.world.arguments("deregister_image"), [{"ImageId": ami(0xC1)}])
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xB1), ami(0xD1)})
+
+    def test_without_the_row_the_same_run_takes_the_oldest_image(self):
+        # The control: nothing but the journal row separates this run from the one above.
+        self.three_usable_images_with_version_5_the_oldest()
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["journal_resolved"]), (0, []))
+        self.assertEqual(payload["retention"]["deregistered"], 1)
+        self.assertEqual(self.world.arguments("deregister_image"), [{"ImageId": ami(0xB1)}])
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xC1), ami(0xD1)})
 
 
 # -- 6.1: status ---------------------------------------------------------------------

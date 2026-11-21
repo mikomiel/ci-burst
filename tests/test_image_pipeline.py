@@ -156,6 +156,7 @@ bucket = "{bucket}"
 prefix = "{prefix}"
 """
 GATE = 'gate_command = "bash scripts/example-gate.sh"'
+NO_GATE = "allow_no_gate = true"
 STATE_DIRECTORY = "/var/lib/example-image-state"
 
 
@@ -663,6 +664,7 @@ class FakeSource:
         self.errors = {}
         self.calls = []
         self.on_chunk = None
+        self.on_read = None
         self.fail_after_first = None
 
     def branch(self, name):
@@ -673,6 +675,8 @@ class FakeSource:
 
     def raw_file(self, sha, path):
         self.calls.append(("raw_file", path))
+        if self.on_read is not None:
+            self.on_read()
         if "raw_file" in self.errors:
             raise self.errors["raw_file"]
         if path not in self.files:
@@ -689,6 +693,26 @@ class FakeSource:
             yield chunk
             if number == 0 and self.fail_after_first is not None:
                 raise self.fail_after_first
+
+
+class CommitSource(FakeSource):
+    """A forge whose files depend on the commit that is read: ``at`` maps a commit to the files it holds.
+
+    A commit that ``at`` does not name holds ``files``. ``reads`` lists every ``(commit, path)`` that was read.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.at = {}
+        self.reads = []
+
+    def raw_file(self, sha, path):
+        self.reads.append((sha, path))
+        files, self.files = self.files, self.at.get(sha, self.files)
+        try:
+            return super().raw_file(sha, path)
+        finally:
+            self.files = files
 
 
 class Crash(BaseException):
@@ -708,6 +732,16 @@ class CrashingState(ImageState):
                 self.crash_on.discard(name)
                 raise Crash(name)
         return super().advance_build(build_id, state=state, **fields)
+
+
+class BuildEndedBeforeTheLock(ImageState):
+    """A state file whose active build ends, in another process, after the peek and before the writer lock is taken."""
+
+    def acquire_writer(self):
+        active = self.active_build(DEPLOYMENT)
+        if active is not None:
+            self.advance_build(active.id, state="failed", reason_code="CONSOLE_BLIND")
+        return super().acquire_writer()
 
 
 class Interrupted(BaseException):
@@ -990,6 +1024,41 @@ class PrecheckTests(PipelineCase):
             with self.subTest(name):
                 self.refused(call, "IMAGE_GATE_REQUIRED")
         self.assert_nothing_touched()
+
+    # The gate requirement guards a new launch. An applying pass that finds a build in flight settles it (see the
+    # tests of the gate in ``FailureTests`` and ``GateEvidenceTests``), so only an applying pass looks at the state.
+
+    def test_a_missing_gate_is_refused_before_any_client_when_the_state_has_no_build_in_flight(self):
+        # The state file exists and holds only an ended build: the look at it is read-only and ends the pass.
+        self.add_build("earlier", "failed")
+        self.configure(toml=render_toml(gate=""))
+        before = snapshot_tree(self.state_dir)
+        entry_points = {"pass": lambda: self.pipeline.run_pass(apply=True), "until done": self.pipeline.run_until_done}
+        for name, call in entry_points.items():
+            with self.subTest(name):
+                self.refused(call, "IMAGE_GATE_REQUIRED")
+        self.assertEqual(self.sessions, [])
+        self.assertEqual(self.source_sessions, 0)
+        self.assertEqual(self.world.calls, [])
+        self.assertEqual(snapshot_tree(self.state_dir), before)
+        # The look took no writer lock and left no connection open.
+        self.assertFalse(self.state.available)
+        other = ImageState(self.state_dir, clock=self.clock)
+        other.connect()
+        self.addCleanup(other.close)
+        other.acquire_writer()
+
+    def test_a_missing_gate_is_still_refused_by_plan_when_a_build_is_in_flight(self):
+        # A build in flight is settled by an applying pass only: plan decides nothing about it.
+        self.add_build("stuck", "building", age=600)
+        self.configure(toml=render_toml(gate=""))
+        before = snapshot_tree(self.state_dir)
+        entry_points = {"plan": self.pipeline.plan, "pass without apply": lambda: self.pipeline.run_pass(apply=False)}
+        for name, call in entry_points.items():
+            with self.subTest(name):
+                self.refused(call, "IMAGE_GATE_REQUIRED")
+        self.assertEqual((self.sessions, self.source_sessions, self.world.calls), ([], 0, []))
+        self.assertEqual(snapshot_tree(self.state_dir), before)
 
     def test_a_missing_gate_that_is_allowed_is_planned_and_reported(self):
         self.configure(toml=render_toml(gate="allow_no_gate = true"))
@@ -2374,6 +2443,20 @@ class FailureTests(PipelineCase):
         self.assertIn("archive:delete_failed", result["notes"])
         self.assertEqual(len(self.world.objects), 1)
 
+    def test_a_start_without_a_gate_is_refused_before_the_row_and_the_upload(self):
+        # The pass began because a build was in flight. That build ended before the pass took the lock, so the pass
+        # reaches the start of a new build, and a new build needs a gate or the opt-out.
+        self.add_build("settled", "building", age=5 * DAY)
+        self.configure(render_toml(gate=""), state=BuildEndedBeforeTheLock(self.state_dir, clock=self.clock))
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_GATE_REQUIRED")
+        (ended,) = self.builds()
+        self.assertEqual((ended.id, ended.state, ended.reason_code), ("settled", "failed", "CONSOLE_BLIND"))
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.urls, [])
+
     def assert_unstaged(self, build):
         """A build that waits for the next pass to stage its archive: no builder, no archive hash, no failure."""
         self.assertEqual((build.state, build.builder_id, build.archive_sha256), ("building", None, None))
@@ -2546,6 +2629,197 @@ class FailureTests(PipelineCase):
         self.assertEqual(result["decision"], "candidate", result)
         self.assertEqual(self.only_build().id, first.id)
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    # -- a stage that is done again under other inputs ---------------------------------
+    # A build is inserted under one digest. A pass that stages it again launches only under the inputs that give that
+    # digest: the basis files at the row's own commit, the warm settings and the script, read as they are now.
+
+    def assert_inputs_changed(self, result, first):
+        """The pass ended the row without a failure and staged nothing: the first pass opened the only upload."""
+        self.assert_refused(result, "IMAGE_INPUTS_CHANGED")
+        build = self.only_build()
+        self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "IMAGE_INPUTS_CHANGED"))
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.arguments("terminate_instances"), [])
+        self.assertEqual(self.world.objects, {})
+
+    def test_a_resumed_stage_under_another_script_ends_the_row_without_a_failure_and_launches_nothing(self):
+        first = self.unstaged_build()
+        self.restart(script=SCRIPT + b"# edited\n")
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assert_inputs_changed(result, first)
+        # The check comes before the second upload: only the first pass opened one.
+        self.assertNotIn("create_multipart_upload", self.world.names(mark))
+
+    def test_a_resumed_stage_under_another_gate_command_ends_the_row_without_a_failure_and_launches_nothing(self):
+        first = self.unstaged_build()
+        self.configure(render_toml(gate=NO_GATE))
+        result = self.apply()
+        self.assert_inputs_changed(result, first)
+        self.assertEqual(self.control().consecutive_failures, 0)
+
+    def test_a_resumed_stage_that_finds_the_inputs_changed_deletes_the_archive_the_row_names(self):
+        self.world.hooks["generate_presigned_url"] = lambda arguments: self.clock.advance(400)
+        self.apply()
+        first = self.only_build()
+        self.assertEqual(list(self.world.objects), [first.archive_key])
+        del self.world.hooks["generate_presigned_url"]
+        self.configure(render_toml(gate=NO_GATE))
+        result = self.apply()
+        self.assert_inputs_changed(result, first)
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+
+    def test_a_resumed_stage_for_which_the_commit_lacks_a_basis_path_ends_the_row_without_a_failure(self):
+        first = self.unstaged_build()
+        # The file now names a second basis path. The commit of the row does not hold it, so the digest is not the row's.
+        paths = 'basis_paths = ["example.lock"]'
+        self.assertIn(paths, render_toml())
+        self.configure(render_toml().replace(paths, 'basis_paths = ["example.lock", "other.lock"]'))
+        result = self.apply()
+        self.assert_inputs_changed(result, first)
+
+    def test_a_resumed_stage_whose_forge_read_fails_raises_and_leaves_the_row_unstaged(self):
+        first = self.unstaged_build()
+        self.source.errors["raw_file"] = ObservationRefusal("FORGEJO_UNAVAILABLE")
+        mark = len(self.world.calls)
+        self.refused(self.apply, "FORGEJO_UNAVAILABLE")
+        self.assertNotIn("create_multipart_upload", self.world.names(mark))
+        self.assert_unstaged(self.only_build())
+        self.assertEqual(self.only_build().id, first.id)
+        # The refusal is neither an ended row nor a failure: the next pass reads again and stages.
+        del self.source.errors["raw_file"]
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    # The forge client puts no deadline on a read of a basis file, so the pass deadline passes during the reads only
+    # because the clock moves while they run.
+
+    def test_a_resumed_stage_whose_basis_reads_outlast_the_pass_leaves_the_build_for_the_next_pass(self):
+        first = self.unstaged_build()
+        self.source.on_read = lambda: self.clock.advance(400)
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("building", None))
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        self.assert_unstaged(self.only_build())
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertNotIn("create_multipart_upload", self.world.names(mark))
+        self.assertEqual(len(self.archive_keys()), 1)
+        # Nothing is lost: the next pass reads the files again, stages the archive and launches.
+        self.source.on_read = None
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(len(self.archive_keys()), 2)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_a_resumed_stage_that_finds_the_inputs_changed_after_the_pass_deadline_ends_no_row(self):
+        # The digest differs, but the pass has no time left to end the row: the next pass does.
+        first = self.unstaged_build()
+        self.configure(render_toml(gate=NO_GATE))
+        self.source.on_read = lambda: self.clock.advance(400)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("building", None))
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        self.assert_unstaged(self.only_build())
+        self.assertEqual(self.only_build().id, first.id)
+        self.source.on_read = None
+        self.assert_inputs_changed(self.apply(), first)
+
+    def test_a_resumed_stage_under_the_same_inputs_reads_the_commit_of_the_row_and_launches(self):
+        self.source = CommitSource()
+        first = self.unstaged_build()
+        self.assertEqual(first.source_sha, SOURCE_SHA)
+        # The branch moved on and its head holds another lock file. The commit of the row still holds the first one.
+        self.source.sha = "cd" * 20
+        self.source.at[self.source.sha] = {"example.lock": b"a lock file of a later commit\n"}
+        self.source.reads.clear()
+        mark = len(self.source.calls)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        build = self.only_build()
+        self.assertEqual((build.id, build.source_sha), (first.id, SOURCE_SHA))
+        self.assertEqual(self.source.reads, [(SOURCE_SHA, "example.lock")])
+        # One read of the basis file at the row's commit, then the archive of that commit: the branch head is not read.
+        self.assertEqual(self.source.calls[mark:], [("raw_file", "example.lock"), ("archive", SOURCE_SHA)])
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_the_pass_after_a_row_that_ended_for_its_inputs_decides_as_usual(self):
+        first = self.unstaged_build()
+        edited = SCRIPT + b"# edited\n"
+        self.restart(script=edited)
+        self.assert_inputs_changed(self.apply(), first)
+        # The ended row counts toward the limits like any refused row: the next build waits for the interval.
+        self.clock.advance(DAY + HOUR)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        ended, started = self.builds()
+        self.assertEqual((ended.id, ended.state, ended.reason_code), (first.id, "failed", "IMAGE_INPUTS_CHANGED"))
+        self.assertEqual((started.state, started.script_sha256), ("candidate", image.script_sha256(edited)))
+        self.assertNotEqual(started.basis_digest, first.basis_digest)
+        self.assertEqual(self.control().consecutive_failures, 0)
+
+    # -- a file that loses its gate while a build waits to be staged again -------------------
+    # The gate requirement guards a new launch. A build that has a row is settled by the passes that follow, whatever
+    # the file says about the gate by then: the pass ends the row when its inputs changed, and launches only under
+    # the inputs that the row was inserted with.
+
+    def unstaged_build_with_an_archive(self):
+        """A build whose first pass ran out of time after the upload: its row names an archive and has no builder."""
+        self.world.hooks["generate_presigned_url"] = lambda arguments: self.clock.advance(400)
+        self.apply()
+        del self.world.hooks["generate_presigned_url"]
+        first = self.only_build()
+        self.assertEqual(list(self.world.objects), [first.archive_key])
+        return first
+
+    def test_a_resumed_stage_whose_file_lost_the_gate_and_has_no_opt_out_ends_the_row_instead_of_leaving_it(self):
+        first = self.unstaged_build_with_an_archive()
+        self.assertEqual(first.gate_configured, 1)
+        self.configure(render_toml(gate=""))
+        result = self.apply()
+        self.assert_inputs_changed(result, first)
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.control().consecutive_failures, 0)
+
+    def test_the_pass_after_a_row_that_ended_for_a_lost_gate_is_refused_before_any_client(self):
+        first = self.unstaged_build_with_an_archive()
+        self.configure(render_toml(gate=""))
+        self.assert_inputs_changed(self.apply(), first)
+        before = (len(self.world.calls), len(self.sessions), self.source_sessions)
+        # No build is in flight now, so the pass is a new launch and the gate requirement refuses it as before.
+        self.refused(self.apply, "IMAGE_GATE_REQUIRED")
+        self.assertEqual((len(self.world.calls), len(self.sessions), self.source_sessions), before)
+        build = self.only_build()
+        self.assertEqual((build.id, build.state), (first.id, "failed"))
+
+    def test_a_resumed_stage_whose_file_lost_the_opt_out_ends_the_row_and_launches_nothing(self):
+        # The digest does not hold the opt-out, so the inputs of the row still give it. Only the gate requirement
+        # can refuse the launch of this build: without it the builder would start with no gate and no opt-out.
+        self.configure(render_toml(gate=NO_GATE))
+        first = self.unstaged_build_with_an_archive()
+        self.assertEqual(first.gate_configured, 0)
+        self.configure(render_toml(gate=""))
+        self.assertEqual(self.digest(), first.basis_digest)
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_GATE_REQUIRED")
+        build = self.only_build()
+        self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "IMAGE_GATE_REQUIRED"))
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.launches, [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
 
     def resumed_stage_with_100_seconds_left(self):
         """A build that waits for its stage to be done again, and the clock 100 seconds short of its deadline.
@@ -2792,6 +3066,102 @@ class ReadDeadlineTests(PipelineCase):
         self.assertEqual(self.by_id_reads(ami(0xA1)), [])
 
 
+class BasisReadDeadlineTests(PipelineCase):
+    """A read of a basis file does not start once the pass deadline is over.
+
+    The forge client puts no deadline on a read, so the pipeline reads the clock before each one. Each test makes
+    the pass run out of time inside a read and counts the files that the forge was asked for: a pass that reads the
+    clock only after the last file ends in the same place, and has made every request by then.
+    """
+
+    PATHS = ("example.lock", "second.lock", "third.lock")
+
+    def several_basis_paths(self):
+        """The deployment file names three basis paths and the forge holds all three."""
+        single = 'basis_paths = ["example.lock"]'
+        self.assertIn(single, render_toml())
+        names = ", ".join(f'"{path}"' for path in self.PATHS)
+        self.configure(render_toml().replace(single, f"basis_paths = [{names}]"))
+        self.source.files = {path: LOCK_FILE + path.encode() for path in self.PATHS}
+
+    def reads(self, mark=0):
+        """The basis files that the forge was asked for since ``mark``, a position in its call log."""
+        return [path for kind, path in self.source.calls[mark:] if kind == "raw_file"]
+
+    def unstaged_build(self):
+        """A build whose first pass ran out of time during the stage: it has no builder and no staged archive."""
+        self.source.on_chunk = lambda: self.clock.advance(400)
+        self.apply()
+        self.source.on_chunk = None
+        return self.only_build()
+
+    def assert_left_for_the_next_pass(self, result, first, world_mark):
+        """The pass noted the deadline and left the row as it was: no failure, no second upload, no builder."""
+        self.assertEqual((result["decision"], result["reason"]), ("building", None))
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assertEqual((build.state, build.builder_id, build.archive_sha256), ("building", None, None))
+        self.assertNotIn("create_multipart_upload", self.world.names(world_mark))
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.events("image_build_failed"), [])
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+
+    def test_a_decision_does_not_start_a_basis_read_past_the_pass_deadline(self):
+        self.several_basis_paths()
+        self.source.on_read = lambda: self.clock.advance(400)
+        self.refused(self.apply, "pass_deadline_exceeded")
+        self.assertEqual(self.reads(), ["example.lock"])
+        # Nothing was started: no row, no archive and no builder.
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
+    def test_a_plan_does_not_start_a_basis_read_past_the_pass_deadline(self):
+        self.several_basis_paths()
+        self.source.on_read = lambda: self.clock.advance(400)
+        self.refused(self.plan, "pass_deadline_exceeded")
+        self.assertEqual(self.reads(), ["example.lock"])
+        # The archive probe and the provider come after the reads, and neither was reached.
+        self.assertNotIn(("archive", SOURCE_SHA), self.source.calls)
+        self.assertEqual((self.sessions, self.world.calls), ([], []))
+        self.assertFalse(self.state_dir.exists())
+
+    def test_a_resumed_stage_does_not_start_a_basis_read_past_the_pass_deadline(self):
+        self.several_basis_paths()
+        first = self.unstaged_build()
+        source_mark, world_mark = len(self.source.calls), len(self.world.calls)
+        self.source.on_read = lambda: self.clock.advance(400)
+        result = self.apply()
+        self.assertEqual(self.reads(source_mark), ["example.lock"])
+        self.assert_left_for_the_next_pass(result, first, world_mark)
+        # Nothing is lost: the next pass reads every file again, stages the archive and launches.
+        self.source.on_read = None
+        self.world.console_plan = [(30.0, READY)]
+        source_mark = len(self.source.calls)
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.reads(source_mark), list(self.PATHS))
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    def test_a_resumed_stage_does_not_start_its_first_basis_read_when_the_deadline_passed_before_it(self):
+        self.several_basis_paths()
+        first = self.unstaged_build()
+        source_mark, world_mark = len(self.source.calls), len(self.world.calls)
+
+        def run_out_of_time(arguments):
+            # The read of the pin's image is the last read of the pass before the stage is done again.
+            if arguments.get("ImageIds") == [ami(0xA1)]:
+                self.clock.advance(400)
+
+        self.world.hooks["describe_images"] = run_out_of_time
+        result = self.apply()
+        self.assertEqual(self.reads(source_mark), [])
+        self.assert_left_for_the_next_pass(result, first, world_mark)
+
+
 class ControlTests(PipelineCase):
     """What a pass writes into the control row, and what the row then refuses."""
 
@@ -2990,6 +3360,173 @@ class ResumeTests(PipelineCase):
         self.assertEqual((result["decision"], result["reason"]), ("failed", "WARM_FAILED"))
         self.assertEqual(self.control().consecutive_failures, 1)
         self.assertEqual(len(self.events("image_build_failed")), 1)
+
+
+class GateEvidenceTests(PipelineCase):
+    """A candidate records the gate of the build that was launched, never the gate that the file holds when it ends.
+
+    The builder prints its marker only after its gate command passed, so a build that launched with a gate passed it,
+    and a build that launched without one has nothing to show. The file can change between the launch and the pass
+    that sees the marker: a gate gained or dropped there must not change what the candidate says about the build.
+    """
+
+    def unstaged_build(self):
+        """A build whose first pass ran out of time during the stage: it has no builder and no staged archive."""
+        self.source.on_chunk = lambda: self.clock.advance(400)
+        self.apply()
+        self.source.on_chunk = None
+        return self.only_build()
+
+    def finish(self):
+        """The pass that sees the marker ends the build as a candidate."""
+        self.clock.advance(30)
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        return self.only_build()
+
+    def launch_then_edit(self, launched, edited):
+        """A build launched under the gate setting ``launched``, ended by a pass that reads the file as ``edited``."""
+        self.configure(render_toml(gate=launched))
+        self.world.console_plan = [(300.0, READY)]
+        _, launched_build = self.start_build()
+        self.configure(render_toml(gate=edited))
+        return launched_build, self.finish()
+
+    def test_a_build_launched_without_a_gate_is_not_credited_with_a_gate_that_the_file_gains(self):
+        launched, built = self.launch_then_edit(NO_GATE, GATE)
+        self.assertEqual(launched.gate_configured, 0)
+        self.assertEqual(built.id, launched.id)
+        self.assertEqual((built.gate_configured, built.gate_passed), (0, 0))
+
+    def test_a_build_launched_with_a_gate_keeps_its_evidence_when_the_file_drops_the_gate(self):
+        launched, built = self.launch_then_edit(GATE, NO_GATE)
+        self.assertEqual(launched.gate_configured, 1)
+        self.assertEqual(built.id, launched.id)
+        self.assertEqual((built.gate_configured, built.gate_passed), (1, 1))
+
+    def test_a_build_launched_with_a_gate_is_settled_when_the_file_drops_the_gate_and_has_no_opt_out(self):
+        # The gate requirement guards a new launch: the pass that finds this build in flight settles it, and the
+        # candidate keeps the evidence of the launch that happened. Nothing else is launched.
+        launched, built = self.launch_then_edit(GATE, "")
+        self.assertEqual(launched.gate_configured, 1)
+        self.assertEqual(built.id, launched.id)
+        self.assertEqual((built.gate_configured, built.gate_passed), (1, 1))
+        self.assertEqual(len(self.builds()), 1)
+        self.assertEqual(len(self.world.launches), 1)
+
+    def test_a_build_launched_without_a_gate_under_a_file_that_did_not_change_records_no_gate(self):
+        self.configure(render_toml(gate=NO_GATE))
+        self.world.console_plan = [(300.0, READY)]
+        self.start_build()
+        built = self.finish()
+        self.assertEqual((built.gate_configured, built.gate_passed), (0, 0))
+
+    def test_a_row_that_records_no_gate_shows_that_none_ran(self):
+        self.world.console_plan = [(300.0, READY)]
+        _, build = self.start_build()
+        self.write(lambda state: state.advance_build(build.id, gate_configured=None))
+        self.assertIsNone(self.only_build().gate_configured)
+        built = self.finish()
+        # The file holds a gate command, but the row does not say that the build ran it.
+        self.assertEqual((built.gate_configured, built.gate_passed), (0, 0))
+
+    def finish_after_damaging_the_recorded_gate(self, value):
+        """A build launched without a gate, whose row is damaged after the launch, then ended by a pass.
+
+        The damage comes after the launch because the launch writes the column itself.
+        """
+        self.configure(render_toml(gate=NO_GATE))
+        self.world.console_plan = [(300.0, READY)]
+        _, build = self.start_build()
+        self.assertEqual(build.gate_configured, 0)
+        self.write(lambda state: state.advance_build(build.id, gate_configured=value))
+        self.assertEqual(self.only_build().gate_configured, value)
+        return self.finish()
+
+    def test_a_recorded_gate_of_two_is_not_gate_evidence(self):
+        # Only a recorded 1 shows that a gate ran: 2 is not "true".
+        built = self.finish_after_damaging_the_recorded_gate(2)
+        self.assertEqual((built.gate_configured, built.gate_passed), (0, 0))
+
+    def test_a_recorded_gate_that_is_text_is_not_gate_evidence(self):
+        built = self.finish_after_damaging_the_recorded_gate("yes")
+        self.assertEqual((built.gate_configured, built.gate_passed), (0, 0))
+
+    def test_a_recorded_gate_of_one_is_still_gate_evidence(self):
+        # The control for the two tests above: the same flow with an undamaged row records the gate that ran.
+        self.configure(render_toml(gate=GATE))
+        self.world.console_plan = [(300.0, READY)]
+        _, build = self.start_build()
+        self.assertEqual(build.gate_configured, 1)
+        built = self.finish()
+        self.assertEqual((built.gate_configured, built.gate_passed), (1, 1))
+
+    # -- a build that is staged again ------------------------------------------------
+    # A stage that the pass deadline ended is done again by a later pass. That pass launches only under the inputs
+    # that its row was inserted with (the gate command is one of them), so the gate it writes is the gate it was
+    # inserted with. The write of the gate in the stage stays as a second line of defence.
+
+    def staged_again(self, inserted, restaged):
+        """A build inserted under the gate setting ``inserted``, and the pass that stages it under ``restaged``."""
+        self.configure(render_toml(gate=inserted))
+        inserted_build = self.unstaged_build()
+        self.configure(render_toml(gate=restaged))
+        self.world.console_plan = [(30.0, READY)]
+        return inserted_build, self.apply()
+
+    def assert_not_launched_under_another_gate(self, inserted, result):
+        """The pass ended the row, launched no builder and counted no failure."""
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_INPUTS_CHANGED"), result)
+        self.assertEqual(self.world.launches, [])
+        build = self.only_build()
+        self.assertEqual((build.id, build.state, build.reason_code), (inserted.id, "failed", "IMAGE_INPUTS_CHANGED"))
+        # The row still says what it was inserted with: no launch happened to write another gate.
+        self.assertEqual((build.gate_configured, build.gate_passed), (inserted.gate_configured, None))
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_a_build_inserted_with_a_gate_is_not_launched_without_it_when_staged_again(self):
+        inserted, result = self.staged_again(GATE, NO_GATE)
+        self.assertEqual(inserted.gate_configured, 1)
+        self.assert_not_launched_under_another_gate(inserted, result)
+
+    def test_a_build_inserted_without_a_gate_is_not_launched_with_one_when_staged_again(self):
+        inserted, result = self.staged_again(NO_GATE, GATE)
+        self.assertEqual(inserted.gate_configured, 0)
+        self.assert_not_launched_under_another_gate(inserted, result)
+
+    def test_a_build_staged_again_under_the_gate_it_was_inserted_with_records_that_gate(self):
+        inserted, result = self.staged_again(GATE, GATE)
+        self.assertEqual(result["decision"], "candidate", result)
+        built = self.only_build()
+        (launch,) = self.world.launches
+        self.assertEqual(built.id, inserted.id)
+        self.assertIn(f"export WARM_GATE_COMMAND={shlex.quote('bash scripts/example-gate.sh')}", launch["UserData"])
+        self.assertEqual((built.gate_configured, built.gate_passed), (1, 1))
+
+    def test_a_build_staged_again_without_a_gate_under_a_file_that_still_has_none_records_no_gate(self):
+        inserted, result = self.staged_again(NO_GATE, NO_GATE)
+        self.assertEqual(result["decision"], "candidate", result)
+        built = self.only_build()
+        (launch,) = self.world.launches
+        self.assertEqual(built.id, inserted.id)
+        self.assertIn(f"export WARM_GATE_COMMAND={shlex.quote('')}", launch["UserData"])
+        self.assertEqual((built.gate_configured, built.gate_passed), (0, 0))
+
+    def test_the_stage_writes_the_gate_of_the_launch_when_the_row_has_lost_its_value(self):
+        # The defence in ``_stage_and_launch``: the row names the gate of the launch that starts the builder, so a row
+        # that lost its value still records the gate that ran.
+        self.configure(render_toml(gate=GATE))
+        inserted = self.unstaged_build()
+        self.write(lambda state: state.advance_build(inserted.id, gate_configured=None))
+        self.assertIsNone(self.only_build().gate_configured)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        built = self.only_build()
+        self.assertEqual(built.id, inserted.id)
+        self.assertEqual((built.gate_configured, built.gate_passed), (1, 1))
 
 
 class ReconcileTests(PipelineCase):
@@ -3368,6 +3905,158 @@ class RetentionTests(PipelineCase):
         # Three usable images against a retention of two: the oldest unprotected one goes.
         self.assertIn(result["build"]["image_id"], self.world.images)
         self.assertEqual(len([i for i in self.world.images if i != ami(0xA1)]), 2)
+
+    # -- a pass that reads a stale file ----------------------------------------------
+    # A container whose bind mount of the deployment file keeps the old inode reads the file as it was before
+    # ``promote --write`` replaced it. The file of these tests pins version 3 (``PIN``): the pin that a promotion
+    # or a rollback replaced. Only the journal names the pin that was written.
+
+    def three_usable_images(self, oldest):
+        """Three usable images against ``retain = 2``: retention takes the oldest unless something protects it.
+
+        ``oldest`` is the image number of the first image: it has a ``promoted`` row and the oldest creation time. The
+        other two are verified candidates, and the newest of them is protected as the current candidate. No pin names
+        any of the three.
+        """
+        self.configure(render_toml(image_extra="retain = 2\nretain_min_age_seconds = 3600\n"))
+        self.pin_current()
+        rows = ((oldest, "promoted", 9 * DAY), (0xC1, "candidate", 3 * DAY), (0xD1, "candidate", 2 * DAY))
+        for number, state, age in rows:
+            name = f"build-{number:x}"
+            self.add_build(name, state, age=age, image_id=ami(number), verified_at=NOW - age + HOUR)
+            self.world.add_image(ami(number), tags=owned(name), age=age, snapshots=(snap(number),))
+            self.world.add_snapshot(snap(number), tags=owned(name), age=age)
+
+    def complete_a_rollback(self, *, old_pin, new_pin):
+        def roll_back(state):
+            row = state.journal_insert(
+                kind="rollback",
+                old_pin=old_pin,
+                new_pin=new_pin,
+                old_file_sha256="0" * 64,
+                new_file_sha256="1" * 64,
+                backup_name="deployment.toml.bak",
+                backup_sha256="2" * 64,
+                contained_pin=new_pin,
+            )
+            state.journal_complete(row.id)
+
+        self.write(roll_back)
+
+    def test_the_image_that_a_promotion_just_wrote_survives_a_pass_that_reads_a_stale_file(self):
+        # The file this pass reads pins A (version 3). The journal says that B (version 4) replaced it.
+        self.three_usable_images(0xB1)
+        self.world.set_version(WORKER, 4, {"ImageId": ami(0xB1)})
+        self.add_journal(old_pin=PIN, new_pin=4)
+        result = self.apply()
+        self.assertEqual(result["retention"]["deregistered"], 1)
+        # The oldest unprotected image goes instead of B.
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xB1), ami(0xD1)})
+        self.assertEqual(self.world.arguments("deregister_image"), [{"ImageId": ami(0xC1)}])
+
+    def test_without_a_journal_row_the_same_pass_takes_the_oldest_image(self):
+        # The control: nothing but the journal row separates this pass from the one above.
+        self.three_usable_images(0xB1)
+        result = self.apply()
+        self.assertEqual(result["retention"]["deregistered"], 1)
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xC1), ami(0xD1)})
+
+    def test_the_image_that_a_rollback_just_restored_survives_a_pass_that_reads_a_stale_file(self):
+        # The file this pass reads pins version 3. The rollback replaced it with the older version 2.
+        self.three_usable_images(0xE1)
+        self.world.set_version(WORKER, PREVIOUS, {"ImageId": ami(0xE1)})
+        self.complete_a_rollback(old_pin=PIN, new_pin=PREVIOUS)
+        result = self.apply()
+        self.assertEqual(result["retention"]["deregistered"], 1)
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xE1), ami(0xD1)})
+
+    def test_plan_does_not_list_the_promoted_image_for_deletion_when_the_file_is_stale(self):
+        self.three_usable_images(0xB1)
+        self.world.set_version(WORKER, 4, {"ImageId": ami(0xB1)})
+        self.add_journal(old_pin=PIN, new_pin=4)
+        rows = self.plan()["deletion"]["items"]
+        deregistered = [row["image_id"] for row in rows if row["action"] == "deregister"]
+        self.assertEqual(deregistered, [ami(0xC1)])
+        self.assertNotIn(ami(0xB1), [row["image_id"] for row in rows])
+        self.assertIn(ami(0xB1), self.world.images)
+
+    def test_a_promoted_version_that_the_account_does_not_return_deletes_nothing_and_fails_no_build(self):
+        # The pass cannot say which image the last promotion wrote, so the whole rule refuses, as for any pin.
+        self.three_usable_images(0xB1)
+        self.add_journal(old_pin=PIN, new_pin=4)  # no version 4 exists in the account
+        result = self.apply()
+        self.assertEqual(result["retention"], {"refused": "IMAGE_DELETION_UNSAFE"})
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xB1), ami(0xC1), ami(0xD1)})
+        self.assertEqual(self.world.arguments("deregister_image"), [])
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+
+    # -- a row that was resolved aborted ---------------------------------------------
+    # A promotion to B replaced the file and stopped before it completed its row. A pass that reads the old file
+    # resolves the row as aborted. The row is then neither pending nor complete, yet the file on disk pins B.
+
+    def abort_the_pending_row(self):
+        self.write(lambda state: state.journal_abort(state.pending_journal()[0].id))
+
+    def test_plan_does_not_list_the_image_of_an_aborted_promotion_for_deletion(self):
+        self.three_usable_images(0xB1)
+        self.world.set_version(WORKER, 4, {"ImageId": ami(0xB1)})
+        self.add_journal(old_pin=PIN, new_pin=4, status="pending")
+        self.abort_the_pending_row()
+        rows = self.plan()["deletion"]["items"]
+        deregistered = [row["image_id"] for row in rows if row["action"] == "deregister"]
+        self.assertEqual(deregistered, [ami(0xC1)])
+        self.assertNotIn(ami(0xB1), [row["image_id"] for row in rows])
+        self.assertIn(ami(0xB1), self.world.images)
+
+    def test_a_later_failed_promotion_does_not_expose_the_image_of_an_earlier_aborted_one(self):
+        # A promotion from 3 to 4 renamed the file and stopped; a pass reading the old file resolved it aborted. A
+        # later promotion from 3 to 5 through the same stale file committed its row, failed, and was resolved aborted
+        # too. The file on disk still pins 4, and only the older aborted row names it.
+        self.three_usable_images(0xB1)
+        self.world.set_version(WORKER, 4, {"ImageId": ami(0xB1)})
+        self.world.set_version(WORKER, 5, {"ImageId": ami(0xD1)})
+        self.add_journal(old_pin=PIN, new_pin=4, status="pending")
+        self.abort_the_pending_row()
+        self.add_journal(old_pin=PIN, new_pin=5, status="pending")
+        self.abort_the_pending_row()
+        rows = self.plan()["deletion"]["items"]
+        self.assertEqual([row["image_id"] for row in rows if row["action"] == "deregister"], [ami(0xC1)])
+        self.assertNotIn(ami(0xB1), [row["image_id"] for row in rows])
+
+    def test_a_row_that_completes_settles_the_aborted_rows_before_it(self):
+        # After a completed row the file pins what that row wrote, so older aborted rows protect nothing more.
+        self.three_usable_images(0xB1)
+        self.world.set_version(WORKER, 4, {"ImageId": ami(0xB1)})
+        self.add_journal(old_pin=PIN, new_pin=4, status="pending")
+        self.abort_the_pending_row()
+        # A later promotion from version 2 to the pinned version 3 completed. Version 2 names a protected candidate.
+        self.world.set_version(WORKER, PREVIOUS, {"ImageId": ami(0xD1)})
+        self.add_journal(old_pin=PREVIOUS, new_pin=PIN)
+        rows = self.plan()["deletion"]["items"]
+        self.assertEqual([row["image_id"] for row in rows if row["action"] == "deregister"], [ami(0xB1)])
+
+    def test_without_a_row_the_plan_lists_the_oldest_image_for_deletion(self):
+        # The control: nothing but the aborted row separates this plan from the one above.
+        self.three_usable_images(0xB1)
+        rows = self.plan()["deletion"]["items"]
+        self.assertEqual([row["image_id"] for row in rows if row["action"] == "deregister"], [ami(0xB1)])
+
+    def test_both_pins_of_an_aborted_row_are_protected_and_the_previous_pin_stays_that_of_the_completed_row(self):
+        self.pin_current()
+        for number in (0xD1, 0xD2, 0xD3, 0xD4):
+            self.stale_failed_build(f"failed-{number:x}", number)
+        self.world.set_version(WORKER, PREVIOUS, {"ImageId": ami(0xD1)})
+        self.world.set_version(WORKER, 4, {"ImageId": ami(0xD2)})
+        self.world.set_version(WORKER, 5, {"ImageId": ami(0xD3)})
+        # A completed promotion from version 2 to version 3 (the file pins 3), then an aborted one from 4 to 5.
+        self.add_journal(old_pin=PREVIOUS, new_pin=PIN)
+        self.add_journal(old_pin=4, new_pin=5, status="pending")
+        self.abort_the_pending_row()
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["failed_images"]["deregistered"], 1)
+        # Versions 2 (the previous pin of the completed row), 4 and 5 (the pins of the newest row) keep their images.
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xD1), ami(0xD2), ami(0xD3)})
 
 
 POLICY = Path(__file__).resolve().parents[1] / "deploy" / "iam" / "image-build-policy.json"

@@ -41,6 +41,7 @@ ids and stable codes, never a tag value other than those or a provider message.
 """
 
 import copy
+import os
 from dataclasses import InitVar, dataclass, field
 
 from .aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
@@ -130,7 +131,18 @@ def _is_resolved(protected):
     return isinstance(protected, ProtectedSet) and protected._resolved is _PROVENANCE and bool(protected.image_ids)
 
 
-def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate, active, deadline=None):
+def protected_set(
+    aws,
+    config_path,
+    *,
+    previous_pin,
+    pending_journal,
+    candidate,
+    active,
+    promoted_pin=None,
+    latest_pins=(),
+    deadline=None,
+):
     """Resolve the images that no deletion path may remove, or refuse.
 
     The set holds, with a launch-template version read from the worker template
@@ -140,6 +152,19 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
       pin;
     - the image of ``previous_pin`` (an int, or ``None`` when no promotion has
       happened);
+    - the image of ``promoted_pin`` (an int, or ``None`` when none has happened):
+      the new pin of the newest completed journal row, the pin that row wrote to
+      the file. The file names it too, unless the pass reads a stale file (a
+      container whose bind mount of the file keeps the old inode after
+      ``promote --write`` replaces it): then only the journal names the image
+      that was just promoted, and retention could remove it;
+    - the images of the ``latest_pins`` (a tuple of pins, empty when no row
+      follows the newest complete one): both pins of every journal row newer
+      than the newest ``complete`` row, whatever its status. A pass that reads
+      the stale file resolves a write that never completed its row as
+      ``aborted``, so the row is neither pending nor complete, yet the file on
+      disk can already pin its new version, and a later failed write does not
+      say which pin is live;
     - the images of ``old_pin`` and ``new_pin`` of every row of
       ``pending_journal``;
     - the image of ``candidate`` and of ``active``, the current candidate and the
@@ -159,8 +184,9 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
     never reads the file's bytes and never decides which of a row's two pins is
     live. Pass every row in status ``pending``: a diverged row stays pending.
 
-    It refuses with ``IMAGE_DELETION_UNSAFE`` when the configuration cannot be
-    loaded, when a pin is not a version number, when the read does not return
+    It refuses with ``IMAGE_DELETION_UNSAFE`` when the deployment file is a
+    view of a file that a rename replaced (no name links its inode), when the
+    configuration cannot be loaded, when a pin is not a version number, when the read does not return
     exactly the pinned versions, when a version cannot be read, or when a version
     names no literal image (an alias that resolves later says which image is in
     use only at launch). Then no path may delete anything: ``plan_deletions``
@@ -169,6 +195,14 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
     detail names a version number at most, never a provider message.
     """
     try:
+        stale = os.stat(config_path).st_nlink == 0
+    except OSError:
+        stale = False  # the load below refuses a file that cannot be read
+    if stale:
+        # A bind mount of the file itself that a rename elsewhere replaced: its pins and the journal rows that a
+        # pass resolved from it are old, so no set built from them says which image is live.
+        raise _unsafe("the deployment file is a view of a file that was replaced")
+    try:
         config = load(config_path)
     except ConfigRefusal:
         raise _unsafe("the deployment configuration could not be loaded") from None
@@ -176,6 +210,9 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
     pins.extend(zone.launch_template_version for zone in config.aws.zones)
     if previous_pin is not None:
         pins.append(previous_pin)
+    if promoted_pin is not None:
+        pins.append(promoted_pin)
+    pins.extend(latest_pins)
     for row in pending_journal:
         pins.extend((row.old_pin, row.new_pin))
     # Check each pin before the set below merges equal values: 3.0 and True would

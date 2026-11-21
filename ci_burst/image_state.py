@@ -666,6 +666,15 @@ class ImageState:
         )
         return Journal(**dict(row)) if row else None
 
+    def journal_last(self):
+        """The newest row of any status and kind, or ``None``.
+
+        A row that was resolved ``aborted`` still names the two pins that its write was about to change, and the
+        deployment file can still carry the new one: the deletion rule protects both.
+        """
+        row = self._require().execute("SELECT * FROM promotion_journal ORDER BY id DESC LIMIT 1").fetchone()
+        return Journal(**dict(row)) if row else None
+
     # -- observed pins ----------------------------------------------------
     def pin_last(self):
         """The newest pin observation, or ``None`` before the first."""

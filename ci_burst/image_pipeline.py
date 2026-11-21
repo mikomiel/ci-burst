@@ -56,10 +56,14 @@ and again before the launch, when either can have changed. The pass answers
 time while it stages the archive does not fail the build either: the row stays
 ``building`` with no builder, and the next pass stages the archive again under
 the same key and launches. The build deadline still ends such a build. That pass
-runs the template check of a start again first: an unsafe template ends the row
-``failed`` and the pass answers ``refused``, like a refused start check. The
-launch reads the clock again right before the provider call: at or after the
-build deadline no builder is launched, and the build fails ``CONSOLE_BLIND``.
+checks first that the inputs still give the digest of the row: the basis files at
+the row's own commit, the warm settings and the script. Changed inputs end the
+row ``failed`` with ``IMAGE_INPUTS_CHANGED``, count no failure and launch nothing,
+and the next pass decides from the new inputs. It then runs the template check of
+a start again: an unsafe template ends the row ``failed`` and the pass answers
+``refused``, like a refused start check. The launch reads the clock again right
+before the provider call: at or after the build deadline no builder is launched,
+and the build fails ``CONSOLE_BLIND``.
 
 Secrets. The presigned archive URL and the rendered user data live in local
 variables of ``_Pass._launch`` and nowhere else: not in the state file, not in an
@@ -92,7 +96,7 @@ from pathlib import Path
 
 from . import image, image_console, image_deletion
 from .aws import BASIS_DIGEST_TAG, BUILD_ID_TAG, BUILDER_STATES, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
-from .errors import DeadlineRefusal, ImageRefusal, ProviderRefusal, Refusal
+from .errors import DeadlineRefusal, ImageRefusal, ObservationRefusal, ProviderRefusal, Refusal
 from .export import _label, _write_atomic
 from .forgejo import require_protected
 from .image_state import ACTIVE_STATES, BUILD_STATES, Control
@@ -133,6 +137,10 @@ IMAGE_NOT_AVAILABLE = "IMAGE_NOT_AVAILABLE"
 IMAGE_ORPHAN_RECORDED = "IMAGE_ORPHAN_RECORDED"
 IMAGE_BUILD_ALREADY_ACTIVE = "IMAGE_BUILD_ALREADY_ACTIVE"
 IMAGE_CREDENTIAL_SHORT = "IMAGE_CREDENTIAL_SHORT"
+#: A pass ended a build that it would have staged again, because the inputs no longer give the digest of its row.
+#: Nothing was launched, so it is no failure. ``_restage`` raises it as it raises ``IMAGE_BUILD_TEMPLATE_UNSAFE``, so
+#: ``START_REFUSALS``, the filter of the checks of a start, does not hold it.
+IMAGE_INPUTS_CHANGED = "IMAGE_INPUTS_CHANGED"
 
 #: The refusals that end a start without a failed build. Both are checked before anything is staged and again
 #: once the archive is up, because either can change in between. Neither counts toward the cooldown or the block.
@@ -239,6 +247,7 @@ class _Facts:
     candidate: object
     previous_pin: int | None
     promoted_pin: int | None
+    latest_pins: tuple
     pending: list
     builds: list
 
@@ -246,8 +255,9 @@ class _Facts:
 def _read_facts(state, deployment, now):
     """The state file's answers, or the answers of a new file when there is none."""
     if not state.available:
-        return _Facts(Control(0, None, False, None), None, None, 0, None, None, None, None, [], [])
+        return _Facts(Control(0, None, False, None), None, None, 0, None, None, None, None, (), [], [])
     journal = state.journal_last_complete()
+    latest = state.journal_last()
     builds = state.builds(deployment)
     return _Facts(
         control=state.control_get(),
@@ -267,6 +277,10 @@ def _read_facts(state, deployment, now):
         # The pin that the same row wrote to the file. The file names it too, unless this pass reads a stale file, and
         # then only the journal says which image was just promoted (or, after a rollback, restored).
         promoted_pin=journal.new_pin if journal is not None else None,
+        # Both pins of the newest row of any status. A write that stopped before it completed its row, and that a
+        # pass reading a stale file then resolved as aborted, is neither pending nor complete, yet the file on
+        # disk can already pin its new version.
+        latest_pins=(latest.old_pin, latest.new_pin) if latest is not None else (),
         pending=state.pending_journal(),
         builds=builds,
     )
@@ -676,9 +690,9 @@ class ImagePipeline:
     ``IMAGE_USERDATA_TOO_LARGE`` in ``plan``, ``IMAGE_STATE_LOCKED`` and every
     provider read that fails) are raised. The answers of the trigger rules, and
     the two refusals of a start (``START_REFUSALS``), are returned as the
-    decision ``refused`` with a ``reason``. So is ``IMAGE_BUILD_TEMPLATE_UNSAFE``
-    when a pass stages again a build that has a row: the row ends and counts no
-    failure. A build that ends badly is returned
+    decision ``refused`` with a ``reason``. So are ``IMAGE_BUILD_TEMPLATE_UNSAFE``
+    and ``IMAGE_INPUTS_CHANGED`` when a pass stages again a build that has a row:
+    the row ends and counts no failure. A build that ends badly is returned
     as the decision ``failed`` with the reason code of the failure. A result
     holds ids, 12-character digests, counts and codes only.
     """
@@ -719,10 +733,12 @@ class ImagePipeline:
 
     def _read_basis(self, source):
         """The sha of the protected branch head and the basis files at that sha."""
-        settings = self._image.source
-        head = require_protected(source.branch(settings.branch))
-        files = {path: source.raw_file(head.sha, path) for path in settings.basis_paths}
-        return head.sha, files
+        head = require_protected(source.branch(self._image.source.branch))
+        return head.sha, self._basis_files(source, head.sha)
+
+    def _basis_files(self, source, sha):
+        """The basis files at the commit ``sha``, by path."""
+        return {path: source.raw_file(sha, path) for path in self._image.source.basis_paths}
 
     def _digest(self, files, script):
         warm = self._image.warm
@@ -876,6 +892,7 @@ class ImagePipeline:
             self._config_path,
             previous_pin=facts.previous_pin,
             promoted_pin=facts.promoted_pin,
+            latest_pins=facts.latest_pins,
             pending_journal=facts.pending,
             candidate=facts.candidate,
             active=facts.active,
@@ -1278,14 +1295,20 @@ class _Pass:
         ``_fail`` deletes the archive the row names. The deadline is checked here on entry and again in ``_launch``,
         right before the provider call, because the upload and the reads in between take time.
 
+        The inputs are checked first: the basis files at the row's own commit, the warm settings and the script, as
+        this pass reads them, must give the digest that the row was inserted under, because that digest is what tags
+        the image. Changed inputs end the row as a refused start check does: ``failed`` with ``IMAGE_INPUTS_CHANGED``,
+        no failure counted, and the pass answers ``refused``. The next pass decides from the new inputs.
+
         The template check of a start runs again, because the template and the rules of its groups can change
-        between two passes. An unsafe template ends the row as a refused start check does: ``failed`` with the
-        refusal's code, and the pass answers ``refused``. The pass deadline inside the check leaves the row as it is
-        for the next pass.
+        between two passes. An unsafe template ends the row the same way, with its own code. The pass deadline inside
+        either check leaves the row as it is for the next pass; any other refusal of a read is raised and leaves it
+        too.
         """
         if self.clock() >= build.deadline_at:
             return self._fail(build, image_console.CONSOLE_BLIND, builder_alive=False)
         try:
+            self._check_inputs_unchanged(build)
             self.p._check_build_template(self.aws, self.deadline)
         except DeadlineRefusal:
             self.notes.append("pass_deadline_exceeded")
@@ -1298,8 +1321,29 @@ class _Pass:
             return self._end_refused(build, reason)
         return self._stage(build)
 
+    def _check_inputs_unchanged(self, build):
+        """Refuse with ``IMAGE_INPUTS_CHANGED`` unless the inputs of ``build`` still give the digest of its row.
+
+        ``_decide`` hashed the files at the branch head, the warm settings and the script into that digest. This is the
+        same digest over the files at the commit of the row, since the head can have moved, with the settings and the
+        script as this pass reads them. A path that the commit does not hold is a changed input too: the settings name
+        the paths. The forge client puts no deadline on a read, so the clock is read once the files are in: a pass
+        whose deadline passed during the reads ends no row, whatever they showed. Any other refusal of a read is
+        raised, and the row stays for the next pass.
+        """
+        try:
+            files = self.p._basis_files(self._source(), build.source_sha)
+        except ObservationRefusal as refusal:
+            if refusal.reason != "IMAGE_BASIS_PATH_MISSING":
+                raise
+            files = None
+        if self.clock() >= self.deadline:
+            raise DeadlineRefusal("the basis files")
+        if files is None or self.p._digest(files, self.script) != build.basis_digest:
+            raise ImageRefusal(IMAGE_INPUTS_CHANGED, "the inputs of the build changed since its row was written")
+
     def _end_refused(self, build, reason):
-        """End a build whose start a check refused: drop its archive and count no failure.
+        """End a build whose start or restage a check refused: drop its archive and count no failure.
 
         Nothing was launched, so the row is no failed build: the cooldown, the failure count and the block stay as
         they were. The row ends as ``failed`` with the refusal's code, because the one-active index needs it to end.
@@ -1322,8 +1366,9 @@ class _Pass:
             if close is not None:
                 close()
         # ``_launch`` renders the gate command into the user data from ``cfg``, so the row records the gate of this
-        # launch before it happens. A build that is staged again after the pass deadline ended its first stage thus
-        # records the gate of the launch that starts its builder, not the gate of its insert.
+        # launch before it happens. A stage that is done again gets here only when the inputs still give the digest of
+        # the row, the gate command among them, so this writes the value the row already has, and repairs a row that
+        # lost it.
         build = s.advance_build(
             build.id,
             archive_key=upload.key,
@@ -1600,8 +1645,9 @@ class _Pass:
         s, now = self.s, self.clock()
         # The evidence is the launched build's, never the gate that the configuration holds now: the file may have
         # changed since the launch. The builder prints its ready marker only after its gate command passed, so a
-        # build that launched with a gate passed it. A row that records nothing shows that no gate ran.
-        gate = int(bool(build.gate_configured))
+        # build that launched with a gate passed it. Only the integer 1 on the row shows that a gate ran: a row that
+        # records nothing, or any other value, shows that none did.
+        gate = 1 if type(build.gate_configured) is int and build.gate_configured == 1 else 0
         with s.transaction():
             build = s.advance_build(
                 build.id,

@@ -358,6 +358,45 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **WHEN** a build row has ended by a refusal
 - **THEN** it counts toward `max_builds_per_day` and `min_build_interval_seconds` like any other row
 
+### Requirement: A stage done again launches only under the inputs of its row
+A pass that stages a build again MUST first check that the basis files at the row's own commit, the warm settings and the script give the digest that the row was inserted under. If they do not, or the commit lacks a basis path, the pass MUST launch no builder and MUST end the row as `failed` with `IMAGE_INPUTS_CHANGED`, as for a refused start: its archive is deleted and no failure is counted. A pass whose deadline passes during those reads MUST leave the row for the next pass.
+
+#### Scenario: The gate command changes before the stage is done again
+- **WHEN** a build row is inserted with a gate command, the pass deadline ends its stage and the configuration then holds no gate command
+- **THEN** the next pass ends the row `failed` with `IMAGE_INPUTS_CHANGED` and launches no builder
+- **AND** the pass answers `refused` and counts no failure
+
+#### Scenario: The script or a warm command changes
+- **WHEN** the warm script or a warm command differs from the one that gave the row's digest when the stage is done again
+- **THEN** the row ends `failed` with `IMAGE_INPUTS_CHANGED` and no builder is launched
+
+#### Scenario: A staged archive is deleted
+- **WHEN** the row names an archive and the check finds that the inputs changed
+- **THEN** that archive is deleted and no new upload is made
+
+#### Scenario: A basis path is missing at the row's commit
+- **WHEN** the configuration names a basis path that the row's commit does not hold
+- **THEN** the row ends `failed` with `IMAGE_INPUTS_CHANGED` and no failure is counted
+
+#### Scenario: The branch head moves
+- **WHEN** the protected branch head moves after the row was inserted and the files at the row's commit still give its digest
+- **THEN** the pass stages the archive of the row's commit and launches the builder
+
+#### Scenario: A basis read fails
+- **WHEN** a read of a basis file ends with a refusal other than a missing path
+- **THEN** the pass ends with that refusal and the row stays `building` with no builder
+- **AND** no failure is counted and the next pass checks again
+
+#### Scenario: The pass deadline passes during the basis reads
+- **WHEN** the pass deadline passes while the basis files are read during a resumed stage, whether or not they show a changed input
+- **THEN** the row stays `building` with no builder and no `archive_sha256`, and it is not ended
+- **AND** no failure is counted and the next pass checks again
+
+#### Scenario: The next pass decides from the current inputs
+- **WHEN** a row has ended with `IMAGE_INPUTS_CHANGED`
+- **THEN** the next pass decides from the current inputs like after any ended row
+- **AND** the ended row counts toward `max_builds_per_day` and `min_build_interval_seconds`
+
 ### Requirement: A run can supervise a build to completion
 Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run --apply --until-done` MUST repeat bounded passes with a fixed sleep between them until the build reaches `candidate` or `failed`, or the build deadline passes. Without `--until-done`, `run --apply` MUST run one pass. Rerunning the same command MUST resume an interrupted supervisor from the state file. `--until-done` MUST be refused without `--apply`.
 
@@ -374,7 +413,7 @@ Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run
 - **THEN** the supervisor ends the build with `MARKER_TIMEOUT` or `CONSOLE_BLIND`
 
 #### Scenario: The pass deadline ends the staging
-- **WHEN** the pass deadline passes during the template precheck of a resumed stage, during the upload or before the launch call
+- **WHEN** the pass deadline passes during the inputs check or the template precheck of a resumed stage, during the upload or before the launch call
 - **THEN** the row stays `building` with no builder and no `archive_sha256`
 - **AND** the next pass stages again under the same archive key and no failure is counted
 
@@ -478,7 +517,7 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **THEN** a new build MAY start once the cooldown and the daily cap permit
 
 ### Requirement: A gate command is required
-`image.warm.gate_command` MUST be non-empty unless `allow_no_gate = true`. Otherwise the command MUST refuse with `IMAGE_GATE_REQUIRED`. The candidate record MUST show the gate setting that the builder was launched with, not the one that the configuration holds when the build ends. Documentation MUST state that the offline gate proves cache behavior and does not prove that the image is safe.
+`image.warm.gate_command` MUST be non-empty unless `allow_no_gate = true`. Otherwise the command MUST refuse with `IMAGE_GATE_REQUIRED`. The candidate record MUST show the gate setting that the builder was launched with, not the one that the configuration holds when the build ends, and only a recorded 1 MUST count as a gate that ran. Documentation MUST state that the offline gate proves cache behavior and does not prove that the image is safe.
 
 #### Scenario: No gate and no opt-out
 - **WHEN** the gate command is empty and `allow_no_gate` is false
@@ -496,6 +535,11 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 #### Scenario: A gate is dropped while a build runs
 - **WHEN** a build is launched with a gate command and the configuration holds no gate command when the build ends
 - **THEN** the candidate record states that the gate ran and passed
+
+#### Scenario: The recorded gate setting is not 1
+- **WHEN** a build is launched without a gate command, its row then records a gate setting other than the integer 1, for example 2, and the build ends
+- **THEN** the candidate record states that no gate ran
+- **AND** `promote --write` refuses with `PROMOTE_GATE_NOT_PASSED` while `allow_no_gate` is false
 
 ### Requirement: The image is created in the pass that sees the marker
 The pass that first sees the marker MUST call `CreateImage` before any step that is not a read, with no reboot, and MUST tag the image and its snapshots with `ci-burst:image-build`, the deployment, the build id, the basis digest, the source sha, the script sha and, when read, the base image. The pass MUST NOT leave the builder running after the image is `available` or after the snapshot window or lifetime timer ends it. Waiting for the image and every later step MAY continue in a later pass.
@@ -819,7 +863,7 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **THEN** the command refuses and does not write
 
 ### Requirement: Every image deletion resolves the protected set
-Every path that deregisters an image or deletes a snapshot (retention, failed-build cleanup, orphan cleanup and the pending-image timeout) MUST first resolve the protected set: the images of every launch-template version that the TOML references, including per-zone pins, the previous and new pins of the newest completed journal row, the pins of a pending journal row, the current candidate unless its row records `TEMPLATE_DRIFT`, and an active build. It MUST NOT deregister a protected image.
+Every path that deregisters an image or deletes a snapshot (retention and every cleanup path) MUST first resolve the protected set: the images of every launch-template version that the TOML references, including per-zone pins; both pins of the newest completed journal row and of the newest journal row of any status; the pins of a pending row; the current candidate unless its row records `TEMPLATE_DRIFT`; and an active build. It MUST NOT deregister a protected image.
 
 #### Scenario: A protected image
 - **WHEN** an image is the pin's, the previous pin's, a journal pin's, or the candidate's while its row does not record `TEMPLATE_DRIFT`
@@ -849,6 +893,14 @@ Every path that deregisters an image or deletes a snapshot (retention, failed-bu
 #### Scenario: A stale file after a rollback
 - **WHEN** a rollback from version B to version A is complete, the file that a pass reads still pins version B, and the image of version A is old enough for retention
 - **THEN** no deletion path removes the image of version A
+
+#### Scenario: A promotion that a pass resolved as aborted
+- **WHEN** a promotion to version B replaced the file and stopped before its row completed, a pass that read the old file resolved the row `aborted`, and the image of version B is old enough for retention
+- **THEN** no deletion path (retention, failed-build cleanup, orphan cleanup or the pending-image timeout) removes the image of either pin of that row
+
+#### Scenario: A pin of the newest row cannot be read
+- **WHEN** a pin of the newest journal row is not a version number, or its version cannot be read or names no literal image
+- **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE` and no path deletes anything
 
 ### Requirement: Every image deletion is verified and fails closed
 Every deletion path MUST verify the ownership tags (image-build, deployment and build id) before it deletes, MUST delete nothing when the TOML or a launch-template version cannot be read, and MUST delete a snapshot only after a confirmed deregistration of its image. A deletion path MUST only report what it would remove unless `--apply` is given.

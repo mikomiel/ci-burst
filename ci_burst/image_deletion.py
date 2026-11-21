@@ -131,7 +131,16 @@ def _is_resolved(protected):
 
 
 def protected_set(
-    aws, config_path, *, previous_pin, pending_journal, candidate, active, promoted_pin=None, deadline=None
+    aws,
+    config_path,
+    *,
+    previous_pin,
+    pending_journal,
+    candidate,
+    active,
+    promoted_pin=None,
+    latest_pins=(),
+    deadline=None,
 ):
     """Resolve the images that no deletion path may remove, or refuse.
 
@@ -148,6 +157,12 @@ def protected_set(
       container whose bind mount of the file keeps the old inode after
       ``promote --write`` replaces it): then only the journal names the image
       that was just promoted, and retention could remove it;
+    - the images of the ``latest_pins`` (an ``(old_pin, new_pin)`` tuple, or
+      empty when the journal has no row): both pins of the newest journal row,
+      whatever its status. A pass that reads the stale file resolves a write
+      that never completed its row as ``aborted``, so the row is neither
+      pending nor complete, yet the file on disk can already pin its new
+      version;
     - the images of ``old_pin`` and ``new_pin`` of every row of
       ``pending_journal``;
     - the image of ``candidate`` and of ``active``, the current candidate and the
@@ -186,6 +201,7 @@ def protected_set(
         pins.append(previous_pin)
     if promoted_pin is not None:
         pins.append(promoted_pin)
+    pins.extend(latest_pins)
     for row in pending_journal:
         pins.extend((row.old_pin, row.new_pin))
     # Check each pin before the set below merges equal values: 3.0 and True would

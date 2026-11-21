@@ -1,8 +1,9 @@
 """The read helpers that the image pipeline adds to the image state file.
 
 A read-only open that creates nothing, the pin log, the orphan candidate, the
-verified candidate and the newest completed journal row. The schema and its
-version are unchanged by all of them, which ``SchemaVersionTests`` pins.
+verified candidate, the newest completed journal row and the newest journal row
+of any status. The schema and its version are unchanged by all of them, which
+``SchemaVersionTests`` pins.
 """
 
 import sqlite3
@@ -399,6 +400,51 @@ class JournalLastCompleteTests(ImageStateCase):
         with self.state.transaction():
             self.state.journal_abort(later.id)
         self.assertEqual(self.state.journal_last_complete().id, first.id)
+
+
+class JournalLastTests(ImageStateCase):
+    """The newest row of any status: a row that was resolved ``aborted`` still names its two pins."""
+
+    def test_there_is_none_without_a_row(self):
+        self.assertIsNone(self.state.journal_last())
+
+    def test_the_newest_row_wins_whatever_its_status(self):
+        first = self.add_journal(old_pin=3, new_pin=4, contained_pin=3)
+        with self.state.transaction():
+            self.state.journal_complete(first.id)
+        self.assertEqual(self.state.journal_last().id, first.id)
+        second = self.add_journal(old_pin=4, new_pin=5, contained_pin=4)
+        newest = self.state.journal_last()
+        self.assertEqual((newest.id, newest.status), (second.id, "pending"))
+        with self.state.transaction():
+            self.state.journal_abort(second.id)
+        newest = self.state.journal_last()
+        self.assertEqual((newest.id, newest.status, newest.old_pin, newest.new_pin), (second.id, "aborted", 4, 5))
+
+    def test_a_rollback_row_counts_like_a_promotion(self):
+        self.add_journal(old_pin=3, new_pin=4, contained_pin=3)
+        rollback = self.add_journal(kind="rollback", old_pin=4, new_pin=3, contained_pin=3, candidate_id=None)
+        newest = self.state.journal_last()
+        self.assertEqual((newest.id, newest.kind), (rollback.id, "rollback"))
+
+    def test_the_newest_complete_row_stays_the_one_that_journal_last_complete_names(self):
+        first = self.add_journal()
+        with self.state.transaction():
+            self.state.journal_complete(first.id)
+        later = self.add_journal(old_pin=4, new_pin=5)
+        with self.state.transaction():
+            self.state.journal_abort(later.id)
+        self.assertEqual(self.state.journal_last().id, later.id)
+        self.assertEqual(self.state.journal_last_complete().id, first.id)
+
+    def test_it_reads_through_a_read_only_open(self):
+        # ``image status`` and a ``promote`` without ``--write`` open the file this way.
+        row = self.add_journal()
+        self.state.close()
+        reader = ImageState(self.directory, clock=self.clock)
+        self.addCleanup(reader.close)
+        self.assertTrue(reader.connect_readonly())
+        self.assertEqual(reader.journal_last().id, row.id)
 
 
 if __name__ == "__main__":

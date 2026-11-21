@@ -920,6 +920,134 @@ class PromotedPinTests(DeletionCase):
         self.assertEqual(self.mutations(), [])
 
 
+class LatestPinsTests(DeletionCase):
+    """Both pins of the newest journal row of any status protect their images.
+
+    A promotion can replace the deployment file and stop before it completes its row. A pass that reads the old file
+    resolves that row as aborted, so no pending row and no completed row names the pin that the new file holds. These
+    tests use ``JOURNAL_OLD`` and ``JOURNAL_NEW`` as the two pins of that row, and the file of the account (``PIN``)
+    as the file that the pass reads.
+    """
+
+    LATEST = (JOURNAL_OLD, JOURNAL_NEW)
+
+    def refused(self, **resolve):
+        with self.assertRaises(ImageRefusal) as raised:
+            self.resolve(**resolve)
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        return raised.exception
+
+    def usable_images_with_the_new_pin_oldest(self):
+        """Four usable images against a retention of three, and the new pin's image is the oldest."""
+        self.made(11, "candidate", age=9 * DAY, image_id=JOURNAL_NEW_IMAGE)
+        for number, age in ((12, 8), (13, 7), (14, 6)):
+            self.made(number, "candidate", age=age * DAY)
+
+    def test_both_pins_of_the_latest_row_protect_their_images(self):
+        protected = self.resolve(latest_pins=self.LATEST)
+        self.assertEqual(protected.image_ids, {PIN_IMAGE, JOURNAL_OLD_IMAGE, JOURNAL_NEW_IMAGE})
+        self.assertIn(JOURNAL_OLD_IMAGE, protected)
+        self.assertIn(JOURNAL_NEW_IMAGE, protected)
+
+    def test_without_the_latest_pins_the_same_set_names_neither_image(self):
+        # The control: nothing but the pins separates this set from the one above.
+        protected = self.resolve()
+        self.assertNotIn(JOURNAL_OLD_IMAGE, protected)
+        self.assertNotIn(JOURNAL_NEW_IMAGE, protected)
+
+    def test_no_latest_pins_is_the_same_as_before(self):
+        # An empty tuple is the state before any promotion, and it is the default of the argument.
+        self.assertEqual(self.resolve(previous_pin=PREVIOUS, latest_pins=()).image_ids, {PIN_IMAGE, PREVIOUS_IMAGE})
+        self.assertEqual(self.resolve(previous_pin=PREVIOUS).image_ids, {PIN_IMAGE, PREVIOUS_IMAGE})
+
+    def test_the_latest_pins_are_read_with_the_other_versions_in_one_call(self):
+        self.resolve(previous_pin=PREVIOUS, latest_pins=self.LATEST)
+        (read,) = self.requests("describe_launch_template_versions")
+        self.assertEqual(read["LaunchTemplateName"], WORKER)
+        self.assertEqual(read["Versions"], [str(PREVIOUS), str(PIN), str(JOURNAL_OLD), str(JOURNAL_NEW)])
+        self.assertEqual(self.names(), ["describe_launch_template_versions"])
+
+    def test_every_path_leaves_the_images_of_the_latest_pins_alone(self):
+        self.add_image(JOURNAL_OLD_IMAGE, "build-lost", age=30 * DAY)
+        self.add_image(JOURNAL_NEW_IMAGE, "build-lost", age=30 * DAY)
+        plan = self.plan("all", latest_pins=self.LATEST)
+        self.assertEqual(
+            self.summary(plan),
+            [
+                ("orphan", "skip", JOURNAL_OLD_IMAGE, "protected"),
+                ("orphan", "skip", JOURNAL_NEW_IMAGE, "protected"),
+            ],
+        )
+        report = apply_deletions(self.aws, plan, apply=True)
+        self.assertEqual(self.results(report), [("skip", "skipped"), ("skip", "skipped")])
+        self.assertEqual(self.mutations(), [])
+        self.assertLessEqual({JOURNAL_OLD_IMAGE, JOURNAL_NEW_IMAGE}, self.stored_images())
+
+    def test_without_the_latest_pins_the_same_images_are_planned(self):
+        self.add_image(JOURNAL_OLD_IMAGE, "build-lost", age=30 * DAY)
+        self.add_image(JOURNAL_NEW_IMAGE, "build-lost", age=30 * DAY)
+        plan = self.plan("all")
+        self.assertEqual(
+            self.summary(plan),
+            [
+                ("orphan", "deregister", JOURNAL_OLD_IMAGE, None),
+                ("orphan", "deregister", JOURNAL_NEW_IMAGE, None),
+            ],
+        )
+
+    def test_retention_takes_the_next_oldest_image_and_not_the_new_pin_of_the_latest_row(self):
+        self.usable_images_with_the_new_pin_oldest()
+        plan = self.plan("retention", latest_pins=self.LATEST)
+        self.assertEqual([item["image_id"] for item in plan], [ami(12)])
+        self.run_paths("retention", latest_pins=self.LATEST)
+        self.assertEqual(self.requests("deregister_image"), [{"ImageId": ami(12)}])
+        self.assertIn(JOURNAL_NEW_IMAGE, self.stored_images())
+
+    def test_without_the_latest_pins_retention_takes_the_new_pin_image_first(self):
+        # The control that shows the hazard: only the latest pins separate the two plans.
+        self.usable_images_with_the_new_pin_oldest()
+        plan = self.plan("retention")
+        self.assertEqual([item["image_id"] for item in plan], [JOURNAL_NEW_IMAGE])
+
+    def test_a_pin_that_is_not_a_version_number_is_unsafe_before_any_call(self):
+        for name, value in (
+            ("zero", 0),
+            ("negative", -1),
+            ("true", True),
+            ("false", False),
+            ("text", "3"),
+            ("float", 3.0),
+        ):
+            for position, pins in (("old", (value, JOURNAL_NEW)), ("new", (JOURNAL_OLD, value))):
+                with self.subTest(name, position=position):
+                    self.reset()
+                    self.refused(latest_pins=pins)
+                    self.assertEqual(self.calls, [])
+
+    def test_a_latest_version_that_the_provider_does_not_return_is_unsafe(self):
+        for version in self.LATEST:
+            with self.subTest(version=version):
+                self.reset()
+                del self.ec2.versions_store[(WORKER, version)]
+                self.refused(latest_pins=self.LATEST)
+
+    def test_a_latest_version_that_names_no_literal_image_is_unsafe(self):
+        self.ec2.versions_store[(WORKER, JOURNAL_NEW)]["LaunchTemplateData"] = {"ImageId": "resolve:ssm:/example/alias"}
+        refusal = self.refused(latest_pins=self.LATEST)
+        self.assertIn(str(JOURNAL_NEW), refusal.detail)
+        self.assertNotIn("alias", refusal.detail)
+
+    def test_a_latest_version_that_cannot_be_read_stops_every_path_and_deletes_nothing(self):
+        self.usable_images_with_the_new_pin_oldest()
+        del self.ec2.versions_store[(WORKER, JOURNAL_NEW)]
+        for mode in (*image_deletion.PATHS, "all"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ImageRefusal) as raised:
+                    self.run_paths(mode, latest_pins=self.LATEST)
+                self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertEqual(self.mutations(), [])
+
+
 class ActiveBuildTests(DeletionCase):
     def test_no_path_takes_the_image_of_an_active_build(self):
         for state, image_state in (("building", "available"), ("imaging", "available"), ("imaging", "pending")):

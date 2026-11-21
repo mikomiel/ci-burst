@@ -220,6 +220,16 @@ class PromoteCase(CliCase):
         finally:
             connection.close()
 
+    def corrupt_build(self, build_id, **fields):
+        """A change of a build row that only damage or a hand edit of the state file could make."""
+        connection = sqlite3.connect(self.state_dir / "image-state.sqlite")
+        try:
+            assignments = ", ".join(f"{column} = ?" for column in fields)
+            connection.execute(f"UPDATE image_builds SET {assignments} WHERE id = ?", (*fields.values(), build_id))
+            connection.commit()
+        finally:
+            connection.close()
+
     def protected(self):
         """The images that no deletion path may take, with the rows that are pending now."""
         pending = self.query(lambda state: state.pending_journal())
@@ -676,6 +686,46 @@ class LaunchedGateTests(PromoteCase):
         self.assertEqual((build.gate_configured, build.gate_passed), (1, 1))
         payload = self.promoted()
         self.assertEqual(payload["evidence"]["gate"], {"configured": True, "passed": True})
+        self.assertEqual(self.pin_in_file(), build.template_version)
+
+    def build_with_a_damaged_gate_record(self, value):
+        """A build launched without a gate, whose row was damaged to ``value`` before the pass that ends it.
+
+        The file gains a gate command before that pass, so the file is no witness either: a gate that is required
+        but was not run is the case that the write must refuse.
+        """
+        self.configure(self.image_toml(gate=NO_GATE))
+        self.world.console_plan = [(300.0, READY)]
+        _, launched = self.start_build()
+        self.assertEqual(launched.gate_configured, 0)
+        self.corrupt_build(launched.id, gate_configured=value)
+        self.configure(self.image_toml(gate=GATE))
+        self.clock.advance(30)
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        return self.only_build()
+
+    def test_a_record_with_a_gate_value_other_than_one_is_refused_as_a_build_without_a_gate(self):
+        # Only an exact recorded 1 shows that a gate ran. A damaged value of 2 would read as "true" under a cast.
+        build = self.build_with_a_damaged_gate_record(2)
+        self.assertEqual((build.gate_configured, build.gate_passed), (0, 0))
+        error = self.refusal((), "PROMOTE_GATE_NOT_PASSED")
+        self.assertEqual(error["detail"], "the record shows gate configured 0 and passed 0")
+        self.assertEqual(self.pin_in_file(), PIN)
+        self.assertEqual(self.backups(), [])
+
+    def test_a_record_that_shows_the_gate_with_an_exact_one_is_still_promoted(self):
+        # The control for the test above: the same flow, with the row left as the launch wrote it, under a file that
+        # holds a gate command, promotes.
+        self.configure(self.image_toml(gate=GATE))
+        self.world.console_plan = [(300.0, READY)]
+        _, launched = self.start_build()
+        self.assertEqual(launched.gate_configured, 1)
+        self.clock.advance(30)
+        self.assertEqual(self.apply()["decision"], "candidate")
+        build = self.only_build()
+        self.assertEqual((build.gate_configured, build.gate_passed), (1, 1))
+        self.promoted()
         self.assertEqual(self.pin_in_file(), build.template_version)
 
 

@@ -548,6 +548,46 @@ class RunApplyJournalTests(CliCase):
         code, payload = self.invoke("image", "run", "--apply")
         self.assertEqual((code, payload["journal_resolved"]), (0, []))
 
+    # -- the image of a promotion that this run resolves as aborted -------------------
+    # A promotion to version 5 replaced the deployment file and stopped before it completed its row. A container
+    # whose bind mount keeps the old inode runs this command: it reads the old file, so the row is resolved as
+    # aborted. After that, no pending row and no completed row names version 5, and the file this run reads does not.
+
+    def three_usable_images_with_version_5_the_oldest(self):
+        """Three usable images against ``retain = 2``: retention takes the oldest unless something protects it.
+
+        The oldest is the image of version 5. The newest of the other two is protected as the current candidate.
+        """
+        self.configure(self.image_toml(image_extra="retain = 2\nretain_min_age_seconds = 3600\n"))
+        self.pin_current()
+        self.add_world_candidate("build-b", 5, 0xB1, age=9 * DAY)
+        self.add_world_candidate("build-c", 6, 0xC1, age=3 * DAY)
+        self.add_world_candidate("build-d", 7, 0xD1, age=2 * DAY)
+
+    def test_the_image_of_a_promotion_that_this_run_resolves_as_aborted_survives_retention_in_the_same_pass(self):
+        self.three_usable_images_with_version_5_the_oldest()
+        row = self.pending(old_sha=self.file_sha(), candidate_id="build-b")
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            payload["journal_resolved"], [{"journal_id": row.id, "kind": "promotion", "resolution": "aborted"}]
+        )
+        self.assertEqual(self.journal_rows()[0]["status"], "aborted")
+        self.assertEqual(self.pin_in_file(), PIN)
+        self.assertEqual(payload["retention"]["deregistered"], 1)
+        # The oldest image that nothing protects goes instead of version 5's.
+        self.assertEqual(self.world.arguments("deregister_image"), [{"ImageId": ami(0xC1)}])
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xB1), ami(0xD1)})
+
+    def test_without_the_row_the_same_run_takes_the_oldest_image(self):
+        # The control: nothing but the journal row separates this run from the one above.
+        self.three_usable_images_with_version_5_the_oldest()
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["journal_resolved"]), (0, []))
+        self.assertEqual(payload["retention"]["deregistered"], 1)
+        self.assertEqual(self.world.arguments("deregister_image"), [{"ImageId": ami(0xB1)}])
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xC1), ami(0xD1)})
+
 
 # -- 6.1: status ---------------------------------------------------------------------
 

@@ -56,10 +56,26 @@ and again before the launch, when either can have changed. The pass answers
 time while it stages the archive does not fail the build either: the row stays
 ``building`` with no builder, and the next pass stages the archive again under
 the same key and launches. The build deadline still ends such a build. That pass
-runs the template check of a start again first: an unsafe template ends the row
-``failed`` and the pass answers ``refused``, like a refused start check. The
-launch reads the clock again right before the provider call: at or after the
-build deadline no builder is launched, and the build fails ``CONSOLE_BLIND``.
+checks first that the inputs still give the digest of the row: the basis files at
+the row's own commit, the warm settings and the script. Changed inputs end the
+row ``failed`` with ``IMAGE_INPUTS_CHANGED``, count no failure and launch nothing,
+and the next pass decides from the new inputs. It then runs the template check of
+a start again: an unsafe template ends the row ``failed`` and the pass answers
+``refused``, like a refused start check. The launch reads the clock again right
+before the provider call: at or after the build deadline no builder is launched,
+and the build fails ``CONSOLE_BLIND``.
+
+The gate requirement (``IMAGE_GATE_REQUIRED``: neither a gate command nor the
+opt-out ``allow_no_gate``) guards a launch, not a build that has a row. ``plan``
+and an applying pass are refused before any client is built, except an applying
+pass whose state file holds a build in flight: it settles that build, and refuses
+every launch it would make, a new build or a stage that is done again, with the
+same code and no failure counted.
+
+The pass deadline bounds the reads of the forge too. The forge client puts no
+deadline on a read of a basis file, so the clock is read before each request:
+none starts at or after the deadline, in ``plan``, in a decision and in the check
+of a stage that is done again.
 
 Secrets. The presigned archive URL and the rendered user data live in local
 variables of ``_Pass._launch`` and nowhere else: not in the state file, not in an
@@ -133,9 +149,15 @@ IMAGE_NOT_AVAILABLE = "IMAGE_NOT_AVAILABLE"
 IMAGE_ORPHAN_RECORDED = "IMAGE_ORPHAN_RECORDED"
 IMAGE_BUILD_ALREADY_ACTIVE = "IMAGE_BUILD_ALREADY_ACTIVE"
 IMAGE_CREDENTIAL_SHORT = "IMAGE_CREDENTIAL_SHORT"
+#: A pass ended a build that it would have staged again, because the inputs no longer give the digest of its row.
+#: Nothing was launched, so it is no failure. ``_restage`` raises it as it raises ``IMAGE_BUILD_TEMPLATE_UNSAFE``, so
+#: ``START_REFUSALS``, the filter of the checks of a start, does not hold it.
+IMAGE_INPUTS_CHANGED = "IMAGE_INPUTS_CHANGED"
 
 #: The refusals that end a start without a failed build. Both are checked before anything is staged and again
 #: once the archive is up, because either can change in between. Neither counts toward the cooldown or the block.
+#: ``IMAGE_GATE_REQUIRED`` refuses a launch too, and counts no failure either, but a pass never changes its own
+#: configuration: ``_start_refusal`` returns it once, first, and this filter does not hold it.
 START_REFUSALS = (IMAGE_CREDENTIAL_SHORT, IMAGE_BUILD_ALREADY_ACTIVE)
 
 #: Tag keys that ``CreateImage`` adds to the ones the adapter sets. The build
@@ -238,6 +260,8 @@ class _Facts:
     active: object
     candidate: object
     previous_pin: int | None
+    promoted_pin: int | None
+    latest_pins: tuple
     pending: list
     builds: list
 
@@ -245,8 +269,9 @@ class _Facts:
 def _read_facts(state, deployment, now):
     """The state file's answers, or the answers of a new file when there is none."""
     if not state.available:
-        return _Facts(Control(0, None, False, None), None, None, 0, None, None, None, [], [])
+        return _Facts(Control(0, None, False, None), None, None, 0, None, None, None, None, (), [], [])
     journal = state.journal_last_complete()
+    unsettled = state.journal_since_complete()
     builds = state.builds(deployment)
     return _Facts(
         control=state.control_get(),
@@ -263,6 +288,13 @@ def _read_facts(state, deployment, now):
         # orphan image is recorded as a candidate that nobody verified.
         candidate=state.verified_candidate(deployment),
         previous_pin=journal.old_pin if journal is not None else None,
+        # The pin that the same row wrote to the file. The file names it too, unless this pass reads a stale file, and
+        # then only the journal says which image was just promoted (or, after a rollback, restored).
+        promoted_pin=journal.new_pin if journal is not None else None,
+        # Both pins of every row newer than the newest complete one. A write that stopped before it completed its
+        # row, and that a pass reading a stale file then resolved as aborted, is neither pending nor complete, yet
+        # the file on disk can already pin its new version, and a later write that failed does not settle which.
+        latest_pins=tuple(pin for row in unsettled for pin in (row.old_pin, row.new_pin)),
         pending=state.pending_journal(),
         builds=builds,
     )
@@ -670,11 +702,14 @@ class ImagePipeline:
     ``IMAGE_SOURCE_FORBIDDEN``, ``IMAGE_BRANCH_UNPROTECTED``,
     ``IMAGE_BASIS_PATH_MISSING``, ``IMAGE_BUILD_TEMPLATE_UNSAFE``,
     ``IMAGE_USERDATA_TOO_LARGE`` in ``plan``, ``IMAGE_STATE_LOCKED`` and every
-    provider read that fails) are raised. The answers of the trigger rules, and
+    provider read that fails) are raised. ``IMAGE_GATE_REQUIRED`` is raised by
+    ``plan`` and by an applying pass whose state holds no build in flight: a pass
+    that settles one is not refused for it, and answers ``refused`` with that code
+    only when a launch is asked of it. The answers of the trigger rules, and
     the two refusals of a start (``START_REFUSALS``), are returned as the
-    decision ``refused`` with a ``reason``. So is ``IMAGE_BUILD_TEMPLATE_UNSAFE``
-    when a pass stages again a build that has a row: the row ends and counts no
-    failure. A build that ends badly is returned
+    decision ``refused`` with a ``reason``. So are ``IMAGE_BUILD_TEMPLATE_UNSAFE``
+    and ``IMAGE_INPUTS_CHANGED`` when a pass stages again a build that has a row:
+    the row ends and counts no failure. A build that ends badly is returned
     as the decision ``failed`` with the reason code of the failure. A result
     holds ids, 12-character digests, counts and codes only.
     """
@@ -702,10 +737,32 @@ class ImagePipeline:
         self._script = script
 
     # -- shared inputs ---------------------------------------------------------
-    def _inputs(self):
-        """The checks that need no network, then the warm script's bytes."""
+    def _gate_missing(self):
+        """True when a launch would have neither a gate command nor the opt-out."""
         warm = self._image.warm
-        if not warm.gate_command and not warm.allow_no_gate:
+        return not warm.gate_command and not warm.allow_no_gate
+
+    def _build_in_flight(self):
+        """Whether the state file holds a build of this deployment that is not over. It reads and creates nothing.
+
+        A state that the caller opened (the command line opens it for writing and holds the writer lock) is read as
+        it is and left open. A closed one is opened for reading only, for this one read. An absent file holds no build.
+        """
+        opened = not self._state.available
+        present = self._state.connect_readonly() if opened else True
+        try:
+            return present and self._state.active_build(self._config.deployment) is not None
+        finally:
+            if opened:
+                self._state.close()
+
+    def _inputs(self, *, apply=False):
+        """The checks that need no network, then the warm script's bytes.
+
+        The gate requirement guards a new launch. A missing gate refuses every entry point except an applying pass
+        that finds a build in flight: that pass settles the build and launches nothing new (``_Pass._start_refusal``).
+        """
+        if self._gate_missing() and not (apply and self._build_in_flight()):
             raise ImageRefusal(
                 IMAGE_GATE_REQUIRED, "image.warm.gate_command is empty and image.warm.allow_no_gate is false"
             )
@@ -713,12 +770,23 @@ class ImagePipeline:
             self._script = image.shipped_script()
         return self._script
 
-    def _read_basis(self, source):
+    def _read_basis(self, source, deadline=None):
         """The sha of the protected branch head and the basis files at that sha."""
-        settings = self._image.source
-        head = require_protected(source.branch(settings.branch))
-        files = {path: source.raw_file(head.sha, path) for path in settings.basis_paths}
-        return head.sha, files
+        head = require_protected(source.branch(self._image.source.branch))
+        return head.sha, self._basis_files(source, head.sha, deadline)
+
+    def _basis_files(self, source, sha, deadline=None):
+        """The basis files at the commit ``sha``, by path.
+
+        The forge client puts no deadline on a read, so with a ``deadline`` the clock is read before each request:
+        none starts at or after it (``DeadlineRefusal``).
+        """
+        files = {}
+        for path in self._image.source.basis_paths:
+            if deadline is not None and self._clock() >= deadline:
+                raise DeadlineRefusal("the basis files")
+            files[path] = source.raw_file(sha, path)
+        return files
 
     def _digest(self, files, script):
         warm = self._image.warm
@@ -802,7 +870,7 @@ class ImagePipeline:
         deadline = now + PASS_DEADLINE_SECONDS
         settings = self._image.source
         source = self._source_factory()
-        sha, files = self._read_basis(source)
+        sha, files = self._read_basis(source, deadline)
         self._probe_archive(source, sha, deadline)
         digest = self._digest(files, script)
         aws = self._aws_factory()
@@ -871,6 +939,8 @@ class ImagePipeline:
             aws,
             self._config_path,
             previous_pin=facts.previous_pin,
+            promoted_pin=facts.promoted_pin,
+            latest_pins=facts.latest_pins,
             pending_journal=facts.pending,
             candidate=facts.candidate,
             active=facts.active,
@@ -903,13 +973,16 @@ class ImagePipeline:
 
         With ``apply`` the pass takes the state file's writer lock (a pass that
         is already running gives ``IMAGE_STATE_LOCKED``) and releases it at the
-        end. A state that the caller opened stays open.
+        end. A state that the caller opened stays open. Without a gate command
+        or the opt-out the pass is refused (``IMAGE_GATE_REQUIRED``) before any
+        client is built, unless the state holds a build in flight: the pass then
+        settles that build and starts no other.
         """
         if not self._image.enabled:
             return {"decision": DISABLED}
         if not apply:
             return self.plan(force=force)
-        script = self._inputs()
+        script = self._inputs(apply=True)
         opened = not self._state.available
         self._state.connect()
         try:
@@ -1193,7 +1266,7 @@ class _Pass:
     def _decide(self, pin):
         """Read the forge, apply the trigger rules and, when a build is due, start it."""
         now = self.clock()
-        sha, files = self.p._read_basis(self._source())
+        sha, files = self.p._read_basis(self._source(), self.deadline)
         digest = self.p._digest(files, self.script)
         facts = _read_facts(self.s, self.dep, now)
         # A builder that reconcile just terminated still counts as active for this
@@ -1213,6 +1286,11 @@ class _Pass:
         The result is the build, or ``None`` when a check refused the start: nothing was written then.
         """
         s, aws, cfg = self.s, self.aws, self.cfg
+        if self.p._gate_missing():
+            # Before the template check too: a pass that settled a build in flight runs without a gate, and the
+            # refusal a new build owes it is the gate requirement, not whatever the template shows.
+            self.refused = IMAGE_GATE_REQUIRED
+            return None
         self.p._check_build_template(aws, self.deadline)
         reason = self._start_refusal()
         if reason is not None:
@@ -1233,7 +1311,14 @@ class _Pass:
         return self._stage(build)
 
     def _start_refusal(self):
-        """The reason a start is refused now, or ``None``. Neither check reads the forge or spends anything."""
+        """The reason a launch is refused now, or ``None``. None of the checks reads the forge or spends anything.
+
+        The gate requirement is the first. A pass that settles a build in flight runs without a gate command or the
+        opt-out (``ImagePipeline._inputs``), and a launch needs one of them, whether the build is new or a stage that
+        is done again.
+        """
+        if self.p._gate_missing():
+            return IMAGE_GATE_REQUIRED
         try:
             self.aws.check_credential_life(self.cfg.source.presign_seconds)
             self._check_no_builder()
@@ -1273,14 +1358,29 @@ class _Pass:
         ``_fail`` deletes the archive the row names. The deadline is checked here on entry and again in ``_launch``,
         right before the provider call, because the upload and the reads in between take time.
 
+        The inputs are checked first: the basis files at the row's own commit, the warm settings and the script, as
+        this pass reads them, must give the digest that the row was inserted under, because that digest is what tags
+        the image. Changed inputs end the row as a refused start check does: ``failed`` with ``IMAGE_INPUTS_CHANGED``,
+        no failure counted, and the pass answers ``refused``. The next pass decides from the new inputs.
+
         The template check of a start runs again, because the template and the rules of its groups can change
-        between two passes. An unsafe template ends the row as a refused start check does: ``failed`` with the
-        refusal's code, and the pass answers ``refused``. The pass deadline inside the check leaves the row as it is
-        for the next pass.
+        between two passes. An unsafe template ends the row the same way, with its own code. The pass deadline inside
+        either check leaves the row as it is for the next pass; any other refusal of a read is raised and leaves it
+        too.
+
+        The gate requirement runs between the two, before the template is read. The file can lose its gate command
+        and the opt-out while the row waits, and the digest does not hold the opt-out: a row inserted under it gives
+        the same digest once it is gone. That row ends with ``IMAGE_GATE_REQUIRED`` and no failure, and no builder is
+        launched. The other checks of a launch (``_start_refusal``) run last.
         """
         if self.clock() >= build.deadline_at:
             return self._fail(build, image_console.CONSOLE_BLIND, builder_alive=False)
         try:
+            self._check_inputs_unchanged(build)
+            if self.p._gate_missing():
+                # Before the template read: a withdrawn opt-out is the refusal this row owes, and an unsafe template
+                # or a refused read of its groups would otherwise mask it.
+                raise ImageRefusal(IMAGE_GATE_REQUIRED)
             self.p._check_build_template(self.aws, self.deadline)
         except DeadlineRefusal:
             self.notes.append("pass_deadline_exceeded")
@@ -1293,8 +1393,27 @@ class _Pass:
             return self._end_refused(build, reason)
         return self._stage(build)
 
+    def _check_inputs_unchanged(self, build):
+        """Refuse with ``IMAGE_INPUTS_CHANGED`` unless the inputs of ``build`` still give the digest of its row.
+
+        ``_decide`` hashed the files at the branch head, the warm settings and the script into that digest. This is the
+        same digest over the files at the commit of the row, since the head can have moved, with the settings and the
+        script as this pass reads them. A basis path that the forge answers as missing (a 404) is not proof that the
+        inputs changed: the commit is immutable and held every path when the row was written, and a 404 can come from
+        an unavailable route too. That refusal is raised like any other, the row stays for the next pass, and the
+        build deadline bounds the retries. The forge client puts no deadline on a read, so ``_basis_files`` reads the clock before each request
+        and this reads it once more once the files are in, because the last read can pass the deadline too: a pass
+        whose deadline passed during the reads ends no row, whatever they showed. Any other refusal of a read is
+        raised, and the row stays for the next pass.
+        """
+        files = self.p._basis_files(self._source(), build.source_sha, self.deadline)
+        if self.clock() >= self.deadline:
+            raise DeadlineRefusal("the basis files")
+        if self.p._digest(files, self.script) != build.basis_digest:
+            raise ImageRefusal(IMAGE_INPUTS_CHANGED, "the inputs of the build changed since its row was written")
+
     def _end_refused(self, build, reason):
-        """End a build whose start a check refused: drop its archive and count no failure.
+        """End a build whose start or restage a check refused: drop its archive and count no failure.
 
         Nothing was launched, so the row is no failed build: the cooldown, the failure count and the block stay as
         they were. The row ends as ``failed`` with the refusal's code, because the one-active index needs it to end.
@@ -1316,7 +1435,16 @@ class _Pass:
             close = getattr(chunks, "close", None)
             if close is not None:
                 close()
-        build = s.advance_build(build.id, archive_key=upload.key, archive_sha256=upload.sha256)
+        # ``_launch`` renders the gate command into the user data from ``cfg``, so the row records the gate of this
+        # launch before it happens. A stage that is done again gets here only when the inputs still give the digest of
+        # the row, the gate command among them, so this writes the value the row already has, and repairs a row that
+        # lost it.
+        build = s.advance_build(
+            build.id,
+            archive_key=upload.key,
+            archive_sha256=upload.sha256,
+            gate_configured=int(bool(cfg.warm.gate_command)),
+        )
         try:
             instance_id = self._launch(build, upload)
         except DeadlineRefusal:
@@ -1585,7 +1713,11 @@ class _Pass:
     # -- terminal states -----------------------------------------------------------
     def _succeed(self, build, version):
         s, now = self.s, self.clock()
-        gate = int(bool(self.cfg.warm.gate_command))
+        # The evidence is the launched build's, never the gate that the configuration holds now: the file may have
+        # changed since the launch. The builder prints its ready marker only after its gate command passed, so a
+        # build that launched with a gate passed it. Only the integer 1 on the row shows that a gate ran: a row that
+        # records nothing, or any other value, shows that none did.
+        gate = 1 if type(build.gate_configured) is int and build.gate_configured == 1 else 0
         with s.transaction():
             build = s.advance_build(
                 build.id,

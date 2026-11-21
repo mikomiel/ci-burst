@@ -738,6 +738,26 @@ class ImageState:
         )
         return _journal_row(row) if row else None
 
+    def journal_since_complete(self):
+        """Every row newer than the newest ``complete`` row, of any status and kind, oldest first.
+
+        Every row when no row is complete. A row that was resolved ``aborted`` still names the two pins that its write
+        was about to change, and the deployment file can still carry the new one: a pass that reads a stale file
+        resolves a write that renamed the file but never completed its row as ``aborted``. A later write that fails
+        through the same stale file leaves a second such row, and the live pin is then named only by the first. Until
+        a row completes, no read says which of these pins is live, so the deletion rule protects them all. Only failed
+        promotions since the last one that completed add rows here.
+        """
+        self._refuse_a_journal_outside_the_schema()
+        rows = self._require().execute(
+            # With no complete row every row counts, whatever its id: a fallback id such as 0 would skip a row at or
+            # below it.
+            "SELECT * FROM promotion_journal WHERE NOT EXISTS ("
+            "SELECT 1 FROM promotion_journal WHERE status = 'complete') OR id > ("
+            "SELECT MAX(id) FROM promotion_journal WHERE status = 'complete') ORDER BY id"
+        )
+        return [_journal_row(row) for row in rows]
+
     # -- observed pins ----------------------------------------------------
     def pin_last(self):
         """The newest pin observation, or ``None`` before the first."""

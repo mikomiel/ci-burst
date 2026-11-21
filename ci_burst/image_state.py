@@ -750,8 +750,11 @@ class ImageState:
         """
         self._refuse_a_journal_outside_the_schema()
         rows = self._require().execute(
-            "SELECT * FROM promotion_journal WHERE id > COALESCE("
-            "(SELECT MAX(id) FROM promotion_journal WHERE status = 'complete'), 0) ORDER BY id"
+            # With no complete row every row counts, whatever its id: a fallback id such as 0 would skip a row at or
+            # below it.
+            "SELECT * FROM promotion_journal WHERE NOT EXISTS ("
+            "SELECT 1 FROM promotion_journal WHERE status = 'complete') OR id > ("
+            "SELECT MAX(id) FROM promotion_journal WHERE status = 'complete') ORDER BY id"
         )
         return [_journal_row(row) for row in rows]
 

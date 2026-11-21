@@ -422,6 +422,15 @@ class JournalSinceCompleteTests(ImageStateCase):
         rows = self.state.journal_since_complete()
         self.assertEqual([(row.status, row.old_pin, row.new_pin) for row in rows], [("aborted", 3, 4), ("aborted", 3, 5)])
 
+    def test_a_row_at_id_zero_counts_while_none_is_complete(self):
+        # SQLite accepts an explicit id of 0 or below. With no complete row there is no cutoff, so no id is skipped.
+        row = self.add_journal(old_pin=3, new_pin=4, contained_pin=3)
+        with self.state.transaction():
+            self.state.journal_abort(row.id)
+        self.state._require().execute("UPDATE promotion_journal SET id = 0 WHERE id = ?", (row.id,))
+        rows = self.state.journal_since_complete()
+        self.assertEqual([(r.id, r.status, r.old_pin, r.new_pin) for r in rows], [(0, "aborted", 3, 4)])
+
     def test_a_complete_row_settles_every_row_before_it(self):
         aborted = self.add_journal(old_pin=3, new_pin=4, contained_pin=3)
         with self.state.transaction():

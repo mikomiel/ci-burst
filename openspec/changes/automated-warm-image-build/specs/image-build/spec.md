@@ -180,7 +180,7 @@ A build MUST start only when the digest differs from the pin's tag and the minim
 - **AND** `run --apply --force` skips the interval but still applies the daily cap
 
 ### Requirement: The source archive is staged privately, bounded and deleted
-The command MUST stream the archive for the resolved sha through a hashing wrapper into a multipart upload under the configured bucket and prefix, and MUST NOT write the archive to disk. The size cap `source.max_archive_bytes` MUST abort the upload and delete the object. The command MUST make one delete call for the archive at the terminal state of the build, and the bucket lifecycle rule MUST be documented as a backstop only. The command MUST NOT create the bucket or change its configuration.
+The command MUST stream the archive for the resolved sha through a hashing wrapper into a multipart upload under the configured bucket and prefix, and MUST NOT write the archive to disk. The size cap `source.max_archive_bytes` MUST abort the upload and delete the object. When a build whose row records an archive key ends, the command MUST make one delete call for it; docs MUST name the bucket lifecycle rule a backstop only. The command MUST NOT create the bucket or change its configuration.
 
 #### Scenario: The delete at a terminal state is refused
 - **WHEN** a build reaches a terminal state and the provider refuses the delete of its archive
@@ -197,8 +197,8 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 - **THEN** the upload is aborted and no builder is launched
 
 #### Scenario: The build ends
-- **WHEN** a build reaches `candidate` or `failed`
-- **THEN** the pass makes one delete call for its archive object
+- **WHEN** a build whose row records an archive key reaches `candidate` or `failed`
+- **THEN** the pass makes one delete call for that key
 
 ### Requirement: The archive key joins the prefix and the build id with one slash
 The archive key MUST be the configured prefix, exactly one `/` and `<build-id>.tar.gz`, whether the configured prefix ends with no slash, one slash or several. The listing of stray archives MUST use the same prefix with its one slash, so that it never reaches a sibling prefix.

@@ -1286,6 +1286,11 @@ class _Pass:
         The result is the build, or ``None`` when a check refused the start: nothing was written then.
         """
         s, aws, cfg = self.s, self.aws, self.cfg
+        if self.p._gate_missing():
+            # Before the template check too: a pass that settled a build in flight runs without a gate, and the
+            # refusal a new build owes it is the gate requirement, not whatever the template shows.
+            self.refused = IMAGE_GATE_REQUIRED
+            return None
         self.p._check_build_template(aws, self.deadline)
         reason = self._start_refusal()
         if reason is not None:

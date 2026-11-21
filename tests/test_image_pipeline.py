@@ -2457,6 +2457,18 @@ class FailureTests(PipelineCase):
         self.assertEqual(self.world.arguments("run_instances"), [])
         self.assertEqual(self.world.urls, [])
 
+    def test_a_start_without_a_gate_is_refused_for_the_gate_and_not_for_an_unsafe_template(self):
+        # The same race, with a build template that would also be refused: the gate requirement is the one reported.
+        self.add_build("settled", "building", age=5 * DAY)
+        self.configure(render_toml(gate=""), state=BuildEndedBeforeTheLock(self.state_dir, clock=self.clock))
+        data = copy.deepcopy(SAFE_BUILDER)
+        data["IamInstanceProfile"] = {"Name": "sentinel-profile"}
+        self.world.set_version(BUILDER, 1, data)
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_GATE_REQUIRED")
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
     def assert_unstaged(self, build):
         """A build that waits for the next pass to stage its archive: no builder, no archive hash, no failure."""
         self.assertEqual((build.state, build.builder_id, build.archive_sha256), ("building", None, None))

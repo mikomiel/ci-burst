@@ -1697,6 +1697,30 @@ class StaleViewTests(PromoteCase):
             os.close(descriptor)
         self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
 
+    def test_a_rename_during_the_read_is_refused_as_stale(self):
+        # The descriptor was checked by nothing before the read: a replacement between the open and the read
+        # leaves old bytes, and the check after the read sees that the open file lost its name.
+        target = Path(self.config.path).resolve()
+        replacement = target.parent / "replacement.tmp"
+        replacement.write_bytes(target.read_bytes())
+        descriptor = os.open(target, os.O_RDONLY)
+        real = os.read
+        renamed = []
+
+        def read(fd, size):
+            if not renamed:
+                renamed.append(True)
+                os.replace(replacement, target)
+            return real(fd, size)
+
+        try:
+            with mock.patch("os.read", read), self.assertRaises(ImageRefusal) as raised:
+                image_promote._read_open_file(self.config, target, descriptor)
+        finally:
+            os.close(descriptor)
+        self.assertEqual(renamed, [True])
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
+
     def test_the_same_file_still_linked_is_read(self):
         # The control: nothing but the rename separates this read from the one above.
         target = Path(self.config.path).resolve()

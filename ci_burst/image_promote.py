@@ -152,22 +152,24 @@ def _read_open_file(config, target, descriptor):
         metadata = os.fstat(descriptor)
     except OSError as error:
         raise ConfigRefusal("CONFIG_UNREADABLE", f"{config.path}: {error}") from None
-    if metadata.st_nlink == 0:
-        # A bind mount of the file itself keeps the inode that was mounted. Once a write elsewhere replaced the file
-        # by a rename, that inode has no name left, and every fact read from it is old: a hash that resolves a
-        # pending row the wrong way, a pin that is no longer live.
-        raise ImageRefusal(
-            PROMOTE_FILE_STALE,
-            "this view of the deployment file was replaced; mount its directory, not the file, and run again",
-        )
     try:
         chunks = []
         while chunk := os.read(descriptor, 1 << 16):
             chunks.append(chunk)
+        linked = os.fstat(descriptor).st_nlink > 0
         data = b"".join(chunks)
         text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError) as error:
         raise ConfigRefusal("CONFIG_UNREADABLE", f"{config.path}: {error}") from None
+    if not linked:
+        # A bind mount of the file itself keeps the inode that was mounted. Once a write elsewhere replaced the file
+        # by a rename, that inode has no name left, and every fact read from it is old: a hash that resolves a
+        # pending row the wrong way, a pin that is no longer live. The check runs after the read, on the descriptor
+        # that supplied the bytes, so a replacement during the read is seen too.
+        raise ImageRefusal(
+            PROMOTE_FILE_STALE,
+            "this view of the deployment file was replaced; mount its directory, not the file, and run again",
+        )
     try:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:

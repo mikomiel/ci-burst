@@ -887,7 +887,7 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **THEN** the command refuses with `PROMOTE_FILE_CHANGED` and writes nothing
 
 #### Scenario: A stale view of the file
-- **WHEN** a container mounted the file itself, a write elsewhere then replaced the file by a rename, and the mounted file has no link left (`st_nlink == 0`)
+- **WHEN** a container mounted the file itself, a write elsewhere replaced the file by a rename before or during the read, and the open file has no link left (`st_nlink == 0`) once its bytes are read
 - **THEN** a command in that container that resolves the journal, promotes or rolls back refuses with `PROMOTE_FILE_STALE` and writes nothing
 
 ### Requirement: Promotion runs in an isolated operator container
@@ -969,7 +969,7 @@ Every path that deregisters an image or deletes a snapshot (retention and every 
 - **THEN** no deletion path removes the image of either pin of either row until a newer row completes
 
 #### Scenario: A stale view of the file at a deletion
-- **WHEN** the deployment file that a pass reads is a view of a file that a rename replaced and that has no link left (`st_nlink == 0`)
+- **WHEN** the deployment file that a pass reads is a view of a file that a rename replaced before or during the read, and the open file has no link left (`st_nlink == 0`) once its bytes are read
 - **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE` and no path deletes anything
 
 #### Scenario: A pin of an unsettled row cannot be read

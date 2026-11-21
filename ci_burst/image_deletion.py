@@ -45,7 +45,7 @@ import os
 from dataclasses import InitVar, dataclass, field
 
 from .aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
-from .config import load
+from .config import loads
 from .errors import ConfigRefusal, ImageRefusal, ProviderRefusal
 from .image_state import ACTIVE_STATES
 from .image_template import TEMPLATE_DRIFT
@@ -131,6 +131,35 @@ def _is_resolved(protected):
     return isinstance(protected, ProtectedSet) and protected._resolved is _PROVENANCE and bool(protected.image_ids)
 
 
+def _load_deployment(config_path):
+    """The deployment configuration, read from one open file whose link count is checked after the read.
+
+    A bind mount of the file itself keeps the inode that was mounted. Once a rename elsewhere replaced the file,
+    that inode has no name left, and its pins and the journal rows that a pass resolved from it are old. The check
+    runs on the descriptor that supplied the bytes, after they were read, so a replacement during the read is seen.
+    """
+    unreadable = "the deployment configuration could not be loaded"
+    try:
+        descriptor = os.open(config_path, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        raise _unsafe(unreadable) from None
+    try:
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+        stale = os.fstat(descriptor).st_nlink == 0
+    except OSError:
+        raise _unsafe(unreadable) from None
+    finally:
+        os.close(descriptor)
+    if stale:
+        raise _unsafe("the deployment file is a view of a file that was replaced")
+    try:
+        return loads(b"".join(chunks).decode("utf-8"), config_path)
+    except (UnicodeDecodeError, ConfigRefusal):
+        raise _unsafe(unreadable) from None
+
+
 def protected_set(
     aws,
     config_path,
@@ -194,18 +223,7 @@ def protected_set(
     (see ``ProtectedSet``). A refusal of the deadline passes unchanged. The
     detail names a version number at most, never a provider message.
     """
-    try:
-        stale = os.stat(config_path).st_nlink == 0
-    except OSError:
-        stale = False  # the load below refuses a file that cannot be read
-    if stale:
-        # A bind mount of the file itself that a rename elsewhere replaced: its pins and the journal rows that a
-        # pass resolved from it are old, so no set built from them says which image is live.
-        raise _unsafe("the deployment file is a view of a file that was replaced")
-    try:
-        config = load(config_path)
-    except ConfigRefusal:
-        raise _unsafe("the deployment configuration could not be loaded") from None
+    config = _load_deployment(config_path)
     pins = [config.aws.launch_template_version]
     pins.extend(zone.launch_template_version for zone in config.aws.zones)
     if previous_pin is not None:

@@ -471,19 +471,40 @@ class ProtectedSetRefusalTests(DeletionCase):
 
     def test_a_stale_view_of_the_deployment_file_is_unsafe_and_reads_no_version(self):
         # A bind mount of the file itself that a rename elsewhere replaced: no name links the inode any more.
-        real = os.stat
-        target = Path(self.deployment_file)
+        real = os.fstat
+        inode = os.stat(self.deployment_file).st_ino
 
-        def stale(path, *arguments, **keywords):
-            result = real(path, *arguments, **keywords)
-            if Path(path) != target:
+        def stale(descriptor):
+            result = real(descriptor)
+            if result.st_ino != inode:
                 return result
             values = list(result[:10])
             values[stat.ST_NLINK] = 0
             return os.stat_result(values)
 
-        with mock.patch("os.stat", stale):
+        with mock.patch("os.fstat", stale):
             refusal = self.refused()
+        self.assertIn("replaced", refusal.detail)
+        self.assertEqual(self.ec2.calls, [])
+
+    def test_a_replacement_during_the_read_is_unsafe_and_reads_no_version(self):
+        # The file is replaced by a rename after it was opened and before its bytes are read: the open file is the
+        # old inode, which has no name left once the bytes are in. The new file pins another version.
+        target = Path(self.deployment_file)
+        replacement = target.parent / "replacement.tmp"
+        replacement.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+        real = os.read
+        renamed = []
+
+        def read(descriptor, size):
+            if not renamed:
+                renamed.append(True)
+                os.replace(replacement, target)
+            return real(descriptor, size)
+
+        with mock.patch("os.read", read):
+            refusal = self.refused()
+        self.assertEqual(renamed, [True])
         self.assertIn("replaced", refusal.detail)
         self.assertEqual(self.ec2.calls, [])
 

@@ -535,6 +535,26 @@ class RunApplyJournalTests(CliCase):
         self.assertEqual(snapshot_tree(self.config_dir), tree)
         self.assertEqual((self.sessions, self.source_sessions), ([], 0), "no client is built before the refusal")
 
+    def test_a_row_whose_status_is_outside_the_schema_refuses_the_whole_run_and_deletes_nothing(self):
+        # A pending row whose status a damaged file no longer says: a run that skipped it would neither resolve it
+        # nor protect the pin it may roll back to from retention.
+        self.pin_current()
+        self.pending(old_sha=self.file_sha())
+        connection = sqlite3.connect(self.state_dir / "image-state.sqlite")
+        try:
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute("UPDATE promotion_journal SET status = 'pendinG'")
+            connection.commit()
+        finally:
+            connection.close()
+        before, calls = self.dump(), len(self.world.calls)
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_STATE_UNREADABLE"))
+        self.assertNotIn("pendinG", json.dumps(payload))
+        self.assertEqual(self.dump(), before)
+        self.assertEqual(len(self.world.calls), calls, "no image is deregistered")
+        self.assertEqual((self.sessions, self.source_sessions), ([], 0), "no client is built before the refusal")
+
     def test_an_until_done_run_resolves_the_row_once_before_its_first_pass(self):
         self.pin_current()
         self.pending(old_sha=self.file_sha())

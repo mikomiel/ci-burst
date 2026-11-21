@@ -669,8 +669,30 @@ class ImageState:
         row = self._require().execute("SELECT * FROM promotion_journal WHERE id = ?", (journal_id,)).fetchone()
         return _journal_row(row) if row else None
 
+    def _refuse_a_journal_outside_the_schema(self):
+        """Refuse when any row's kind or status is outside the schema.
+
+        A query that selects by status or kind would skip such a row, and a damaged ``pending`` row that is skipped
+        is a promotion that nothing resolves and a rollback target that retention does not protect. The refusal
+        names the row, never the value.
+        """
+        kinds = ", ".join("?" for _ in JOURNAL_KINDS)
+        statuses = ", ".join("?" for _ in JOURNAL_STATUSES)
+        row = (
+            self._require()
+            .execute(
+                "SELECT id FROM promotion_journal WHERE typeof(kind) != 'text' OR typeof(status) != 'text'"
+                f" OR kind NOT IN ({kinds}) OR status NOT IN ({statuses}) ORDER BY id LIMIT 1",
+                (*JOURNAL_KINDS, *JOURNAL_STATUSES),
+            )
+            .fetchone()
+        )
+        if row is not None:
+            raise StateRefusal("IMAGE_STATE_UNREADABLE", f"promotion journal row {int(row['id'])} is malformed")
+
     def pending_journal(self):
         """Every ``pending`` row, oldest first."""
+        self._refuse_a_journal_outside_the_schema()
         rows = self._require().execute("SELECT * FROM promotion_journal WHERE status = 'pending' ORDER BY id")
         return [_journal_row(row) for row in rows]
 
@@ -680,6 +702,7 @@ class ImageState:
         Without ``kind`` the row is of either kind, which is what the deletion
         rule needs. A rollback asks for ``kind="promotion"``.
         """
+        self._refuse_a_journal_outside_the_schema()
         clause, arguments = ("", ()) if kind is None else (" AND kind = ?", (kind,))
         row = (
             self._require()

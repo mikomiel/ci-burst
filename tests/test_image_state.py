@@ -1053,15 +1053,13 @@ class DetachedCopyTests(ImageStateCase):
                 finally:
                     connection.close()
                 self.state.connect()
-                # A row whose status is not "pending" is not a pending row: only a read of the row itself meets it.
-                reads = [lambda: self.state.journal(1)] + ([self.state.pending_journal] if column == "kind" else [])
+                # The reads that select by status or kind refuse too: they would otherwise skip the damaged row.
+                reads = (self.state.pending_journal, lambda: self.state.journal(1), self.state.journal_last_complete)
                 for read in reads:
                     with self.assertRaises(StateRefusal) as raised:
                         read()
                     self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
                     self.assertNotIn("not a value", raised.exception.detail)
-                if column == "status":
-                    self.assertEqual(self.state.pending_journal(), [])
 
     def test_a_state_that_is_not_open_has_no_copy(self):
         self.state.close()

@@ -171,8 +171,10 @@ repository.
       then confirms: the token reads the branch, every basis file and the first
       chunk of the archive; the branch is reported protected; the rendered
       user-data size; and the build template is safe. You also confirm that those
-      earlier gates are recorded. The token scope and the `protected` flag are the
-      parts of G6 that `image plan` settles.
+      earlier gates are recorded. The `protected` flag is the part of G6 that
+      `image plan` settles. A passing plan does not show that the token is
+      read-only: an overprivileged token passes the same reads, so record the
+      scope that Forgejo shows for the token as separate evidence.
 - [ ] Before the first build, you inspect the archive yourself to settle the rest
       of G6: you list the archive of the commit that `image plan` reports, confirm
       the leading directory that `strip_components` drops, and confirm that
@@ -192,8 +194,13 @@ repository.
       `promote --write`, a rollback or a hand edit of the pin, you finished or
       stopped any running `--until-done` container, and afterwards you started a
       fresh one ([container.md](container.md#run-the-image-commands)).
-      `promote --write` ran in the isolated container, one canary job completed on
-      the new version, and `--rollback` restored the previous pin
+      Before the pin changed, one canary job completed on the new version from a
+      test identity or a test deployment
+      ([warm-image.md](warm-image.md#canary-and-cutover)): `promote --write`
+      replaces the production pin at once, and the next scheduled `apply` can
+      launch from it. Only then `promote --write` ran in the isolated container,
+      the first production job on the new version was watched, and `--rollback`
+      restored the previous pin
       ([operations.md](operations.md#rolling-back-an-image)). The effect on job
       duration is measured, as the `warm-worker-image` change already requires
       (its tasks 6.5 and 6.6).

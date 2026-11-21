@@ -649,10 +649,13 @@ carries both as `journal_resolved` and `pin_evidence`.
 
 `image status` prints `decision: status` with the active and last build, the
 candidate and its evidence, the pin and any zone pins, the rollback target and why
-it is or is not available, the images that retention protects, the counters
+it is or is not available, the images that retention protects as far as the state file and the TOML show
+them, the counters
 (`consecutive_failures`, `builds_last_day`, `cooldown_until`, `last_check_at`), the
-`blocked` explanation and any pending promotion row. Plain `status` makes no
-provider call. `status --refresh` makes describe calls for the live pin, the
+`blocked` explanation and any pending promotion row. The protected list is
+partial: it omits the new pin of the newest completed journal row and the pins of
+rows since it, which retention also protects. The `deletion` part of `image plan`
+gives the actual decision. Plain `status` makes no provider call. `status --refresh` makes describe calls for the live pin, the
 rollback target and the newest verified candidates, and records whether each
 version and image still exists and whether the candidate version differs from its
 source in any field but `ImageId`. A promotion decides from that record, so run
@@ -706,7 +709,9 @@ and again just before the launch. A wrong input is raised, not answered, and
 nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge
 (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
 or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
-before the template, so an unsafe template never hides a missing gate. A pass that
+before the template, so an unsafe template never hides a missing gate. A stage done
+again is the exception: its row exists, so these refusals end the row and are
+answered `refused` (below). A pass that
 finds a build in flight runs and settles it even without a gate; a launch that
 pass would then make is refused with `IMAGE_GATE_REQUIRED`, answered `refused`,
 and counts no failure.
@@ -715,10 +720,12 @@ A pass deadline can end a pass after the build row is written and before the
 builder is launched. The next pass stages that build again, and first checks its
 inputs: the basis files at the row's own commit, the warm and gate commands,
 `strip_components` and the script must still give the row's digest. A different
-digest ends the row `failed` with `IMAGE_INPUTS_CHANGED`; a file that lost the
-opt-out of a row inserted under `allow_no_gate` ends it with
-`IMAGE_GATE_REQUIRED`. Both are answered `refused`, count no failure and try to
-delete the row's archive. A refused read of a basis file, a `404` included, ends
+digest ends the row `failed` with `IMAGE_INPUTS_CHANGED`. The gate command is in
+the digest, so removing a configured gate ends the row this way too. A file that
+lost the opt-out of a row inserted under `allow_no_gate` keeps the digest and ends
+the row with `IMAGE_GATE_REQUIRED`; an unsafe build template then ends it with
+`IMAGE_BUILD_TEMPLATE_UNSAFE`. Each is answered `refused`, counts no failure, writes
+no `image_build_failed` event and tries to delete the row's archive. A refused read of a basis file, a `404` included, ends
 the pass and leaves the row for the next pass: the commit cannot have lost the
 file, so a `404` there can be an unavailable route, and the build deadline bounds
 the retries. `lifetime_seconds` and `snapshot_seconds` are not in the digest: a
@@ -837,9 +844,12 @@ A refusal names the item and the recorded value, never a secret.
 `PROMOTE_DIRECTORY_NOT_DEDICATED` also lists up to five of the foreign entry names
 in the directory, so that you can move them. With `--write` every refusal is
 raised and exits `2`. Without `--write`, the checks that
-depend on the record are reported in `write_check` and the command exits `0`;
-only a preview with nothing to show (`PROMOTE_NO_CANDIDATE`,
-`PROMOTE_VERSION_NOT_CANDIDATE`, `ROLLBACK_NO_PROMOTION`) is itself refused.
+depend on the record are planned against the snapshot the preview read and
+reported in `write_check`. That is not a promise that the write will succeed, and
+a preview can still be refused: when it has nothing to show
+(`PROMOTE_NO_CANDIDATE`, `PROMOTE_VERSION_NOT_CANDIDATE`, `ROLLBACK_NO_PROMOTION`),
+when the TOML changes while it reads (`PROMOTE_FILE_CHANGED`), or before the
+plan when the file is a stale view or the journal cannot be read.
 
 | Code | Meaning | What to do |
 | --- | --- | --- |
@@ -917,7 +927,7 @@ with every URL, presigned query string and archive key replaced by
 | `image_marker_seen` | the pass first reads the ready marker on the builder's console | `build_id`, `builder_id`, `latency_seconds` |
 | `image_created` | the image of the build was created or adopted | `build_id`, `builder_id`, `image_id` |
 | `image_candidate_ready` | the candidate version was created and compared `clean` | `build_id`, `image_id`, `template_version`, `digest`, `duration_seconds` |
-| `image_build_failed` | a build ended `failed` | `build_id`, `reason`, `image_id`, `digest`, `duration_seconds`, `drift_fields`, `framed_tail` |
+| `image_build_failed` | a build failed and the failure was counted. A refused start or restage that ends its row `failed` (such as `IMAGE_INPUTS_CHANGED`) writes none; it shows in `image_check` with `decision: refused` | `build_id`, `reason`, `image_id`, `digest`, `duration_seconds`, `drift_fields`, `framed_tail` |
 | `image_reconciled` | reconcile ended a builder, deleted an archive, recorded an image or adopted a leftover | `builders_terminated`, `archives_deleted`, `images_recorded`, `builder_adopted`, `image_adopted`, `build_id` |
 | `image_pruned` | the deletion rule deregistered an image, deleted a snapshot or failed to | `deregistered`, `snapshots_deleted`, `failed`, `skipped` |
 | `image_blocked` | the failure that set `blocked` | `consecutive_failures`, `build_id` |
@@ -1116,7 +1126,7 @@ The trigger rules and the two start refusals are in
 | Code | Meaning |
 | --- | --- |
 | `IMAGE_UNTIL_DONE_NEEDS_APPLY` | `--until-done` without `--apply` |
-| `IMAGE_GATE_REQUIRED` | `[image.warm].gate_command` is empty and `allow_no_gate` is `false`. Raised before any client is built when no build is in flight; a pass that settles a build in flight answers it `refused` for the launch it would make, and a stage done again ends its row `failed` with it |
+| `IMAGE_GATE_REQUIRED` | `[image.warm].gate_command` is empty and `allow_no_gate` is `false`. Raised before any client is built when no build is in flight; a pass that settles a build in flight answers it `refused` for the launch it would make, and a stage done again of a row inserted under `allow_no_gate` ends its row `failed` with it (a row inserted with a gate command ends as `IMAGE_INPUTS_CHANGED`) |
 | `IMAGE_INPUTS_CHANGED` | a stage done again found that the basis files at the row's commit, the warm or gate commands, `strip_components` or the script no longer give the row's digest. Answered `refused`; the row ends `failed`, its archive delete is attempted and no failure is counted |
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the image token while the branch or a basis file was read. The same answer to the archive request of a staging run ends the build `failed` |
 | `IMAGE_BRANCH_UNPROTECTED` | the configured branch is not protected on the forge |

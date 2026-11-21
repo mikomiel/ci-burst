@@ -424,10 +424,13 @@ anything is written. `/etc/ci-burst` cannot serve, because it holds the credenti
 directories and the env-files. The build line mounts the same directory read-only
 instead of the file: a promotion replaces the file atomically, and a mount of the
 single file keeps serving the old one to a build container that is still running
-([container.md](container.md#run-the-image-commands)). Such a container refuses
-with `PROMOTE_FILE_STALE`, or with `IMAGE_DELETION_UNSAFE` at a deletion, instead
-of acting on the old file, as long as no hard link keeps the old file named: do
-not keep hard links to the TOML. Give the file its own
+([container.md](container.md#run-the-image-commands)). The stale-file check
+protects journal resolution (`PROMOTE_FILE_STALE`) and every image and snapshot
+deletion (`IMAGE_DELETION_UNSAFE`, which skips the deletions and does not end the
+pass), as long as no hard link keeps the old file named: do not keep hard links to
+the TOML. It does not stop a running `--until-done` container, which keeps the
+settings and the pin it loaded at its start, so finish or stop it before a
+promotion. Give the file its own
 directory, owned by the container user so the container can create files in it:
 
 ```sh
@@ -688,8 +691,10 @@ Notes on the values:
 - `commands` and `gate_command` become the builder's `WARM_COMMANDS` and
   `WARM_GATE_COMMAND`; [warm-image.md](warm-image.md#inputs) owns their meaning
   and its examples show one pair per ecosystem. An entry with a control character
-  is refused. With an empty `gate_command` and `allow_no_gate = false` every `image`
-  command that reads inputs refuses with `IMAGE_GATE_REQUIRED`. The rendered user
+  is refused. With an empty `gate_command` and `allow_no_gate = false`, `image plan`
+  and an applying pass with no build in flight refuse with `IMAGE_GATE_REQUIRED`;
+  a pass that finds a build in flight settles it and refuses only the launch it
+  would make ([operations.md](operations.md#when-a-build-starts)). The rendered user
   data must stay under 16384 bytes; `image plan` prints its size, measured with a
   synthetic URL of 4096 characters, and a longer one is a refusal there
   (`IMAGE_USERDATA_TOO_LARGE`, exit `2`). A real presigned URL can be longer, so an
@@ -718,8 +723,9 @@ Notes on the values:
   termination, and at least one security group, none of which has an inbound rule.
   The image id of that template is the cold base image: the builder starts from it,
   never from the warm image.
-- The staging bucket and its lifecycle rule are yours: ci-burst deletes the
-  archive when a build ends, and the lifecycle rule is a backstop only. Give each
+- The staging bucket and its lifecycle rule are yours: when a build ends, ci-burst
+  makes one delete call for the archive key that its row records, and the
+  lifecycle rule is a backstop only. Give each
   deployment a prefix of its own that nothing else uses: no other deployment, tool
   or person writes under it, and no prefix of another deployment is the same as
   yours, inside it or around it. Every applying pass deletes each object under the

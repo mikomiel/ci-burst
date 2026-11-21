@@ -182,6 +182,11 @@ A build MUST start only when the digest differs from the pin's tag and the minim
 ### Requirement: The source archive is staged privately, bounded and deleted
 The command MUST stream the archive for the resolved sha through a hashing wrapper into a multipart upload under the configured bucket and prefix, and MUST NOT write the archive to disk. The size cap `source.max_archive_bytes` MUST abort the upload and delete the object. The command MUST delete the archive at the terminal state of the build, and the bucket lifecycle rule MUST be documented as a backstop only. The command MUST NOT create the bucket or change its configuration.
 
+#### Scenario: The delete at a terminal state is refused
+- **WHEN** a build reaches a terminal state and the provider refuses the delete of its archive
+- **THEN** the pass notes `archive:delete_failed` and the row keeps its terminal state
+- **AND** the deletion counts as unconfirmed, not as done, and the bucket lifecycle rule stays the backstop
+
 #### Scenario: The archive exceeds the cap
 - **WHEN** the streamed bytes pass `source.max_archive_bytes`
 - **THEN** the multipart upload is aborted and the key is deleted
@@ -359,7 +364,7 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **THEN** it counts toward `max_builds_per_day` and `min_build_interval_seconds` like any other row
 
 ### Requirement: A stage done again launches only under the inputs of its row
-A pass that stages a build again MUST first check that the basis files at the row's own commit, the warm settings and the script give the digest that the row was inserted under. If they do not, or the commit lacks a basis path, the pass MUST launch no builder and MUST end the row as `failed` with `IMAGE_INPUTS_CHANGED`, as for a refused start: its archive is deleted and no failure is counted. A pass whose deadline passes during those reads MUST leave the row for the next pass.
+A pass that stages a build again MUST first check that the basis files at the row's own commit, the warm settings and the script give the digest that the row was inserted under. If they do not, or the commit lacks a basis path, the pass MUST launch no builder and MUST end the row as `failed` with `IMAGE_INPUTS_CHANGED`, as for a refused start: the pass tries to delete its archive and no failure is counted. A pass whose deadline passes during those reads MUST leave the row for the next pass.
 
 #### Scenario: The gate command changes before the stage is done again
 - **WHEN** a build row is inserted with a gate command, the pass deadline ends its stage and the configuration then holds no gate command
@@ -372,8 +377,8 @@ A pass that stages a build again MUST first check that the basis files at the ro
 
 #### Scenario: A staged archive is removed
 - **WHEN** the row names an archive and the check finds that the inputs changed
-- **THEN** the pass deletes that archive and makes no new upload
-- **AND** a refused delete leaves the object and is reported as `archive:delete_failed`
+- **THEN** the pass tries to delete that archive and makes no new upload
+- **AND** a refused delete is noted `archive:delete_failed` and the deletion is unconfirmed
 
 #### Scenario: A basis path is missing at the row's commit
 - **WHEN** the configuration names a basis path that the row's commit does not hold
@@ -563,7 +568,7 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **AND** `promote --write` refuses with `PROMOTE_GATE_NOT_PASSED` while `allow_no_gate` is false
 
 ### Requirement: A missing gate refuses a launch and does not strand a build
-The gate requirement MUST guard a launch. `plan`, and an applying pass whose state holds no build in flight, MUST refuse with `IMAGE_GATE_REQUIRED` before any client is built. An applying pass whose state holds a build in flight MUST run and settle that build. A launch that pass still reaches MUST be refused with `IMAGE_GATE_REQUIRED`, counting no failure: a new build leaves no row and no upload, and a stage done again under its row's inputs ends the row `failed` and deletes its archive.
+The gate requirement MUST guard a launch. `plan`, and an applying pass whose state holds no build in flight, MUST refuse with `IMAGE_GATE_REQUIRED` before any client is built. An applying pass whose state holds a build in flight MUST run and settle that build. A launch that pass still reaches MUST be refused with `IMAGE_GATE_REQUIRED`, counting no failure: a new build leaves no row and no upload, and a stage done again under its row's inputs ends the row `failed` and tries to delete its archive.
 
 #### Scenario: A build in flight is settled with no gate command and no opt-out
 - **WHEN** a build is `building` or `imaging` and the configuration then holds no gate command and no opt-out

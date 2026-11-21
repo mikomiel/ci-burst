@@ -188,8 +188,10 @@ tag condition for that action, and none of the verification gates G1 to G13 in
 the design covers it directly; the nearest is G7 (console blind-probe cause).
 Treat it as an evidence gap: check it with the IAM policy simulator or a real
 call before enabling. If the condition does not match, the Allow does not apply
-and the console read is refused, so a build would fail closed with
-`CONSOLE_BLIND`. Do not widen the grant to `instance/*` without the tag to work
+and the console read is refused. The code does not settle that as `CONSOLE_BLIND`:
+each pass raises the provider refusal and exits nonzero, and the build does not
+advance ([#203](https://github.com/mikomiel/ci-burst/issues/203)); the signal is
+`CiBurstImageBuildNotAdvancing` ([operations.md](operations.md#image-events-and-metrics)). Do not widen the grant to `instance/*` without the tag to work
 around that; record the result and decide with the maintainer.
 
 Images and snapshots may carry the keys `ci-burst:image-build`,
@@ -279,9 +281,9 @@ an S3 client and no IAM client. Every pass builds a new SDK session, so a role
 that cannot be assumed (an expired source key, a trust policy that denies it)
 fails that pass with the provider's error code, not with a stale session.
 
-A pass starts a build only when the assumed session outlives
+A pass starts a build only when the assumed session is known to outlive
 `[image.source].presign_seconds`, the life of the archive URL it gives the
-builder. Otherwise it answers `refused` with `IMAGE_CREDENTIAL_SHORT`, counts no
+builder. Otherwise, including when the expiry is unknown, it answers `refused` with `IMAGE_CREDENTIAL_SHORT`, counts no
 failure and starts nothing. The default of 1800 seconds fits the 3600-second
 session; a value near 3600 does not.
 
@@ -646,7 +648,7 @@ prefix = "warm-image-source/"
 | `build_deadline_seconds` | `900..14400` | `2700` | a build with no verdict by then ends `failed` |
 | `failure_cooldown_seconds` | `600..172800` | `21600` | the wait after a failed build |
 | `max_consecutive_failures` | `1..10` | `3` | consecutive failed builds that set `blocked` |
-| `retain` | `2..6` | `3` | the images that retention keeps |
+| `retain` | `2..6` | `3` | the image count at which retention stops pruning |
 | `retain_min_age_seconds` | `3600..2592000` | `86400` | retention takes only an image older than this |
 | `promote_max_age_seconds` | `3600..2592000` | `172800` | the oldest verification that `promote --write` accepts |
 

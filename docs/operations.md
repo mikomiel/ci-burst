@@ -698,19 +698,19 @@ cooldown with it.
 | Order | Check | Answer when it stops the build | `--force` |
 | --- | --- | --- | --- |
 | 1 | the basis digest equals the digest tag of the image behind the pin | `digest_unchanged` (an answer, exit `0`) | skipped |
-| 2 | the last build started less than `min_build_interval_seconds` ago | `refused`, `IMAGE_MIN_INTERVAL` | skipped |
-| 3 | `max_builds_per_day` builds started in the last 24 hours | `refused`, `IMAGE_DAILY_CAP` | not skipped |
+| 2 | the newest build row of any state, a refused one included, started less than `min_build_interval_seconds` ago | `refused`, `IMAGE_MIN_INTERVAL` | skipped |
+| 3 | `max_builds_per_day` build rows of any state started in the last 24 hours | `refused`, `IMAGE_DAILY_CAP` | not skipped |
 | 4 | a failure cooldown is running | `refused`, `IMAGE_FAILURE_COOLDOWN` | cleared first |
 | 5 | the state is `blocked` | `refused`, `IMAGE_BLOCKED` | cleared first |
-| 6 | a builder or an active build exists | `refused`, `IMAGE_BUILD_ALREADY_ACTIVE` | not skipped |
+| 6 | a builder exists that reconcile ended in this pass; in `image plan` and a run without `--apply`, also an active build or builder (an applying pass with an active build resumes it and answers its state) | `refused`, `IMAGE_BUILD_ALREADY_ACTIVE` | not skipped |
 
 Two refusals belong to the start itself and count no failure:
-`IMAGE_CREDENTIAL_SHORT` (the role session would not outlive the archive URL, see
+`IMAGE_CREDENTIAL_SHORT` (the role session would not outlive the archive URL, or its expiry is unknown, see
 [deployment.md](deployment.md#image-build-role-and-source-identity-optional)) and
 `IMAGE_BUILD_ALREADY_ACTIVE`. A pass checks both before it writes the build row
 and again just before the launch. A wrong input is raised, not answered, and
-nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge
-(`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
+nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge on the branch or
+basis reads (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
 or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
 before the template, so an unsafe template never hides a missing gate. A stage done
 again is the exception for its input rechecks: a changed digest, a missing gate or
@@ -725,8 +725,9 @@ pass would then make is refused with `IMAGE_GATE_REQUIRED`, answered `refused`,
 and counts no failure.
 
 A pass deadline can end a pass after the build row is written and before the
-builder is launched. The next pass stages that build again, and first checks its
-inputs: the basis files at the row's own commit, the warm and gate commands,
+builder is launched. The next pass stages that build again. Past the build deadline
+it ends the build `failed` with `CONSOLE_BLIND` instead, a counted failure; before
+it, the pass first checks its inputs: the basis files at the row's own commit, the warm and gate commands,
 `strip_components` and the script must still give the row's digest. A different
 digest ends the row `failed` with `IMAGE_INPUTS_CHANGED`. The gate command is in
 the digest, so removing a configured gate ends the row this way too. A file that
@@ -932,9 +933,9 @@ with every URL, presigned query string and archive key replaced by
 | Event | Written when | Fields |
 | --- | --- | --- |
 | `image_check` | when an applying pass finishes with a decision, a `refused` or `failed` one included; a pass that raises before it records an outcome writes none, and a write that raises after this event leaves it in place | `decision`, `reason`, `forced`, `build_id`, `digest`, `pin_digest`, `pin_version`, `source_sha` |
-| `image_build_started` | a builder has been launched | `build_id`, `builder_id`, `digest`, `source_sha`, `forced`, `deadline_at` |
-| `image_marker_seen` | the pass first reads the ready marker on the builder's console | `build_id`, `builder_id`, `latency_seconds` |
-| `image_created` | the image of the build was created or adopted | `build_id`, `builder_id`, `image_id` |
+| `image_build_started` | the launch call returned a builder id (a builder that reconcile adopts after an uncertain launch writes none) | `build_id`, `builder_id`, `digest`, `source_sha`, `forced`, `deadline_at` |
+| `image_marker_seen` | a pass reads the ready marker on the builder's console (again on later passes while the image creation is unresolved) | `build_id`, `builder_id`, `latency_seconds` |
+| `image_created` | `CreateImage` returned an id, or the pass found the image by its tags while creating it (an image that reconcile adopts writes `image_reconciled` instead) | `build_id`, `builder_id`, `image_id` |
 | `image_candidate_ready` | the candidate version was created and compared `clean` | `build_id`, `image_id`, `template_version`, `digest`, `duration_seconds` |
 | `image_build_failed` | a build failed and the failure was counted. A refused start or restage that ends its row `failed` (such as `IMAGE_INPUTS_CHANGED`) writes none; it shows in `image_check` with `decision: refused` | `build_id`, `reason`, `image_id`, `digest`, `duration_seconds`, `drift_fields`, `framed_tail` |
 | `image_reconciled` | reconcile ended a builder, deleted an archive, recorded an image or adopted a leftover | `builders_terminated`, `archives_deleted`, `images_recorded`, `builder_adopted`, `image_adopted`, `build_id` |
@@ -948,36 +949,37 @@ undo the promotion.
 
 Every applying pass also rewrites `image-metrics.prom`, a Prometheus textfile in
 the same directory, and the telemetry counters beside it. A pass that started
-writes them even when it ended `refused` or raised, unless the write of the textfile
-itself fails: the command then exits `1` and the old textfile stays. A run that stops before the
+tries to write them even when it ended `refused` or raised. If that write fails, the
+old textfile stays in place. A run that stops before the
 pass (a wrong input, a writer lock held by another pass) writes nothing, and no
 other command rewrites the file. Every series carries the `deployment` label.
 
 | Series | Type | Meaning |
 | --- | --- | --- |
 | `ci_burst_image_builds{state}` | gauge | builds by state: `building`, `imaging`, `candidate`, `failed`, `promoted` |
-| `ci_burst_image_last_build_timestamp_seconds{outcome}` | gauge | Unix time of the last build that ended `candidate` or `failed`; a series exists only for an outcome that has occurred |
-| `ci_burst_image_build_duration_seconds` | gauge | seconds from start to end of the last build that ended; absent until one has |
-| `ci_burst_image_console_latency_seconds` | gauge | seconds from the build start to the first sighting of the ready marker; absent until one was seen |
+| `ci_burst_image_last_build_timestamp_seconds{outcome}` | gauge | Unix time of the last build that ended `candidate`, or `failed` with a counted failure; a series exists only for an outcome that has occurred |
+| `ci_burst_image_build_duration_seconds` | gauge | seconds from start to end of the last build that ended `candidate` or with a counted failure; absent until one has |
+| `ci_burst_image_console_latency_seconds` | gauge | seconds from the build start to the latest sighting of the ready marker; absent until one was seen |
 | `ci_burst_image_consecutive_failures` | gauge | failed builds since the last `candidate` |
 | `ci_burst_image_blocked` | gauge | `1` while builds are blocked |
-| `ci_burst_image_candidate_waiting_seconds` | gauge | seconds since the newest verified candidate was verified; `0` when none waits |
-| `ci_burst_image_stale_seconds` | gauge | age of the image behind the configured pin; absent while no pass has read its creation time |
+| `ci_burst_image_candidate_waiting_seconds` | gauge | seconds since the newest verified candidate was last verified (`image status --refresh` restarts it); `0` when none waits |
+| `ci_burst_image_stale_seconds` | gauge | age of the image behind the configured pin; absent when the newest pass found no creation time for it |
 | `ci_burst_image_leaked_resources_total{kind}` | counter | leaked resources that reconcile found and removed: `builder`, `archive`, `image`, `snapshot` |
-| `ci_burst_image_last_run_timestamp_seconds` | gauge | Unix time of the last pass that wrote the textfile: a pass that returned a decision, and also one that raised |
+| `ci_burst_image_last_run_timestamp_seconds` | gauge | Unix time of the last successful textfile write, by a pass that returned a decision or one that raised |
 
 Three things look alike and are not the same:
 
-- A pass attempt is a pass that started. It rewrites the textfile and sets
-  `ci_burst_image_last_run_timestamp_seconds`, whether it returned a result or
-  raised.
+- A pass attempt is a pass that started. It tries to rewrite the textfile, and a
+  successful write sets `ci_burst_image_last_run_timestamp_seconds`, whether the
+  pass returned a result or raised.
 - A completed decision is a pass that returned a result, a `refused` or `failed`
   one included. Only it writes the `image_check` event and the check time that
-  `image status` reports as `last_check_at`, and it writes both before the
-  textfile, so a failed textfile write leaves them recorded. A plain `image status` records that
-  time too, so it is no proof that a pass ran. A pass that raises records no
-  decision: it prints `{"error": ...}` and exits `1` for a provider failure or `2`
-  for another refusal.
+  `image status` reports as `last_check_at`; a later failure in the same command,
+  such as a failed textfile write, does not undo them. A plain `image status`
+  records that time too when a state file exists and no pass holds its lock, so it
+  is no proof that a pass ran. A pass that raises
+  before its answer records no decision: it prints `{"error": ...}` and exits
+  nonzero.
 - The blocked state is the `blocked` flag of the control row, shown by
   `ci_burst_image_blocked`. It is not the answer of a pass; see
   [The blocked state](#the-blocked-state).
@@ -994,7 +996,7 @@ These rules are examples. This repository ships no alert rules and no Prometheus
 configuration. The thresholds are starting points: set them from the cadence at
 which you run passes and from how often your lockfiles change. Set the `for` of
 `CiBurstImageBuildNotAdvancing` above your `build_deadline_seconds` (at most 14400)
-plus the time between two of your passes. `CiBurstImageNoPassStarted` applies only
+plus the time between two of your passes. `CiBurstImageMetricsStale` applies only
 if you schedule `image run --apply` yourself.
 
 ```yaml
@@ -1022,16 +1024,16 @@ groups:
         expr: ci_burst_image_candidate_waiting_seconds > 48 * 3600
         for: 1h
         annotations:
-          summary: "A verified candidate has waited 48 hours for a decision"
+          summary: "The newest candidate was last verified more than 48 hours ago"
       - alert: CiBurstImageLeakedResources
         expr: increase(ci_burst_image_leaked_resources_total[1d]) > 0
         annotations:
           summary: "Reconcile removed a leaked builder, archive, image or snapshot"
-      - alert: CiBurstImageNoPassStarted
+      - alert: CiBurstImageMetricsStale
         expr: time() - ci_burst_image_last_run_timestamp_seconds > 2 * 24 * 3600
         for: 1h
         annotations:
-          summary: "No image pass has started for two days"
+          summary: "No image pass has written its metrics for two days"
       - alert: CiBurstImageBuildNotAdvancing
         expr: ci_burst_image_builds{state=~"building|imaging"} > 0
         for: 6h
@@ -1039,19 +1041,15 @@ groups:
           summary: "A build has stayed active for 6 hours: passes are failing or not running"
 ```
 
-`CiBurstImageNoPassStarted` watches pass attempts, so it fires only when passes stop
-starting. The timestamp also moves when a pass raises, so repeated provider failures
-do not trip it, and a pass that raises before it records an outcome records no
-failed build, so the failure rules stay quiet as well. A pass can also raise after
-it committed an outcome, for example when an event write fails after a counted
-failure; that outcome then stays in the state, and reaches the metrics only if
-their publication succeeds. `CiBurstImageBuildNotAdvancing` covers a build in flight: a pass
-that raises before it advances the build cannot end it at its deadline, so the build
-stays `building` or `imaging`. A pass that raises before it records an outcome
-while no build is in flight has no failure series of its own: it can still move
-`ci_burst_image_last_run_timestamp_seconds`, but it records no decision and no
-failed build. Its signals are its exit status (`1` for a provider failure, `2` for
-another refusal) and the missing `image_check` event. Alert on the scheduled run's
+`CiBurstImageMetricsStale` watches the last successful textfile write. It fires
+when passes stop, and also when passes run but cannot write the textfile; it does
+not fire while the series has never existed. A pass that raises can still write the
+textfile, so repeated provider failures do not trip it, and the failure rules can
+stay quiet as well. `CiBurstImageBuildNotAdvancing` covers a build in flight: a
+pass that raises before it advances the build cannot end it at its deadline, so the
+build stays `building` or `imaging`. Without a build in flight, a pass that raises
+has no failure series of its own. Its signals are its nonzero exit status and the
+missing `image_check` event. Alert on the scheduled run's
 absence or nonzero exit in your scheduler, as
 [container.md](container.md#scheduled-operation-with-systemd) does for the cleanup
 run, and not on a missing document.
@@ -1093,15 +1091,15 @@ A builder that outlives its lifetime is a defect. Find it by its
 
 The image of a failed build is removed by the deletion rule, except that the image
 of a build whose row records `TEMPLATE_DRIFT` is kept for 24 hours first.
-Retention keeps at least `retain` owned `available` images, protected ones
-counted, so a pinned image whose row records `TEMPLATE_DRIFT` counts toward it
-and fewer than `retain` usable images can remain. It removes only images older than
+Retention prunes only while the images it counts number more than `retain`, so
+`retain` bounds how far it prunes; it does not promise that many usable images
+exist. It removes only images older than
 `retain_min_age_seconds`, and never removes a protected image: the image behind
 the pin, a zone pin, the previous pin, the new pin of the newest completed
 promotion or rollback, both pins of every journal row since that one (a failed
 promotion that a pass resolved from a stale file still names the live pin), the
-pins of a pending promotion, the candidate (unless a refresh recorded it as `TEMPLATE_DRIFT`: then only a pin that names its image protects it) or the active build. `retain` is a
-floor for retention, not a cap: the protected set can hold more images. When it
+pins of a pending promotion, the newest verified candidate (unless a refresh recorded it as `TEMPLATE_DRIFT`: then only a pin that names its image protects it) or the active build. `retain` is not a
+cap: the protected set can hold more images. When it
 cannot resolve that set it deletes nothing (`IMAGE_DELETION_UNSAFE`), and a
 deployment file that is a stale view of a replaced file is one such case. A
 journal row whose pin is not a version number is refused when the journal is
@@ -1126,7 +1124,7 @@ code ends a build `failed`.
 | `WARM_FAILED` | the builder printed a failure marker: a warm command or the gate failed. The event carries a framed tail |
 | `IMAGE_MARKER_DIGEST_MISMATCH` | the builder reports another archive digest than the staged one |
 | `MARKER_TIMEOUT` | no ready marker by the build deadline, or the marker was first read at or after it |
-| `CONSOLE_BLIND` | no console text could be read by the deadline, or the launch fell at or after it |
+| `CONSOLE_BLIND` | the console returned no text by the deadline, or the launch fell at or after it. A console read that the provider refuses is not settled this way: the pass raises and the build does not advance ([#203](https://github.com/mikomiel/ci-burst/issues/203)) |
 | `IMAGE_BUILDER_GONE` | the builder ended before a verdict and no image of the build was listed |
 | `IMAGE_NOT_AVAILABLE` | the image failed, or was not `available` by the deadline |
 | `TEMPLATE_DRIFT` | the candidate version differs from the pin in a field other than `ImageId`; `drift_fields` names them |
@@ -1144,11 +1142,11 @@ The trigger rules and the two start refusals are in
 | Code | Meaning |
 | --- | --- |
 | `IMAGE_UNTIL_DONE_NEEDS_APPLY` | `--until-done` without `--apply` |
-| `IMAGE_GATE_REQUIRED` | `[image.warm].gate_command` is empty and `allow_no_gate` is `false`. Raised before any client is built when no build is in flight; a pass that settles a build in flight answers it `refused` for the launch it would make, and a stage done again of a row inserted under `allow_no_gate` ends its row `failed` with it (a row inserted with a gate command ends as `IMAGE_INPUTS_CHANGED`) |
+| `IMAGE_GATE_REQUIRED` | `[image.warm].gate_command` is empty and `allow_no_gate` is `false`. Raised before any client is built by `image plan` and a run without `--apply`, and by an applying pass when no build is in flight; a pass that settles a build in flight answers it `refused` for the launch it would make, and a stage done again of a row inserted under `allow_no_gate` ends its row `failed` with it (a row inserted with a gate command ends as `IMAGE_INPUTS_CHANGED`) |
 | `IMAGE_INPUTS_CHANGED` | a stage done again found that the basis files at the row's commit, the warm or gate commands, `strip_components` or the script no longer give the row's digest. Answered `refused`; the row ends `failed`, its archive delete is attempted and no failure is counted |
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the image token while the branch or a basis file was read. The same answer to the archive request of a staging run ends the build `failed` |
 | `IMAGE_BRANCH_UNPROTECTED` | the configured branch is not protected on the forge |
-| `IMAGE_BASIS_PATH_MISSING` | a `basis_paths` file is not in the repository at the head sha |
+| `IMAGE_BASIS_PATH_MISSING` | the forge answered `404` for a `basis_paths` file, or the path escapes the repository, at the commit read (the branch head; the row's own commit on a stage done again) |
 | `IMAGE_BUILD_TEMPLATE_UNSAFE` | the build launch template or its version is missing or fails a safety check; the detail names the properties, never a value. A read of the template that the provider refuses, such as a version that EC2 reports as not found, is the provider's own refusal instead: it is raised (exit `1`), and on a stage done again it leaves the row for the next pass |
 | `IMAGE_USERDATA_TOO_LARGE` | in `image plan`: the user data, rendered with a synthetic URL, is 16384 bytes or more. In an applying run it ends the build `failed` instead (first table) |
 | `IMAGE_SCRIPT_MISSING` | the container image does not hold the shipped warm script |

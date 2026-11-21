@@ -78,7 +78,7 @@ front of the script ([step 3](#3-render-the-user-data)).
 | `WARM_SRC_URL` | yes | `https` URL of a `.tar.gz` source archive that the builder can fetch without credentials. |
 | `WARM_SRC_SHA256` | yes | The archive's sha256, 64 hex digits. The script refuses to run without it and stops when the fetched bytes differ. |
 | `WARM_COMMANDS` | yes | The warm commands, one per line. Blank lines and lines that start with `#` are ignored. At least one is required. |
-| `WARM_GATE_COMMAND` | no | One command that tests that the warm layer is enough, run after the warm commands in the same account, environment and network. The script does not forbid downloads: the command must, with its tool's offline switch ([Examples](#examples)). Join steps with `&&` or `;`. |
+| `WARM_GATE_COMMAND` | no | One command that tests that the warm layer is enough, run after the warm commands in the same account, environment and network. The script does not forbid downloads: the command must, with its tool's offline switch ([Examples](#examples)). The script tests only the command's final exit status, so join steps that must all succeed with `&&`, never `;`. |
 | `WARM_LIFETIME_SECONDS` | no | Builder lifetime bound, 600 to 14400, default 5400. |
 | `WARM_SNAPSHOT_SECONDS` | no | How long the builder stays up after the marker, 60 to 3600, default 1800. |
 | `WARM_SRC_STRIP_COMPONENTS` | no | Leading path components that extraction drops, 0 or 1, default 0. A forge archive wraps the source in one directory and needs 1. Any other value stops the script before the fetch. |
@@ -178,10 +178,13 @@ command. This section owns the workflow.
    pass that first sees `IMAGE_READY`, it creates the image from the running
    builder. That pass, or a later one, waits for the image to be `available` and
    then terminates the builder; on a pass at or after the build deadline, reconcile
-   can terminate the builder first. A build with no ready marker by
-   `build_deadline_seconds` ends `failed`; an image still pending at the deadline
-   fails the build, but the first read after the deadline can still find it
-   `available` and go on.
+   can terminate the builder first. The build deadline decides the outcome only in
+   a pass that reaches its checks: a build with no ready marker by
+   `build_deadline_seconds` then ends `failed`, and an image still pending at the
+   deadline fails the build, though the first read after the deadline can still
+   find it `available` and go on. A pass that raises earlier, for example on a
+   refused console read ([#203](https://github.com/mikomiel/ci-burst/issues/203)),
+   leaves the build in flight.
 4. It creates a new version of the worker launch template that copies the pinned
    version and changes `ImageId` only, reads both versions back and compares them.
    A difference in any other field fails the build (`TEMPLATE_DRIFT`). Otherwise the
@@ -255,7 +258,9 @@ npm `postinstall` that fetches a binary, can still download and succeed, so chec
 those steps offline separately. A gate that does so proves cache behavior and no
 more. It does not prove that the image is safe: it says
 nothing about the software the commands installed, the content of the archive or the
-base image. A candidate is a verified cache, not an approved image. Read its
+base image. A candidate whose gate tested offline behavior is a verified cache, not
+an approved image; a candidate built with `allow_no_gate = true` and no gate is not
+even that. Read its
 evidence with `image status` and run a canary
 ([Canary and cutover](#canary-and-cutover)) before you promote it.
 

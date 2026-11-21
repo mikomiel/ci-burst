@@ -640,8 +640,9 @@ or advances the active one (`building`, then `imaging`, then `candidate` or
 `failed`), then runs retention. `--until-done` repeats passes, 30 seconds apart, until the build is `candidate` or
 `failed` or a pass has nothing in flight (a refusal, an unchanged digest). It needs
 `--apply` and refuses without it (`IMAGE_UNTIL_DONE_NEEDS_APPLY`, before the
-configuration is read). A pass that raises ends the loop, and the next run resumes
-the same build. `--force` counts for the first pass only.
+configuration is read). A pass that raises ends the loop. The exit status does not
+tell whether a build is still in flight: a pass can commit a result and then raise,
+so read `image status` before the next run. `--force` counts for the first pass only.
 
 An applying run first resolves the pending promotion row that a crashed
 `promote --write` left, from the hash of the TOML, and after its pass it records

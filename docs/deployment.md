@@ -646,7 +646,7 @@ prefix = "warm-image-source/"
 | `state_directory` | absolute path | required | the image state directory; it differs from the ledger's directory and lies neither inside it nor around it |
 | `min_build_interval_seconds` | `3600..604800` | `86400` | the least time between the starts of two builds; `--force` skips it |
 | `max_builds_per_day` | `1..6` | `2` | builds that may start in 24 hours; `--force` does not skip it |
-| `build_deadline_seconds` | `900..14400` | `2700` | a build with no verdict by then ends `failed`, unless the console read is refused ([#203](https://github.com/mikomiel/ci-burst/issues/203)) |
+| `build_deadline_seconds` | `900..14400` | `2700` | a build with no verdict by then ends `failed` in a pass that reaches the deadline check; a pass that raises earlier, such as on a refused console read ([#203](https://github.com/mikomiel/ci-burst/issues/203)), leaves it in flight |
 | `failure_cooldown_seconds` | `600..172800` | `21600` | the wait after a failed build |
 | `max_consecutive_failures` | `1..10` | `3` | consecutive failed builds that set `blocked` |
 | `retain` | `2..6` | `3` | the image count at which retention stops pruning |
@@ -715,8 +715,10 @@ Notes on the values:
   one directory. Keep `1` unless you have confirmed the layout your forge returns.
   Confirm it by listing the archive yourself: `image plan` reads one chunk of it
   and shows neither the layout nor what `export-ignore` drops.
-- `build_deadline_seconds` bounds the whole build, and the builder's own
-  `lifetime_seconds` timer powers it off if no pass ever runs. A `blocked` state
+- `build_deadline_seconds` ends a build that has no verdict in a pass that reaches
+  the deadline check; it is not a hard bound, because a pass that raises earlier
+  leaves the build in flight. The builder's own `lifetime_seconds` timer powers it
+  off if no pass ends it. A `blocked` state
   begins after `max_consecutive_failures` failed builds in a row; refusals are not
   failures. [operations.md](operations.md#image-commands) owns the states and their
   recovery.

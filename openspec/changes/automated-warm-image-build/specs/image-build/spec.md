@@ -375,9 +375,9 @@ A pass that stages a build again MUST first recompute the digest over the basis 
 - **WHEN** the warm script or a warm command differs from the one that gave the row's digest when the stage is done again
 - **THEN** the row ends `failed` with `IMAGE_INPUTS_CHANGED` and no builder is launched
 
-#### Scenario: A setting outside the digest changes while a stage waits
-- **WHEN** only a setting outside the digest, such as `lifetime_seconds` or `snapshot_seconds`, changed since the row was inserted
-- **THEN** the digest still matches and the stage launches with the value that the file holds at the launch
+#### Scenario: The builder lifetime changes while a stage waits
+- **WHEN** only `lifetime_seconds` or `snapshot_seconds` changed since the row was inserted
+- **THEN** the digest still matches, and a stage that passes its launch checks renders those values from the configuration of the resumed pass
 
 #### Scenario: A staged archive is removed
 - **WHEN** the row names an archive and the check finds that the inputs changed

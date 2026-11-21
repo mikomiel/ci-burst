@@ -6,7 +6,9 @@ The layer is optional. An operator who never runs it keeps the cold base image
 that [`deploy/runner/image/provision.sh`](../deploy/runner/image/provision.sh)
 builds, and nothing else in this repository changes.
 
-This document owns the runbook and the examples. The script is
+This document owns the build workflow and the examples: the
+[automated build](#the-automated-build), and the [manual runbook](#manual-runbook)
+that stays as the fallback. The script is
 [`deploy/runner/image/warm-cache.sh`](../deploy/runner/image/warm-cache.sh); the
 image directory's [README](../deploy/runner/image/README.md) owns the base image
 and the rollout of any image; [runner-setup.md](runner-setup.md) links here.
@@ -16,8 +18,14 @@ and the rollout of any image; [runner-setup.md](runner-setup.md) links here.
 - **Generic.** The script knows no consumer. You supply a source archive, its
   sha256, the warm commands and optionally an offline gate command. No command
   that fills a cache lives in this repository.
-- **Source only.** The script creates no image, calls no cloud API and holds no
-  credential. It ends at a marker, and you create the image with the AWS CLI.
+- **The script holds no credential.** It creates no image, calls no cloud API and
+  ends at a marker. In the manual runbook you create the image with the AWS CLI. In
+  the automated build the controller reads the marker and creates the image with
+  its own identity, outside the builder.
+- **A cache check, not a safety check.** A gate command that fails on a download
+  tests that the cache serves the warm commands; the script itself does not forbid
+  the network. It does not prove that the image is safe
+  ([The candidate and what the gate proves](#the-candidate-and-what-the-gate-proves)).
 - **Downloads only.** A warm cache removes downloads. The job still resolves its
   own lockfile and runs its own commands, so it checks the same things as on a
   cold worker. It is not a shortcut around a check.
@@ -66,10 +74,14 @@ front of the script ([step 3](#3-render-the-user-data)).
 | `WARM_SRC_URL` | yes | `https` URL of a `.tar.gz` source archive that the builder can fetch without credentials. |
 | `WARM_SRC_SHA256` | yes | The archive's sha256, 64 hex digits. The script refuses to run without it and stops when the fetched bytes differ. |
 | `WARM_COMMANDS` | yes | The warm commands, one per line. Blank lines and lines that start with `#` are ignored. At least one is required. |
-| `WARM_GATE_COMMAND` | no | One command that proves the warm layer is enough, run after the warm commands with downloads forbidden. Join steps with `&&` or `;`. |
+| `WARM_GATE_COMMAND` | no | One command that tests that the warm layer is enough, run after the warm commands in the same account, environment and network. The script does not forbid downloads: the command must, with its tool's offline switch ([Examples](#examples)). Join steps with `&&` or `;`. |
 | `WARM_LIFETIME_SECONDS` | no | Builder lifetime bound, 600 to 14400, default 5400. |
 | `WARM_SNAPSHOT_SECONDS` | no | How long the builder stays up after the marker, 60 to 3600, default 1800. |
 | `WARM_SRC_STRIP_COMPONENTS` | no | Leading path components that extraction drops, 0 or 1, default 0. A forge archive wraps the source in one directory and needs 1. Any other value stops the script before the fetch. |
+
+The automated build renders each of these from the `[image]` tables
+([deployment.md](deployment.md#the-image-tables-optional)), so the defaults in this
+table apply to the manual runbook only.
 
 Each command runs from the extracted source root, as the `runner` account, in its
 own transient systemd unit:
@@ -119,8 +131,9 @@ group ends with it, so a background process it started dies too.
    `IMAGE_READY` as its last line, and stays up for the snapshot window.
 
 **Success** is the `IMAGE_READY` line. The script does not power the builder off,
-because you create the image from the running builder. The lifetime timer still
-ends it if you never do.
+because the image is created from the running builder: by you in the manual runbook,
+by the controller in the automated build. The lifetime timer still ends the builder
+if nobody does.
 
 **Failure** prints `WARM FAIL ...`, then up to 60 lines of the consumer log with
 every line prefixed by `  | `, holds for 300 seconds so the console can be read,
@@ -131,7 +144,133 @@ or printable ASCII with `?`, so no carriage return, escape sequence or Unicode
 line separator can start a console line of its own. Trust a line that is exactly
 `IMAGE_READY` and nothing that starts with `  | `.
 
-## Runbook
+## The automated build
+
+The `image` commands do the manual steps for you: they render the inputs, stage the
+archive, launch the builder, read its marker, create the image and add an inert
+launch-template version. The path is optional and off by default. Everything above
+this section still applies, because the builder runs the same script with the same
+inputs, the same cache environment and the same examples.
+
+Each topic has one owner. [operations.md](operations.md#automated-warm-image-build)
+owns the commands, exit codes, events, metrics, the `blocked` state and the reason
+codes. [deployment.md](deployment.md#the-image-tables-optional) owns the
+configuration, the image role profile, the token and the dedicated TOML directory.
+[container.md](container.md#run-the-image-commands) owns the container line of each
+command. This section owns the workflow.
+
+### The flow
+
+1. `image run --apply` resolves the head of the protected branch with the image
+   token, reads the files that `[image.source].basis_paths` lists and computes the
+   basis digest.
+2. When a build is due, it streams the archive of that commit into a private bucket
+   prefix, renders the user data from the `[image.warm]` values and the shipped
+   script, and launches one builder from the build launch template.
+3. The builder runs this script. The controller reads the builder's console. In the
+   pass that first sees `IMAGE_READY`, it creates the image from the running
+   builder, waits for the image to be `available`, terminates the builder and
+   deletes the archive. A build that has no verdict by `build_deadline_seconds` ends
+   `failed`.
+4. It creates a new version of the worker launch template that copies the pinned
+   version and changes `ImageId` only, reads both versions back and compares them.
+   A difference in any other field fails the build (`TEMPLATE_DRIFT`). Otherwise the
+   image and the new version are a candidate. The version is inert: it is not the
+   default version, and no worker launches from it.
+5. A person reads the evidence and promotes the candidate with
+   `image promote --write`, which edits one line of the deployment TOML. Nothing
+   else moves the pin.
+
+The automated builder starts from the cold base image that the build launch
+template names, and never from the warm image. It does not take the image behind
+the pin as its base, and the image policy lets the image role launch only that one
+base image. The manual runbook below differs: its step 4 launches from the image
+you choose as `<base-image-id>`.
+
+```sh
+python -m ci_burst image plan    --config deployment.toml
+python -m ci_burst image run     --config deployment.toml --apply --until-done
+python -m ci_burst image status  --config deployment.toml --refresh
+python -m ci_burst image promote --config deployment.toml
+python -m ci_burst image promote --config deployment.toml --write
+python -m ci_burst image promote --config deployment.toml --rollback --write
+```
+
+Run each as a one-off container, as [container.md](container.md#run-the-image-commands)
+shows. The first command is read-only. The last two write the TOML, and the
+promotion container has no network and no credential.
+
+### Triggers
+
+Nothing starts a build by itself. You run `image run --apply`, or you schedule it
+yourself: this repository ships no unit or timer for it. A run starts a build only
+when the basis digest differs from the `ci-burst:basis-digest` tag of the image
+behind the pin, and no rule stops it: the minimum interval, the daily cap, a failure
+cooldown, the `blocked` state, or a builder that already exists. An image that was
+built by hand has no digest tag, so the first automated build after a manual one is
+always due. [operations.md](operations.md#when-a-build-starts) lists the rules in
+order and what `--force` skips.
+
+The `image-build` capability spec of the `automated-warm-image-build` change owns
+the exact inputs of the basis digest, and this page does not restate them. The
+digest does not cover the cold base image or the build launch template. When either
+changes, the digest stays the same and no build becomes due, so force one:
+
+```sh
+python -m ci_burst image run --config deployment.toml --apply --until-done --force
+```
+
+List every file that the warm commands read to decide what to install in
+`basis_paths`, so that a change to it makes a build due. A file that is not listed
+does not.
+
+### The candidate and what the gate proves
+
+A candidate is a build whose builder printed `IMAGE_READY`, which it does only after
+every warm command and the gate command, when one is configured, exited `0`, and
+whose launch-template version differs from the pin in `ImageId` alone. The script
+runs the gate as it runs a warm command: the same account, the same `env -i`
+environment and cache variables, the same source root and the same network. It
+blocks only the instance-metadata addresses for that account, and it tests only the
+exit status of the gate command. Whether a pass shows that the cache is enough
+therefore depends on the command: write it to fail when it would download, with the
+tool's offline switch, as the [examples](#examples) do. A gate that does so proves
+cache behavior and no more. It does not prove that the image is safe: it says
+nothing about the software the commands installed, the content of the archive or the
+base image. A candidate is a verified cache, not an approved image. Read its
+evidence with `image status` and run a canary
+([Canary and cutover](#canary-and-cutover)) before you promote it.
+
+A build without a gate is possible only with `allow_no_gate = true`, and a promotion
+accepts such a candidate only while that setting is still `true`. The build records
+at launch whether a gate was configured. Do not change `[image.warm]` (`commands`,
+`gate_command`, `allow_no_gate`) while a build is active: the builder runs with the
+settings it launched with, and its gate evidence must describe what ran. Wait until
+the build is `candidate` or `failed`.
+
+### Promotion and rollback
+
+`image promote` prints the candidate's evidence and the one-line change. With
+`--write` it replaces the `launch_template_version` of `[aws]` after it has checked
+the image, the version, the drift result, the gate and the age of the record, and
+it keeps a backup. The next `apply` launches from the new version.
+
+`image promote --rollback --write` restores the pin that the last promotion
+replaced, after it has checked that the previous version and its image still exist.
+A pin that you edit by hand bypasses the drift check and every other check of
+`promote`, so use the command. The checks, the reason codes and the recovery steps
+are in [operations.md](operations.md#candidate-and-promotion).
+
+### The manual runbook is the fallback
+
+The runbook below builds the same layer by hand with the AWS CLI. Keep it for a
+deployment that has not enabled the image path, and for a build that the automated
+path cannot make: it is blocked, the forge token or the image role is not
+available, or the build launch template is not ready. It does not use the image
+state file, so a manual image has no digest tag and the first automated build after
+it is due.
+
+## Manual runbook
 
 Every identifier below is a placeholder. Replace `<...>` with your own value.
 Never commit a real identifier, and never commit or log a presigned URL.
@@ -340,7 +479,9 @@ using the version it is configured with.
 ### Canary and cutover
 
 Before the move, run a canary: it is an operator obligation, and the controller
-does not enforce it or check for its evidence.
+does not enforce it or check for its evidence. It comes first whether you build by
+hand or promote an automated candidate; the cutover for a candidate is
+`image promote --write` instead of a hand edit of the pin.
 
 1. Point a test identity or a test deployment at the new version and run a job
    from a test repository through it.
@@ -459,6 +600,11 @@ first read on each new worker.
 Rebuild the layer when a lockfile that the warm commands read changes, and when
 the base image changes, because the layer is added to one base image. Repeat the
 runbook with a new archive. The new digest identifies the new image.
+
+With the automated build, a change to a file that `basis_paths` lists makes a build
+due by itself. A change to the cold base image or to the build launch template does
+not, because the basis digest covers neither: force a rebuild
+([Triggers](#triggers)).
 
 An older warm image does not break a job. For a content-addressed package or
 download cache (uv, npm, pip, browser downloads) a stale entry costs only time:

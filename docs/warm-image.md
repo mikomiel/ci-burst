@@ -18,8 +18,11 @@ and the rollout of any image; [runner-setup.md](runner-setup.md) links here.
 - **Generic.** The script knows no consumer. You supply a source archive, its
   sha256, the warm commands and optionally an offline gate command. No command
   that fills a cache lives in this repository.
-- **The script holds no credential.** It creates no image, calls no cloud API and
-  ends at a marker. In the manual runbook you create the image with the AWS CLI. In
+- **The script holds no long-lived credential.** It gets no AWS keys, no instance
+  profile and no Forgejo token, creates no image, calls no cloud API and ends at a
+  marker. In the automated build its user data carries one presigned S3 URL that
+  expires: it is bearer access to one source archive, so treat it as a secret (the
+  console tail masks it). In the manual runbook you create the image with the AWS CLI. In
   the automated build the controller reads the marker and creates the image with
   its own identity, outside the builder.
 - **A cache check, not a safety check.** A gate command that fails on a download

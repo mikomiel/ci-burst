@@ -948,7 +948,8 @@ undo the promotion.
 
 Every applying pass also rewrites `image-metrics.prom`, a Prometheus textfile in
 the same directory, and the telemetry counters beside it. A pass that started
-writes them even when it ended `refused` or raised. A run that stops before the
+writes them even when it ended `refused` or raised, unless the write of the textfile
+itself fails: the command then exits `1` and the old textfile stays. A run that stops before the
 pass (a wrong input, a writer lock held by another pass) writes nothing, and no
 other command rewrites the file. Every series carries the `deployment` label.
 
@@ -972,7 +973,8 @@ Three things look alike and are not the same:
   raised.
 - A completed decision is a pass that returned a result, a `refused` or `failed`
   one included. Only it writes the `image_check` event and the check time that
-  `image status` reports as `last_check_at`. A plain `image status` records that
+  `image status` reports as `last_check_at`, and it writes both before the
+  textfile, so a failed textfile write leaves them recorded. A plain `image status` records that
   time too, so it is no proof that a pass ran. A pass that raises records no
   decision: it prints `{"error": ...}` and exits `1` for a provider failure or `2`
   for another refusal.
@@ -1042,7 +1044,8 @@ starting. The timestamp also moves when a pass raises, so repeated provider fail
 do not trip it, and a pass that raises before it records an outcome records no
 failed build, so the failure rules stay quiet as well. A pass can also raise after
 it committed an outcome, for example when an event write fails after a counted
-failure; that outcome then stays in the state and the metrics. `CiBurstImageBuildNotAdvancing` covers a build in flight: a pass
+failure; that outcome then stays in the state, and reaches the metrics only if
+their publication succeeds. `CiBurstImageBuildNotAdvancing` covers a build in flight: a pass
 that raises before it advances the build cannot end it at its deadline, so the build
 stays `building` or `imaging`. A pass that raises before it records an outcome
 while no build is in flight has no failure series of its own: it can still move
@@ -1090,7 +1093,9 @@ A builder that outlives its lifetime is a defect. Find it by its
 
 The image of a failed build is removed by the deletion rule, except that the image
 of a build whose row records `TEMPLATE_DRIFT` is kept for 24 hours first.
-Retention keeps at least `retain` usable images, removes only images older than
+Retention keeps at least `retain` owned `available` images, protected ones
+counted, so a pinned image whose row records `TEMPLATE_DRIFT` counts toward it
+and fewer than `retain` usable images can remain. It removes only images older than
 `retain_min_age_seconds`, and never removes a protected image: the image behind
 the pin, a zone pin, the previous pin, the new pin of the newest completed
 promotion or rollback, both pins of every journal row since that one (a failed

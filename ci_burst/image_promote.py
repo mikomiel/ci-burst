@@ -842,6 +842,14 @@ def _preview(snapshot, state, clock, version, rollback):
         planned = state.detached_copy()
     finally:
         state.close()
+    # The file was read before the copy. A promotion that renamed the file in between would leave the preview
+    # resolving its row against the old hash, so the file is read again: the copy lies between two equal reads, or
+    # the preview refuses. Nothing is locked for this.
+    again = read_snapshot(config)
+    if again.target != snapshot.target or again.sha256 != snapshot.sha256:
+        raise ImageRefusal(
+            PROMOTE_FILE_CHANGED, "the file changed while the preview read it and the state; run the preview again"
+        )
     pending = []
     try:
         # The report of the pending rows comes first, so a refusal still carries it; then every row, as the write

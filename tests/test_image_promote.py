@@ -660,6 +660,21 @@ class PreviewTests(PromoteCase):
                 self.assertEqual((code, written["error"]), (2, error))
         self.assertEqual([row["status"] for row in self.journal_rows()], ["complete"])
 
+    def test_a_preview_refuses_when_the_file_changes_between_its_read_and_the_copy_of_the_state(self):
+        self.seed()
+        copy = ImageState.detached_copy
+
+        def copy_then_change_the_file(state):
+            copied = copy(state)
+            self.config_path.write_bytes(self.config_path.read_bytes() + b"# a promotion renamed the file here\n")
+            return copied
+
+        with mock.patch.object(ImageState, "detached_copy", copy_then_change_the_file):
+            code, payload = self.show()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"), payload)
+        code, payload = self.show()  # with nothing changing, the next preview plans
+        self.assertEqual((code, payload["decision"]), (0, "preview"), payload)
+
     def test_a_damaged_completed_row_refuses_the_preview_and_the_write_alike_and_changes_nothing(self):
         self.crash_a_second_promotion(self.crash_before_rename)  # A to B completed; B to C is pending, then aborted
         for damage in ({"old_pin": "x; not a pin"}, {"kind": "x; not a kind"}):

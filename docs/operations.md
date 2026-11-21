@@ -828,8 +828,8 @@ that your jobs pass on it. Read the evidence, run a canary
    `image_promoted` event follows. The command keeps the file mode of the TOML.
    Changing its owner is best-effort. A `[[aws.availability_zones]]` entry with its
    own `launch_template_version` is refused (`PROMOTE_ZONE_PIN`).
-4. The next `apply` loads the new pin and launches from it. An `apply` that is
-   already running keeps the pin it loaded. Watch the first workers in the
+4. The next `apply` loads the new pin and uses it for new admissions. An `apply`
+   that is already running keeps the pin it loaded. A launch intent that was recorded before the edit is retried with its original request, so it can still launch on the old image. Watch the first workers in the
    worker evidence above before you treat the image as live.
 
 `promote` is local. It makes no AWS or forge call, builds no client and holds no
@@ -914,13 +914,15 @@ pins the version that promotion wrote, the backup still has its recorded hash an
 contains the recorded previous pin, and the previous version and its image were
 read as existing and `available` within `promote_max_age_seconds`. It writes the
 previous pin with the same single-key edit, so other changes that you made to the
-TOML since then stay. The `rollback` object of `image status` says whether a
-rollback is available now and, if not, why.
+TOML since then stay. The `rollback` object of `image status` reports the rollback evidence: the target
+and whether its record is fresh. It does not check every write precondition, such
+as a zone pin (`PROMOTE_ZONE_PIN`); read `write_check` in the output of
+`image promote --rollback` without `--write` for those.
 
 If no rollback is available, set the pin by hand to a version whose image exists.
 The rest of rollback is the same as for the scaling path (see
 [Scheduler, cleanup and rollback](#scheduler-cleanup-and-rollback)): the pin is
-read by `apply`, so the next pass launches from the restored image. To stop the
+read by `apply`, so the next pass admits new workers on the restored image. A launch intent that was recorded before the edit is retried with its original request, so it can still launch on the old image. To stop the
 image path itself, set `enabled = false`: every image command then answers
 `disabled`, and the scaling path is unaffected. The edit disables fresh
 invocations only: a running `image run --apply --until-done` container keeps the

@@ -672,7 +672,7 @@ prefix = "warm-image-source/"
 | `gate_command` | a string | empty | the gate command; empty means no gate. The script runs it like a warm command, on the same network, and tests only its exit status, so write it to fail on a download ([warm-image.md](warm-image.md#the-candidate-and-what-the-gate-proves)) |
 | `allow_no_gate` | `true` or `false` | `false` | accept an empty gate |
 | `lifetime_seconds` | `600..14400` | `3600` | the builder's own lifetime bound |
-| `snapshot_seconds` | `60..3600` | `1800` | how long the builder stays up after the marker |
+| `snapshot_seconds` | `60..3600` | `1800` | how long the script sleeps after the marker; the lifetime timer or the controller can end the builder sooner |
 
 `[image.build]`:
 

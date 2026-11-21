@@ -80,7 +80,7 @@ front of the script ([step 3](#3-render-the-user-data)).
 | `WARM_COMMANDS` | yes | The warm commands, one per line. Blank lines and lines that start with `#` are ignored. At least one is required. |
 | `WARM_GATE_COMMAND` | no | One command that tests that the warm layer is enough, run after the warm commands in the same account, environment and network. The script does not forbid downloads: the command must, with its tool's offline switch ([Examples](#examples)). The script tests only the command's final exit status, so join steps that must all succeed with `&&`, never `;`. |
 | `WARM_LIFETIME_SECONDS` | no | Builder lifetime bound, 600 to 14400, default 5400. |
-| `WARM_SNAPSHOT_SECONDS` | no | How long the builder stays up after the marker, 60 to 3600, default 1800. |
+| `WARM_SNAPSHOT_SECONDS` | no | How long the script sleeps after it prints the marker, 60 to 3600, default 1800. Not an uptime guarantee: the lifetime timer or the controller can end the builder sooner. |
 | `WARM_SRC_STRIP_COMPONENTS` | no | Leading path components that extraction drops, 0 or 1, default 0. A forge archive wraps the source in one directory and needs 1. Any other value stops the script before the fetch. |
 
 The automated build renders each of these from the `[image]` tables
@@ -157,8 +157,8 @@ this section still applies, because the builder runs the same script with the sa
 inputs, the same cache environment and the same examples.
 
 Each topic has one owner. [operations.md](operations.md#automated-warm-image-build)
-owns the commands, exit codes, events, metrics, the `blocked` state and the reason
-codes. [deployment.md](deployment.md#the-image-tables-optional) owns the
+owns the commands, exit codes, the `blocked` state and the reason codes of each
+step; the reference of events and metrics is a separate change (task 7.8). [deployment.md](deployment.md#the-image-tables-optional) owns the
 configuration, the image role profile, the token and the dedicated TOML directory.
 [container.md](container.md#run-the-image-commands) owns the container line of each
 command. This section owns the workflow.
@@ -175,9 +175,11 @@ command. This section owns the workflow.
    again before it stages it
    ([operations.md](operations.md#when-a-build-starts)).
 3. The builder runs this script. The controller reads the builder's console. In the
-   pass that first sees `IMAGE_READY`, it creates the image from the running
-   builder, if the builder is still alive and the build is still within its deadline
-   when the create call is made; otherwise the build fails without an image. That pass, or a later one, waits for the image to be `available` and
+   pass that first sees `IMAGE_READY`, it requests the image from the running
+   builder, unless the builder was last seen gone or the deadline has passed. A
+   request whose outcome is unknown can leave the build for a later pass, or the
+   build can fail although the image exists; the image of a failed build is removed
+   by the deletion rule. That pass, or a later one, waits for the image to be `available` and
    then terminates the builder; on a pass at or after the build deadline, reconcile
    can terminate the builder first. The build deadline decides the outcome only in
    a pass that reaches its checks: a build with no ready marker by
@@ -277,7 +279,7 @@ the build is `candidate` or `failed`.
 `image promote` prints the candidate's evidence and the one-line change. With
 `--write` it replaces the `launch_template_version` of `[aws]` after it has checked
 the image, the version, the drift result, the gate and the age of the record, and
-it keeps a backup. The next `apply` launches from the new version.
+it keeps a backup. The next `apply` uses the new version for new admissions. A launch intent that was recorded before the edit is retried with its original request, so it can still launch on the old image.
 
 `image promote --rollback --write` restores the pin that the last promotion
 replaced, after it has checked that the previous version and its image still exist.

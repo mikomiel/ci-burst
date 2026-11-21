@@ -10,6 +10,7 @@ its ledger. This module holds no AWS or Forgejo code.
 
 import fcntl
 import os
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -17,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import StateRefusal
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 SCHEMA_VERSION = 1
 STATE_FILE = "image-state.sqlite"
@@ -780,13 +783,20 @@ class ImageState:
 
 
 def _journal_row(row):
-    """A ``Journal`` from a row, or the refusal of a row whose pins or names are not what this module writes.
+    """A ``Journal`` from a row, or the refusal of a row that the promotion does not write.
 
     SQLite's ``INTEGER`` and ``TEXT`` affinities do not reject other types, so a hand-edited or damaged file can
-    hold text or a blob where a pin belongs, or a kind or a status outside the schema. Such a value is never passed on: it would reach a detail or the
-    output verbatim. The refusal names no value.
+    hold text or a blob where a pin belongs, or a kind or a status outside the schema. A row can also hold values
+    of the right type that contradict each other, where the writer records one fact twice. Such a row is never
+    passed on: its values could reach a detail or the output verbatim, or resolve the row the wrong way and leave
+    an image unprotected. The refusal names the row and no value.
     """
     data = dict(row)
+    hashes = ("old_file_sha256", "new_file_sha256", "backup_sha256")
+    hashes_ok = all(type(data[key]) is str and _SHA256.fullmatch(data[key]) for key in hashes)
+    # The backup is the old file, and the rename changed the file: a row whose old hash is its new one would be
+    # resolved as aborted after a rename that happened.
+    hashes_ok = hashes_ok and data["old_file_sha256"] != data["new_file_sha256"]
     pins_ok = all(type(data[key]) is int and data[key] >= 1 for key in ("old_pin", "new_pin", "contained_pin"))
     # The one writer records the pin that the file held as both: a row where they differ was changed afterwards, and
     # either value could then name the wrong image to resolve or to protect from retention.
@@ -795,7 +805,7 @@ def _journal_row(row):
     # The schema's CHECK holds kind and status to these values, but a file written without it, or with checks
     # turned off, need not.
     enums_ok = texts_ok and data["kind"] in JOURNAL_KINDS and data["status"] in JOURNAL_STATUSES
-    if not (pins_ok and enums_ok):
+    if not (pins_ok and enums_ok and hashes_ok):
         raise StateRefusal("IMAGE_STATE_UNREADABLE", f"promotion journal row {int(data['id'])} is malformed")
     return Journal(**data)
 

@@ -1057,6 +1057,34 @@ class DetachedCopyTests(ImageStateCase):
                         read()
                     self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
 
+    def test_a_journal_row_with_a_hash_that_the_promotion_does_not_write_is_refused_and_not_echoed(self):
+        self.add_journal()
+        cases = (
+            ("old_file_sha256", "'x; not a hash'"),
+            ("new_file_sha256", "'A' || substr(new_file_sha256, 2)"),  # not lower-case hex
+            ("backup_sha256", "substr(backup_sha256, 2)"),  # 63 characters
+            ("old_file_sha256", "new_file_sha256"),  # the old file is the new one
+        )
+        for column, expression in cases:
+            with self.subTest(column=column, expression=expression):
+                self.state.close()
+                connection = sqlite3.connect(self.state.path)
+                try:
+                    connection.execute(
+                        "UPDATE promotion_journal SET old_file_sha256 = ?, new_file_sha256 = ?, backup_sha256 = ?",
+                        ("1" * 64, "2" * 64, "1" * 64),
+                    )
+                    connection.execute(f"UPDATE promotion_journal SET {column} = {expression}")
+                    connection.commit()
+                finally:
+                    connection.close()
+                self.state.connect()
+                for read in (self.state.pending_journal, lambda: self.state.journal(1), self.state.journal_check):
+                    with self.assertRaises(StateRefusal) as raised:
+                        read()
+                    self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+                    self.assertNotIn("not a hash", raised.exception.detail)
+
     def test_a_journal_row_with_a_kind_or_status_outside_the_schema_is_refused_and_not_echoed(self):
         self.add_journal()
         for column in ("kind", "status"):

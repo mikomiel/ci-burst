@@ -1533,21 +1533,21 @@ class ResolutionTests(unittest.TestCase):
         return [self.state.journal(number).status for number in range(1, 5) if self.state.journal(number)]
 
     def test_the_hash_names_the_resolution(self):
-        row = self.row("o" * 64, "n" * 64)
-        self.assertEqual(image_promote.implied_resolution(row, "o" * 64), "aborted")
-        self.assertEqual(image_promote.implied_resolution(row, "n" * 64), "complete")
-        self.assertEqual(image_promote.implied_resolution(row, "x" * 64), "diverged")
+        row = self.row("a" * 64, "b" * 64)
+        self.assertEqual(image_promote.implied_resolution(row, "a" * 64), "aborted")
+        self.assertEqual(image_promote.implied_resolution(row, "b" * 64), "complete")
+        self.assertEqual(image_promote.implied_resolution(row, "c" * 64), "diverged")
 
     def test_nothing_pending_resolves_nothing(self):
-        self.assertEqual(image_promote.resolve_pending(self.state, "o" * 64), [])
+        self.assertEqual(image_promote.resolve_pending(self.state, "a" * 64), [])
 
     def test_each_row_is_resolved_from_its_own_hashes_and_only_a_completed_promotion_promotes_its_candidate(self):
         self.candidate("kept")
         self.candidate("done")
-        self.row("o" * 64, "x" * 64, candidate_id="kept")
-        self.row("y" * 64, "o" * 64, candidate_id="done")
-        self.row("z" * 64, "o" * 64, kind="rollback", candidate_id="done")
-        resolved = image_promote.resolve_pending(self.state, "o" * 64)
+        self.row("a" * 64, "c" * 64, candidate_id="kept")
+        self.row("d" * 64, "a" * 64, candidate_id="done")
+        self.row("e" * 64, "a" * 64, kind="rollback", candidate_id="done")
+        resolved = image_promote.resolve_pending(self.state, "a" * 64)
         self.assertEqual(
             resolved,
             [
@@ -1562,10 +1562,10 @@ class ResolutionTests(unittest.TestCase):
 
     def test_one_diverged_row_refuses_the_whole_resolution_and_writes_nothing(self):
         self.candidate("kept")
-        self.row("o" * 64, "x" * 64, candidate_id="kept")
-        self.row("y" * 64, "z" * 64, candidate_id="kept")
+        self.row("a" * 64, "c" * 64, candidate_id="kept")
+        self.row("d" * 64, "e" * 64, candidate_id="kept")
         with self.assertRaises(StateRefusal) as raised:
-            image_promote.resolve_pending(self.state, "o" * 64)
+            image_promote.resolve_pending(self.state, "a" * 64)
         self.assertEqual(raised.exception.reason, "PROMOTION_JOURNAL_DIVERGED")
         self.assertIn("row 2", raised.exception.detail)
         self.assertEqual(self.statuses(), ["pending", "pending"])
@@ -1574,10 +1574,10 @@ class ResolutionTests(unittest.TestCase):
     def test_a_candidate_that_is_no_longer_a_candidate_or_never_existed_is_left_alone(self):
         self.candidate("failed-one")
         self.state.advance_build("failed-one", state="failed")
-        self.row("y" * 64, "o" * 64, candidate_id="failed-one")
-        self.row("y" * 64, "o" * 64, candidate_id="never-recorded")
-        self.row("y" * 64, "o" * 64)
-        image_promote.resolve_pending(self.state, "o" * 64)
+        self.row("d" * 64, "a" * 64, candidate_id="failed-one")
+        self.row("d" * 64, "a" * 64, candidate_id="never-recorded")
+        self.row("d" * 64, "a" * 64)
+        image_promote.resolve_pending(self.state, "a" * 64)
         self.assertEqual(self.state.build("failed-one").state, "failed")
         self.assertEqual(self.statuses(), ["complete", "complete", "complete"])
 

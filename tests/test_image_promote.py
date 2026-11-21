@@ -677,6 +677,12 @@ class PreviewTests(PromoteCase):
             os.replace(replacement, self.config_path)
             return copied
 
+        def copy_then_replace_the_file_with_a_fifo(state):
+            copied = copy(state)
+            self.config_path.unlink()
+            os.mkfifo(self.config_path, 0o600)
+            return copied
+
         def copy_then_write_a_file_that_does_not_load(state):
             copied = copy(state)
             self.config_path.write_bytes(self.config_path.read_bytes() + b'"x; an unknown key" = 1\n')
@@ -686,14 +692,17 @@ class PreviewTests(PromoteCase):
         for change in (
             copy_then_change_the_file,
             copy_then_replace_the_file_with_the_same_bytes,
+            copy_then_replace_the_file_with_a_fifo,
             copy_then_write_a_file_that_does_not_load,
         ):
             with self.subTest(change=change.__name__):
+                self.config_path.unlink(missing_ok=True)
                 self.config_path.write_bytes(original)
-                with mock.patch.object(ImageState, "detached_copy", change):
+                with mock.patch.object(ImageState, "detached_copy", change), _deadline(10):
                     code, payload = self.show()
                 self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"), payload)
                 self.assertNotIn("unknown key", json.dumps(payload))
+        self.config_path.unlink(missing_ok=True)
         self.config_path.write_bytes(original)
         code, payload = self.show()  # with nothing changing, the next preview plans
         self.assertEqual((code, payload["decision"]), (0, "preview"), payload)

@@ -105,7 +105,7 @@ class Snapshot:
     mode: int
     uid: int
     gid: int
-    identity: tuple  # (device, inode) of the file the bytes were read from
+    identity: tuple  # what tells the file the bytes were read from from any other: see ``_identity``
 
     @property
     def pin(self):
@@ -146,28 +146,43 @@ def read_snapshot(config):
         mode=stat.S_IMODE(metadata.st_mode),
         uid=metadata.st_uid,
         gid=metadata.st_gid,
-        identity=(metadata.st_dev, metadata.st_ino),
+        identity=_identity(metadata),
     )
+
+
+def _identity(metadata):
+    """The device and inode, with the change and modification times and the size.
+
+    A file that replaced another can reuse its inode, but not its change time, which no write of the content or
+    of the times can set back: the pair tells a file that was replaced, even by the same bytes, from one that was not.
+    """
+    return (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns, metadata.st_mtime_ns, metadata.st_size)
 
 
 def _is_unchanged(snapshot):
     """Whether the deployment path still leads to the same file with the same bytes. It parses nothing.
 
-    The identity tells two atomic replacements that restored the same bytes (a promotion, then a rollback) from an
-    unchanged file; the hash tells an edit in place. Any error reading the file is a change.
+    The path is compared before anything is opened, the open neither follows a link nor waits for a writer, and the
+    identity is compared before the bytes are read: a replacement by a FIFO, a link or another file is a change, and
+    never a hang. Any error is a change.
     """
     try:
         target = Path(snapshot.config.path).resolve()
-        with open(target, "rb") as handle:
-            metadata = os.fstat(handle.fileno())
-            data = handle.read()
+        if target != snapshot.target:
+            return False
+        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or _identity(metadata) != snapshot.identity:
+                return False
+            chunks = []
+            while chunk := os.read(descriptor, 1 << 16):
+                chunks.append(chunk)
+        finally:
+            os.close(descriptor)
     except OSError:
         return False
-    return (
-        target == snapshot.target
-        and (metadata.st_dev, metadata.st_ino) == snapshot.identity
-        and sha256_of(data) == snapshot.sha256
-    )
+    return sha256_of(b"".join(chunks)) == snapshot.sha256
 
 
 def sha256_of(data):

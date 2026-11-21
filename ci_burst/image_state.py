@@ -690,6 +690,16 @@ class ImageState:
         if row is not None:
             raise StateRefusal("IMAGE_STATE_UNREADABLE", f"promotion journal row {int(row['id'])} is malformed")
 
+    def journal_check(self):
+        """Refuse unless every journal row is one this module writes; ``IMAGE_STATE_UNREADABLE`` names the first.
+
+        An applying run checks the whole journal before its pass, so a damaged completed row that retention or
+        cleanup would read later stops the run before any client is built or anything in the account changes.
+        """
+        self._refuse_a_journal_outside_the_schema()
+        for row in self._require().execute("SELECT * FROM promotion_journal ORDER BY id"):
+            _journal_row(row)
+
     def pending_journal(self):
         """Every ``pending`` row, oldest first."""
         self._refuse_a_journal_outside_the_schema()

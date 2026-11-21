@@ -15,6 +15,9 @@ class Refusal(Exception):
         self.reason = reason
         self.detail = detail
         self.uncertain = uncertain
+        #: Facts that a command found before it refused, printed next to the error (``promote`` puts its
+        #: ``pending_journal`` here). Ids, digests and codes only, as in any result.
+        self.report = {}
 
     def as_dict(self):
         data = {"reason": self.reason}

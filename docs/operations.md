@@ -931,7 +931,7 @@ with every URL, presigned query string and archive key replaced by
 
 | Event | Written when | Fields |
 | --- | --- | --- |
-| `image_check` | when an applying pass finishes with a decision, a `refused` or `failed` one included; a pass that raises writes none | `decision`, `reason`, `forced`, `build_id`, `digest`, `pin_digest`, `pin_version`, `source_sha` |
+| `image_check` | when an applying pass finishes with a decision, a `refused` or `failed` one included; a pass that raises before it records an outcome writes none, and a write that raises after this event leaves it in place | `decision`, `reason`, `forced`, `build_id`, `digest`, `pin_digest`, `pin_version`, `source_sha` |
 | `image_build_started` | a builder has been launched | `build_id`, `builder_id`, `digest`, `source_sha`, `forced`, `deadline_at` |
 | `image_marker_seen` | the pass first reads the ready marker on the builder's console | `build_id`, `builder_id`, `latency_seconds` |
 | `image_created` | the image of the build was created or adopted | `build_id`, `builder_id`, `image_id` |
@@ -1039,11 +1039,13 @@ groups:
 
 `CiBurstImageNoPassStarted` watches pass attempts, so it fires only when passes stop
 starting. The timestamp also moves when a pass raises, so repeated provider failures
-do not trip it, and a pass that raises records no failed build, so the failure rules
-stay quiet as well. `CiBurstImageBuildNotAdvancing` covers a build in flight: a pass
+do not trip it, and a pass that raises before it records an outcome records no
+failed build, so the failure rules stay quiet as well. A pass can also raise after
+it committed an outcome, for example when an event write fails after a counted
+failure; that outcome then stays in the state and the metrics. `CiBurstImageBuildNotAdvancing` covers a build in flight: a pass
 that raises before it advances the build cannot end it at its deadline, so the build
-stays `building` or `imaging`. A pass that raises while no build is in flight has
-no failure series of its own: it can still move
+stays `building` or `imaging`. A pass that raises before it records an outcome
+while no build is in flight has no failure series of its own: it can still move
 `ci_burst_image_last_run_timestamp_seconds`, but it records no decision and no
 failed build. Its signals are its exit status (`1` for a provider failure, `2` for
 another refusal) and the missing `image_check` event. Alert on the scheduled run's
@@ -1093,7 +1095,7 @@ Retention keeps at least `retain` usable images, removes only images older than
 the pin, a zone pin, the previous pin, the new pin of the newest completed
 promotion or rollback, both pins of every journal row since that one (a failed
 promotion that a pass resolved from a stale file still names the live pin), the
-pins of a pending promotion, the candidate or the active build. `retain` is a
+pins of a pending promotion, the candidate (unless a refresh recorded it as `TEMPLATE_DRIFT`: then only a pin that names its image protects it) or the active build. `retain` is a
 floor for retention, not a cap: the protected set can hold more images. When it
 cannot resolve that set it deletes nothing (`IMAGE_DELETION_UNSAFE`), and a
 deployment file that is a stale view of a replaced file is one such case. A
@@ -1142,7 +1144,7 @@ The trigger rules and the two start refusals are in
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the image token while the branch or a basis file was read. The same answer to the archive request of a staging run ends the build `failed` |
 | `IMAGE_BRANCH_UNPROTECTED` | the configured branch is not protected on the forge |
 | `IMAGE_BASIS_PATH_MISSING` | a `basis_paths` file is not in the repository at the head sha |
-| `IMAGE_BUILD_TEMPLATE_UNSAFE` | the build launch template or its version is missing or fails a safety check; the detail names the properties, never a value |
+| `IMAGE_BUILD_TEMPLATE_UNSAFE` | the build launch template or its version is missing or fails a safety check; the detail names the properties, never a value. A read of the template that the provider refuses, such as a version that EC2 reports as not found, is the provider's own refusal instead: it is raised (exit `1`), and on a stage done again it leaves the row for the next pass |
 | `IMAGE_USERDATA_TOO_LARGE` | in `image plan`: the user data, rendered with a synthetic URL, is 16384 bytes or more. In an applying run it ends the build `failed` instead (first table) |
 | `IMAGE_SCRIPT_MISSING` | the container image does not hold the shipped warm script |
 | `IMAGE_STATE_LOCKED` | another pass or refresh holds the writer lock of the state file |

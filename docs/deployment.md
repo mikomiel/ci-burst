@@ -464,7 +464,10 @@ fresh one afterwards.
 
 ## 5. Write the deployment TOML
 
-`/etc/ci-burst/deployment.toml` on both hosts, identical content:
+`/etc/ci-burst/deployment.toml` on both hosts, identical content. If you use the
+image feature, the scaler's copy lives at `/etc/ci-burst-deployment/deployment.toml`
+instead ([The dedicated TOML directory](#the-dedicated-toml-directory)); use that host path on the
+scaler in this step and in every later command that mounts the file:
 
 ```toml
 deployment = "example-ci-burst"
@@ -892,7 +895,10 @@ Check the timers with `systemctl list-timers 'ci-burst-*'`. Do not start
 `apply` yet: the next two steps qualify it first.
 
 Run one command by hand before trusting the timer. The shape is in
-[container.md](container.md) § "Run one command manually":
+[container.md](container.md) § "Run one command manually". With the image feature,
+replace the host side of the deployment-file `--volume` with
+`/etc/ci-burst-deployment/deployment.toml`; the container side and `--config` stay
+as they are:
 
 ```sh
 podman run --rm --init --network ci-burst --name ci-burst-manual --read-only \

@@ -116,7 +116,7 @@ def main(argv=None):
             else:
                 result = controller.reap(apply=arguments.apply)
     except Refusal as refusal:
-        print(json.dumps({"error": refusal.as_dict()}, indent=2, sort_keys=True))
+        print(json.dumps({"error": refusal.as_dict(), **refusal.report}, indent=2, sort_keys=True))
         # A provider refusal that escapes an image command is a provider failure.
         return 1 if arguments.command == "image" and isinstance(refusal, ProviderRefusal) else 2
     except Exception as error:  # noqa: BLE001 - the boundary reports a type name only

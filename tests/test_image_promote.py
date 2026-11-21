@@ -598,6 +598,8 @@ class PreviewTests(PromoteCase):
         for arguments in ((), ("--version", "5")):
             code, payload = self.show_changing_nothing(*arguments)
             self.assertEqual(code, 2, payload)
+            # The row on disk is still pending: the refused preview says so, with the resolution the hash implies.
+            self.assertEqual([item["implied_resolution"] for item in payload["pending_journal"]], ["complete"])
             previews[arguments] = payload["error"]
         self.assertEqual(
             [error["reason"] for error in previews.values()], ["PROMOTE_NO_CANDIDATE", "PROMOTE_VERSION_NOT_CANDIDATE"]

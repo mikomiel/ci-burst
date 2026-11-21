@@ -53,7 +53,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import config as configuration
-from .errors import ConfigRefusal, ImageRefusal, StateRefusal
+from .errors import ConfigRefusal, ImageRefusal, Refusal, StateRefusal
 from .image_template import CLEAN
 
 PROMOTE_NO_CANDIDATE = "PROMOTE_NO_CANDIDATE"
@@ -709,7 +709,9 @@ def promote(config, *, state, clock, events, version=None, rollback=False, write
     state in memory and drops the copy. A row that the file matches by neither
     hash is not resolved, as ``--write`` refuses to resolve it, so the command
     plans against that row as it is. Once there is a candidate or a rollback
-    row to show, the write check is the first refusal that ``--write`` meets.
+    row to show, the write check is the first planning refusal that ``--write``
+    meets for the files and rows as read (a lock that another command holds at
+    the time of the write is not foreseen).
     Without one, the selection refusal is raised before the directory, zone-pin
     and divergence checks, so in a state that holds two refusals the command can
     name another one than ``--write`` names first. A refusal is raised.
@@ -797,6 +799,7 @@ def _preview(snapshot, state, clock, version, rollback):
         planned = state.detached_copy()
     finally:
         state.close()
+    pending = []
     try:
         pending = pending_report(planned, snapshot.sha256)
         # ``--write`` resolves a pending row before it plans, so the preview plans against the rows as that leaves
@@ -844,6 +847,12 @@ def _preview(snapshot, state, clock, version, rollback):
             "write_check": _write_check(refusal),
             **report,
         }
+    except Refusal as refusal:
+        # A refused preview still says that a row is pending and how the hash resolves it: the refusal can be
+        # the consequence of that resolution, and the row on disk stays pending until a write resolves it.
+        if pending:
+            refusal.report = {**refusal.report, "pending_journal": pending}
+        raise
     finally:
         planned.close()
 

@@ -1014,6 +1014,7 @@ class DetachedCopyTests(ImageStateCase):
         copy.close()
         before = self.on_disk()
         self.assertIs(copy.connect(), copy)
+        self.assertFalse(copy.connect_readonly(), "a closed copy does not open the file read-only either")
         self.assertFalse(copy.available)
         with self.assertRaises(StateRefusal) as raised:
             copy.control_get()

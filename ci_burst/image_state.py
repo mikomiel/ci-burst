@@ -749,7 +749,7 @@ class ImageState:
 class _DetachedState(ImageState):
     """The copy that ``detached_copy`` returns.
 
-    It has no other writer, so it takes no lock and never opens the file for writing: ``connect`` and
+    It has no other writer, so it takes no lock and never opens the file: ``connect``, ``connect_readonly`` and
     ``acquire_writer`` do nothing.
     """
 
@@ -758,6 +758,9 @@ class _DetachedState(ImageState):
 
     def acquire_writer(self):
         return self  # there is no writer to exclude, and the lock file belongs to the file
+
+    def connect_readonly(self):
+        return self._connection is not None  # never the file: a closed copy stays closed
 
 
 def _give_up_on_a_locked_source(status, remaining, total):

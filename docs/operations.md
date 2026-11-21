@@ -885,7 +885,7 @@ plan when the file is a stale view or the journal cannot be read.
 | `PROMOTE_DIRECTORY_NOT_DEDICATED` | the directory holds more than the TOML, its `.bak.*` backups, its lock file and its promote temporary file, or it cannot be listed | give the TOML a dedicated directory ([deployment.md](deployment.md#the-dedicated-toml-directory)) |
 | `PROMOTE_BUSY` | another promotion holds the lock file; it is never waited for | wait, then run the command again |
 | `PROMOTE_WRITE_FAILED` | a local file step failed; the detail names the errno and no path | fix the directory (space, mode, owner) and run the command again |
-| `PROMOTION_JOURNAL_DIVERGED` | the TOML matches neither hash of a pending journal row | restore the TOML from the backup the row names, then run a resolving command |
+| `PROMOTION_JOURNAL_DIVERGED` | the TOML matches neither hash of a pending journal row | copy the current TOML outside the dedicated directory first. The backup the row names is the whole file before the promotion, so check it against the row's recorded hash, restore it, run a resolving command, and then reapply any later edit you still want |
 | `PROMOTE_FILE_STALE` | the open TOML has no name left: the container mounted the file itself and a rename elsewhere replaced it | mount the directory of the file, not the file, and run again |
 | `PIN_RECORD_DIVERGED` | the pin or the backup no longer matches what the newest completed promotion recorded | set the pin by hand to the intended version, then `image status --refresh` |
 | `ROLLBACK_NO_PROMOTION` | no completed promotion is recorded, or no state file exists | set the pin by hand |
@@ -914,20 +914,28 @@ pins the version that promotion wrote, the backup still has its recorded hash an
 contains the recorded previous pin, and the previous version and its image were
 read as existing and `available` within `promote_max_age_seconds`. It writes the
 previous pin with the same single-key edit, so other changes that you made to the
-TOML since then stay. The `rollback` object of `image status` reports the rollback evidence: the target
-and whether its record is fresh. It does not check every write precondition, such
+TOML since then stay. The `rollback` object of `image status` reports either the target and its
+evidence or the reason a rollback is not available now. It does not check every write precondition, such
 as a zone pin (`PROMOTE_ZONE_PIN`); read `write_check` in the output of
 `image promote --rollback` without `--write` for those.
 
 If no rollback is available, set the pin by hand to a version whose image exists.
 The rest of rollback is the same as for the scaling path (see
 [Scheduler, cleanup and rollback](#scheduler-cleanup-and-rollback)): the pin is
-read by `apply`, so the next pass admits new workers on the restored image. A launch intent that was recorded before the edit is retried with its original request, so it can still launch on the old image. To stop the
+read by `apply`, so the next pass admits new workers on the restored image, except
+in a zone whose entry carries its own `launch_template_version`: check every zone
+pin. A launch intent that was recorded before the edit is retried with its original
+request, so it can still launch on the old image. When the old image must not run
+again, contain it as an incident instead: stop `apply` admission, keep cleanup
+running, and reconcile the existing workers and intents
+([Scheduler, cleanup and rollback](#scheduler-cleanup-and-rollback)). To stop the
 image path itself, set `enabled = false`: every image command then answers
 `disabled`, and the scaling path is unaffected. The edit disables fresh
 invocations only: a running `image run --apply --until-done` container keeps the
 configuration it loaded at its start, so stop that container too. A builder that is
-already running then ends by its own timers (next section), not by a pass.
+already running is then no longer ended by a pass. Its own timer exists only if its
+user data ran, so confirm that each tagged builder of the deployment is terminated
+(next section) instead of assuming that it stops itself.
 
 ### Image events and metrics
 
@@ -943,7 +951,9 @@ A builder is an on-demand instance of the build launch template, tagged
 instance itself end a leaked builder without any controller: the warm script arms
 its own lifetime timer first (`image.warm.lifetime_seconds`), and the template
 terminates the instance on shutdown. Both hold when the controller host is down or
-the image path is disabled.
+the image path is disabled, but only if the user data ran: a builder whose script
+never started has no timer, and terminate-on-shutdown does not start a shutdown.
+Check for such a builder by its tag and terminate it.
 
 When passes do run, every applying pass reconciles before it does anything else.
 It terminates every tagged builder that is not the active build's, and the active

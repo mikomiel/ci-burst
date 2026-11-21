@@ -216,7 +216,9 @@ repository.
       image build today, so G8 and this item apply only once one exists.
 - [ ] When the cold base image or the build launch template changes, you force a
       rebuild with `image run --apply --until-done --force`, because the basis
-      digest covers neither
+      digest covers neither, only after any build in flight has settled, and you
+      check that the candidate's builder was launched after the change from the
+      intended template before you promote it
       ([warm-image.md](warm-image.md#triggers)).
 - [ ] You rotate the source key on the schedule that
       [deployment.md](deployment.md#image-build-role-and-source-identity-optional)

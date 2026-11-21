@@ -132,7 +132,8 @@ group ends with it, so a background process it started dies too.
    is fatal, and the process check repeats right before the marker, so a late
    background writer cannot change the image after the clean-up.
 6. Prints `CACHE size=...`, then `WARM_SOURCE_SHA256 <digest>`, then
-   `IMAGE_READY` as its last line, and stays up for the snapshot window.
+   `IMAGE_READY` as its last line, and sleeps for the snapshot window; the
+   lifetime timer or the controller can end the builder sooner.
 
 **Success** is the `IMAGE_READY` line. The script does not power the builder off,
 because the image is created from the running builder: by you in the manual runbook,
@@ -175,8 +176,8 @@ command. This section owns the workflow.
    again before it stages it
    ([operations.md](operations.md#when-a-build-starts)).
 3. The builder runs this script. The controller reads the builder's console. In the
-   pass that first sees `IMAGE_READY`, it requests the image from the running
-   builder, unless the builder was last seen gone or the deadline has passed. A
+   pass that first sees `IMAGE_READY`, it requests the image from the recorded
+   builder, unless that builder was last seen gone or the deadline has passed. A
    request whose outcome is unknown can leave the build for a later pass, or the
    build can fail although the image exists; the image of a failed build is removed
    by the deletion rule. That pass, or a later one, waits for the image to be `available` and
@@ -235,7 +236,12 @@ order and what `--force` skips.
 The `image-build` capability spec of the `automated-warm-image-build` change owns
 the exact inputs of the basis digest, and this page does not restate them. The
 digest does not cover the cold base image or the build launch template. When either
-changes, the digest stays the same and no build becomes due, so force one:
+changes, the digest stays the same and no build becomes due, so force one.
+First let any build in flight settle (`image status` shows no active build): a
+forced run resumes a build in flight instead of starting a new one, and a build
+whose image is requested after the change can carry the new base in its tags
+although its builder started on the old one. Before you promote the result, check
+that its builder was launched after the change, from the intended template.
 
 ```sh
 python -m ci_burst image run --config deployment.toml --apply --until-done --force

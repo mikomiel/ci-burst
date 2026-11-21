@@ -927,9 +927,10 @@ installed it becomes:
 5. Revert the source change through a reviewed pull request. Do not rewrite
    published history.
 
-The image pin is not part of this order. A bad warm image is undone by moving the
-pin back, not by stopping admission; see
-[operations.md](operations.md#rolling-back-an-image).
+The image pin is not part of this order. A routine rollback of a warm image moves
+the pin back ([operations.md](operations.md#rolling-back-an-image)). When the old
+image must not run again, treat it as an incident: a recorded launch intent can
+still retry on it, so stop admission as above as well.
 
 ### Retiring the cleanup host
 

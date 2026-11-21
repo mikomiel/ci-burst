@@ -1033,7 +1033,7 @@ class DetachedCopyTests(ImageStateCase):
                 finally:
                     connection.close()
                 self.state.connect()
-                for read in (self.state.pending_journal, lambda: self.state.journal(1)):
+                for read in (self.state.pending_journal, lambda: self.state.journal(1), self.state.journal_last):
                     with self.assertRaises(StateRefusal) as raised:
                         read()
                     self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
@@ -1062,7 +1062,12 @@ class DetachedCopyTests(ImageStateCase):
                 finally:
                     connection.close()
                 self.state.connect()
-                for read in (self.state.pending_journal, lambda: self.state.journal(1), self.state.journal_check):
+                for read in (
+                    self.state.pending_journal,
+                    lambda: self.state.journal(1),
+                    self.state.journal_check,
+                    self.state.journal_last,
+                ):
                     with self.assertRaises(StateRefusal) as raised:
                         read()
                     self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")

@@ -744,8 +744,9 @@ class ImageState:
         A row that was resolved ``aborted`` still names the two pins that its write was about to change, and the
         deployment file can still carry the new one: the deletion rule protects both.
         """
+        self._refuse_a_journal_outside_the_schema()
         row = self._require().execute("SELECT * FROM promotion_journal ORDER BY id DESC LIMIT 1").fetchone()
-        return Journal(**dict(row)) if row else None
+        return _journal_row(row) if row else None
 
     # -- observed pins ----------------------------------------------------
     def pin_last(self):

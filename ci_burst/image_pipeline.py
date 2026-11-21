@@ -271,7 +271,7 @@ def _read_facts(state, deployment, now):
     if not state.available:
         return _Facts(Control(0, None, False, None), None, None, 0, None, None, None, None, (), [], [])
     journal = state.journal_last_complete()
-    latest = state.journal_last()
+    unsettled = state.journal_since_complete()
     builds = state.builds(deployment)
     return _Facts(
         control=state.control_get(),
@@ -291,10 +291,10 @@ def _read_facts(state, deployment, now):
         # The pin that the same row wrote to the file. The file names it too, unless this pass reads a stale file, and
         # then only the journal says which image was just promoted (or, after a rollback, restored).
         promoted_pin=journal.new_pin if journal is not None else None,
-        # Both pins of the newest row of any status. A write that stopped before it completed its row, and that a
-        # pass reading a stale file then resolved as aborted, is neither pending nor complete, yet the file on
-        # disk can already pin its new version.
-        latest_pins=(latest.old_pin, latest.new_pin) if latest is not None else (),
+        # Both pins of every row newer than the newest complete one. A write that stopped before it completed its
+        # row, and that a pass reading a stale file then resolved as aborted, is neither pending nor complete, yet
+        # the file on disk can already pin its new version, and a later write that failed does not settle which.
+        latest_pins=tuple(pin for row in unsettled for pin in (row.old_pin, row.new_pin)),
         pending=state.pending_journal(),
         builds=builds,
     )

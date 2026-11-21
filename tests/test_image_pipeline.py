@@ -4009,6 +4009,33 @@ class RetentionTests(PipelineCase):
         self.assertNotIn(ami(0xB1), [row["image_id"] for row in rows])
         self.assertIn(ami(0xB1), self.world.images)
 
+    def test_a_later_failed_promotion_does_not_expose_the_image_of_an_earlier_aborted_one(self):
+        # A promotion from 3 to 4 renamed the file and stopped; a pass reading the old file resolved it aborted. A
+        # later promotion from 3 to 5 through the same stale file committed its row, failed, and was resolved aborted
+        # too. The file on disk still pins 4, and only the older aborted row names it.
+        self.three_usable_images(0xB1)
+        self.world.set_version(WORKER, 4, {"ImageId": ami(0xB1)})
+        self.world.set_version(WORKER, 5, {"ImageId": ami(0xD1)})
+        self.add_journal(old_pin=PIN, new_pin=4, status="pending")
+        self.abort_the_pending_row()
+        self.add_journal(old_pin=PIN, new_pin=5, status="pending")
+        self.abort_the_pending_row()
+        rows = self.plan()["deletion"]["items"]
+        self.assertEqual([row["image_id"] for row in rows if row["action"] == "deregister"], [ami(0xC1)])
+        self.assertNotIn(ami(0xB1), [row["image_id"] for row in rows])
+
+    def test_a_row_that_completes_settles_the_aborted_rows_before_it(self):
+        # After a completed row the file pins what that row wrote, so older aborted rows protect nothing more.
+        self.three_usable_images(0xB1)
+        self.world.set_version(WORKER, 4, {"ImageId": ami(0xB1)})
+        self.add_journal(old_pin=PIN, new_pin=4, status="pending")
+        self.abort_the_pending_row()
+        # A later promotion from version 2 to the pinned version 3 completed. Version 2 names a protected candidate.
+        self.world.set_version(WORKER, PREVIOUS, {"ImageId": ami(0xD1)})
+        self.add_journal(old_pin=PREVIOUS, new_pin=PIN)
+        rows = self.plan()["deletion"]["items"]
+        self.assertEqual([row["image_id"] for row in rows if row["action"] == "deregister"], [ami(0xB1)])
+
     def test_without_a_row_the_plan_lists_the_oldest_image_for_deletion(self):
         # The control: nothing but the aborted row separates this plan from the one above.
         self.three_usable_images(0xB1)

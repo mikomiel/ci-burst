@@ -402,40 +402,41 @@ class JournalLastCompleteTests(ImageStateCase):
         self.assertEqual(self.state.journal_last_complete().id, first.id)
 
 
-class JournalLastTests(ImageStateCase):
-    """The newest row of any status: a row that was resolved ``aborted`` still names its two pins."""
+class JournalSinceCompleteTests(ImageStateCase):
+    """Every row newer than the newest complete one: a row that was resolved ``aborted`` still names its two pins."""
+
+    def ids(self, reader=None):
+        return [row.id for row in (reader or self.state).journal_since_complete()]
 
     def test_there_is_none_without_a_row(self):
-        self.assertIsNone(self.state.journal_last())
+        self.assertEqual(self.ids(), [])
 
-    def test_the_newest_row_wins_whatever_its_status(self):
+    def test_every_row_counts_while_none_is_complete(self):
         first = self.add_journal(old_pin=3, new_pin=4, contained_pin=3)
         with self.state.transaction():
-            self.state.journal_complete(first.id)
-        self.assertEqual(self.state.journal_last().id, first.id)
-        second = self.add_journal(old_pin=4, new_pin=5, contained_pin=4)
-        newest = self.state.journal_last()
-        self.assertEqual((newest.id, newest.status), (second.id, "pending"))
+            self.state.journal_abort(first.id)
+        second = self.add_journal(old_pin=3, new_pin=5, contained_pin=3)
+        self.assertEqual(self.ids(), [first.id, second.id])
         with self.state.transaction():
             self.state.journal_abort(second.id)
-        newest = self.state.journal_last()
-        self.assertEqual((newest.id, newest.status, newest.old_pin, newest.new_pin), (second.id, "aborted", 4, 5))
+        rows = self.state.journal_since_complete()
+        self.assertEqual([(row.status, row.old_pin, row.new_pin) for row in rows], [("aborted", 3, 4), ("aborted", 3, 5)])
+
+    def test_a_complete_row_settles_every_row_before_it(self):
+        aborted = self.add_journal(old_pin=3, new_pin=4, contained_pin=3)
+        with self.state.transaction():
+            self.state.journal_abort(aborted.id)
+        complete = self.add_journal(old_pin=3, new_pin=5, contained_pin=3)
+        with self.state.transaction():
+            self.state.journal_complete(complete.id)
+        self.assertEqual(self.ids(), [])
+        later = self.add_journal(old_pin=5, new_pin=6, contained_pin=5)
+        self.assertEqual(self.ids(), [later.id])
+        self.assertEqual(self.state.journal_last_complete().id, complete.id)
 
     def test_a_rollback_row_counts_like_a_promotion(self):
-        self.add_journal(old_pin=3, new_pin=4, contained_pin=3)
         rollback = self.add_journal(kind="rollback", old_pin=4, new_pin=3, contained_pin=3, candidate_id=None)
-        newest = self.state.journal_last()
-        self.assertEqual((newest.id, newest.kind), (rollback.id, "rollback"))
-
-    def test_the_newest_complete_row_stays_the_one_that_journal_last_complete_names(self):
-        first = self.add_journal()
-        with self.state.transaction():
-            self.state.journal_complete(first.id)
-        later = self.add_journal(old_pin=4, new_pin=5)
-        with self.state.transaction():
-            self.state.journal_abort(later.id)
-        self.assertEqual(self.state.journal_last().id, later.id)
-        self.assertEqual(self.state.journal_last_complete().id, first.id)
+        self.assertEqual(self.ids(), [rollback.id])
 
     def test_it_reads_through_a_read_only_open(self):
         # ``image status`` and a ``promote`` without ``--write`` open the file this way.
@@ -444,8 +445,7 @@ class JournalLastTests(ImageStateCase):
         reader = ImageState(self.directory, clock=self.clock)
         self.addCleanup(reader.close)
         self.assertTrue(reader.connect_readonly())
-        self.assertEqual(reader.journal_last().id, row.id)
-
+        self.assertEqual(self.ids(reader), [row.id])
 
 if __name__ == "__main__":
     unittest.main()

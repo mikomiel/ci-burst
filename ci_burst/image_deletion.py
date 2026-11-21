@@ -157,12 +157,13 @@ def protected_set(
       container whose bind mount of the file keeps the old inode after
       ``promote --write`` replaces it): then only the journal names the image
       that was just promoted, and retention could remove it;
-    - the images of the ``latest_pins`` (an ``(old_pin, new_pin)`` tuple, or
-      empty when the journal has no row): both pins of the newest journal row,
-      whatever its status. A pass that reads the stale file resolves a write
-      that never completed its row as ``aborted``, so the row is neither
-      pending nor complete, yet the file on disk can already pin its new
-      version;
+    - the images of the ``latest_pins`` (a tuple of pins, empty when no row
+      follows the newest complete one): both pins of every journal row newer
+      than the newest ``complete`` row, whatever its status. A pass that reads
+      the stale file resolves a write that never completed its row as
+      ``aborted``, so the row is neither pending nor complete, yet the file on
+      disk can already pin its new version, and a later failed write does not
+      say which pin is live;
     - the images of ``old_pin`` and ``new_pin`` of every row of
       ``pending_journal``;
     - the image of ``candidate`` and of ``active``, the current candidate and the

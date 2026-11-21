@@ -919,7 +919,7 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **THEN** the command refuses and does not write
 
 ### Requirement: Every image deletion resolves the protected set
-Every path that deregisters an image or deletes a snapshot (retention and every cleanup path) MUST first resolve the protected set: the images of every launch-template version that the TOML references, including per-zone pins; both pins of the newest completed journal row and of the newest journal row of any status; the pins of a pending row; the current candidate unless its row records `TEMPLATE_DRIFT`; and an active build. It MUST NOT deregister a protected image.
+Every path that deregisters an image or deletes a snapshot (retention and every cleanup path) MUST first resolve the protected set: the images of every launch-template version that the TOML references, including per-zone pins; both pins of the newest completed journal row and of every row newer than it; the pins of a pending row; the current candidate unless its row records `TEMPLATE_DRIFT`; and an active build. It MUST NOT deregister a protected image.
 
 #### Scenario: A protected image
 - **WHEN** an image is the pin's, the previous pin's, a journal pin's, or the candidate's while its row does not record `TEMPLATE_DRIFT`
@@ -954,8 +954,12 @@ Every path that deregisters an image or deletes a snapshot (retention and every 
 - **WHEN** a promotion to version B replaced the file and stopped before its row completed, a pass that read the old file resolved the row `aborted`, and the image of version B is old enough for retention
 - **THEN** no deletion path (retention, failed-build cleanup, orphan cleanup or the pending-image timeout) removes the image of either pin of that row
 
-#### Scenario: A pin of the newest row cannot be read
-- **WHEN** a pin of the newest journal row is not a version number, or its version cannot be read or names no literal image
+#### Scenario: A later promotion fails after a promotion that a pass resolved as aborted
+- **WHEN** after that aborted row a promotion to version C commits its row and fails, and a pass resolves it `aborted` too
+- **THEN** no deletion path removes the image of either pin of either row until a newer row completes
+
+#### Scenario: A pin of an unsettled row cannot be read
+- **WHEN** a pin of a journal row newer than the newest completed one is not a version number, or its version cannot be read or names no literal image
 - **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE` and no path deletes anything
 
 ### Requirement: Every image deletion is verified and fails closed

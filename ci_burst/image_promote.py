@@ -88,6 +88,7 @@ _PIN_LINE = re.compile(r"([ \t]*launch_template_version[ \t]*=[ \t]*)([0-9]+)([ 
 _TEMPORARY_SUFFIX = ".promote-tmp"
 _LOCK_SUFFIX = ".lock"
 _BACKUP_INFIX = ".bak."
+_BACKUP_STAMP = "%Y%m%dT%H%M%SZ"
 _FOREIGN_NAMES_SHOWN = 5
 
 
@@ -487,7 +488,7 @@ def _errno_name(error):
 
 
 def _create_backup(snapshot, now):
-    stamp = datetime.fromtimestamp(now, UTC).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.fromtimestamp(now, UTC).strftime(_BACKUP_STAMP)
     base = snapshot.target.name + _BACKUP_INFIX + stamp
     for attempt in range(100):
         path = snapshot.target.parent / (base if attempt == 0 else f"{base}-{attempt}")
@@ -650,9 +651,17 @@ def rollback_plan(state, snapshot, now):
     return RollbackPlan(row=row, previous_pin=row.old_pin, backup_name=row.backup_name, target=owner)
 
 
-def _backup_name_pattern(target_name):
-    """The names that ``_create_backup`` gives a backup of ``target_name``: a UTC stamp and an optional counter."""
-    return re.compile(re.escape(target_name + _BACKUP_INFIX) + r"[0-9]{8}T[0-9]{6}Z(?:-[1-9][0-9]?)?")
+def _is_generated_backup_name(target_name, name):
+    """Whether ``_create_backup`` can give ``name`` to a backup of ``target_name``: a real UTC time and a counter."""
+    pattern = re.escape(target_name + _BACKUP_INFIX) + r"([0-9]{8}T[0-9]{6}Z)(?:-[1-9][0-9]?)?"
+    match = re.fullmatch(pattern, name)
+    if match is None:
+        return False
+    try:
+        datetime.strptime(match.group(1), _BACKUP_STAMP)
+    except ValueError:  # the shape of a stamp, but no such time: 20260230T010000Z or 20260101T250000Z
+        return False
+    return True
 
 
 def _read_regular_file(path):
@@ -678,7 +687,7 @@ def _check_backup(snapshot, row):
     name = row.backup_name
     # Only a name that ``_create_backup`` makes is opened or shown: anything else in the row is damage or a hand
     # edit, and it is named by the row id, never echoed.
-    if not _backup_name_pattern(snapshot.target.name).fullmatch(name):
+    if not _is_generated_backup_name(snapshot.target.name, name):
         raise StateRefusal(
             PIN_RECORD_DIVERGED, f"journal row {row.id} names a backup that this tool does not make next to the file"
         )
@@ -690,7 +699,8 @@ def _check_backup(snapshot, row):
         raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} no longer has its recorded sha256")
     try:
         pin = tomllib.loads(data.decode("utf-8"))["aws"]["launch_template_version"]
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError):
+    # ``ValueError`` covers a bad encoding, bad TOML and an integer longer than Python converts.
+    except (ValueError, KeyError, TypeError, RecursionError):
         raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} cannot be parsed for its pin") from None
     # An integer only: ``3.0`` equals ``3`` but the strict loader refuses it, so it is not the recorded pin.
     if type(pin) is not int or pin != row.old_pin or row.contained_pin != row.old_pin:

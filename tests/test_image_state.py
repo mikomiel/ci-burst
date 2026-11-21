@@ -1039,6 +1039,30 @@ class DetachedCopyTests(ImageStateCase):
                     self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
                     self.assertNotIn("not a pin", raised.exception.detail)
 
+    def test_a_journal_row_with_a_kind_or_status_outside_the_schema_is_refused_and_not_echoed(self):
+        self.add_journal()
+        for column in ("kind", "status"):
+            with self.subTest(column=column):
+                self.state.close()
+                connection = sqlite3.connect(self.state.path)
+                try:
+                    connection.execute("PRAGMA ignore_check_constraints = ON")  # what a damaged file can hold
+                    connection.execute("UPDATE promotion_journal SET kind = 'promotion', status = 'pending'")
+                    connection.execute(f"UPDATE promotion_journal SET {column} = ?", ("x; not a value",))
+                    connection.commit()
+                finally:
+                    connection.close()
+                self.state.connect()
+                # A row whose status is not "pending" is not a pending row: only a read of the row itself meets it.
+                reads = [lambda: self.state.journal(1)] + ([self.state.pending_journal] if column == "kind" else [])
+                for read in reads:
+                    with self.assertRaises(StateRefusal) as raised:
+                        read()
+                    self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+                    self.assertNotIn("not a value", raised.exception.detail)
+                if column == "status":
+                    self.assertEqual(self.state.pending_journal(), [])
+
     def test_a_state_that_is_not_open_has_no_copy(self):
         self.state.close()
         with self.assertRaises(StateRefusal) as raised:

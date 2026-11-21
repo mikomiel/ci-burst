@@ -223,6 +223,13 @@ class PromoteCase(CliCase):
                 return number
         raise AssertionError("no pin line")
 
+    def huge_pin_in_the_backup(self):
+        """The first backup with a pin longer than Python converts to an integer, and its hash recorded to match."""
+        backup = self.backups()[0]
+        data = backup.read_bytes().replace(b"launch_template_version = 3", b"launch_template_version = 1" + b"0" * 5000)
+        backup.write_bytes(data)
+        self.corrupt_journal(1, backup_sha256=sha(data))
+
     def corrupt_journal(self, journal_id, **fields):
         """A change of a journal row that only damage or a hand edit of the state file could make."""
         connection = sqlite3.connect(self.state_dir / "image-state.sqlite")
@@ -651,6 +658,16 @@ class PreviewTests(PromoteCase):
                 code, written = self.write_pin(*arguments)
                 self.assertEqual((code, written["error"]), (2, error))
         self.assertEqual([row["status"] for row in self.journal_rows()], ["complete"])
+
+    def test_a_backup_whose_pin_cannot_be_converted_does_not_stop_a_promotion_preview(self):
+        self.seed("build-b", 5, 0xB1, age=900)
+        self.seed("build-c", 6, 0xC1, age=300)
+        self.change("build-b", source_pin=4)
+        self.crash_after_rename()  # the row of the promotion to 6 is pending; the preview completes it on a copy
+        self.huge_pin_in_the_backup()
+        code, payload = self.show_changing_nothing()
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "promote"), payload)
+        self.assertEqual((payload["rollback"]["available"], payload["rollback"]["reason"]), (False, "PIN_RECORD_DIVERGED"))
 
     def test_a_promotion_preview_picks_the_candidate_that_the_write_picks_after_the_resolution(self):
         self.seed("build-b", 5, 0xB1, age=900)
@@ -1780,6 +1797,9 @@ class RollbackTests(PromoteCase):
             "deployment.toml.bak.outside",  # the right prefix, but not a name that a backup is given
             "deployment.toml.bak.20260101T000000Z\x00",  # a NUL would make the open raise ValueError
             "deployment.toml.bak.20260101T000000Z/../x",
+            "deployment.toml.bak.20260230T010000Z",  # the shape of a stamp, but February has no 30th
+            "deployment.toml.bak.20260101T250000Z",
+            "deployment.toml.bak.20260101T000000Z-0",
         )
         for name in names:
             with self.subTest(name=name):
@@ -1788,6 +1808,12 @@ class RollbackTests(PromoteCase):
                 self.assertIn("journal row 1", error["detail"])
                 self.assertIn("next to the file", error["detail"])
                 self.assertNotIn(name, error["detail"])
+
+    def test_a_backup_whose_pin_cannot_be_converted_is_refused(self):
+        self.promote_a_refreshed_pin()
+        self.huge_pin_in_the_backup()
+        error = self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
+        self.assertIn("cannot be parsed for its pin", error["detail"])
 
     def test_the_backup_of_a_newer_aborted_row_is_never_read(self):
         self.promote_a_refreshed_pin()

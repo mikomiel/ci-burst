@@ -478,7 +478,7 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **THEN** a new build MAY start once the cooldown and the daily cap permit
 
 ### Requirement: A gate command is required
-`image.warm.gate_command` MUST be non-empty unless `allow_no_gate = true`. Otherwise the command MUST refuse with `IMAGE_GATE_REQUIRED`. Documentation MUST state that the offline gate proves cache behavior and does not prove that the image is safe.
+`image.warm.gate_command` MUST be non-empty unless `allow_no_gate = true`. Otherwise the command MUST refuse with `IMAGE_GATE_REQUIRED`. The candidate record MUST show the gate setting that the builder was launched with, not the one that the configuration holds when the build ends. Documentation MUST state that the offline gate proves cache behavior and does not prove that the image is safe.
 
 #### Scenario: No gate and no opt-out
 - **WHEN** the gate command is empty and `allow_no_gate` is false
@@ -487,6 +487,15 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 #### Scenario: The opt-out is recorded
 - **WHEN** `allow_no_gate` is true and the gate command is empty
 - **THEN** the build proceeds and the candidate record states that no gate ran
+
+#### Scenario: A gate is gained while a build runs
+- **WHEN** a build is launched with no gate command and the configuration holds a gate command when the build ends
+- **THEN** the candidate record states that no gate ran
+- **AND** `promote --write` refuses with `PROMOTE_GATE_NOT_PASSED` while `allow_no_gate` is false
+
+#### Scenario: A gate is dropped while a build runs
+- **WHEN** a build is launched with a gate command and the configuration holds no gate command when the build ends
+- **THEN** the candidate record states that the gate ran and passed
 
 ### Requirement: The image is created in the pass that sees the marker
 The pass that first sees the marker MUST call `CreateImage` before any step that is not a read, with no reboot, and MUST tag the image and its snapshots with `ci-burst:image-build`, the deployment, the build id, the basis digest, the source sha, the script sha and, when read, the base image. The pass MUST NOT leave the builder running after the image is `available` or after the snapshot window or lifetime timer ends it. Waiting for the image and every later step MAY continue in a later pass.
@@ -642,7 +651,7 @@ After the image is `available`, the command MUST create a new launch-template ve
 
 #### Scenario: Only the image differs
 - **WHEN** the new version equals the pin's version except for `ImageId`
-- **THEN** the candidate record stores the version, the image id, the archive sha, the script sha, the gate result and the source pin
+- **THEN** the candidate record stores the version, the image id, the archive sha, the script sha, the gate result of the launched build and the source pin
 
 #### Scenario: Another field differs
 - **WHEN** the read-back shows any other difference
@@ -810,7 +819,7 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **THEN** the command refuses and does not write
 
 ### Requirement: Every image deletion resolves the protected set
-Every path that deregisters an image or deletes a snapshot (retention, failed-build cleanup, orphan cleanup and the pending-image timeout) MUST first resolve the protected set: the images of every launch-template version that the TOML references, including per-zone pins, the recorded previous pin, the pins of a pending promotion journal row, the current candidate unless its row records `TEMPLATE_DRIFT`, and an active build. It MUST NOT deregister a protected image.
+Every path that deregisters an image or deletes a snapshot (retention, failed-build cleanup, orphan cleanup and the pending-image timeout) MUST first resolve the protected set: the images of every launch-template version that the TOML references, including per-zone pins, the previous and new pins of the newest completed journal row, the pins of a pending journal row, the current candidate unless its row records `TEMPLATE_DRIFT`, and an active build. It MUST NOT deregister a protected image.
 
 #### Scenario: A protected image
 - **WHEN** an image is the pin's, the previous pin's, a journal pin's, or the candidate's while its row does not record `TEMPLATE_DRIFT`
@@ -832,6 +841,14 @@ Every path that deregisters an image or deletes a snapshot (retention, failed-bu
 #### Scenario: A pending journal pins an image
 - **WHEN** a promotion journal row is pending and names a version whose image would otherwise be removed
 - **THEN** no deletion path removes it
+
+#### Scenario: A stale file after a promotion
+- **WHEN** a promotion from version A to version B is complete, the file that a pass reads still pins version A, and the image of version B is old enough for retention
+- **THEN** no deletion path removes the image of version B
+
+#### Scenario: A stale file after a rollback
+- **WHEN** a rollback from version B to version A is complete, the file that a pass reads still pins version B, and the image of version A is old enough for retention
+- **THEN** no deletion path removes the image of version A
 
 ### Requirement: Every image deletion is verified and fails closed
 Every deletion path MUST verify the ownership tags (image-build, deployment and build id) before it deletes, MUST delete nothing when the TOML or a launch-template version cannot be read, and MUST delete a snapshot only after a confirmed deregistration of its image. A deletion path MUST only report what it would remove unless `--apply` is given.

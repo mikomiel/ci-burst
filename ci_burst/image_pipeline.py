@@ -238,6 +238,7 @@ class _Facts:
     active: object
     candidate: object
     previous_pin: int | None
+    promoted_pin: int | None
     pending: list
     builds: list
 
@@ -245,7 +246,7 @@ class _Facts:
 def _read_facts(state, deployment, now):
     """The state file's answers, or the answers of a new file when there is none."""
     if not state.available:
-        return _Facts(Control(0, None, False, None), None, None, 0, None, None, None, [], [])
+        return _Facts(Control(0, None, False, None), None, None, 0, None, None, None, None, [], [])
     journal = state.journal_last_complete()
     builds = state.builds(deployment)
     return _Facts(
@@ -263,6 +264,9 @@ def _read_facts(state, deployment, now):
         # orphan image is recorded as a candidate that nobody verified.
         candidate=state.verified_candidate(deployment),
         previous_pin=journal.old_pin if journal is not None else None,
+        # The pin that the same row wrote to the file. The file names it too, unless this pass reads a stale file, and
+        # then only the journal says which image was just promoted (or, after a rollback, restored).
+        promoted_pin=journal.new_pin if journal is not None else None,
         pending=state.pending_journal(),
         builds=builds,
     )
@@ -871,6 +875,7 @@ class ImagePipeline:
             aws,
             self._config_path,
             previous_pin=facts.previous_pin,
+            promoted_pin=facts.promoted_pin,
             pending_journal=facts.pending,
             candidate=facts.candidate,
             active=facts.active,
@@ -1316,7 +1321,15 @@ class _Pass:
             close = getattr(chunks, "close", None)
             if close is not None:
                 close()
-        build = s.advance_build(build.id, archive_key=upload.key, archive_sha256=upload.sha256)
+        # ``_launch`` renders the gate command into the user data from ``cfg``, so the row records the gate of this
+        # launch before it happens. A build that is staged again after the pass deadline ended its first stage thus
+        # records the gate of the launch that starts its builder, not the gate of its insert.
+        build = s.advance_build(
+            build.id,
+            archive_key=upload.key,
+            archive_sha256=upload.sha256,
+            gate_configured=int(bool(cfg.warm.gate_command)),
+        )
         try:
             instance_id = self._launch(build, upload)
         except DeadlineRefusal:
@@ -1585,7 +1598,10 @@ class _Pass:
     # -- terminal states -----------------------------------------------------------
     def _succeed(self, build, version):
         s, now = self.s, self.clock()
-        gate = int(bool(self.cfg.warm.gate_command))
+        # The evidence is the launched build's, never the gate that the configuration holds now: the file may have
+        # changed since the launch. The builder prints its ready marker only after its gate command passed, so a
+        # build that launched with a gate passed it. A row that records nothing shows that no gate ran.
+        gate = int(bool(build.gate_configured))
         with s.transaction():
             build = s.advance_build(
                 build.id,

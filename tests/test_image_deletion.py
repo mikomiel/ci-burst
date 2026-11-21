@@ -802,6 +802,124 @@ class ProtectedImageTests(DeletionCase):
         )
 
 
+class PromotedPinTests(DeletionCase):
+    """The new pin of the newest completed journal row protects its image, whatever file a pass reads.
+
+    A container whose bind mount of the deployment file keeps the old inode reads the file as it was before
+    ``promote --write`` replaced it. That file still pins A, so only the journal names B, the image that was just
+    promoted from A. These tests use the file of the account (``PIN`` is A) and ``JOURNAL_NEW`` as B.
+    """
+
+    def refused(self, **resolve):
+        with self.assertRaises(ImageRefusal) as raised:
+            self.resolve(**resolve)
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        return raised.exception
+
+    def usable_images_with_b_the_oldest(self):
+        """Four usable images against a retention of three, and B is the oldest, so retention takes B first."""
+        self.made(11, "promoted", age=9 * DAY, image_id=JOURNAL_NEW_IMAGE)
+        for number, age in ((12, 8), (13, 7), (14, 6)):
+            self.made(number, "candidate", age=age * DAY)
+
+    def test_the_image_of_the_promoted_pin_is_protected_when_the_file_still_pins_the_old_one(self):
+        protected = self.resolve(previous_pin=PIN, promoted_pin=JOURNAL_NEW)
+        self.assertEqual(protected.image_ids, {PIN_IMAGE, JOURNAL_NEW_IMAGE})
+        self.assertIn(JOURNAL_NEW_IMAGE, protected)
+
+    def test_a_stale_file_alone_does_not_protect_the_promoted_image(self):
+        # The control: without the promoted pin nothing in this set names B.
+        self.assertNotIn(JOURNAL_NEW_IMAGE, self.resolve(previous_pin=PIN))
+
+    def test_the_promoted_pin_protects_nothing_else_by_itself(self):
+        self.assertEqual(self.resolve(promoted_pin=JOURNAL_NEW).image_ids, {PIN_IMAGE, JOURNAL_NEW_IMAGE})
+
+    def test_no_promoted_pin_is_the_same_as_before(self):
+        # ``None`` is the state before any promotion, and it is the default of the argument.
+        self.assertEqual(self.resolve(previous_pin=PREVIOUS, promoted_pin=None).image_ids, {PIN_IMAGE, PREVIOUS_IMAGE})
+        self.assertEqual(self.resolve(previous_pin=PREVIOUS).image_ids, {PIN_IMAGE, PREVIOUS_IMAGE})
+
+    def test_in_the_normal_case_the_promoted_pin_adds_nothing(self):
+        # After a promotion the file pins the new version too, so the journal names an image the file names already.
+        protected = self.resolve(previous_pin=PREVIOUS, promoted_pin=PIN)
+        self.assertEqual(protected.image_ids, {PIN_IMAGE, PREVIOUS_IMAGE})
+
+    def test_the_promoted_pin_is_read_with_the_other_versions_in_one_call(self):
+        self.resolve(previous_pin=PREVIOUS, promoted_pin=JOURNAL_NEW)
+        (read,) = self.requests("describe_launch_template_versions")
+        self.assertEqual(read["LaunchTemplateName"], WORKER)
+        self.assertEqual(read["Versions"], [str(PREVIOUS), str(PIN), str(JOURNAL_NEW)])
+        self.assertEqual(self.names(), ["describe_launch_template_versions"])
+
+    def test_a_promoted_pin_that_another_source_names_is_read_once(self):
+        self.resolve(previous_pin=PREVIOUS, promoted_pin=PIN)
+        (read,) = self.requests("describe_launch_template_versions")
+        self.assertEqual(read["Versions"], [str(PREVIOUS), str(PIN)])
+
+    def test_every_path_leaves_the_image_of_the_promoted_pin_alone(self):
+        self.add_image(JOURNAL_NEW_IMAGE, "build-lost", age=30 * DAY)
+        plan = self.plan("all", previous_pin=PIN, promoted_pin=JOURNAL_NEW)
+        self.assertEqual(self.summary(plan), [("orphan", "skip", JOURNAL_NEW_IMAGE, "protected")])
+        report = apply_deletions(self.aws, plan, apply=True)
+        self.assertEqual(self.results(report), [("skip", "skipped")])
+        self.assertEqual(self.mutations(), [])
+        self.assertIn(JOURNAL_NEW_IMAGE, self.stored_images())
+
+    def test_without_the_promoted_pin_the_same_image_is_planned(self):
+        self.add_image(JOURNAL_NEW_IMAGE, "build-lost", age=30 * DAY)
+        plan = self.plan("all", previous_pin=PIN)
+        self.assertEqual(self.summary(plan), [("orphan", "deregister", JOURNAL_NEW_IMAGE, None)])
+
+    def test_retention_takes_the_next_oldest_image_and_not_the_promoted_one(self):
+        self.usable_images_with_b_the_oldest()
+        plan = self.plan("retention", previous_pin=PIN, promoted_pin=JOURNAL_NEW)
+        self.assertEqual([item["image_id"] for item in plan], [ami(12)])
+        self.run_paths("retention", previous_pin=PIN, promoted_pin=JOURNAL_NEW)
+        self.assertEqual(self.requests("deregister_image"), [{"ImageId": ami(12)}])
+        self.assertIn(JOURNAL_NEW_IMAGE, self.stored_images())
+
+    def test_without_the_promoted_pin_retention_takes_the_promoted_image_first(self):
+        # The control that shows the hazard: only the promoted pin separates the two plans.
+        self.usable_images_with_b_the_oldest()
+        plan = self.plan("retention", previous_pin=PIN)
+        self.assertEqual([item["image_id"] for item in plan], [JOURNAL_NEW_IMAGE])
+
+    def test_a_pin_that_is_not_a_version_number_is_unsafe_before_any_call(self):
+        for name, value in (
+            ("zero", 0),
+            ("negative", -1),
+            ("true", True),
+            ("false", False),
+            ("text", "3"),
+            ("float", 3.0),
+        ):
+            with self.subTest(name):
+                self.reset()
+                self.refused(promoted_pin=value)
+                self.assertEqual(self.calls, [])
+
+    def test_a_promoted_version_that_the_provider_does_not_return_is_unsafe(self):
+        del self.ec2.versions_store[(WORKER, JOURNAL_NEW)]
+        self.refused(previous_pin=PIN, promoted_pin=JOURNAL_NEW)
+
+    def test_a_promoted_version_that_names_no_literal_image_is_unsafe(self):
+        self.ec2.versions_store[(WORKER, JOURNAL_NEW)]["LaunchTemplateData"] = {"ImageId": "resolve:ssm:/example/alias"}
+        refusal = self.refused(previous_pin=PIN, promoted_pin=JOURNAL_NEW)
+        self.assertIn(str(JOURNAL_NEW), refusal.detail)
+        self.assertNotIn("alias", refusal.detail)
+
+    def test_a_promoted_version_that_cannot_be_read_stops_every_path_and_deletes_nothing(self):
+        # Only the promoted version is missing: the file's pin and the previous pin read fine.
+        self.usable_images_with_b_the_oldest()
+        del self.ec2.versions_store[(WORKER, JOURNAL_NEW)]
+        for mode in (*image_deletion.PATHS, "all"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ImageRefusal) as raised:
+                    self.run_paths(mode, previous_pin=PIN, promoted_pin=JOURNAL_NEW)
+                self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertEqual(self.mutations(), [])
+
+
 class ActiveBuildTests(DeletionCase):
     def test_no_path_takes_the_image_of_an_active_build(self):
         for state, image_state in (("building", "available"), ("imaging", "available"), ("imaging", "pending")):

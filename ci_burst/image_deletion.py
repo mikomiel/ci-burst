@@ -130,7 +130,9 @@ def _is_resolved(protected):
     return isinstance(protected, ProtectedSet) and protected._resolved is _PROVENANCE and bool(protected.image_ids)
 
 
-def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate, active, deadline=None):
+def protected_set(
+    aws, config_path, *, previous_pin, pending_journal, candidate, active, promoted_pin=None, deadline=None
+):
     """Resolve the images that no deletion path may remove, or refuse.
 
     The set holds, with a launch-template version read from the worker template
@@ -140,6 +142,12 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
       pin;
     - the image of ``previous_pin`` (an int, or ``None`` when no promotion has
       happened);
+    - the image of ``promoted_pin`` (an int, or ``None`` when none has happened):
+      the new pin of the newest completed journal row, the pin that row wrote to
+      the file. The file names it too, unless the pass reads a stale file (a
+      container whose bind mount of the file keeps the old inode after
+      ``promote --write`` replaces it): then only the journal names the image
+      that was just promoted, and retention could remove it;
     - the images of ``old_pin`` and ``new_pin`` of every row of
       ``pending_journal``;
     - the image of ``candidate`` and of ``active``, the current candidate and the
@@ -176,6 +184,8 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
     pins.extend(zone.launch_template_version for zone in config.aws.zones)
     if previous_pin is not None:
         pins.append(previous_pin)
+    if promoted_pin is not None:
+        pins.append(promoted_pin)
     for row in pending_journal:
         pins.extend((row.old_pin, row.new_pin))
     # Check each pin before the set below merges equal values: 3.0 and True would

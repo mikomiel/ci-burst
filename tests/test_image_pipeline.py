@@ -156,6 +156,7 @@ bucket = "{bucket}"
 prefix = "{prefix}"
 """
 GATE = 'gate_command = "bash scripts/example-gate.sh"'
+NO_GATE = "allow_no_gate = true"
 STATE_DIRECTORY = "/var/lib/example-image-state"
 
 
@@ -2992,6 +2993,90 @@ class ResumeTests(PipelineCase):
         self.assertEqual(len(self.events("image_build_failed")), 1)
 
 
+class GateEvidenceTests(PipelineCase):
+    """A candidate records the gate of the build that was launched, never the gate that the file holds when it ends.
+
+    The builder prints its marker only after its gate command passed, so a build that launched with a gate passed it,
+    and a build that launched without one has nothing to show. The file can change between the launch and the pass
+    that sees the marker: a gate gained or dropped there must not change what the candidate says about the build.
+    """
+
+    def unstaged_build(self):
+        """A build whose first pass ran out of time during the stage: it has no builder and no staged archive."""
+        self.source.on_chunk = lambda: self.clock.advance(400)
+        self.apply()
+        self.source.on_chunk = None
+        return self.only_build()
+
+    def finish(self):
+        """The pass that sees the marker ends the build as a candidate."""
+        self.clock.advance(30)
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        return self.only_build()
+
+    def launch_then_edit(self, launched, edited):
+        """A build launched under the gate setting ``launched``, ended by a pass that reads the file as ``edited``."""
+        self.configure(render_toml(gate=launched))
+        self.world.console_plan = [(300.0, READY)]
+        _, launched_build = self.start_build()
+        self.configure(render_toml(gate=edited))
+        return launched_build, self.finish()
+
+    def staged_again(self, inserted, restaged):
+        """A build inserted under the gate setting ``inserted`` and launched, by a later pass, under ``restaged``."""
+        self.configure(render_toml(gate=inserted))
+        inserted_build = self.unstaged_build()
+        self.configure(render_toml(gate=restaged))
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        (launch,) = self.world.launches
+        return inserted_build, self.only_build(), launch["UserData"]
+
+    def test_a_build_launched_without_a_gate_is_not_credited_with_a_gate_that_the_file_gains(self):
+        launched, built = self.launch_then_edit(NO_GATE, GATE)
+        self.assertEqual(launched.gate_configured, 0)
+        self.assertEqual(built.id, launched.id)
+        self.assertEqual((built.gate_configured, built.gate_passed), (0, 0))
+
+    def test_a_build_launched_with_a_gate_keeps_its_evidence_when_the_file_drops_the_gate(self):
+        launched, built = self.launch_then_edit(GATE, NO_GATE)
+        self.assertEqual(launched.gate_configured, 1)
+        self.assertEqual(built.id, launched.id)
+        self.assertEqual((built.gate_configured, built.gate_passed), (1, 1))
+
+    def test_a_build_launched_without_a_gate_under_a_file_that_did_not_change_records_no_gate(self):
+        self.configure(render_toml(gate=NO_GATE))
+        self.world.console_plan = [(300.0, READY)]
+        self.start_build()
+        built = self.finish()
+        self.assertEqual((built.gate_configured, built.gate_passed), (0, 0))
+
+    def test_a_row_that_records_no_gate_shows_that_none_ran(self):
+        self.world.console_plan = [(300.0, READY)]
+        _, build = self.start_build()
+        self.write(lambda state: state.advance_build(build.id, gate_configured=None))
+        self.assertIsNone(self.only_build().gate_configured)
+        built = self.finish()
+        # The file holds a gate command, but the row does not say that the build ran it.
+        self.assertEqual((built.gate_configured, built.gate_passed), (0, 0))
+
+    def test_a_build_staged_again_without_the_gate_it_was_inserted_with_records_no_gate(self):
+        inserted, built, user_data = self.staged_again(GATE, NO_GATE)
+        self.assertEqual(inserted.gate_configured, 1)
+        self.assertEqual(built.id, inserted.id)
+        self.assertIn(f"export WARM_GATE_COMMAND={shlex.quote('')}", user_data)
+        self.assertEqual((built.gate_configured, built.gate_passed), (0, 0))
+
+    def test_a_build_staged_again_with_a_gate_it_was_inserted_without_records_that_gate(self):
+        inserted, built, user_data = self.staged_again(NO_GATE, GATE)
+        self.assertEqual(inserted.gate_configured, 0)
+        self.assertEqual(built.id, inserted.id)
+        self.assertIn(f"export WARM_GATE_COMMAND={shlex.quote('bash scripts/example-gate.sh')}", user_data)
+        self.assertEqual((built.gate_configured, built.gate_passed), (1, 1))
+
+
 class ReconcileTests(PipelineCase):
     """What the first step of every pass finds and removes."""
 
@@ -3368,6 +3453,91 @@ class RetentionTests(PipelineCase):
         # Three usable images against a retention of two: the oldest unprotected one goes.
         self.assertIn(result["build"]["image_id"], self.world.images)
         self.assertEqual(len([i for i in self.world.images if i != ami(0xA1)]), 2)
+
+    # -- a pass that reads a stale file ----------------------------------------------
+    # A container whose bind mount of the deployment file keeps the old inode reads the file as it was before
+    # ``promote --write`` replaced it. The file of these tests pins version 3 (``PIN``): the pin that a promotion
+    # or a rollback replaced. Only the journal names the pin that was written.
+
+    def three_usable_images(self, oldest):
+        """Three usable images against ``retain = 2``: retention takes the oldest unless something protects it.
+
+        ``oldest`` is the image number of the first image: it has a ``promoted`` row and the oldest creation time. The
+        other two are verified candidates, and the newest of them is protected as the current candidate. No pin names
+        any of the three.
+        """
+        self.configure(render_toml(image_extra="retain = 2\nretain_min_age_seconds = 3600\n"))
+        self.pin_current()
+        rows = ((oldest, "promoted", 9 * DAY), (0xC1, "candidate", 3 * DAY), (0xD1, "candidate", 2 * DAY))
+        for number, state, age in rows:
+            name = f"build-{number:x}"
+            self.add_build(name, state, age=age, image_id=ami(number), verified_at=NOW - age + HOUR)
+            self.world.add_image(ami(number), tags=owned(name), age=age, snapshots=(snap(number),))
+            self.world.add_snapshot(snap(number), tags=owned(name), age=age)
+
+    def complete_a_rollback(self, *, old_pin, new_pin):
+        def roll_back(state):
+            row = state.journal_insert(
+                kind="rollback",
+                old_pin=old_pin,
+                new_pin=new_pin,
+                old_file_sha256="0" * 64,
+                new_file_sha256="1" * 64,
+                backup_name="deployment.toml.bak",
+                backup_sha256="2" * 64,
+                contained_pin=new_pin,
+            )
+            state.journal_complete(row.id)
+
+        self.write(roll_back)
+
+    def test_the_image_that_a_promotion_just_wrote_survives_a_pass_that_reads_a_stale_file(self):
+        # The file this pass reads pins A (version 3). The journal says that B (version 4) replaced it.
+        self.three_usable_images(0xB1)
+        self.world.set_version(WORKER, 4, {"ImageId": ami(0xB1)})
+        self.add_journal(old_pin=PIN, new_pin=4)
+        result = self.apply()
+        self.assertEqual(result["retention"]["deregistered"], 1)
+        # The oldest unprotected image goes instead of B.
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xB1), ami(0xD1)})
+        self.assertEqual(self.world.arguments("deregister_image"), [{"ImageId": ami(0xC1)}])
+
+    def test_without_a_journal_row_the_same_pass_takes_the_oldest_image(self):
+        # The control: nothing but the journal row separates this pass from the one above.
+        self.three_usable_images(0xB1)
+        result = self.apply()
+        self.assertEqual(result["retention"]["deregistered"], 1)
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xC1), ami(0xD1)})
+
+    def test_the_image_that_a_rollback_just_restored_survives_a_pass_that_reads_a_stale_file(self):
+        # The file this pass reads pins version 3. The rollback replaced it with the older version 2.
+        self.three_usable_images(0xE1)
+        self.world.set_version(WORKER, PREVIOUS, {"ImageId": ami(0xE1)})
+        self.complete_a_rollback(old_pin=PIN, new_pin=PREVIOUS)
+        result = self.apply()
+        self.assertEqual(result["retention"]["deregistered"], 1)
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xE1), ami(0xD1)})
+
+    def test_plan_does_not_list_the_promoted_image_for_deletion_when_the_file_is_stale(self):
+        self.three_usable_images(0xB1)
+        self.world.set_version(WORKER, 4, {"ImageId": ami(0xB1)})
+        self.add_journal(old_pin=PIN, new_pin=4)
+        rows = self.plan()["deletion"]["items"]
+        deregistered = [row["image_id"] for row in rows if row["action"] == "deregister"]
+        self.assertEqual(deregistered, [ami(0xC1)])
+        self.assertNotIn(ami(0xB1), [row["image_id"] for row in rows])
+        self.assertIn(ami(0xB1), self.world.images)
+
+    def test_a_promoted_version_that_the_account_does_not_return_deletes_nothing_and_fails_no_build(self):
+        # The pass cannot say which image the last promotion wrote, so the whole rule refuses, as for any pin.
+        self.three_usable_images(0xB1)
+        self.add_journal(old_pin=PIN, new_pin=4)  # no version 4 exists in the account
+        result = self.apply()
+        self.assertEqual(result["retention"], {"refused": "IMAGE_DELETION_UNSAFE"})
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xB1), ami(0xC1), ami(0xD1)})
+        self.assertEqual(self.world.arguments("deregister_image"), [])
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
 
 
 POLICY = Path(__file__).resolve().parents[1] / "deploy" / "iam" / "image-build-policy.json"

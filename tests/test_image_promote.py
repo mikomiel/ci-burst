@@ -40,8 +40,11 @@ from test_image_cli import CliCase
 from test_image_pipeline import (
     DAY,
     DEPLOYMENT,
+    GATE,
+    NO_GATE,
     NOW,
     PIN,
+    READY,
     SCRIPT,
     SOURCE_SHA,
     WORKER,
@@ -636,6 +639,44 @@ class VerificationTests(PromoteCase):
         self.promoted("--version", "5")
         zones = load(self.config_path).aws.zones
         self.assertEqual([zone.launch_template_version for zone in zones], [5, 5])
+
+
+class LaunchedGateTests(PromoteCase):
+    """A write reads the gate evidence of the build that was launched, not the gate that the file holds when it ends.
+
+    The builds here are real: a pass launches the builder under one deployment file, the file changes, and the pass
+    that sees the marker ends the build.
+    """
+
+    def build_across_an_edit(self, launched, edited):
+        """A build launched under the gate setting ``launched``, ended by a pass that reads the file as ``edited``."""
+        self.configure(self.image_toml(gate=launched))
+        self.world.console_plan = [(300.0, READY)]
+        self.start_build()
+        self.configure(self.image_toml(gate=edited))
+        self.clock.advance(30)
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        return self.only_build()
+
+    def test_a_build_launched_without_a_gate_is_refused_when_the_file_gains_a_gate_before_the_build_ends(self):
+        build = self.build_across_an_edit(NO_GATE, GATE)
+        self.assertEqual((build.gate_configured, build.gate_passed), (0, 0))
+        code, payload = self.show()
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["evidence"]["gate"], {"configured": False, "passed": False})
+        self.assertEqual(payload["write_check"]["reason"], "PROMOTE_GATE_NOT_PASSED")
+        error = self.refusal((), "PROMOTE_GATE_NOT_PASSED")
+        self.assertEqual(self.pin_in_file(), PIN)
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(error["detail"], "the record shows gate configured 0 and passed 0")
+
+    def test_a_build_launched_with_a_gate_is_promoted_with_its_evidence_when_the_file_drops_the_gate(self):
+        build = self.build_across_an_edit(GATE, NO_GATE)
+        self.assertEqual((build.gate_configured, build.gate_passed), (1, 1))
+        payload = self.promoted()
+        self.assertEqual(payload["evidence"]["gate"], {"configured": True, "passed": True})
+        self.assertEqual(self.pin_in_file(), build.template_version)
 
 
 # -- 6.4: the edit ---------------------------------------------------------------------

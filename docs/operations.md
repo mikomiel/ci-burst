@@ -649,13 +649,15 @@ carries both as `journal_resolved` and `pin_evidence`.
 
 `image status` prints `decision: status` with the active and last build, the
 candidate and its evidence, the pin and any zone pins, the rollback target and why
-it is or is not available, the images that retention protects as far as the state file and the TOML show
-them, the counters
+it is or is not available, a local report of protected images built from the
+state file and the TOML, the counters
 (`consecutive_failures`, `builds_last_day`, `cooldown_until`, `last_check_at`), the
-`blocked` explanation and any pending promotion row. The protected list is
-partial: it omits the new pin of the newest completed journal row and the pins of
-rows since it, which retention also protects. The `deletion` part of `image plan`
-gives the actual decision. Plain `status` makes no provider call. `status --refresh` makes describe calls for the live pin, the
+`blocked` explanation and any pending promotion row. The protected report is not
+the deletion rule: it omits the new pin of the newest completed journal row and
+the pins of settled rows since it, which retention protects, and it can list a
+candidate that a refresh recorded as `TEMPLATE_DRIFT`, which retention does not
+protect. The `deletion` part of `image plan` gives the current dry-run deletion
+decision. Plain `status` makes no provider call. `status --refresh` makes describe calls for the live pin, the
 rollback target and the newest verified candidates, and records whether each
 version and image still exists and whether the candidate version differs from its
 source in any field but `ImageId`. A promotion decides from that record, so run
@@ -710,8 +712,9 @@ nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge
 (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
 or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
 before the template, so an unsafe template never hides a missing gate. A stage done
-again is the exception: its row exists, so these refusals end the row and are
-answered `refused` (below). A pass that
+again is the exception for three of them: a changed digest, a missing gate or
+opt-out, and an unsafe template verdict end its row and are answered `refused`
+(below). A refused forge read is still raised there and leaves the row. A pass that
 finds a build in flight runs and settles it even without a gate; a launch that
 pass would then make is refused with `IMAGE_GATE_REQUIRED`, answered `refused`,
 and counts no failure.
@@ -905,9 +908,10 @@ The rest of rollback is the same as for the scaling path (see
 [Scheduler, cleanup and rollback](#scheduler-cleanup-and-rollback)): the pin is
 read by `apply`, so the next pass launches from the restored image. To stop the
 image path itself, set `enabled = false`: every image command then answers
-`disabled`, and the scaling path is unaffected. Disabling stops the passes, so a
-builder that is already running ends by its own timers (next section), not by a
-pass.
+`disabled`, and the scaling path is unaffected. The edit disables fresh
+invocations only: a running `image run --apply --until-done` container keeps the
+configuration it loaded at its start, so stop that container too. A builder that is
+already running then ends by its own timers (next section), not by a pass.
 
 ### Image events and metrics
 

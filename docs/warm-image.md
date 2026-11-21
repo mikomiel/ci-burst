@@ -173,7 +173,8 @@ command. This section owns the workflow.
 3. The builder runs this script. The controller reads the builder's console. In the
    pass that first sees `IMAGE_READY`, it creates the image from the running
    builder. That pass, or a later one, waits for the image to be `available` and
-   then terminates the builder. A build with no ready marker by
+   then terminates the builder; on a pass at or after the build deadline, reconcile
+   can terminate the builder first. A build with no ready marker by
    `build_deadline_seconds` ends `failed`; an image still pending at the deadline
    fails the build, but the first read after the deadline can still find it
    `available` and go on.
@@ -181,8 +182,8 @@ command. This section owns the workflow.
    version and changes `ImageId` only, reads both versions back and compares them.
    A difference in any other field fails the build (`TEMPLATE_DRIFT`). Otherwise the
    image and the new version are a candidate. Once the build is a candidate or has
-   failed, the pass makes one delete call for the archive (a refused call is noted
-   `archive:delete_failed`). The version is inert: it is not the
+   failed, the pass makes one delete call for the archive if the row records an
+   archive key (a refused call is noted `archive:delete_failed`). The version is inert: it is not the
    default version, and no worker launches from it.
 5. A person reads the evidence and promotes the candidate with
    `image promote --write`, which edits one line of the deployment TOML. Nothing
@@ -199,13 +200,16 @@ python -m ci_burst image plan    --config deployment.toml
 python -m ci_burst image run     --config deployment.toml --apply --until-done
 python -m ci_burst image status  --config deployment.toml --refresh
 python -m ci_burst image promote --config deployment.toml
+# run the canary from a test identity or deployment first (Canary and cutover)
 python -m ci_burst image promote --config deployment.toml --write
 python -m ci_burst image promote --config deployment.toml --rollback --write
 ```
 
 Run each as a one-off container, as [container.md](container.md#run-the-image-commands)
 shows. The first command is read-only. The last two write the TOML, and the
-promotion container has no network and no credential.
+promotion container has no network and no credential. `promote --write` changes the
+production pin at once, so the canary of
+[Canary and cutover](#canary-and-cutover) comes before it.
 
 ### Triggers
 

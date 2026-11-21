@@ -83,6 +83,24 @@ def changed_lines(before, after):
     ]
 
 
+
+@contextlib.contextmanager
+def _deadline(seconds):
+    """Fail the test instead of hanging it when the body blocks for ``seconds``."""
+    import signal
+
+    def expired(signum, frame):
+        raise AssertionError(f"blocked for {seconds} s")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 class PromoteCase(CliCase):
     """A deployment directory, a state directory and an account, with every client forbidden."""
 
@@ -543,6 +561,29 @@ class PreviewTests(PromoteCase):
         self.assertEqual(written["resolved"], [{"journal_id": 2, "kind": "promotion", "resolution": "complete"}])
         self.assertEqual(written["change"], payload["pin_change"])
         self.assertEqual(self.pin_in_file(), 5)
+
+    def test_a_backup_replaced_by_a_link_or_a_fifo_is_neither_followed_nor_waited_for(self):
+        self.crash_a_second_promotion(self.crash_after_rename)
+        backup = self.config_dir / self.journal_rows()[-1]["backup_name"]
+        elsewhere = self.dir / "elsewhere"
+        elsewhere.mkdir()
+        original = elsewhere / "kept-backup"
+        shutil.copyfile(backup, original)
+        cases = {
+            "a link to the same bytes": lambda: backup.symlink_to(original),
+            "a FIFO with no writer": lambda: os.mkfifo(backup, 0o600),
+        }
+        for name, replace in cases.items():
+            with self.subTest(name):
+                backup.unlink()
+                replace()
+                with _deadline(20):  # a read of a FIFO with no writer would block here
+                    code, payload = self.show("--rollback")
+                self.assertEqual((code, payload["decision"]), (0, "preview"))
+                rollback = payload["rollback"]
+                self.assertEqual((rollback["available"], rollback["reason"]), (False, "PIN_RECORD_DIVERGED"))
+                self.assertIn("regular file", rollback["detail"])
+                self.assertFalse(payload["write_check"]["ok"])
 
     def test_a_rollback_preview_with_no_earlier_promotion_plans_the_rollback_that_the_write_makes_after_the_row(self):
         self.seed()

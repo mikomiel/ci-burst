@@ -667,12 +667,12 @@ class ImageState:
 
     def journal(self, journal_id):
         row = self._require().execute("SELECT * FROM promotion_journal WHERE id = ?", (journal_id,)).fetchone()
-        return Journal(**dict(row)) if row else None
+        return _journal_row(row) if row else None
 
     def pending_journal(self):
         """Every ``pending`` row, oldest first."""
         rows = self._require().execute("SELECT * FROM promotion_journal WHERE status = 'pending' ORDER BY id")
-        return [Journal(**dict(row)) for row in rows]
+        return [_journal_row(row) for row in rows]
 
     def journal_last_complete(self, kind=None):
         """The newest ``complete`` row, or ``None``: its ``old_pin`` is the pin it replaced.
@@ -689,7 +689,7 @@ class ImageState:
             )
             .fetchone()
         )
-        return Journal(**dict(row)) if row else None
+        return _journal_row(row) if row else None
 
     # -- observed pins ----------------------------------------------------
     def pin_last(self):
@@ -744,6 +744,21 @@ class ImageState:
         if self._connection is None:
             raise StateRefusal("IMAGE_STATE_UNAVAILABLE")
         return self._connection
+
+
+def _journal_row(row):
+    """A ``Journal`` from a row, or the refusal of a row whose pins or names are not what this module writes.
+
+    SQLite's ``INTEGER`` and ``TEXT`` affinities do not reject other types, so a hand-edited or damaged file can
+    hold text or a blob where a pin belongs. Such a value is never passed on: it would reach a detail or the
+    output verbatim. The refusal names no value.
+    """
+    data = dict(row)
+    pins_ok = all(type(data[key]) is int and data[key] >= 1 for key in ("old_pin", "new_pin", "contained_pin"))
+    texts_ok = all(type(data[key]) is str for key in ("kind", "status", "backup_name", "backup_sha256"))
+    if not (pins_ok and texts_ok):
+        raise StateRefusal("IMAGE_STATE_UNREADABLE", f"promotion journal row {int(data['id'])} is malformed")
+    return Journal(**data)
 
 
 class _DetachedState(ImageState):

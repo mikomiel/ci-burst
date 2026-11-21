@@ -650,15 +650,33 @@ def rollback_plan(state, snapshot, now):
     return RollbackPlan(row=row, previous_pin=row.old_pin, backup_name=row.backup_name, target=owner)
 
 
+def _read_regular_file(path):
+    """The bytes of ``path``, which must be a regular file itself.
+
+    The file is opened without following a symbolic link and without waiting for a writer, so a link or a FIFO in
+    place of a backup is an ``OSError`` here and never a read of another file or a hang.
+    """
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
 def _check_backup(snapshot, row):
     """The named backup must exist, hold the recorded bytes and contain the recorded previous pin."""
     name = row.backup_name
     if name != Path(name).name or not name.startswith(snapshot.target.name + _BACKUP_INFIX):
         raise StateRefusal(PIN_RECORD_DIVERGED, "the journal names a backup that is not next to the file")
     try:
-        data = (snapshot.target.parent / name).read_bytes()
+        data = _read_regular_file(snapshot.target.parent / name)
     except OSError:
-        raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} cannot be read") from None
+        raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} cannot be read as a regular file") from None
     if sha256_of(data) != row.backup_sha256:
         raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} no longer has its recorded sha256")
     try:

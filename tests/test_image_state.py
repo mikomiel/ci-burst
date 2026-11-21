@@ -1021,6 +1021,24 @@ class DetachedCopyTests(ImageStateCase):
         self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNAVAILABLE")
         self.assertEqual(self.on_disk(), before)
 
+    def test_a_journal_row_with_a_pin_that_is_not_a_version_is_refused_and_not_echoed(self):
+        self.add_journal()
+        for value in ("x; not a pin", b"\x00\xff", 0, 2.5):
+            with self.subTest(value=value):
+                self.state.close()
+                connection = sqlite3.connect(self.state.path)
+                try:
+                    connection.execute("UPDATE promotion_journal SET old_pin = ?", (value,))
+                    connection.commit()
+                finally:
+                    connection.close()
+                self.state.connect()
+                for read in (self.state.pending_journal, lambda: self.state.journal(1)):
+                    with self.assertRaises(StateRefusal) as raised:
+                        read()
+                    self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+                    self.assertNotIn("not a pin", raised.exception.detail)
+
     def test_a_state_that_is_not_open_has_no_copy(self):
         self.state.close()
         with self.assertRaises(StateRefusal) as raised:

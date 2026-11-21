@@ -291,6 +291,31 @@ class ImageState:
         self._read_only = True
         return True
 
+    def detached_copy(self):
+        """A copy of the open database in memory, as an ``ImageState`` of its own: a view to plan against.
+
+        The copy has no file and no writer lock, and a write to it changes nothing on disk, so a caller may
+        resolve a journal row on it to see what the next write would see. It does not follow the file after
+        this call, and the caller closes it; closing it leaves this state open. The data comes through this
+        connection, so a read-only connection leaves the file, its directory and its lock as they were. A
+        source that another process holds locked is refused as ``IMAGE_STATE_UNREADABLE``, as a read of it
+        is: ``backup`` alone would retry it without end.
+        """
+        source = self._require()
+        memory = sqlite3.connect(":memory:", isolation_level=None)
+        memory.row_factory = sqlite3.Row
+        try:
+            source.backup(memory, progress=_give_up_on_a_locked_source)
+        except sqlite3.DatabaseError as error:
+            memory.close()
+            raise StateRefusal("IMAGE_STATE_UNREADABLE", type(error).__name__) from None
+        except BaseException:
+            memory.close()
+            raise
+        copy = _DetachedState(self.directory, clock=self._clock)
+        copy._connection = memory
+        return copy
+
     def close(self):
         if self._connection is not None:
             self._connection.close()
@@ -719,6 +744,26 @@ class ImageState:
         if self._connection is None:
             raise StateRefusal("IMAGE_STATE_UNAVAILABLE")
         return self._connection
+
+
+class _DetachedState(ImageState):
+    """The copy that ``detached_copy`` returns.
+
+    It has no other writer, so it takes no lock and never opens the file for writing: ``connect`` and
+    ``acquire_writer`` do nothing.
+    """
+
+    def connect(self):
+        return self  # a closed copy stays closed: reopening would open the file that this one was copied from
+
+    def acquire_writer(self):
+        return self  # there is no writer to exclude, and the lock file belongs to the file
+
+
+def _give_up_on_a_locked_source(status, remaining, total):
+    """The ``progress`` callback of ``backup``, which retries a locked source until it is free. A read gives up."""
+    if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        raise sqlite3.OperationalError("database is locked")
 
 
 def _user_version(connection):

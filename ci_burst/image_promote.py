@@ -34,9 +34,10 @@ never the promotion.
 
 A crash between two of these steps leaves a state that the next write form
 (``--write``, ``--rollback --write``) or ``image run --apply`` resolves from the
-file hash (``resolve_pending``). Without ``--write`` a command only reports the
-resolution that the hash implies. Nothing here deletes a backup that a journal
-row names.
+file hash (``resolve_pending``). Without ``--write`` ``image status`` only
+reports the resolution that the hash implies, and ``promote`` also plans as the
+write would after it, against a copy of the state in memory. Nothing here
+deletes a backup that a journal row names.
 """
 
 import errno
@@ -701,9 +702,17 @@ def promote(config, *, state, clock, events, version=None, rollback=False, write
     it as the form needs and closes it. Without ``write`` the command reads only
     local files (the state file, the deployment TOML and the backup that a
     journal row names) and builds no client. The state is opened for reading
-    only: nothing is created or written, and a pending journal row is reported
-    with the resolution that the file hash implies, not resolved. A refusal is
-    raised.
+    only: nothing is created, locked or written, and a pending journal row is
+    reported with the resolution that the file hash implies, not resolved. The
+    candidate, the rollback target and the plan are those that ``--write`` finds
+    after it resolves the row: the command resolves the rows on a copy of the
+    state in memory and drops the copy. A row that the file matches by neither
+    hash is not resolved, as ``--write`` refuses to resolve it, so the command
+    plans against that row as it is. Once there is a candidate or a rollback
+    row to show, the write check is the first refusal that ``--write`` meets.
+    Without one, the selection refusal is raised before the directory, zone-pin
+    and divergence checks, so in a state that holds two refusals the command can
+    name another one than ``--write`` names first. A refusal is raised.
 
     A local file-system error in the write path is the refusal
     ``PROMOTE_WRITE_FAILED``, and its detail names the errno and no path.
@@ -753,8 +762,12 @@ def _check_edit(snapshot, new_pin):
     check_reparse(snapshot, new_text, new_pin)
 
 
+def _diverged(pending):
+    return any(item["implied_resolution"] == "diverged" for item in pending)
+
+
 def _check_no_divergence(pending):
-    if any(item["implied_resolution"] == "diverged" for item in pending):
+    if _diverged(pending):
         raise StateRefusal(PROMOTION_JOURNAL_DIVERGED, "the file matches neither hash of a pending journal row")
 
 
@@ -781,11 +794,21 @@ def _preview(snapshot, state, clock, version, rollback):
     if not state.connect_readonly():
         raise _missing_state(rollback)
     try:
-        pending = pending_report(state, snapshot.sha256)
-        plan, refusal = try_rollback_plan(state, snapshot, now)
+        planned = state.detached_copy()
+    finally:
+        state.close()
+    try:
+        pending = pending_report(planned, snapshot.sha256)
+        # ``--write`` resolves a pending row before it plans, so the preview plans against the rows as that leaves
+        # them. The copy takes the resolution and the file never does. A row that matches neither hash is not
+        # resolved, as the write refuses to resolve it: the copy keeps that row, and ``_check_no_divergence`` puts
+        # it in the write check. Any other refusal of the resolution is the write's too, so it is raised here.
+        if not _diverged(pending):
+            resolve_pending(planned, snapshot.sha256)
+        plan, refusal = try_rollback_plan(planned, snapshot, now)
         report = {"pending_journal": pending, "rollback": describe_rollback(plan, refusal)}
         if rollback:
-            row = state.journal_last_complete(kind="promotion")
+            row = planned.journal_last_complete(kind="promotion")
             if row is None:
                 raise refusal
             # The checks of ``--rollback --write``, in the order it runs them. It writes the previous pin
@@ -804,7 +827,7 @@ def _preview(snapshot, state, clock, version, rollback):
                 "write_check": _write_check(first),
                 **report,
             }
-        build = select_candidate(state, config.deployment, version)
+        build = select_candidate(planned, config.deployment, version)
         refusal = _first_refusal(
             lambda: check_directory(snapshot.target),
             lambda: check_zone_pins(snapshot.raw),
@@ -817,12 +840,12 @@ def _preview(snapshot, state, clock, version, rollback):
             "action": "promote",
             "evidence": evidence(build, now),
             "pin_change": _try_change(snapshot, build.template_version),
-            "previous_pin": _pin_report(state, snapshot),
+            "previous_pin": _pin_report(planned, snapshot),
             "write_check": _write_check(refusal),
             **report,
         }
     finally:
-        state.close()
+        planned.close()
 
 
 def _pin_report(state, snapshot):

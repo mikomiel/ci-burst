@@ -738,7 +738,7 @@ Before the rename, `promote --write` MUST commit a pending-promotion journal row
 - **AND** the state file is not changed except for the check timestamp
 
 ### Requirement: A pending promotion is resolved from the file hash
-The next `promote --write`, `promote --rollback --write` or `image run --apply` MUST resolve a pending row from the file hash: the old hash marks it aborted, the new hash completes it, and any other hash refuses with `PROMOTION_JOURNAL_DIVERGED`. A `promote` without `--write` MUST report the resolution that the hash implies and write nothing. While a row is pending or diverged, both of its pins MUST be protected from deletion.
+The next `promote --write`, `promote --rollback --write` or `image run --apply` MUST resolve a pending row from the file hash: the old hash marks it aborted, the new hash completes it, and any other hash refuses with `PROMOTION_JOURNAL_DIVERGED`. A `promote` without `--write` MUST report the resolution that the hash implies, plan against the rows as that resolution leaves them, and write nothing. While a row is pending or diverged, both of its pins MUST be protected from deletion.
 
 #### Scenario: A crash before the rename
 - **WHEN** the process stops after the journal commit and before the rename
@@ -758,6 +758,12 @@ The next `promote --write`, `promote --rollback --write` or `image run --apply` 
 #### Scenario: A plain promote meets a pending row
 - **WHEN** an operator runs `promote` without `--write` while a row is pending
 - **THEN** the preview names the row and the resolution that the file hash implies
+- **AND** the candidate and the rollback target are those that `promote --write` finds after it resolves the row
+- **AND** the row, the state file and the TOML are unchanged
+
+#### Scenario: A rollback preview meets a pending row
+- **WHEN** a promotion from B to C stopped after the rename, so that its row is pending and the file holds C, and an operator runs `promote --rollback` without `--write`
+- **THEN** the preview plans the rollback to B that `promote --rollback --write` makes after it completes the row
 - **AND** the row, the state file and the TOML are unchanged
 
 ### Requirement: Promotion keeps a backup and refuses a changed file

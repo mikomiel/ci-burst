@@ -499,6 +499,143 @@ class PreviewTests(PromoteCase):
         self.assertEqual(payload["write_check"].get("reason"), "PIN_RECORD_DIVERGED")
         self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
 
+    # -- a pending row: the preview plans as the write does after it resolves the row ---------
+    #
+    # Each test below runs the preview first and then the write, and compares the two. The write resolves the row
+    # for real, so what it does is the reference for what the preview must say.
+
+    def show_changing_nothing(self, *arguments):
+        """``image promote`` without ``--write``. It leaves every file, table and event as it was and takes no lock."""
+        locks = (self.lock_file(), self.state_dir / "image-state.sqlite.lock")
+        for lock in locks:
+            lock.unlink(missing_ok=True)  # a lock file is made on demand, so one that is absent must stay absent
+        tree, fingerprint = snapshot_tree(self.dir), self.fingerprint()
+        result = self.show(*arguments)
+        self.assertEqual(snapshot_tree(self.dir), tree)
+        self.assertEqual(self.fingerprint(), fingerprint)
+        self.assertFalse(any(lock.exists() for lock in locks))
+        return result
+
+    def crash_a_second_promotion(self, crash):
+        """A to B completed, then B to C crashed (``crash`` is a crash helper): the row of B to C is pending."""
+        self.seed()
+        self.refresh()
+        self.promoted()
+        self.seed("build-c", 6, 0xC1, age=300, source_pin=5)
+        self.clock.advance(60)
+        crash("--version", "6")
+
+    def test_a_rollback_preview_plans_the_rollback_of_a_promotion_that_the_write_completes_first(self):
+        self.crash_a_second_promotion(self.crash_after_rename)
+        self.assertEqual(self.pin_in_file(), 6)
+        code, payload = self.show_changing_nothing("--rollback")
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "rollback"))
+        self.assertEqual(
+            [(item["journal_id"], item["implied_resolution"]) for item in payload["pending_journal"]], [(2, "complete")]
+        )
+        self.assertEqual(payload["write_check"], {"ok": True})
+        self.assertEqual(
+            payload["pin_change"], {"line": self.pin_line_number(), "from": self.pin_to(6), "to": self.pin_to(5)}
+        )
+        self.assertEqual((payload["rollback"]["available"], payload["rollback"]["to_pin"]), (True, 5))
+        code, written = self.write_pin("--rollback")
+        self.assertEqual((code, written["decision"], written["to_pin"]), (0, "rolled_back", 5))
+        self.assertEqual(written["resolved"], [{"journal_id": 2, "kind": "promotion", "resolution": "complete"}])
+        self.assertEqual(written["change"], payload["pin_change"])
+        self.assertEqual(self.pin_in_file(), 5)
+
+    def test_a_rollback_preview_with_no_earlier_promotion_plans_the_rollback_that_the_write_makes_after_the_row(self):
+        self.seed()
+        self.refresh()
+        self.crash_after_rename()  # the first promotion: the file holds its pin, and its row is pending
+        code, payload = self.show_changing_nothing("--rollback")
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "rollback"))
+        self.assertEqual(payload["write_check"], {"ok": True})
+        self.assertEqual(payload["pin_change"]["from"], self.pin_to(5))
+        self.assertEqual(payload["pin_change"]["to"], self.pin_to(PIN))
+        code, written = self.write_pin("--rollback")
+        self.assertEqual((code, written["decision"], written["to_pin"]), (0, "rolled_back", PIN))
+        self.assertEqual(written["change"], payload["pin_change"])
+
+    def test_a_rollback_preview_with_no_earlier_promotion_names_the_refusal_that_the_write_meets_after_the_row(self):
+        self.seed()
+        self.crash_after_rename()  # no pass read the previous pin, so the rollback has no recorded target
+        code, payload = self.show_changing_nothing("--rollback")
+        self.assertEqual((code, payload["action"]), (0, "rollback"))
+        self.assertEqual(payload["write_check"].get("reason"), "ROLLBACK_PREVIOUS_NOT_RECORDED")
+        self.assertEqual(payload["rollback"]["reason"], "ROLLBACK_PREVIOUS_NOT_RECORDED")
+        code, written = self.write_pin("--rollback")
+        self.assertEqual((code, written["error"]["reason"]), (2, "ROLLBACK_PREVIOUS_NOT_RECORDED"))
+        self.assertEqual(payload["write_check"], {"ok": False, **written["error"]})
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["complete"], "the resolution stays")
+
+    def test_a_rollback_preview_plans_as_if_a_row_that_the_file_shows_aborted_were_aborted(self):
+        self.crash_a_second_promotion(self.crash_before_rename)
+        self.assertEqual(self.pin_in_file(), 5)
+        code, payload = self.show_changing_nothing("--rollback")
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "rollback"))
+        self.assertEqual([item["implied_resolution"] for item in payload["pending_journal"]], ["aborted"])
+        self.assertEqual(payload["write_check"], {"ok": True})
+        self.assertEqual(payload["pin_change"]["from"], self.pin_to(5))
+        self.assertEqual(payload["pin_change"]["to"], self.pin_to(PIN))
+        code, written = self.write_pin("--rollback")
+        self.assertEqual((code, written["decision"], written["to_pin"]), (0, "rolled_back", PIN))
+        self.assertEqual(written["resolved"], [{"journal_id": 2, "kind": "promotion", "resolution": "aborted"}])
+        self.assertEqual(written["change"], payload["pin_change"])
+
+    def test_a_rollback_preview_with_nothing_to_roll_back_after_the_resolution_refuses_as_the_write_does(self):
+        self.seed()
+        self.crash_before_rename()  # the only row is aborted, so no promotion ever completed
+        code, payload = self.show_changing_nothing("--rollback")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "ROLLBACK_NO_PROMOTION"))
+        code, written = self.write_pin("--rollback")
+        self.assertEqual((code, written["error"]), (2, payload["error"]))
+
+    def test_a_promotion_preview_after_a_crash_past_the_rename_refuses_as_the_write_does(self):
+        self.seed()
+        self.crash_after_rename()  # the file holds build-b's pin, the row is pending and build-b is still a candidate
+        previews = {}
+        for arguments in ((), ("--version", "5")):
+            code, payload = self.show_changing_nothing(*arguments)
+            self.assertEqual(code, 2, payload)
+            previews[arguments] = payload["error"]
+        self.assertEqual(
+            [error["reason"] for error in previews.values()], ["PROMOTE_NO_CANDIDATE", "PROMOTE_VERSION_NOT_CANDIDATE"]
+        )
+        # The first write resolves the row for real, and the second meets the journal that the previews planned against.
+        for arguments, error in previews.items():
+            with self.subTest(arguments=arguments):
+                code, written = self.write_pin(*arguments)
+                self.assertEqual((code, written["error"]), (2, error))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["complete"])
+
+    def test_a_promotion_preview_picks_the_candidate_that_the_write_picks_after_the_resolution(self):
+        self.seed("build-b", 5, 0xB1, age=900)
+        self.seed("build-c", 6, 0xC1, age=300)
+        self.change("build-b", source_pin=4)  # told apart from build-c by the pin that its record names
+        self.crash_after_rename()  # the write picks build-c, the newest: the file holds 6 and the row is pending
+        self.assertEqual(self.pin_in_file(), 6)
+        code, payload = self.show_changing_nothing()
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "promote"))
+        self.assertEqual([item["implied_resolution"] for item in payload["pending_journal"]], ["complete"])
+        self.assertEqual(payload["evidence"]["build_id"], "build-b", "build-c is promoted once the row is resolved")
+        self.assertEqual(payload["pin_change"]["to"], self.pin_to(5))
+        self.assertEqual(payload["write_check"]["reason"], "PIN_MOVED")
+        self.assertIn("derived from version 4", payload["write_check"]["detail"])
+        code, written = self.write_pin()
+        self.assertEqual((code, {"ok": False, **written["error"]}), (2, payload["write_check"]))
+
+    def test_a_preview_over_a_pending_row_takes_no_lock_and_waits_for_none(self):
+        self.crash_a_second_promotion(self.crash_after_rename)
+        expected = self.show("--rollback")
+        self.assertEqual((expected[0], expected[1]["write_check"]), (0, {"ok": True}))
+        holder = ImageState(self.state_dir, clock=self.clock)
+        holder.connect()
+        self.addCleanup(holder.close)
+        holder.acquire_writer()
+        with image_promote.file_lock(self.config_path.resolve()):
+            self.assertEqual(self.show("--rollback"), expected)
+
 
 # -- 6.3: what a write refuses ---------------------------------------------------------
 

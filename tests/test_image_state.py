@@ -940,5 +940,110 @@ class PromotionSupportTests(ImageStateCase):
         self.assertFalse((self.root / "unconnected").exists())
 
 
+class DetachedCopyTests(ImageStateCase):
+    """``detached_copy``: the open file as a state in memory, to resolve rows on and plan against without a write."""
+
+    DEPLOYMENT = "example-deployment"
+
+    def open_read_only(self):
+        reader = ImageState(self.directory, clock=self.clock)
+        self.addCleanup(reader.close)
+        self.assertTrue(reader.connect_readonly())
+        return reader
+
+    def copy_of(self, state):
+        copy = state.detached_copy()
+        self.addCleanup(copy.close)
+        return copy
+
+    def on_disk(self):
+        """What a copy must leave as it found it: the bytes of the file and the names beside it."""
+        return self.state.path.read_bytes(), sorted(item.name for item in self.directory.iterdir())
+
+    def test_a_copy_holds_the_rows_of_the_file_as_of_the_call(self):
+        build = self.add_build()
+        pending = self.add_journal()
+        copy = self.copy_of(self.open_read_only())
+        self.assertEqual(copy.builds(self.DEPLOYMENT), [build])
+        self.assertEqual(copy.pending_journal(), [pending])
+        self.assertEqual(copy.control_get(), self.state.control_get())
+        self.state.control_set(blocked=1)  # the file moves on and the copy does not
+        self.assertFalse(copy.control_get().blocked)
+
+    def test_a_row_resolved_on_the_copy_is_resolved_there_and_nowhere_else(self):
+        self.add_build()
+        pending = self.add_journal()
+        reader = self.open_read_only()
+        before = self.on_disk()
+        copy = self.copy_of(reader)
+        with copy.transaction():
+            copy.journal_complete(pending.id)
+        self.assertEqual(copy.pending_journal(), [])
+        self.assertEqual(copy.journal_last_complete().id, pending.id)
+        self.assertEqual(reader.pending_journal(), [pending])
+        self.assertIsNone(reader.journal_last_complete())
+        self.assertEqual(self.state.pending_journal(), [pending])
+        self.assertEqual(self.on_disk(), before)
+
+    def test_a_copy_makes_no_file_and_neither_takes_nor_drops_the_writer_lock(self):
+        self.state.acquire_writer()
+        before = self.on_disk()
+        copy = self.copy_of(self.open_read_only())
+        self.assertIs(copy.acquire_writer(), copy)  # it asks for no lock, so the writer's lock is no obstacle
+        with copy.transaction():
+            copy.control_set(blocked=1)
+        copy.close()
+        self.assertEqual(self.on_disk(), before)
+        other = ImageState(self.directory, clock=self.clock)
+        self.addCleanup(other.close)
+        with self.assertRaises(StateRefusal) as raised:  # and the writer still holds the lock
+            other.acquire_writer()
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_LOCKED")
+
+    def test_closing_the_copy_leaves_the_state_it_was_made_from_open(self):
+        self.add_build()
+        reader = self.open_read_only()
+        copy = self.copy_of(reader)
+        copy.close()
+        self.assertFalse(copy.available)
+        self.assertTrue(reader.available)
+        self.assertEqual([build.id for build in reader.builds(self.DEPLOYMENT)], ["build-1"])
+
+    def test_a_closed_copy_stays_closed_and_does_not_open_the_file(self):
+        copy = self.copy_of(self.open_read_only())
+        copy.close()
+        before = self.on_disk()
+        self.assertIs(copy.connect(), copy)
+        self.assertFalse(copy.available)
+        with self.assertRaises(StateRefusal) as raised:
+            copy.control_get()
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNAVAILABLE")
+        self.assertEqual(self.on_disk(), before)
+
+    def test_a_state_that_is_not_open_has_no_copy(self):
+        self.state.close()
+        with self.assertRaises(StateRefusal) as raised:
+            self.state.detached_copy()
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNAVAILABLE")
+
+    def test_a_source_that_another_connection_holds_locked_is_refused_and_not_waited_for(self):
+        reader = self.open_read_only()
+        reader._connection.execute("PRAGMA busy_timeout = 100")
+        holder = sqlite3.connect(self.state.path, timeout=1, isolation_level=None, check_same_thread=False)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN EXCLUSIVE")
+        # ``backup`` alone retries a locked source until the lock is gone. If the copy waited, this timer would end
+        # the wait and the copy would succeed: the test would then fail for the missing refusal and not hang.
+        release = threading.Timer(3.0, holder.execute, ("ROLLBACK",))
+        self.addCleanup(release.join)
+        self.addCleanup(release.cancel)
+        release.start()
+        with self.assertRaises(StateRefusal) as raised:
+            reader.detached_copy()
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+        self.assertEqual(raised.exception.detail, "OperationalError")
+        self.assertTrue(reader.available)
+
+
 if __name__ == "__main__":
     unittest.main()

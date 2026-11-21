@@ -1419,7 +1419,7 @@ class _Pass:
 
     def _stage_and_launch(self, build):
         s, aws, cfg = self.s, self.aws, self.cfg
-        key = f"{_archive_prefix(cfg.storage.prefix)}{build.id}.tar.gz"
+        key = self._archive_key(build)
         chunks = self._source().archive(build.source_sha, cfg.source.max_archive_bytes, deadline=self.deadline)
         try:
             upload = aws.put_archive(
@@ -1782,12 +1782,20 @@ class _Pass:
             blocked=control.blocked,
         )
 
+    def _archive_key(self, build):
+        """The one key of the archive of ``build``. A stage done again writes the same key."""
+        return f"{_archive_prefix(self.cfg.storage.prefix)}{build.id}.tar.gz"
+
     def _delete_archive(self, build):
-        """Delete the archive at a terminal state. A failure here is a stray object, not a failed build."""
-        if not build.archive_key:
-            return
+        """Delete the archive at a terminal state. A failure here is a stray object, not a failed build.
+
+        The upload comes before the row records its key, so a pass that stopped in between leaves an object that
+        the row does not name. The key is deterministic, and the delete uses it when the row names none: deleting a
+        key that holds no object is no error. Without this, a row that a later pass ends unstaged (a changed input,
+        a withdrawn gate, the build deadline) leaves the object to the bucket's expiry rule.
+        """
         try:
-            self.aws.delete_object(self.cfg.storage.bucket, build.archive_key)
+            self.aws.delete_object(self.cfg.storage.bucket, build.archive_key or self._archive_key(build))
         except ProviderRefusal:
             self.notes.append("archive:delete_failed")
 

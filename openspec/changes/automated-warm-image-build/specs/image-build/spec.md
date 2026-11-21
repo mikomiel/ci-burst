@@ -351,7 +351,7 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 
 #### Scenario: A resumed stage is refused
 - **WHEN** a pass stages again a build that has no builder and no staged archive, and the check before the upload refuses
-- **THEN** the row ends `failed` with the refusal code and any archive that the row names is deleted
+- **THEN** the row ends `failed` with the refusal code and the archive under the row's key is deleted
 - **AND** no new upload is made and no failure is counted
 
 #### Scenario: A refused row counts toward the limits
@@ -421,7 +421,7 @@ Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run
 #### Scenario: An unstaged build reaches its deadline
 - **WHEN** the build deadline has passed and the row has no builder and no `archive_sha256`
 - **THEN** the build fails with `CONSOLE_BLIND` and no builder is launched
-- **AND** any archive that the row names is deleted
+- **AND** the archive under the row's key is deleted
 
 #### Scenario: Until-done without apply
 - **WHEN** an operator passes `--until-done` without `--apply`
@@ -529,7 +529,7 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 #### Scenario: A resumed stage outlasts the deadline
 - **WHEN** the build deadline passes during the upload of a resumed stage, or during the reads between the upload and the launch call
 - **THEN** no builder is launched and the build fails with `CONSOLE_BLIND`
-- **AND** the archive that the row names is deleted
+- **AND** the archive under the row's key is deleted
 
 #### Scenario: A failed build recovers
 - **WHEN** the basis digest changes or an operator runs `run --apply --force`

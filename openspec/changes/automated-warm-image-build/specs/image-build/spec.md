@@ -364,7 +364,7 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **THEN** it counts toward `max_builds_per_day` and `min_build_interval_seconds` like any other row
 
 ### Requirement: A stage done again launches only under the inputs of its row
-A pass that stages a build again MUST first check that the basis files at the row's own commit, the warm settings and the script give the digest that the row was inserted under. If they do not, or the commit lacks a basis path, the pass MUST launch no builder and MUST end the row as `failed` with `IMAGE_INPUTS_CHANGED`, as for a refused start: the pass tries to delete its archive and no failure is counted. A pass whose deadline passes during those reads MUST leave the row for the next pass.
+A pass that stages a build again MUST first recompute the digest over the basis files at the row's own commit, the warm and gate commands, `strip_components` and the script. If it differs from the row's, or the commit lacks a basis path, the pass MUST launch no builder and MUST end the row `failed` with `IMAGE_INPUTS_CHANGED` as a refused start: it tries to delete the archive and counts no failure. A pass whose deadline passes during those reads MUST leave the row for the next pass.
 
 #### Scenario: The gate command changes before the stage is done again
 - **WHEN** a build row is inserted with a gate command, the pass deadline ends its stage and the configuration then holds no gate command
@@ -374,6 +374,10 @@ A pass that stages a build again MUST first check that the basis files at the ro
 #### Scenario: The script or a warm command changes
 - **WHEN** the warm script or a warm command differs from the one that gave the row's digest when the stage is done again
 - **THEN** the row ends `failed` with `IMAGE_INPUTS_CHANGED` and no builder is launched
+
+#### Scenario: A setting outside the digest changes while a stage waits
+- **WHEN** only a setting outside the digest, such as `lifetime_seconds` or `snapshot_seconds`, changed since the row was inserted
+- **THEN** the digest still matches and the stage launches with the value that the file holds at the launch
 
 #### Scenario: A staged archive is removed
 - **WHEN** the row names an archive and the check finds that the inputs changed

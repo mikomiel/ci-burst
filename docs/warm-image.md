@@ -176,7 +176,8 @@ command. This section owns the workflow.
    ([operations.md](operations.md#when-a-build-starts)).
 3. The builder runs this script. The controller reads the builder's console. In the
    pass that first sees `IMAGE_READY`, it creates the image from the running
-   builder. That pass, or a later one, waits for the image to be `available` and
+   builder, if the builder is still alive and the build is still within its deadline
+   when the create call is made; otherwise the build fails without an image. That pass, or a later one, waits for the image to be `available` and
    then terminates the builder; on a pass at or after the build deadline, reconcile
    can terminate the builder first. The build deadline decides the outcome only in
    a pass that reaches its checks: a build with no ready marker by

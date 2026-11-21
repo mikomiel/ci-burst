@@ -190,8 +190,8 @@ Treat it as an evidence gap: check it with the IAM policy simulator or a real
 call before enabling. If the condition does not match, the Allow does not apply
 and the console read is refused. The code does not settle that as `CONSOLE_BLIND`:
 each pass raises the provider refusal and exits nonzero, and the build does not
-advance ([#203](https://github.com/mikomiel/ci-burst/issues/203)); the signal is
-`CiBurstImageBuildNotAdvancing` ([operations.md](operations.md#image-events-and-metrics)). Do not widen the grant to `instance/*` without the tag to work
+advance ([#203](https://github.com/mikomiel/ci-burst/issues/203)); watch for a
+build that stays `building` in `image status`. Do not widen the grant to `instance/*` without the tag to work
 around that; record the result and decide with the maintainer.
 
 Images and snapshots may carry the keys `ci-burst:image-build`,

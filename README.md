@@ -62,8 +62,8 @@ cost scope, identities, rollback and status semantics. To build the
 operator-owned worker prerequisites, including the IAM role, SSM parameter and
 bootstrap, follow [docs/runner-setup.md](docs/runner-setup.md); an optional warm-cache
 layer for that image, built by hand or with the opt-in `image` commands, is in
-[docs/warm-image.md](docs/warm-image.md). The commands, exit codes, events and
-reason codes of the `image` group are in
+[docs/warm-image.md](docs/warm-image.md). The commands, exit codes and reason
+codes of the `image` group are in
 [docs/operations.md](docs/operations.md#automated-warm-image-build), and their
 container lines are in [docs/container.md](docs/container.md#run-the-image-commands).
 Once those exist, the

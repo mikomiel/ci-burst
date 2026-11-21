@@ -67,7 +67,8 @@ and only then the timer (8).
 
 - [x] 7.1 `docs/warm-image.md`: add an automated section (commands, triggers, the candidate and promotion flow, rollback) and keep the manual runbook as the fallback. State that the offline gate proves cache behavior and not image safety. State that the basis digest excludes the cold base image and the build launch template, so after either changes the operator forces a rebuild with `image run --apply --until-done --force`.
 - [x] 7.2 `docs/deployment.md`: add the `[image]` tables with ranges and defaults, the dedicated TOML directory layout that `promote --write` needs, the image role profile and the source identity (placeholders), the dedicated token and the rotation note for the source key.
-- [x] 7.3 `docs/operations.md`: document the commands, the events and metrics, the `blocked` state and its recovery, example alert rules (not shipped), the leaked-builder backstop and the rollback.
+- [x] 7.3 `docs/operations.md`: document the commands, the `blocked` state and its recovery, the leaked-builder backstop and the rollback.
+- [ ] 7.8 `docs/operations.md`: document the events, the metrics, example alert rules (not shipped) and the full image reason-code table, in a change of its own.
 - [x] 7.4 `docs/runner-setup.md`, `docs/container.md` and the README: link to the one owner of each topic and keep them consistent with each other. Add the one-off container lines for a build and for promotion. The promotion line has no network, no credential mount and a dedicated TOML directory.
 - [x] 7.5 `docs/pilot-checklist.md`: add unticked items for section 9. The checklist records preparation, not authorization.
 - [x] 7.6 Do not edit `CHANGELOG.md`. release-please owns it.

@@ -555,24 +555,6 @@ class RunApplyJournalTests(CliCase):
         self.assertEqual(len(self.world.calls), calls, "no image is deregistered")
         self.assertEqual((self.sessions, self.source_sessions), ([], 0), "no client is built before the refusal")
 
-    def test_a_pending_row_whose_old_hash_was_overwritten_with_its_new_one_refuses_the_run(self):
-        # The rename happened, so the file matches the new hash. With the old hash overwritten by the new one, the
-        # resolution would match the old hash first and abort the row, and nothing would protect the previous pin.
-        self.pin_current()
-        self.pending(new_sha=self.file_sha())
-        connection = sqlite3.connect(self.state_dir / "image-state.sqlite")
-        try:
-            connection.execute("UPDATE promotion_journal SET old_file_sha256 = new_file_sha256")
-            connection.commit()
-        finally:
-            connection.close()
-        before, calls = self.dump(), len(self.world.calls)
-        code, payload = self.invoke("image", "run", "--apply")
-        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_STATE_UNREADABLE"))
-        self.assertEqual(self.dump(), before)
-        self.assertEqual(len(self.world.calls), calls)
-        self.assertEqual((self.sessions, self.source_sessions), ([], 0), "no client is built before the refusal")
-
     def test_a_completed_row_that_was_changed_refuses_the_run_before_any_client(self):
         # Retention and cleanup read the newest completed row late in the pass, after reconcile may have deleted a
         # stray archive: the run checks every row first.

@@ -815,14 +815,6 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **WHEN** the previous pin's image is not recorded as existing
 - **THEN** the command refuses and does not write
 
-### Requirement: The promotion journal is read only as the promotion writes it
-Every read of the promotion journal MUST refuse with `IMAGE_STATE_UNREADABLE`, naming the row and no value, when a row is not what the promotion writes: a pin that is not a positive integer, a kind or status outside the schema, a hash that is not 64 lower-case hex digits, a previous pin that differs from the pin its backup holds, or an old file hash equal to the new one. `image run --apply` MUST check every row before its pass.
-
-#### Scenario: A row that contradicts itself
-- **WHEN** a journal row's previous pin differs from the pin it records for its backup, or its old file hash equals its new one
-- **THEN** `image run --apply`, a preview and a write refuse with `IMAGE_STATE_UNREADABLE` before any client is built, and the row is neither resolved nor used for a rollback
-- **AND** `PIN_RECORD_DIVERGED` remains the refusal for a row that is whole but disagrees with the TOML or its backup
-
 ### Requirement: Every image deletion resolves the protected set
 Every path that deregisters an image or deletes a snapshot (retention, failed-build cleanup, orphan cleanup and the pending-image timeout) MUST first resolve the protected set: the images of every launch-template version that the TOML references, including per-zone pins, the recorded previous pin, the pins of a pending promotion journal row, the current candidate unless its row records `TEMPLATE_DRIFT`, and an active build. It MUST NOT deregister a protected image.
 

@@ -370,9 +370,10 @@ A pass that stages a build again MUST first check that the basis files at the ro
 - **WHEN** the warm script or a warm command differs from the one that gave the row's digest when the stage is done again
 - **THEN** the row ends `failed` with `IMAGE_INPUTS_CHANGED` and no builder is launched
 
-#### Scenario: A staged archive is deleted
+#### Scenario: A staged archive is removed
 - **WHEN** the row names an archive and the check finds that the inputs changed
-- **THEN** that archive is deleted and no new upload is made
+- **THEN** the pass deletes that archive and makes no new upload
+- **AND** a refused delete leaves the object and is reported as `archive:delete_failed`
 
 #### Scenario: A basis path is missing at the row's commit
 - **WHEN** the configuration names a basis path that the row's commit does not hold
@@ -571,12 +572,12 @@ The gate requirement MUST guard a launch. `plan`, and an applying pass whose sta
 
 #### Scenario: A stage that waits for its next pass meets a file with no gate
 - **WHEN** a row is inserted with a gate command, the pass deadline ends its stage and the configuration then holds no gate command and no opt-out
-- **THEN** the next pass ends the row `failed` with `IMAGE_INPUTS_CHANGED`, deletes its archive and starts no new build
+- **THEN** the next pass ends the row `failed` with `IMAGE_INPUTS_CHANGED`, tries to delete its archive and starts no new build
 - **AND** the pass answers `refused` and counts no failure
 
 #### Scenario: The opt-out is withdrawn while a stage waits
 - **WHEN** a row is inserted under `allow_no_gate = true` with no gate command, the pass deadline ends its stage and the configuration then holds no opt-out
-- **THEN** the next pass ends the row `failed` with `IMAGE_GATE_REQUIRED`, deletes its archive and launches no builder
+- **THEN** the next pass ends the row `failed` with `IMAGE_GATE_REQUIRED`, tries to delete its archive and launches no builder
 - **AND** the pass answers `refused` and counts no failure
 
 #### Scenario: The pass after the settled build is refused
@@ -881,7 +882,7 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **THEN** the command refuses with `PROMOTE_FILE_CHANGED` and writes nothing
 
 #### Scenario: A stale view of the file
-- **WHEN** a container mounted the file itself and a write elsewhere then replaced the file by a rename
+- **WHEN** a container mounted the file itself, a write elsewhere then replaced the file by a rename, and the mounted file has no link left (`st_nlink == 0`)
 - **THEN** a command in that container that resolves the journal, promotes or rolls back refuses with `PROMOTE_FILE_STALE` and writes nothing
 
 ### Requirement: Promotion runs in an isolated operator container
@@ -963,7 +964,7 @@ Every path that deregisters an image or deletes a snapshot (retention and every 
 - **THEN** no deletion path removes the image of either pin of either row until a newer row completes
 
 #### Scenario: A stale view of the file at a deletion
-- **WHEN** the deployment file that a pass reads is a view of a file that a rename replaced
+- **WHEN** the deployment file that a pass reads is a view of a file that a rename replaced and that has no link left (`st_nlink == 0`)
 - **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE` and no path deletes anything
 
 #### Scenario: A pin of an unsettled row cannot be read

@@ -627,9 +627,10 @@ forced run would decide.
 seconds, which parts of the pass check: the provider reads, the archive stream and
 its upload, and the polling of the builder, which stops 30 seconds before the
 deadline so that retention can still run. It is not a wall-clock limit. The read of
-the branch and the reads of the basis files (one request each, up to 32 files) get
-no deadline, and neither do the describe calls that record the pin evidence after
-the pass. For the forge reads, `forgejo.timeout_seconds` bounds a silent server on
+the branch and the reads of the basis files (one request each, up to 32 files) are
+not interrupted by it: a request that has begun runs to its end, but no further
+basis read starts once the deadline has passed. The describe calls that record the
+pin evidence after the pass get no deadline. For the forge reads, `forgejo.timeout_seconds` bounds a silent server on
 each request, not a slow one. Each provider call keeps the client's own timeouts
 (10 seconds to connect, 30 seconds to read, one attempt). A pass can therefore
 outlast 240 seconds: if you need a hard bound, set a timeout in the scheduler that
@@ -656,7 +657,7 @@ state file and the TOML, the counters
 the deletion rule: it omits the new pin of the newest completed journal row and
 the pins of settled rows since it, which retention protects, and it can list a
 candidate that a refresh recorded as `TEMPLATE_DRIFT`, which retention does not
-protect. The `deletion` part of `image plan` gives the current dry-run deletion
+protect for being the candidate (a pin that names its image still protects it). The `deletion` part of `image plan` gives the current dry-run deletion
 decision. Plain `status` makes no provider call. `status --refresh` makes describe calls for the live pin, the
 rollback target and the newest verified candidates, and records whether each
 version and image still exists and whether the candidate version differs from its
@@ -712,9 +713,13 @@ nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge
 (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
 or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
 before the template, so an unsafe template never hides a missing gate. A stage done
-again is the exception for three of them: a changed digest, a missing gate or
+again is the exception for its input rechecks: a changed digest, a missing gate or
 opt-out, and an unsafe template verdict end its row and are answered `refused`
-(below). A refused forge read is still raised there and leaves the row. A pass that
+(below), while a refused basis-file read is raised and leaves the row. Once those
+rechecks pass, the stage runs the same staging and launch checks as a first stage:
+a start refusal such as `IMAGE_CREDENTIAL_SHORT` ends the row `refused` without a
+failure, and a definite refusal of the archive request ends it as a failed build,
+counted, with exit `1`. A pass that
 finds a build in flight runs and settles it even without a gate; a launch that
 pass would then make is refused with `IMAGE_GATE_REQUIRED`, answered `refused`,
 and counts no failure.
@@ -1037,8 +1042,10 @@ starting. The timestamp also moves when a pass raises, so repeated provider fail
 do not trip it, and a pass that raises records no failed build, so the failure rules
 stay quiet as well. `CiBurstImageBuildNotAdvancing` covers a build in flight: a pass
 that raises before it advances the build cannot end it at its deadline, so the build
-stays `building` or `imaging`. A pass that raises while no build is in flight leaves
-no series. Its signals are its exit status (`1` for a provider failure, `2` for
+stays `building` or `imaging`. A pass that raises while no build is in flight has
+no failure series of its own: it can still move
+`ci_burst_image_last_run_timestamp_seconds`, but it records no decision and no
+failed build. Its signals are its exit status (`1` for a provider failure, `2` for
 another refusal) and the missing `image_check` event. Alert on the scheduled run's
 absence or nonzero exit in your scheduler, as
 [container.md](container.md#scheduled-operation-with-systemd) does for the cleanup

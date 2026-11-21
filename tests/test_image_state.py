@@ -1039,6 +1039,34 @@ class DetachedCopyTests(ImageStateCase):
                     self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
                     self.assertNotIn("not a pin", raised.exception.detail)
 
+    def test_a_journal_row_with_a_blob_or_number_where_text_belongs_is_refused(self):
+        self.add_journal()
+        cases = (
+            ("old_file_sha256", b"\x01"),
+            ("new_file_sha256", b"\x02"),  # TEXT affinity turns a number into text: only a blob stays apart
+            ("candidate_id", b"build-1"),
+            ("created_at", "x; not a time"),
+        )
+        for column, value in cases:
+            with self.subTest(column=column):
+                self.state.close()
+                connection = sqlite3.connect(self.state.path)
+                try:
+                    connection.execute(
+                        "UPDATE promotion_journal SET old_file_sha256 = ?, new_file_sha256 = ?, candidate_id = ?,"
+                        " created_at = 1.0",
+                        ("1" * 64, "2" * 64, "build-1"),
+                    )
+                    connection.execute(f"UPDATE promotion_journal SET {column} = ?", (value,))
+                    connection.commit()
+                finally:
+                    connection.close()
+                self.state.connect()
+                for read in (self.state.pending_journal, lambda: self.state.journal(1), self.state.journal_check):
+                    with self.assertRaises(StateRefusal) as raised:
+                        read()
+                    self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+
     def test_a_journal_row_with_a_kind_or_status_outside_the_schema_is_refused_and_not_echoed(self):
         self.add_journal()
         for column in ("kind", "status"):

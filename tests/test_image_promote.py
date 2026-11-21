@@ -665,6 +665,10 @@ class PreviewTests(PromoteCase):
         self.corrupt_journal(1, old_pin="x; not a pin")
         code, payload = self.show_changing_nothing("--version", "6")
         self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_STATE_UNREADABLE"), payload)
+        # The valid pending row is still reported, with the resolution that its hash implies.
+        self.assertEqual(
+            [(item["journal_id"], item["implied_resolution"]) for item in payload["pending_journal"]], [(2, "aborted")]
+        )
         fingerprint = self.fingerprint()  # the files (the lock file apart), the rows and the events
         code, written = self.write_pin("--version", "6")
         self.assertEqual((code, written["error"]), (2, payload["error"]))

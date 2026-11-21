@@ -839,8 +839,10 @@ def _preview(snapshot, state, clock, version, rollback):
         state.close()
     pending = []
     try:
-        planned.journal_check()  # the write checks every row first, so a damaged row refuses both alike
+        # The report of the pending rows comes first, so a refusal still carries it; then every row, as the write
+        # checks them before it resolves a pending row, so a damaged row refuses both alike.
         pending = pending_report(planned, snapshot.sha256)
+        planned.journal_check()
         # ``--write`` resolves a pending row before it plans, so the preview plans against the rows as that leaves
         # them. The copy takes the resolution and the file never does. A row that matches neither hash is not
         # resolved, as the write refuses to resolve it: the copy keeps that row, and ``_check_no_divergence`` puts

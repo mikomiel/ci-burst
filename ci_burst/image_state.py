@@ -783,12 +783,17 @@ def _journal_row(row):
     """A ``Journal`` from a row, or the refusal of a row whose pins or names are not what this module writes.
 
     SQLite's ``INTEGER`` and ``TEXT`` affinities do not reject other types, so a hand-edited or damaged file can
-    hold text or a blob where a pin belongs, or a kind or a status outside the schema. Such a value is never passed on: it would reach a detail or the
-    output verbatim. The refusal names no value.
+    hold text or a blob where a pin belongs, a blob where a hash belongs, or a kind or a status outside the
+    schema. Every column is checked for the type that this module stores in it. Such a value is never passed on:
+    it would reach a detail or the output verbatim, or compare unequal to every hash and change a resolution. The
+    refusal names no value.
     """
     data = dict(row)
     pins_ok = all(type(data[key]) is int and data[key] >= 1 for key in ("old_pin", "new_pin", "contained_pin"))
-    texts_ok = all(type(data[key]) is str for key in ("kind", "status", "backup_name", "backup_sha256"))
+    texts = ("kind", "status", "old_file_sha256", "new_file_sha256", "backup_name", "backup_sha256")
+    texts_ok = all(type(data[key]) is str for key in texts)
+    texts_ok = texts_ok and (data["candidate_id"] is None or type(data["candidate_id"]) is str)
+    texts_ok = texts_ok and all(type(data[key]) in (int, float) for key in ("created_at", "updated_at"))
     # The schema's CHECK holds kind and status to these values, but a file written without it, or with checks
     # turned off, need not.
     enums_ok = texts_ok and data["kind"] in JOURNAL_KINDS and data["status"] in JOURNAL_STATUSES

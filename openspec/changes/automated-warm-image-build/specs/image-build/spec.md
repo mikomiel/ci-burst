@@ -870,7 +870,7 @@ The next `promote --write`, `promote --rollback --write` or `image run --apply` 
 - **AND** the row, the state file and the TOML are unchanged
 
 ### Requirement: Promotion keeps a backup and refuses a changed file
-Before the rename, `promote --write` MUST write a timestamped backup and MUST refuse with `PROMOTE_FILE_CHANGED` when the file differs from the bytes it read.
+Before the rename, `promote --write` MUST write a timestamped backup and MUST refuse with `PROMOTE_FILE_CHANGED` when the file differs from the bytes it read. Every command that reads the file to promote, roll back or resolve a journal row MUST refuse with `PROMOTE_FILE_STALE` when no name links the open file any more.
 
 #### Scenario: A backup exists
 - **WHEN** a write succeeds
@@ -879,6 +879,10 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 #### Scenario: The file changed since it was read
 - **WHEN** another editor changes the file after the read
 - **THEN** the command refuses with `PROMOTE_FILE_CHANGED` and writes nothing
+
+#### Scenario: A stale view of the file
+- **WHEN** a container mounted the file itself and a write elsewhere then replaced the file by a rename
+- **THEN** a command in that container that resolves the journal, promotes or rolls back refuses with `PROMOTE_FILE_STALE` and writes nothing
 
 ### Requirement: Promotion runs in an isolated operator container
 `promote` MUST run only as an operator-invoked one-off. The shipped documentation MUST give a container line that has no network, no AWS credential directory and no forge token. `promote --write` MUST refuse with `PROMOTE_DIRECTORY_NOT_DEDICATED` when the directory of the TOML holds anything other than the TOML, its `.bak.*` files, its lock file and its promote temporary file. A test MUST assert that `promote` constructs no AWS client.
@@ -957,6 +961,10 @@ Every path that deregisters an image or deletes a snapshot (retention and every 
 #### Scenario: A later promotion fails after a promotion that a pass resolved as aborted
 - **WHEN** after that aborted row a promotion to version C commits its row and fails, and a pass resolves it `aborted` too
 - **THEN** no deletion path removes the image of either pin of either row until a newer row completes
+
+#### Scenario: A stale view of the file at a deletion
+- **WHEN** the deployment file that a pass reads is a view of a file that a rename replaced
+- **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE` and no path deletes anything
 
 #### Scenario: A pin of an unsettled row cannot be read
 - **WHEN** a pin of a journal row newer than the newest completed one is not a version number, or its version cannot be read or names no literal image

@@ -16,8 +16,11 @@ import collections
 import copy
 import dataclasses
 import json
+import os
+import stat
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -465,6 +468,24 @@ class ProtectedSetRefusalTests(DeletionCase):
             self.resolve(**resolve)
         self.assertEqual(raised.exception.reason, UNSAFE)
         return raised.exception
+
+    def test_a_stale_view_of_the_deployment_file_is_unsafe_and_reads_no_version(self):
+        # A bind mount of the file itself that a rename elsewhere replaced: no name links the inode any more.
+        real = os.stat
+        target = Path(self.deployment_file)
+
+        def stale(path, *arguments, **keywords):
+            result = real(path, *arguments, **keywords)
+            if Path(path) != target:
+                return result
+            values = list(result[:10])
+            values[stat.ST_NLINK] = 0
+            return os.stat_result(values)
+
+        with mock.patch("os.stat", stale):
+            refusal = self.refused()
+        self.assertIn("replaced", refusal.detail)
+        self.assertEqual(self.ec2.calls, [])
 
     def test_an_unreadable_version_is_unsafe_and_leaks_nothing(self):
         self.ec2.errors["describe_launch_template_versions"] = ProviderError("RequestLimitExceeded")

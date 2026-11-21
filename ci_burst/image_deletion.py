@@ -41,6 +41,7 @@ ids and stable codes, never a tag value other than those or a provider message.
 """
 
 import copy
+import os
 from dataclasses import InitVar, dataclass, field
 
 from .aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
@@ -183,8 +184,9 @@ def protected_set(
     never reads the file's bytes and never decides which of a row's two pins is
     live. Pass every row in status ``pending``: a diverged row stays pending.
 
-    It refuses with ``IMAGE_DELETION_UNSAFE`` when the configuration cannot be
-    loaded, when a pin is not a version number, when the read does not return
+    It refuses with ``IMAGE_DELETION_UNSAFE`` when the deployment file is a
+    view of a file that a rename replaced (no name links its inode), when the
+    configuration cannot be loaded, when a pin is not a version number, when the read does not return
     exactly the pinned versions, when a version cannot be read, or when a version
     names no literal image (an alias that resolves later says which image is in
     use only at launch). Then no path may delete anything: ``plan_deletions``
@@ -192,6 +194,14 @@ def protected_set(
     (see ``ProtectedSet``). A refusal of the deadline passes unchanged. The
     detail names a version number at most, never a provider message.
     """
+    try:
+        stale = os.stat(config_path).st_nlink == 0
+    except OSError:
+        stale = False  # the load below refuses a file that cannot be read
+    if stale:
+        # A bind mount of the file itself that a rename elsewhere replaced: its pins and the journal rows that a
+        # pass resolved from it are old, so no set built from them says which image is live.
+        raise _unsafe("the deployment file is a view of a file that was replaced")
     try:
         config = load(config_path)
     except ConfigRefusal:

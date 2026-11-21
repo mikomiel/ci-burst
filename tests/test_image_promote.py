@@ -1677,6 +1677,64 @@ class ReparseTests(PromoteCase):
         self.assertEqual(raised.exception.reason, "PROMOTE_REPARSE_FAILED")
 
 
+class StaleViewTests(PromoteCase):
+    """A container that mounted the file itself keeps the inode that a rename elsewhere replaced."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+
+    def test_an_open_file_that_a_rename_replaced_is_refused_as_stale(self):
+        target = Path(self.config.path).resolve()
+        descriptor = os.open(target, os.O_RDONLY)
+        try:
+            replacement = target.parent / "replacement.tmp"
+            replacement.write_bytes(target.read_bytes())
+            os.replace(replacement, target)
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote._read_open_file(self.config, target, descriptor)
+        finally:
+            os.close(descriptor)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
+
+    def test_the_same_file_still_linked_is_read(self):
+        # The control: nothing but the rename separates this read from the one above.
+        target = Path(self.config.path).resolve()
+        descriptor = os.open(target, os.O_RDONLY)
+        try:
+            snapshot = image_promote._read_open_file(self.config, target, descriptor)
+        finally:
+            os.close(descriptor)
+        self.assertEqual(snapshot.data, target.read_bytes())
+
+    @contextlib.contextmanager
+    def stale_view(self):
+        """Every ``fstat`` of the deployment file reports no link left, as the stale mount does."""
+        real = os.fstat
+        inode = os.stat(Path(self.config.path).resolve()).st_ino
+
+        def fstat(descriptor):
+            result = real(descriptor)
+            if result.st_ino != inode:
+                return result
+            values = list(result[:10])
+            values[stat.ST_NLINK] = 0
+            return os.stat_result(values)
+
+        with mock.patch("os.fstat", fstat):
+            yield
+
+    def test_promote_write_through_a_stale_view_is_refused_and_nothing_is_written(self):
+        with self.stale_view():
+            self.refusal((), "PROMOTE_FILE_STALE")
+        self.assertEqual(self.backups(), [])
+
+    def test_a_rollback_and_a_preview_through_a_stale_view_are_refused(self):
+        with self.stale_view():
+            self.refusal(("--rollback",), "PROMOTE_FILE_STALE")
+            self.refusal((), "PROMOTE_FILE_STALE", write=False)
+
+
 class FreshnessTests(unittest.TestCase):
     LIMIT = 3600
 

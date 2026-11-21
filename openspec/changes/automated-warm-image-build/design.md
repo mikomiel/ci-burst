@@ -472,6 +472,7 @@ Events carry ids, 12-character digests, counts and reason codes. The presigned U
 | Image credentials leaked | Bounded to tagged resources and one prefix. Cannot touch IAM, networking, the pin or other instances. |
 | Promote: candidate unverified or stale | Refusal with the missing item. File unchanged. |
 | Promote: file changed since read | `PROMOTE_FILE_CHANGED`. File unchanged. |
+| A stale view of the file (a container that mounted the file itself, after a rename elsewhere replaced it) | Its inode has no name left. Resolving the journal, `promote` and rollback refuse `PROMOTE_FILE_STALE`; every deletion path refuses `IMAGE_DELETION_UNSAFE`. A pass started after the rename mounts the current file. |
 | Promote: strict re-parse fails | Refusal. File and backup unchanged. |
 | Promote: directory not dedicated | `PROMOTE_DIRECTORY_NOT_DEDICATED`. File unchanged. |
 | Promote: crash before the rename | The journal row is `pending` with the old file hash. The next resolving command marks it `aborted`. |

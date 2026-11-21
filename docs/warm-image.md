@@ -22,8 +22,9 @@ and the rollout of any image; [runner-setup.md](runner-setup.md) links here.
   ends at a marker. In the manual runbook you create the image with the AWS CLI. In
   the automated build the controller reads the marker and creates the image with
   its own identity, outside the builder.
-- **A cache check, not a safety check.** The offline gate proves that the cache
-  serves the warm commands. It does not prove that the image is safe
+- **A cache check, not a safety check.** A gate command that fails on a download
+  tests that the cache serves the warm commands; the script itself does not forbid
+  the network. It does not prove that the image is safe
   ([The candidate and what the gate proves](#the-candidate-and-what-the-gate-proves)).
 - **Downloads only.** A warm cache removes downloads. The job still resolves its
   own lockfile and runs its own commands, so it checks the same things as on a
@@ -73,7 +74,7 @@ front of the script ([step 3](#3-render-the-user-data)).
 | `WARM_SRC_URL` | yes | `https` URL of a `.tar.gz` source archive that the builder can fetch without credentials. |
 | `WARM_SRC_SHA256` | yes | The archive's sha256, 64 hex digits. The script refuses to run without it and stops when the fetched bytes differ. |
 | `WARM_COMMANDS` | yes | The warm commands, one per line. Blank lines and lines that start with `#` are ignored. At least one is required. |
-| `WARM_GATE_COMMAND` | no | One command that proves the warm layer is enough, run after the warm commands with downloads forbidden. Join steps with `&&` or `;`. |
+| `WARM_GATE_COMMAND` | no | One command that tests that the warm layer is enough, run after the warm commands in the same account, environment and network. The script does not forbid downloads: the command must, with its tool's offline switch ([Examples](#examples)). Join steps with `&&` or `;`. |
 | `WARM_LIFETIME_SECONDS` | no | Builder lifetime bound, 600 to 14400, default 5400. |
 | `WARM_SNAPSHOT_SECONDS` | no | How long the builder stays up after the marker, 60 to 3600, default 1800. |
 | `WARM_SRC_STRIP_COMPONENTS` | no | Leading path components that extraction drops, 0 or 1, default 0. A forge archive wraps the source in one directory and needs 1. Any other value stops the script before the fetch. |
@@ -226,16 +227,26 @@ does not.
 ### The candidate and what the gate proves
 
 A candidate is a build whose builder printed `IMAGE_READY`, which it does only after
-every warm command and the offline gate, when one is configured, succeeded, and whose
-launch-template version differs from the pin in `ImageId` alone. The gate proves
-cache behavior. With the network forbidden, the cache served what the warm commands
-need. It does not prove that the image is safe: it says nothing about the software
-the commands installed, the content of the archive or the base image. A candidate is
-a verified cache, not an approved image. Read its evidence with `image status` and
-run a canary ([Canary and cutover](#canary-and-cutover)) before you promote it.
+every warm command and the gate command, when one is configured, exited `0`, and
+whose launch-template version differs from the pin in `ImageId` alone. The script
+runs the gate as it runs a warm command: the same account, the same `env -i`
+environment and cache variables, the same source root and the same network. It
+blocks only the instance-metadata addresses for that account, and it tests only the
+exit status of the gate command. Whether a pass shows that the cache is enough
+therefore depends on the command: write it to fail when it would download, with the
+tool's offline switch, as the [examples](#examples) do. A gate that does so proves
+cache behavior and no more. It does not prove that the image is safe: it says
+nothing about the software the commands installed, the content of the archive or the
+base image. A candidate is a verified cache, not an approved image. Read its
+evidence with `image status` and run a canary
+([Canary and cutover](#canary-and-cutover)) before you promote it.
 
 A build without a gate is possible only with `allow_no_gate = true`, and a promotion
-accepts such a candidate only while that setting is still `true`.
+accepts such a candidate only while that setting is still `true`. The build records
+at launch whether a gate was configured. Do not change `[image.warm]` (`commands`,
+`gate_command`, `allow_no_gate`) while a build is active: the builder runs with the
+settings it launched with, and its gate evidence must describe what ran. Wait until
+the build is `candidate` or `failed`.
 
 ### Promotion and rollback
 

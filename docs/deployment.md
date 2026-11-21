@@ -146,9 +146,17 @@ or `enabled = false`, every image command loads the configuration and answers
 `disabled`, before it opens a state file or a network connection. No live build
 has been qualified. The verification gates G1 to G13 of the
 `automated-warm-image-build` change are your steps, so create this IAM only when
-you intend to run them, and keep `[image].enabled` false until you have recorded
-them, as the
-[pilot checklist](pilot-checklist.md#9-automated-warm-image-build-optional) lists.
+you intend to run them. They do not all come before enabling. Record G1 to G5, G9,
+G10, G12 and G13 first: they need only the IAM and the provider APIs, not an
+enabled build, and `[image].enabled` stays false until they are recorded. G6 is
+recorded in two parts: `image plan` shows that the token reads the branch and its
+protected flag, every basis file and the first chunk of the archive, and a
+separate inspection of the archive before the first build shows its layout and what
+`export-ignore` drops, which `image plan` does not (it reads one chunk and closes
+the stream). G7 and G11 come from the first enabled build, and G8 only after a
+timer unit exists and is qualified; this repository ships none today. The
+[pilot checklist](pilot-checklist.md#9-automated-warm-image-build-optional) lists
+them in that order.
 The manual runbook in [warm-image.md](warm-image.md#manual-runbook) stays the
 fallback. You apply all of this IAM yourself: the controller creates and changes
 none of it and has no IAM client.
@@ -364,7 +372,7 @@ names are examples that Step 5 repeats in the TOML:
 | `/var/lib/ci-burst-warm-image` | the image state directory: the image state file, its lock, the event file, the metrics textfile and the counters |
 | `/etc/ci-burst/aws-image` | the image role profile directory: the `config` and `credentials` files of the section above |
 | `/etc/ci-burst/forgejo-image.env` | the image token, as a podman env-file |
-| `/etc/ci-burst-deployment` | the dedicated TOML directory, only if you want `promote --write` |
+| `/etc/ci-burst-deployment` | the dedicated TOML directory: the build line mounts it read-only and `promote --write` writes in it |
 
 ```sh
 install -d -o 10001 -g 10001 -m 0700 /var/lib/ci-burst-warm-image
@@ -404,7 +412,7 @@ the branch, every basis file and the first chunk of the archive. Treat the file
 like `forgejo.env`: mode `0600`, visible in `podman inspect`, rotated on your own
 schedule.
 
-### The dedicated TOML directory (only for `promote --write`)
+### The dedicated TOML directory
 
 `image promote --write` edits one line of the deployment TOML and writes beside
 it: a backup named `<file>.bak.<UTC stamp>`, the lock file `<file>.lock` and the
@@ -413,8 +421,11 @@ file writable, so that directory must hold only the TOML, its `.bak.*` backups,
 its lock file and its promote temporary file. Any other entry, a subdirectory or a
 symbolic link included, is refused as `PROMOTE_DIRECTORY_NOT_DEDICATED` before
 anything is written. `/etc/ci-burst` cannot serve, because it holds the credential
-directories and the env-files. Give the file its own directory, owned by the
-container user so the container can create files in it:
+directories and the env-files. The build line mounts the same directory read-only
+instead of the file: a promotion replaces the file atomically, and a mount of the
+single file keeps serving the old one to a build container that is still running
+([container.md](container.md#run-the-image-commands)). Give the file its own
+directory, owned by the container user so the container can create files in it:
 
 ```sh
 install -d -o 10001 -g 10001 -m 0755 /etc/ci-burst-deployment
@@ -438,10 +449,12 @@ A promotion edits the file of the host that runs it. The reaper host keeps its o
 copy, and Step 5 asks for identical content on both hosts, so copy the new pin
 there after a promotion.
 
-If you do not want the move, do not use `--write`. `image promote` without it
-prints the evidence and the one-line diff, and you edit the pin by hand. A pin you
-edit by hand is not checked: the drift check and the other verification checks run
-in `promote`, and a hand-written pin bypasses them.
+If you do not want `--write`, leave it out. `image promote` without it prints the
+evidence and the one-line diff, and you edit the pin by hand, in this directory. A
+pin you edit by hand is not checked: the drift check and the other verification
+checks run in `promote`, and a hand-written pin bypasses them. Before a promotion,
+a rollback or a hand edit, finish or stop a running build container, and start a
+fresh one afterwards.
 
 ## 5. Write the deployment TOML
 
@@ -644,7 +657,7 @@ prefix = "warm-image-source/"
 | Key | Range | Default | Meaning |
 | --- | --- | --- | --- |
 | `commands` | non-empty array of non-empty strings | required | the warm commands, one per entry |
-| `gate_command` | a string | empty | the offline gate; empty means no gate |
+| `gate_command` | a string | empty | the gate command; empty means no gate. The script runs it like a warm command, on the same network, and tests only its exit status, so write it to fail on a download ([warm-image.md](warm-image.md#the-candidate-and-what-the-gate-proves)) |
 | `allow_no_gate` | `true` or `false` | `false` | accept an empty gate |
 | `lifetime_seconds` | `600..14400` | `3600` | the builder's own lifetime bound |
 | `snapshot_seconds` | `60..3600` | `1800` | how long the builder stays up after the marker |
@@ -661,7 +674,7 @@ prefix = "warm-image-source/"
 | Key | Range | Default | Meaning |
 | --- | --- | --- | --- |
 | `bucket` | a bucket name | required | the private staging bucket |
-| `prefix` | a key prefix, no `..`, no leading `/` | required | the archive key is the prefix, one `/` and `<build id>.tar.gz`, however many slashes you write at the end |
+| `prefix` | a key prefix, no `..`, no leading `/` | required | the archive key is the prefix, one `/` and `<build id>.tar.gz`, however many slashes you write at the end. The prefix must be exclusive to this deployment (see the notes below) |
 
 Notes on the values:
 
@@ -674,11 +687,20 @@ Notes on the values:
   and its examples show one pair per ecosystem. An entry with a control character
   is refused. With an empty `gate_command` and `allow_no_gate = false` every `image`
   command that reads inputs refuses with `IMAGE_GATE_REQUIRED`. The rendered user
-  data must stay under 16384 bytes; `image plan` prints its size, and a longer one
-  is `IMAGE_USERDATA_TOO_LARGE`. Move long command lists into a script in the
-  repository and list that script in `basis_paths`.
+  data must stay under 16384 bytes; `image plan` prints its size, measured with a
+  synthetic URL of 4096 characters, and a longer one is a refusal there
+  (`IMAGE_USERDATA_TOO_LARGE`, exit `2`). A real presigned URL can be longer, so an
+  applying run can still hit the limit while it renders: that build ends `failed`
+  with the same code and exit `1`. Leave headroom, and move long command lists into
+  a script in the repository and list that script in `basis_paths`.
+- Do not change `[image.warm]` (`commands`, `gate_command`, `allow_no_gate`) while a
+  build is active, that is `building` or `imaging` in `image status`: wait until it
+  is `candidate` or `failed`
+  ([warm-image.md](warm-image.md#the-candidate-and-what-the-gate-proves)).
 - `strip_components` follows the forge's archive layout, which wraps the source in
   one directory. Keep `1` unless you have confirmed the layout your forge returns.
+  Confirm it by listing the archive yourself: `image plan` reads one chunk of it
+  and shows neither the layout nor what `export-ignore` drops.
 - `build_deadline_seconds` bounds the whole build, and the builder's own
   `lifetime_seconds` timer powers it off if no pass ever runs. A `blocked` state
   begins after `max_consecutive_failures` failed builds in a row; refusals are not
@@ -694,8 +716,14 @@ Notes on the values:
   The image id of that template is the cold base image: the builder starts from it,
   never from the warm image.
 - The staging bucket and its lifecycle rule are yours: ci-burst deletes the
-  archive when a build ends and clears older strays under the prefix, and the
-  lifecycle rule is a backstop only.
+  archive when a build ends, and the lifecycle rule is a backstop only. Give each
+  deployment a prefix of its own that nothing else uses: no other deployment, tool
+  or person writes under it, and no prefix of another deployment is the same as
+  yours, inside it or around it. Every applying pass deletes each object under the
+  prefix that is more than one hour old, except the archive of the active build,
+  and it checks neither the name of the key nor who wrote the object. A prefix
+  shared with another deployment, or the example prefix reused in a shared bucket,
+  can delete that deployment's archive or unrelated objects.
 
 ### Change the deployment name
 

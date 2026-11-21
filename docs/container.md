@@ -27,7 +27,9 @@ needs a credential.
   controller's exit code: `0` completed decision, `2` refusal with nothing
   mutated, `1` provider or cleanup failure. A cleanup pass that refused an owned
   resource (`cleanup_degraded`) is a cleanup failure and exits `1`. The exit
-  code is the only completion signal.
+  code is the only completion signal. The `image` group differs: its exit `2`
+  names what the run declined, and the run may have changed state before it
+  declined ([exit codes](operations.md#image-commands)).
 - The units run it with a read-only root filesystem and a tmpfs for `/tmp`.
   Every durable write belongs in the mounted state directory; the tmpfs covers
   transient files.
@@ -119,7 +121,7 @@ cleanup credentials.
 | `/var/lib/ci-burst-warm-image` | scaler, image commands only | writable directory | image state file, its lock, the event file, the metrics textfile |
 | `/etc/ci-burst/aws-image` | scaler, image commands only | read-only directory | image role profile: the source identity and the assume-role profile, no scaling or cleanup keys |
 | `/etc/ci-burst/forgejo-image.env` | scaler, image commands only | podman env-file, not mounted | image token, a different variable from the Forgejo token |
-| `/etc/ci-burst-deployment` | scaler, `promote --write` only | writable directory | the dedicated directory of the deployment TOML |
+| `/etc/ci-burst-deployment` | scaler, image commands only | read-only directory; writable for `promote --write` | the dedicated directory of the deployment TOML |
 
 The last four rows are optional and belong to the image commands.
 [deployment.md](deployment.md#the-image-build-paths-optional) shows how to create
@@ -286,24 +288,40 @@ To build an image, run the build line. A build lasts longer than one pass, so
 podman run --rm --init --network ci-burst --name ci-burst-image-manual \
   --read-only \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
-  --volume /etc/ci-burst/deployment.toml:/etc/ci-burst/deployment.toml:ro \
+  --volume /etc/ci-burst-deployment:/etc/ci-burst-deployment:ro \
   --volume /var/lib/ci-burst-warm-image:/var/lib/ci-burst-warm-image:rw \
   --volume /etc/ci-burst/aws-image:/etc/ci-burst/aws:ro \
   --env-file /etc/ci-burst/forgejo-image.env \
-  localhost/ci-burst:latest image run --apply --until-done --config /etc/ci-burst/deployment.toml
+  localhost/ci-burst:latest image run --apply --until-done --config /etc/ci-burst-deployment/deployment.toml
 ```
 
-The container gets the configuration read-only, the image role profile directory
-read-only, the image state directory writable at the path `[image].state_directory`
-names, and the image token env-file. It gets no scaling credential, no cleanup
-credential, no scaling ledger and no `forgejo.env`. For `image plan`,
-`image run` without `--apply` and `image status --refresh`, replace the command and
-keep the mounts. `image status` without `--refresh` makes no provider call, so it
-needs neither the profile directory nor the token.
+The container gets the dedicated TOML directory read-only
+([deployment.md](deployment.md#the-dedicated-toml-directory) holds the TOML in
+it), the image role profile directory read-only, the image state directory writable
+at the path `[image].state_directory` names, and the image token env-file. It gets
+no scaling credential, no cleanup credential, no scaling ledger and no
+`forgejo.env`. For `image plan` and `image run` without `--apply`, replace the
+command and keep everything else. `image status --refresh` reads only the provider
+with the image role and nothing from the forge, so keep the mounts and leave out the
+env-file. `image status` without `--refresh` makes no provider call, so it needs
+neither the profile directory nor the token.
 
-To promote a candidate, or to roll back, run the promotion line. `promote` is local:
-it makes no AWS or forge call and holds no credential, so its container has no
-network, no credential mount and no env-file, and a read-only root filesystem:
+The line mounts the directory, never the file. `promote --write` replaces the TOML
+atomically, and a mount of the single file keeps serving the file that was there
+when the container started. With the directory mounted, the file that a promotion
+replaced is the file that retention reads on its next pass: retention reloads the
+TOML on every pass, to find the pins it must keep. The rest of a run keeps the
+configuration that the container loaded when it started. So finish or stop a running
+`image run --apply --until-done` container before `promote --write`,
+`promote --rollback --write` or a hand edit of the pin, and start a fresh container
+afterwards: the state file keeps the active build, and the fresh container resumes
+it. Do not widen the mount to `/etc/ci-burst`, which holds the credential
+directories.
+
+To promote a candidate, or to roll back, run the promotion line, after you have
+finished or stopped a running build container as above. `promote` is local: it makes
+no AWS or forge call and holds no credential, so its container has no network, no
+credential mount and no env-file, and a read-only root filesystem:
 
 ```sh
 podman run --rm --init --network none --name ci-burst-promote-manual \
@@ -314,24 +332,33 @@ podman run --rm --init --network none --name ci-burst-promote-manual \
   localhost/ci-burst:latest image promote --config /etc/ci-burst-deployment/deployment.toml --write
 ```
 
-The dedicated TOML directory is writable because `--write` creates a backup, a lock
-file and a temporary file there and replaces the TOML. The image state directory is
-writable because the promotion records its journal row there. Leave out `--write`
-to print the evidence and the one-line diff with the same mounts, and add
-`--rollback` to restore the previous pin. The directory must hold only the TOML,
-its `.bak.*` backups, its lock file and its promote temporary file, or the command
-refuses with `PROMOTE_DIRECTORY_NOT_DEDICATED`
-([deployment.md](deployment.md#the-dedicated-toml-directory-only-for-promote---write)).
-If you moved the deployment TOML into that directory, change only the host side of
-the `--volume` that each unit and build line uses for the file; the container side
-and `--config` stay as they are.
+The line has two writable host mounts and no more. The dedicated TOML directory is
+writable because `--write` creates a backup, a lock file and a temporary file there
+and replaces the TOML. The image state directory is writable because the promotion
+records its journal row and its event there. Everything else that the container can
+write is a tmpfs that vanishes with it: the explicit one on `/tmp`, and those that
+Podman adds to a read-only container by default (`--read-only-tmpfs` covers `/dev`,
+`/dev/shm`, `/run` and `/var/tmp`). `promote` writes its own files only to the two
+directories. The explicit option stays because Podman mounts a writable tmpfs on
+`/tmp` of a read-only container anyway, and the option caps that one at 64 MiB and
+forbids execution in it.
+
+Leave out `--write` to print the evidence and the one-line diff with the same
+mounts, and add `--rollback` to restore the previous pin. The directory must hold
+only the TOML, its `.bak.*` backups, its lock file and its promote temporary file,
+or the command refuses with `PROMOTE_DIRECTORY_NOT_DEDICATED`
+([deployment.md](deployment.md#the-dedicated-toml-directory)). The shipped units
+still mount the TOML as one file: change only the host side of the `--volume` that
+each unit uses for it, so that it reads the file in this directory; the container
+side and `--config` stay as they are.
 
 A manual run is named `ci-burst-image-manual` or `ci-burst-promote-manual`. If one
 does not exit after `Ctrl-C`, remove it by name with `podman rm --force`; a
 survivor blocks the next run of the same name and can still be inside a provider
 call. With SELinux enforcing, the rule above holds: a source that two lines mount
 takes the shared `:z`, and only a source that one line uses alone may take `:Z`.
-Both lines mount the image state directory, so it takes `:z`.
+Both lines mount the image state directory and the dedicated TOML directory, so
+both take `:z`.
 
 ## Scheduled operation with systemd
 

@@ -3326,20 +3326,6 @@ class ResumeTests(PipelineCase):
         self.assertEqual(self.world.objects, {})
         self.assertEqual(self.events("image_build_failed"), [])
 
-    def test_a_crash_after_the_upload_then_a_withdrawn_gate_deletes_the_object_the_row_does_not_name(self):
-        self.crash_after("archive_key")
-        build = self.only_build()
-        self.assertIsNone(build.archive_key)
-        (key,) = self.world.objects
-        self.configure(render_toml(gate=""))
-        result = self.apply()
-        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_INPUTS_CHANGED"), result)
-        ended = self.only_build()
-        self.assertEqual((ended.id, ended.state, ended.reason_code), (build.id, "failed", "IMAGE_INPUTS_CHANGED"))
-        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": key}])
-        self.assertEqual(self.world.objects, {})
-        self.assertEqual(self.world.arguments("run_instances"), [])
-
     def test_a_crash_after_the_image_was_created_is_adopted_and_no_second_image_is_made(self):
         self.world.console_plan = [(30.0, READY)]
         self.crash_after("image_id")

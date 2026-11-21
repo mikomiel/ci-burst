@@ -390,6 +390,7 @@ A pass that stages a build again MUST first check that the basis files at the ro
 #### Scenario: The pass deadline passes during the basis reads
 - **WHEN** the pass deadline passes while the basis files are read during a resumed stage, whether or not they show a changed input
 - **THEN** the row stays `building` with no builder and no `archive_sha256`, and it is not ended
+- **AND** no read of a basis file starts after the deadline
 - **AND** no failure is counted and the next pass checks again
 
 #### Scenario: The next pass decides from the current inputs
@@ -457,6 +458,24 @@ Every provider read of a pass, except the read that confirms a deregistration, M
 - **WHEN** a read of `plan` before its deletion plan, or a reconcile read or the pin read of a `run` pass, would start at or after the deadline
 - **THEN** the command refuses with `pass_deadline_exceeded`
 
+### Requirement: Basis reads are bounded by the pass deadline
+A read of a basis file MUST NOT start at or after the pass deadline: `plan`, the decision of a `run` pass and the inputs check of a stage done again MUST read the clock before each read. `plan` and the decision MUST refuse with `pass_deadline_exceeded`. The inputs check MUST leave the row for the next pass. The forge client puts no deadline on a request, so a read that has started MAY end after the deadline.
+
+#### Scenario: The deadline passes between two basis reads of a plan
+- **WHEN** the pass deadline passes during the read of one basis file and `plan` has another basis path to read
+- **THEN** `plan` refuses with `pass_deadline_exceeded`
+- **AND** it reads no further file, probes no archive and builds no provider client
+
+#### Scenario: The deadline passes between two basis reads of a decision
+- **WHEN** the pass deadline passes during the read of one basis file in the decision of a `run` pass that has another basis path to read
+- **THEN** the command refuses with `pass_deadline_exceeded`
+- **AND** it reads no further file and writes no row
+
+#### Scenario: The deadline passes between two basis reads of a stage done again
+- **WHEN** the pass deadline passes during the read of one basis file of the inputs check, or before its first read
+- **THEN** no further file is read and the pass notes `pass_deadline_exceeded`
+- **AND** the row stays `building` with no builder, no failure is counted and the next pass checks again
+
 ### Requirement: Success requires the framed marker and the staged digest
 A build MUST succeed only when the console shows `WARM_SOURCE_SHA256` with a digest equal to the archive sha256 held in the state file, followed by the whole line `IMAGE_READY`, read through the existing framed-line discipline. A `WARM FAIL` line or a `warm exiting rc=` line MUST fail the build. The command MUST NOT guess success.
 
@@ -517,11 +536,12 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **THEN** a new build MAY start once the cooldown and the daily cap permit
 
 ### Requirement: A gate command is required
-`image.warm.gate_command` MUST be non-empty unless `allow_no_gate = true`. Otherwise the command MUST refuse with `IMAGE_GATE_REQUIRED`. The candidate record MUST show the gate setting that the builder was launched with, not the one that the configuration holds when the build ends, and only a recorded 1 MUST count as a gate that ran. Documentation MUST state that the offline gate proves cache behavior and does not prove that the image is safe.
+`image.warm.gate_command` MUST be non-empty unless `allow_no_gate = true`. Otherwise the command MUST refuse with `IMAGE_GATE_REQUIRED`, except as the next requirement states. The candidate record MUST show the gate setting that the builder was launched with, not the one that the configuration holds when the build ends, and only a recorded 1 MUST count as a gate that ran. Documentation MUST state that the offline gate proves cache behavior and does not prove that the image is safe.
 
 #### Scenario: No gate and no opt-out
-- **WHEN** the gate command is empty and `allow_no_gate` is false
+- **WHEN** the gate command is empty, `allow_no_gate` is false and no build is in flight
 - **THEN** the command refuses with `IMAGE_GATE_REQUIRED` and exits 2
+- **AND** no client is built
 
 #### Scenario: The opt-out is recorded
 - **WHEN** `allow_no_gate` is true and the gate command is empty
@@ -540,6 +560,36 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **WHEN** a build is launched without a gate command, its row then records a gate setting other than the integer 1, for example 2, and the build ends
 - **THEN** the candidate record states that no gate ran
 - **AND** `promote --write` refuses with `PROMOTE_GATE_NOT_PASSED` while `allow_no_gate` is false
+
+### Requirement: A missing gate refuses a launch and does not strand a build
+The gate requirement MUST guard a launch. `plan`, and an applying pass whose state holds no build in flight, MUST refuse with `IMAGE_GATE_REQUIRED` before any client is built. An applying pass whose state holds a build in flight MUST run and settle that build. A launch that pass still reaches MUST be refused with `IMAGE_GATE_REQUIRED`, counting no failure: a new build leaves no row and no upload, and a stage done again under its row's inputs ends the row `failed` and deletes its archive.
+
+#### Scenario: A build in flight is settled with no gate command and no opt-out
+- **WHEN** a build is `building` or `imaging` and the configuration then holds no gate command and no opt-out
+- **THEN** an applying pass runs, settles the build and starts no other
+- **AND** the candidate record shows the gate setting that the builder was launched with
+
+#### Scenario: A stage that waits for its next pass meets a file with no gate
+- **WHEN** a row is inserted with a gate command, the pass deadline ends its stage and the configuration then holds no gate command and no opt-out
+- **THEN** the next pass ends the row `failed` with `IMAGE_INPUTS_CHANGED`, deletes its archive and starts no new build
+- **AND** the pass answers `refused` and counts no failure
+
+#### Scenario: The opt-out is withdrawn while a stage waits
+- **WHEN** a row is inserted under `allow_no_gate = true` with no gate command, the pass deadline ends its stage and the configuration then holds no opt-out
+- **THEN** the next pass ends the row `failed` with `IMAGE_GATE_REQUIRED`, deletes its archive and launches no builder
+- **AND** the pass answers `refused` and counts no failure
+
+#### Scenario: The pass after the settled build is refused
+- **WHEN** the build has ended and the configuration still holds no gate command and no opt-out
+- **THEN** the next pass refuses with `IMAGE_GATE_REQUIRED` before any client is built
+
+#### Scenario: A plan is refused while a build is in flight
+- **WHEN** `plan` runs with no gate command and no opt-out while a build is in flight
+- **THEN** it refuses with `IMAGE_GATE_REQUIRED`
+
+#### Scenario: The build ends before the pass takes the lock
+- **WHEN** an applying pass found a build in flight, the build ended before the pass took the state lock, and the pass then reaches the start of a new build
+- **THEN** the start is refused with `IMAGE_GATE_REQUIRED` before the row and the upload, and the pass answers `refused`
 
 ### Requirement: The image is created in the pass that sees the marker
 The pass that first sees the marker MUST call `CreateImage` before any step that is not a read, with no reboot, and MUST tag the image and its snapshots with `ci-burst:image-build`, the deployment, the build id, the basis digest, the source sha, the script sha and, when read, the base image. The pass MUST NOT leave the builder running after the image is `available` or after the snapshot window or lifetime timer ends it. Waiting for the image and every later step MAY continue in a later pass.

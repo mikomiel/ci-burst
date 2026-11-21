@@ -484,6 +484,42 @@ class RunApplyTests(CliCase):
         self.assertFalse(self.state_dir.exists())
         self.assertEqual(self.sessions, [])
 
+    # The gate requirement guards a new launch. The command opens the state for writing before the pass starts, so
+    # the pass looks for a build in flight through that connection.
+
+    def test_a_configuration_refusal_with_no_build_in_flight_builds_no_client_and_writes_nothing(self):
+        self.add_build("earlier", "failed", age=3 * DAY)
+        self.configure(self.image_toml(gate=""))
+        self.forbid_clients()
+        before = self.dump()
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_GATE_REQUIRED"))
+        self.assertEqual(self.dump(), before)
+        self.assertEqual((self.sessions, self.source_sessions), ([], 0))
+
+    def test_a_pass_settles_a_build_whose_file_lost_the_gate_and_has_no_opt_out(self):
+        # The pass ran out of time after the upload, so the row names an archive and has no builder. The file then
+        # loses its gate, and the command still ends the row and deletes the archive instead of refusing to run.
+        self.world.hooks["generate_presigned_url"] = lambda arguments: self.clock.advance(400)
+        self.assertEqual(self.pipeline.run_pass(apply=True)["decision"], "building")
+        del self.world.hooks["generate_presigned_url"]
+        (first,) = self.builds()
+        self.assertEqual(list(self.world.objects), [first.archive_key])
+        self.configure(self.image_toml(gate=""))
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertNotIn("error", payload)
+        self.assertEqual((code, payload["decision"], payload["reason"]), (2, "refused", "IMAGE_INPUTS_CHANGED"))
+        self.assertEqual(self.row(first.id)["state"], "failed")
+        self.assertEqual(self.row(first.id)["reason_code"], "IMAGE_INPUTS_CHANGED")
+        self.assertEqual(len(self.builds()), 1)
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.control().consecutive_failures, 0)
+        # The next command has no build in flight, so it is a new launch and the requirement refuses it.
+        self.forbid_clients()
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_GATE_REQUIRED"))
+
     def test_a_pass_that_is_locked_out_exits_two(self):
         other = ImageState(self.state_dir, clock=self.clock)
         other.connect()

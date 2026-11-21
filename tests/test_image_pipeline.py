@@ -734,6 +734,16 @@ class CrashingState(ImageState):
         return super().advance_build(build_id, state=state, **fields)
 
 
+class BuildEndedBeforeTheLock(ImageState):
+    """A state file whose active build ends, in another process, after the peek and before the writer lock is taken."""
+
+    def acquire_writer(self):
+        active = self.active_build(DEPLOYMENT)
+        if active is not None:
+            self.advance_build(active.id, state="failed", reason_code="CONSOLE_BLIND")
+        return super().acquire_writer()
+
+
 class Interrupted(BaseException):
     """An operator interrupt."""
 
@@ -1014,6 +1024,41 @@ class PrecheckTests(PipelineCase):
             with self.subTest(name):
                 self.refused(call, "IMAGE_GATE_REQUIRED")
         self.assert_nothing_touched()
+
+    # The gate requirement guards a new launch. An applying pass that finds a build in flight settles it (see the
+    # tests of the gate in ``FailureTests`` and ``GateEvidenceTests``), so only an applying pass looks at the state.
+
+    def test_a_missing_gate_is_refused_before_any_client_when_the_state_has_no_build_in_flight(self):
+        # The state file exists and holds only an ended build: the look at it is read-only and ends the pass.
+        self.add_build("earlier", "failed")
+        self.configure(toml=render_toml(gate=""))
+        before = snapshot_tree(self.state_dir)
+        entry_points = {"pass": lambda: self.pipeline.run_pass(apply=True), "until done": self.pipeline.run_until_done}
+        for name, call in entry_points.items():
+            with self.subTest(name):
+                self.refused(call, "IMAGE_GATE_REQUIRED")
+        self.assertEqual(self.sessions, [])
+        self.assertEqual(self.source_sessions, 0)
+        self.assertEqual(self.world.calls, [])
+        self.assertEqual(snapshot_tree(self.state_dir), before)
+        # The look took no writer lock and left no connection open.
+        self.assertFalse(self.state.available)
+        other = ImageState(self.state_dir, clock=self.clock)
+        other.connect()
+        self.addCleanup(other.close)
+        other.acquire_writer()
+
+    def test_a_missing_gate_is_still_refused_by_plan_when_a_build_is_in_flight(self):
+        # A build in flight is settled by an applying pass only: plan decides nothing about it.
+        self.add_build("stuck", "building", age=600)
+        self.configure(toml=render_toml(gate=""))
+        before = snapshot_tree(self.state_dir)
+        entry_points = {"plan": self.pipeline.plan, "pass without apply": lambda: self.pipeline.run_pass(apply=False)}
+        for name, call in entry_points.items():
+            with self.subTest(name):
+                self.refused(call, "IMAGE_GATE_REQUIRED")
+        self.assertEqual((self.sessions, self.source_sessions, self.world.calls), ([], 0, []))
+        self.assertEqual(snapshot_tree(self.state_dir), before)
 
     def test_a_missing_gate_that_is_allowed_is_planned_and_reported(self):
         self.configure(toml=render_toml(gate="allow_no_gate = true"))
@@ -2398,6 +2443,20 @@ class FailureTests(PipelineCase):
         self.assertIn("archive:delete_failed", result["notes"])
         self.assertEqual(len(self.world.objects), 1)
 
+    def test_a_start_without_a_gate_is_refused_before_the_row_and_the_upload(self):
+        # The pass began because a build was in flight. That build ended before the pass took the lock, so the pass
+        # reaches the start of a new build, and a new build needs a gate or the opt-out.
+        self.add_build("settled", "building", age=5 * DAY)
+        self.configure(render_toml(gate=""), state=BuildEndedBeforeTheLock(self.state_dir, clock=self.clock))
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_GATE_REQUIRED")
+        (ended,) = self.builds()
+        self.assertEqual((ended.id, ended.state, ended.reason_code), ("settled", "failed", "CONSOLE_BLIND"))
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.urls, [])
+
     def assert_unstaged(self, build):
         """A build that waits for the next pass to stage its archive: no builder, no archive hash, no failure."""
         self.assertEqual((build.state, build.builder_id, build.archive_sha256), ("building", None, None))
@@ -2710,6 +2769,58 @@ class FailureTests(PipelineCase):
         self.assertNotEqual(started.basis_digest, first.basis_digest)
         self.assertEqual(self.control().consecutive_failures, 0)
 
+    # -- a file that loses its gate while a build waits to be staged again -------------------
+    # The gate requirement guards a new launch. A build that has a row is settled by the passes that follow, whatever
+    # the file says about the gate by then: the pass ends the row when its inputs changed, and launches only under
+    # the inputs that the row was inserted with.
+
+    def unstaged_build_with_an_archive(self):
+        """A build whose first pass ran out of time after the upload: its row names an archive and has no builder."""
+        self.world.hooks["generate_presigned_url"] = lambda arguments: self.clock.advance(400)
+        self.apply()
+        del self.world.hooks["generate_presigned_url"]
+        first = self.only_build()
+        self.assertEqual(list(self.world.objects), [first.archive_key])
+        return first
+
+    def test_a_resumed_stage_whose_file_lost_the_gate_and_has_no_opt_out_ends_the_row_instead_of_leaving_it(self):
+        first = self.unstaged_build_with_an_archive()
+        self.assertEqual(first.gate_configured, 1)
+        self.configure(render_toml(gate=""))
+        result = self.apply()
+        self.assert_inputs_changed(result, first)
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.control().consecutive_failures, 0)
+
+    def test_the_pass_after_a_row_that_ended_for_a_lost_gate_is_refused_before_any_client(self):
+        first = self.unstaged_build_with_an_archive()
+        self.configure(render_toml(gate=""))
+        self.assert_inputs_changed(self.apply(), first)
+        before = (len(self.world.calls), len(self.sessions), self.source_sessions)
+        # No build is in flight now, so the pass is a new launch and the gate requirement refuses it as before.
+        self.refused(self.apply, "IMAGE_GATE_REQUIRED")
+        self.assertEqual((len(self.world.calls), len(self.sessions), self.source_sessions), before)
+        build = self.only_build()
+        self.assertEqual((build.id, build.state), (first.id, "failed"))
+
+    def test_a_resumed_stage_whose_file_lost_the_opt_out_ends_the_row_and_launches_nothing(self):
+        # The digest does not hold the opt-out, so the inputs of the row still give it. Only the gate requirement
+        # can refuse the launch of this build: without it the builder would start with no gate and no opt-out.
+        self.configure(render_toml(gate=NO_GATE))
+        first = self.unstaged_build_with_an_archive()
+        self.assertEqual(first.gate_configured, 0)
+        self.configure(render_toml(gate=""))
+        self.assertEqual(self.digest(), first.basis_digest)
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_GATE_REQUIRED")
+        build = self.only_build()
+        self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "IMAGE_GATE_REQUIRED"))
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.launches, [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
     def resumed_stage_with_100_seconds_left(self):
         """A build that waits for its stage to be done again, and the clock 100 seconds short of its deadline.
 
@@ -2955,6 +3066,102 @@ class ReadDeadlineTests(PipelineCase):
         self.assertEqual(self.by_id_reads(ami(0xA1)), [])
 
 
+class BasisReadDeadlineTests(PipelineCase):
+    """A read of a basis file does not start once the pass deadline is over.
+
+    The forge client puts no deadline on a read, so the pipeline reads the clock before each one. Each test makes
+    the pass run out of time inside a read and counts the files that the forge was asked for: a pass that reads the
+    clock only after the last file ends in the same place, and has made every request by then.
+    """
+
+    PATHS = ("example.lock", "second.lock", "third.lock")
+
+    def several_basis_paths(self):
+        """The deployment file names three basis paths and the forge holds all three."""
+        single = 'basis_paths = ["example.lock"]'
+        self.assertIn(single, render_toml())
+        names = ", ".join(f'"{path}"' for path in self.PATHS)
+        self.configure(render_toml().replace(single, f"basis_paths = [{names}]"))
+        self.source.files = {path: LOCK_FILE + path.encode() for path in self.PATHS}
+
+    def reads(self, mark=0):
+        """The basis files that the forge was asked for since ``mark``, a position in its call log."""
+        return [path for kind, path in self.source.calls[mark:] if kind == "raw_file"]
+
+    def unstaged_build(self):
+        """A build whose first pass ran out of time during the stage: it has no builder and no staged archive."""
+        self.source.on_chunk = lambda: self.clock.advance(400)
+        self.apply()
+        self.source.on_chunk = None
+        return self.only_build()
+
+    def assert_left_for_the_next_pass(self, result, first, world_mark):
+        """The pass noted the deadline and left the row as it was: no failure, no second upload, no builder."""
+        self.assertEqual((result["decision"], result["reason"]), ("building", None))
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assertEqual((build.state, build.builder_id, build.archive_sha256), ("building", None, None))
+        self.assertNotIn("create_multipart_upload", self.world.names(world_mark))
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.events("image_build_failed"), [])
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+
+    def test_a_decision_does_not_start_a_basis_read_past_the_pass_deadline(self):
+        self.several_basis_paths()
+        self.source.on_read = lambda: self.clock.advance(400)
+        self.refused(self.apply, "pass_deadline_exceeded")
+        self.assertEqual(self.reads(), ["example.lock"])
+        # Nothing was started: no row, no archive and no builder.
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
+    def test_a_plan_does_not_start_a_basis_read_past_the_pass_deadline(self):
+        self.several_basis_paths()
+        self.source.on_read = lambda: self.clock.advance(400)
+        self.refused(self.plan, "pass_deadline_exceeded")
+        self.assertEqual(self.reads(), ["example.lock"])
+        # The archive probe and the provider come after the reads, and neither was reached.
+        self.assertNotIn(("archive", SOURCE_SHA), self.source.calls)
+        self.assertEqual((self.sessions, self.world.calls), ([], []))
+        self.assertFalse(self.state_dir.exists())
+
+    def test_a_resumed_stage_does_not_start_a_basis_read_past_the_pass_deadline(self):
+        self.several_basis_paths()
+        first = self.unstaged_build()
+        source_mark, world_mark = len(self.source.calls), len(self.world.calls)
+        self.source.on_read = lambda: self.clock.advance(400)
+        result = self.apply()
+        self.assertEqual(self.reads(source_mark), ["example.lock"])
+        self.assert_left_for_the_next_pass(result, first, world_mark)
+        # Nothing is lost: the next pass reads every file again, stages the archive and launches.
+        self.source.on_read = None
+        self.world.console_plan = [(30.0, READY)]
+        source_mark = len(self.source.calls)
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.reads(source_mark), list(self.PATHS))
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    def test_a_resumed_stage_does_not_start_its_first_basis_read_when_the_deadline_passed_before_it(self):
+        self.several_basis_paths()
+        first = self.unstaged_build()
+        source_mark, world_mark = len(self.source.calls), len(self.world.calls)
+
+        def run_out_of_time(arguments):
+            # The read of the pin's image is the last read of the pass before the stage is done again.
+            if arguments.get("ImageIds") == [ami(0xA1)]:
+                self.clock.advance(400)
+
+        self.world.hooks["describe_images"] = run_out_of_time
+        result = self.apply()
+        self.assertEqual(self.reads(source_mark), [])
+        self.assert_left_for_the_next_pass(result, first, world_mark)
+
+
 class ControlTests(PipelineCase):
     """What a pass writes into the control row, and what the row then refuses."""
 
@@ -3196,6 +3403,16 @@ class GateEvidenceTests(PipelineCase):
         self.assertEqual(launched.gate_configured, 1)
         self.assertEqual(built.id, launched.id)
         self.assertEqual((built.gate_configured, built.gate_passed), (1, 1))
+
+    def test_a_build_launched_with_a_gate_is_settled_when_the_file_drops_the_gate_and_has_no_opt_out(self):
+        # The gate requirement guards a new launch: the pass that finds this build in flight settles it, and the
+        # candidate keeps the evidence of the launch that happened. Nothing else is launched.
+        launched, built = self.launch_then_edit(GATE, "")
+        self.assertEqual(launched.gate_configured, 1)
+        self.assertEqual(built.id, launched.id)
+        self.assertEqual((built.gate_configured, built.gate_passed), (1, 1))
+        self.assertEqual(len(self.builds()), 1)
+        self.assertEqual(len(self.world.launches), 1)
 
     def test_a_build_launched_without_a_gate_under_a_file_that_did_not_change_records_no_gate(self):
         self.configure(render_toml(gate=NO_GATE))

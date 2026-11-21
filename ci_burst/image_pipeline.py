@@ -65,6 +65,18 @@ a start again: an unsafe template ends the row ``failed`` and the pass answers
 before the provider call: at or after the build deadline no builder is launched,
 and the build fails ``CONSOLE_BLIND``.
 
+The gate requirement (``IMAGE_GATE_REQUIRED``: neither a gate command nor the
+opt-out ``allow_no_gate``) guards a launch, not a build that has a row. ``plan``
+and an applying pass are refused before any client is built, except an applying
+pass whose state file holds a build in flight: it settles that build, and refuses
+every launch it would make, a new build or a stage that is done again, with the
+same code and no failure counted.
+
+The pass deadline bounds the reads of the forge too. The forge client puts no
+deadline on a read of a basis file, so the clock is read before each request:
+none starts at or after the deadline, in ``plan``, in a decision and in the check
+of a stage that is done again.
+
 Secrets. The presigned archive URL and the rendered user data live in local
 variables of ``_Pass._launch`` and nowhere else: not in the state file, not in an
 event, not in the metrics, not in an exception detail. Events pass through a
@@ -144,6 +156,8 @@ IMAGE_INPUTS_CHANGED = "IMAGE_INPUTS_CHANGED"
 
 #: The refusals that end a start without a failed build. Both are checked before anything is staged and again
 #: once the archive is up, because either can change in between. Neither counts toward the cooldown or the block.
+#: ``IMAGE_GATE_REQUIRED`` refuses a launch too, and counts no failure either, but a pass never changes its own
+#: configuration: ``_start_refusal`` returns it once, first, and this filter does not hold it.
 START_REFUSALS = (IMAGE_CREDENTIAL_SHORT, IMAGE_BUILD_ALREADY_ACTIVE)
 
 #: Tag keys that ``CreateImage`` adds to the ones the adapter sets. The build
@@ -688,7 +702,10 @@ class ImagePipeline:
     ``IMAGE_SOURCE_FORBIDDEN``, ``IMAGE_BRANCH_UNPROTECTED``,
     ``IMAGE_BASIS_PATH_MISSING``, ``IMAGE_BUILD_TEMPLATE_UNSAFE``,
     ``IMAGE_USERDATA_TOO_LARGE`` in ``plan``, ``IMAGE_STATE_LOCKED`` and every
-    provider read that fails) are raised. The answers of the trigger rules, and
+    provider read that fails) are raised. ``IMAGE_GATE_REQUIRED`` is raised by
+    ``plan`` and by an applying pass whose state holds no build in flight: a pass
+    that settles one is not refused for it, and answers ``refused`` with that code
+    only when a launch is asked of it. The answers of the trigger rules, and
     the two refusals of a start (``START_REFUSALS``), are returned as the
     decision ``refused`` with a ``reason``. So are ``IMAGE_BUILD_TEMPLATE_UNSAFE``
     and ``IMAGE_INPUTS_CHANGED`` when a pass stages again a build that has a row:
@@ -720,10 +737,32 @@ class ImagePipeline:
         self._script = script
 
     # -- shared inputs ---------------------------------------------------------
-    def _inputs(self):
-        """The checks that need no network, then the warm script's bytes."""
+    def _gate_missing(self):
+        """True when a launch would have neither a gate command nor the opt-out."""
         warm = self._image.warm
-        if not warm.gate_command and not warm.allow_no_gate:
+        return not warm.gate_command and not warm.allow_no_gate
+
+    def _build_in_flight(self):
+        """Whether the state file holds a build of this deployment that is not over. It reads and creates nothing.
+
+        A state that the caller opened (the command line opens it for writing and holds the writer lock) is read as
+        it is and left open. A closed one is opened for reading only, for this one read. An absent file holds no build.
+        """
+        opened = not self._state.available
+        present = self._state.connect_readonly() if opened else True
+        try:
+            return present and self._state.active_build(self._config.deployment) is not None
+        finally:
+            if opened:
+                self._state.close()
+
+    def _inputs(self, *, apply=False):
+        """The checks that need no network, then the warm script's bytes.
+
+        The gate requirement guards a new launch. A missing gate refuses every entry point except an applying pass
+        that finds a build in flight: that pass settles the build and launches nothing new (``_Pass._start_refusal``).
+        """
+        if self._gate_missing() and not (apply and self._build_in_flight()):
             raise ImageRefusal(
                 IMAGE_GATE_REQUIRED, "image.warm.gate_command is empty and image.warm.allow_no_gate is false"
             )
@@ -731,14 +770,23 @@ class ImagePipeline:
             self._script = image.shipped_script()
         return self._script
 
-    def _read_basis(self, source):
+    def _read_basis(self, source, deadline=None):
         """The sha of the protected branch head and the basis files at that sha."""
         head = require_protected(source.branch(self._image.source.branch))
-        return head.sha, self._basis_files(source, head.sha)
+        return head.sha, self._basis_files(source, head.sha, deadline)
 
-    def _basis_files(self, source, sha):
-        """The basis files at the commit ``sha``, by path."""
-        return {path: source.raw_file(sha, path) for path in self._image.source.basis_paths}
+    def _basis_files(self, source, sha, deadline=None):
+        """The basis files at the commit ``sha``, by path.
+
+        The forge client puts no deadline on a read, so with a ``deadline`` the clock is read before each request:
+        none starts at or after it (``DeadlineRefusal``).
+        """
+        files = {}
+        for path in self._image.source.basis_paths:
+            if deadline is not None and self._clock() >= deadline:
+                raise DeadlineRefusal("the basis files")
+            files[path] = source.raw_file(sha, path)
+        return files
 
     def _digest(self, files, script):
         warm = self._image.warm
@@ -822,7 +870,7 @@ class ImagePipeline:
         deadline = now + PASS_DEADLINE_SECONDS
         settings = self._image.source
         source = self._source_factory()
-        sha, files = self._read_basis(source)
+        sha, files = self._read_basis(source, deadline)
         self._probe_archive(source, sha, deadline)
         digest = self._digest(files, script)
         aws = self._aws_factory()
@@ -925,13 +973,16 @@ class ImagePipeline:
 
         With ``apply`` the pass takes the state file's writer lock (a pass that
         is already running gives ``IMAGE_STATE_LOCKED``) and releases it at the
-        end. A state that the caller opened stays open.
+        end. A state that the caller opened stays open. Without a gate command
+        or the opt-out the pass is refused (``IMAGE_GATE_REQUIRED``) before any
+        client is built, unless the state holds a build in flight: the pass then
+        settles that build and starts no other.
         """
         if not self._image.enabled:
             return {"decision": DISABLED}
         if not apply:
             return self.plan(force=force)
-        script = self._inputs()
+        script = self._inputs(apply=True)
         opened = not self._state.available
         self._state.connect()
         try:
@@ -1215,7 +1266,7 @@ class _Pass:
     def _decide(self, pin):
         """Read the forge, apply the trigger rules and, when a build is due, start it."""
         now = self.clock()
-        sha, files = self.p._read_basis(self._source())
+        sha, files = self.p._read_basis(self._source(), self.deadline)
         digest = self.p._digest(files, self.script)
         facts = _read_facts(self.s, self.dep, now)
         # A builder that reconcile just terminated still counts as active for this
@@ -1255,7 +1306,14 @@ class _Pass:
         return self._stage(build)
 
     def _start_refusal(self):
-        """The reason a start is refused now, or ``None``. Neither check reads the forge or spends anything."""
+        """The reason a launch is refused now, or ``None``. None of the checks reads the forge or spends anything.
+
+        The gate requirement is the first. A pass that settles a build in flight runs without a gate command or the
+        opt-out (``ImagePipeline._inputs``), and a launch needs one of them, whether the build is new or a stage that
+        is done again.
+        """
+        if self.p._gate_missing():
+            return IMAGE_GATE_REQUIRED
         try:
             self.aws.check_credential_life(self.cfg.source.presign_seconds)
             self._check_no_builder()
@@ -1304,6 +1362,11 @@ class _Pass:
         between two passes. An unsafe template ends the row the same way, with its own code. The pass deadline inside
         either check leaves the row as it is for the next pass; any other refusal of a read is raised and leaves it
         too.
+
+        The checks of a launch (``_start_refusal``) run last, the gate requirement among them. The file can lose its
+        gate command and the opt-out while the row waits, and the digest does not hold the opt-out: a row inserted
+        under it gives the same digest once it is gone. That row ends with ``IMAGE_GATE_REQUIRED`` and no failure,
+        and no builder is launched.
         """
         if self.clock() >= build.deadline_at:
             return self._fail(build, image_console.CONSOLE_BLIND, builder_alive=False)
@@ -1327,12 +1390,13 @@ class _Pass:
         ``_decide`` hashed the files at the branch head, the warm settings and the script into that digest. This is the
         same digest over the files at the commit of the row, since the head can have moved, with the settings and the
         script as this pass reads them. A path that the commit does not hold is a changed input too: the settings name
-        the paths. The forge client puts no deadline on a read, so the clock is read once the files are in: a pass
+        the paths. The forge client puts no deadline on a read, so ``_basis_files`` reads the clock before each request
+        and this reads it once more once the files are in, because the last read can pass the deadline too: a pass
         whose deadline passed during the reads ends no row, whatever they showed. Any other refusal of a read is
         raised, and the row stays for the next pass.
         """
         try:
-            files = self.p._basis_files(self._source(), build.source_sha)
+            files = self.p._basis_files(self._source(), build.source_sha, self.deadline)
         except ObservationRefusal as refusal:
             if refusal.reason != "IMAGE_BASIS_PATH_MISSING":
                 raise

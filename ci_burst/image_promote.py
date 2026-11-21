@@ -839,6 +839,7 @@ def _preview(snapshot, state, clock, version, rollback):
         state.close()
     pending = []
     try:
+        planned.journal_check()  # the write checks every row first, so a damaged row refuses both alike
         pending = pending_report(planned, snapshot.sha256)
         # ``--write`` resolves a pending row before it plans, so the preview plans against the rows as that leaves
         # them. The copy takes the resolution and the file never does. A row that matches neither hash is not
@@ -958,6 +959,8 @@ def _write(snapshot, state, clock, events, version, rollback):
                 )
             check_zone_pins(snapshot.raw)
             config = snapshot.config
+            # Every row first: a damaged completed row must stop the write here, not after the file changed.
+            state.journal_check()
             resolved = resolve_pending(state, snapshot.sha256)
             now = clock()
             if rollback:

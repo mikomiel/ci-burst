@@ -15,6 +15,7 @@ files are left as the real process would leave them. Every value is synthetic.
 import contextlib
 import errno
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -658,6 +659,17 @@ class PreviewTests(PromoteCase):
                 code, written = self.write_pin(*arguments)
                 self.assertEqual((code, written["error"]), (2, error))
         self.assertEqual([row["status"] for row in self.journal_rows()], ["complete"])
+
+    def test_a_damaged_completed_row_refuses_the_preview_and_the_write_alike_and_changes_nothing(self):
+        self.crash_a_second_promotion(self.crash_before_rename)  # A to B completed; B to C is pending, then aborted
+        self.corrupt_journal(1, old_pin="x; not a pin")
+        code, payload = self.show_changing_nothing("--version", "6")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_STATE_UNREADABLE"), payload)
+        fingerprint = self.fingerprint()  # the files (the lock file apart), the rows and the events
+        code, written = self.write_pin("--version", "6")
+        self.assertEqual((code, written["error"]), (2, payload["error"]))
+        self.assertNotIn("not a pin", json.dumps(written))
+        self.assertEqual(self.fingerprint(), fingerprint)
 
     def test_a_backup_whose_pin_cannot_be_converted_does_not_stop_a_promotion_preview(self):
         self.seed("build-b", 5, 0xB1, age=900)

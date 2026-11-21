@@ -562,13 +562,14 @@ class RunApplyJournalTests(CliCase):
         self.pending(new_sha=self.file_sha())
         connection = sqlite3.connect(self.state_dir / "image-state.sqlite")
         try:
-            connection.execute("UPDATE promotion_journal SET status = 'complete', contained_pin = contained_pin + 1")
+            connection.execute("UPDATE promotion_journal SET status = 'complete', old_pin = 'x; not a pin'")
             connection.commit()
         finally:
             connection.close()
         before, calls = self.dump(), len(self.world.calls)
         code, payload = self.invoke("image", "run", "--apply")
         self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_STATE_UNREADABLE"))
+        self.assertNotIn("not a pin", json.dumps(payload))
         self.assertEqual(self.dump(), before)
         self.assertEqual(len(self.world.calls), calls, "nothing in the account is read or changed")
         self.assertEqual((self.sessions, self.source_sessions), ([], 0), "no client is built before the refusal")

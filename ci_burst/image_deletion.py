@@ -41,10 +41,11 @@ ids and stable codes, never a tag value other than those or a provider message.
 """
 
 import copy
+import os
 from dataclasses import InitVar, dataclass, field
 
 from .aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
-from .config import load
+from .config import loads
 from .errors import ConfigRefusal, ImageRefusal, ProviderRefusal
 from .image_state import ACTIVE_STATES
 from .image_template import TEMPLATE_DRIFT
@@ -130,7 +131,47 @@ def _is_resolved(protected):
     return isinstance(protected, ProtectedSet) and protected._resolved is _PROVENANCE and bool(protected.image_ids)
 
 
-def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate, active, deadline=None):
+def _load_deployment(config_path):
+    """The deployment configuration, read from one open file whose link count is checked after the read.
+
+    A bind mount of the file itself keeps the inode that was mounted. Once a rename elsewhere replaced the file,
+    that inode has no name left, and its pins and the journal rows that a pass resolved from it are old. The check
+    runs on the descriptor that supplied the bytes, after they were read, so a replacement during the read is seen.
+    """
+    unreadable = "the deployment configuration could not be loaded"
+    try:
+        descriptor = os.open(config_path, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        raise _unsafe(unreadable) from None
+    try:
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+        stale = os.fstat(descriptor).st_nlink == 0
+    except OSError:
+        raise _unsafe(unreadable) from None
+    finally:
+        os.close(descriptor)
+    if stale:
+        raise _unsafe("the deployment file is a view of a file that was replaced")
+    try:
+        return loads(b"".join(chunks).decode("utf-8"), config_path)
+    except (UnicodeDecodeError, ConfigRefusal):
+        raise _unsafe(unreadable) from None
+
+
+def protected_set(
+    aws,
+    config_path,
+    *,
+    previous_pin,
+    pending_journal,
+    candidate,
+    active,
+    promoted_pin=None,
+    latest_pins=(),
+    deadline=None,
+):
     """Resolve the images that no deletion path may remove, or refuse.
 
     The set holds, with a launch-template version read from the worker template
@@ -140,6 +181,19 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
       pin;
     - the image of ``previous_pin`` (an int, or ``None`` when no promotion has
       happened);
+    - the image of ``promoted_pin`` (an int, or ``None`` when none has happened):
+      the new pin of the newest completed journal row, the pin that row wrote to
+      the file. The file names it too, unless the pass reads a stale file (a
+      container whose bind mount of the file keeps the old inode after
+      ``promote --write`` replaces it): then only the journal names the image
+      that was just promoted, and retention could remove it;
+    - the images of the ``latest_pins`` (a tuple of pins, empty when no row
+      follows the newest complete one): both pins of every journal row newer
+      than the newest ``complete`` row, whatever its status. A pass that reads
+      the stale file resolves a write that never completed its row as
+      ``aborted``, so the row is neither pending nor complete, yet the file on
+      disk can already pin its new version, and a later failed write does not
+      say which pin is live;
     - the images of ``old_pin`` and ``new_pin`` of every row of
       ``pending_journal``;
     - the image of ``candidate`` and of ``active``, the current candidate and the
@@ -159,8 +213,9 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
     never reads the file's bytes and never decides which of a row's two pins is
     live. Pass every row in status ``pending``: a diverged row stays pending.
 
-    It refuses with ``IMAGE_DELETION_UNSAFE`` when the configuration cannot be
-    loaded, when a pin is not a version number, when the read does not return
+    It refuses with ``IMAGE_DELETION_UNSAFE`` when the deployment file is a
+    view of a file that a rename replaced (no name links its inode), when the
+    configuration cannot be loaded, when a pin is not a version number, when the read does not return
     exactly the pinned versions, when a version cannot be read, or when a version
     names no literal image (an alias that resolves later says which image is in
     use only at launch). Then no path may delete anything: ``plan_deletions``
@@ -168,14 +223,14 @@ def protected_set(aws, config_path, *, previous_pin, pending_journal, candidate,
     (see ``ProtectedSet``). A refusal of the deadline passes unchanged. The
     detail names a version number at most, never a provider message.
     """
-    try:
-        config = load(config_path)
-    except ConfigRefusal:
-        raise _unsafe("the deployment configuration could not be loaded") from None
+    config = _load_deployment(config_path)
     pins = [config.aws.launch_template_version]
     pins.extend(zone.launch_template_version for zone in config.aws.zones)
     if previous_pin is not None:
         pins.append(previous_pin)
+    if promoted_pin is not None:
+        pins.append(promoted_pin)
+    pins.extend(latest_pins)
     for row in pending_journal:
         pins.extend((row.old_pin, row.new_pin))
     # Check each pin before the set below merges equal values: 3.0 and True would

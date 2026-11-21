@@ -116,7 +116,7 @@ def main(argv=None):
             else:
                 result = controller.reap(apply=arguments.apply)
     except Refusal as refusal:
-        print(json.dumps({"error": refusal.as_dict()}, indent=2, sort_keys=True))
+        print(json.dumps({"error": refusal.as_dict(), **refusal.report}, indent=2, sort_keys=True))
         # A provider refusal that escapes an image command is a provider failure.
         return 1 if arguments.command == "image" and isinstance(refusal, ProviderRefusal) else 2
     except Exception as error:  # noqa: BLE001 - the boundary reports a type name only
@@ -254,15 +254,18 @@ def _resolve_journal(config, state):
 
     The state is left open with the writer lock held, so the pass that follows runs
     under the same lock. A file that matches neither hash of a row refuses the
-    whole run with nothing written (``PROMOTION_JOURNAL_DIVERGED``). With no state
-    file there is nothing to resolve, and nothing is created here: a refusal that
-    needs no network leaves no file behind.
+    whole run with nothing written (``PROMOTION_JOURNAL_DIVERGED``), and so does a
+    journal row of any status that this tool does not write
+    (``IMAGE_STATE_UNREADABLE``): the pass would otherwise meet it only after it had
+    changed the account. With no state file there is nothing to resolve, and
+    nothing is created here: a refusal that needs no network leaves no file behind.
     """
     if not state.connect_readonly():
         return []
     state.close()  # reopen for writing: a read-only connection cannot be upgraded
     state.connect()
     state.acquire_writer()
+    state.journal_check()
     return image_promote.resolve_pending(state, image_promote.read_snapshot(config).sha256)
 
 

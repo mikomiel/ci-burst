@@ -34,9 +34,10 @@ never the promotion.
 
 A crash between two of these steps leaves a state that the next write form
 (``--write``, ``--rollback --write``) or ``image run --apply`` resolves from the
-file hash (``resolve_pending``). Without ``--write`` a command only reports the
-resolution that the hash implies. Nothing here deletes a backup that a journal
-row names.
+file hash (``resolve_pending``). Without ``--write`` ``image status`` only
+reports the resolution that the hash implies, and ``promote`` also plans as the
+write would after it, against a copy of the state in memory. Nothing here
+deletes a backup that a journal row names.
 """
 
 import errno
@@ -47,12 +48,13 @@ import re
 import stat
 import tomllib
 from contextlib import contextmanager, suppress
+import dataclasses
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from . import config as configuration
-from .errors import ConfigRefusal, ImageRefusal, StateRefusal
+from .errors import ConfigRefusal, ImageRefusal, Refusal, StateRefusal
 from .image_template import CLEAN
 
 PROMOTE_NO_CANDIDATE = "PROMOTE_NO_CANDIDATE"
@@ -67,6 +69,7 @@ PROMOTE_ZONE_PIN = "PROMOTE_ZONE_PIN"
 PROMOTE_PIN_LINE_AMBIGUOUS = "PROMOTE_PIN_LINE_AMBIGUOUS"
 PROMOTE_REPARSE_FAILED = "PROMOTE_REPARSE_FAILED"
 PROMOTE_FILE_CHANGED = "PROMOTE_FILE_CHANGED"
+PROMOTE_FILE_STALE = "PROMOTE_FILE_STALE"
 PROMOTE_DIRECTORY_NOT_DEDICATED = "PROMOTE_DIRECTORY_NOT_DEDICATED"
 PROMOTE_BUSY = "PROMOTE_BUSY"
 PROMOTE_WRITE_FAILED = "PROMOTE_WRITE_FAILED"
@@ -87,6 +90,7 @@ _PIN_LINE = re.compile(r"([ \t]*launch_template_version[ \t]*=[ \t]*)([0-9]+)([ 
 _TEMPORARY_SUFFIX = ".promote-tmp"
 _LOCK_SUFFIX = ".lock"
 _BACKUP_INFIX = ".bak."
+_BACKUP_STAMP = "%Y%m%dT%H%M%SZ"
 _FOREIGN_NAMES_SHOWN = 5
 
 
@@ -103,6 +107,8 @@ class Snapshot:
     mode: int
     uid: int
     gid: int
+    identity: tuple  # what tells the file the bytes were read from from any other: see ``_identity``
+    held: int | None = None  # with ``hold``, the descriptor the bytes were read through, still open
 
     @property
     def pin(self):
@@ -112,22 +118,58 @@ class Snapshot:
 # -- reading --------------------------------------------------------------------------
 
 
-def read_snapshot(config):
+def read_snapshot(config, *, hold=False):
     """Read the deployment file once, through the strict loader, and keep its bytes.
 
     The path is followed to the file it names, so the directory that is checked,
     locked and written is the directory the bytes live in. Every pin fact of one
     command comes from these bytes.
+
+    With ``hold`` the descriptor stays open in ``held`` and the caller closes it: while it is open the file's inode
+    cannot be given to another file, so a later check of the path tells this file from any replacement.
     """
     target = Path(config.path).resolve()
     try:
-        data = target.read_bytes()
-        metadata = target.stat()
-        text = data.decode("utf-8")
+        descriptor = os.open(target, os.O_RDONLY | os.O_CLOEXEC)
     except FileNotFoundError:
         raise ConfigRefusal("CONFIG_MISSING", str(config.path)) from None
+    except OSError as error:
+        raise ConfigRefusal("CONFIG_UNREADABLE", f"{config.path}: {error}") from None
+    try:
+        snapshot = _read_open_file(config, target, descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    if hold:
+        return dataclasses.replace(snapshot, held=descriptor)
+    os.close(descriptor)
+    return snapshot
+
+
+def _read_open_file(config, target, descriptor):
+    """The snapshot of the file open at ``descriptor``: its metadata and its bytes come from that one open file."""
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        raise ConfigRefusal("CONFIG_UNREADABLE", f"{config.path}: {error}") from None
+    try:
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+        linked = os.fstat(descriptor).st_nlink > 0
+        data = b"".join(chunks)
+        text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError) as error:
         raise ConfigRefusal("CONFIG_UNREADABLE", f"{config.path}: {error}") from None
+    if not linked:
+        # A bind mount of the file itself keeps the inode that was mounted. Once a write elsewhere replaced the file
+        # by a rename, that inode has no name left, and every fact read from it is old: a hash that resolves a
+        # pending row the wrong way, a pin that is no longer live. The check runs after the read, on the descriptor
+        # that supplied the bytes, so a replacement during the read is seen too.
+        raise ImageRefusal(
+            PROMOTE_FILE_STALE,
+            "this view of the deployment file was replaced; mount its directory, not the file, and run again",
+        )
     try:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
@@ -142,7 +184,45 @@ def read_snapshot(config):
         mode=stat.S_IMODE(metadata.st_mode),
         uid=metadata.st_uid,
         gid=metadata.st_gid,
+        identity=_identity(metadata),
     )
+
+
+def _identity(metadata):
+    """The device and inode, with the change and modification times and the size.
+
+    A file that replaced another can reuse its inode, but not its change time, which no write of the content or
+    of the times can set back: the pair tells a file that was replaced, even by the same bytes, from one that was not.
+    """
+    return (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns, metadata.st_mtime_ns, metadata.st_size)
+
+
+def _is_unchanged(snapshot):
+    """Whether the deployment path still leads to the same file with the same bytes. It parses nothing.
+
+    The path is compared before anything is opened, the open neither follows a link nor waits for a writer, and the
+    identity is compared before the bytes are read: a replacement by a FIFO, a link or another file is a change, and
+    never a hang. Any error is a change.
+    """
+    try:
+        target = Path(snapshot.config.path).resolve()
+        if target != snapshot.target:
+            return False
+        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or _identity(metadata) != snapshot.identity:
+                return False
+            if snapshot.held is not None and _identity(os.fstat(snapshot.held)) != _identity(metadata):
+                return False  # the held file is no longer the one the path names, or it changed
+            chunks = []
+            while chunk := os.read(descriptor, 1 << 16):
+                chunks.append(chunk)
+        finally:
+            os.close(descriptor)
+    except (OSError, RuntimeError):  # ``resolve`` raises ``RuntimeError`` for a loop of links
+        return False
+    return sha256_of(b"".join(chunks)) == snapshot.sha256
 
 
 def sha256_of(data):
@@ -234,8 +314,13 @@ def implied_resolution(row, file_sha256):
     return "diverged"
 
 
-def pending_report(state, file_sha256):
-    """Every pending row with the resolution that the file hash implies. Reads only."""
+def pending_report(state, file_sha256, *, readable_only=False):
+    """Every pending row with the resolution that the file hash implies. Reads only.
+
+    With ``readable_only`` a damaged row anywhere in the journal does not refuse: the report then lists the
+    well-formed pending rows, for a preview whose whole-journal check refuses next.
+    """
+    rows = state.pending_journal_readable() if readable_only else state.pending_journal()
     return [
         {
             "journal_id": row.id,
@@ -244,7 +329,7 @@ def pending_report(state, file_sha256):
             "new_pin": row.new_pin,
             "implied_resolution": implied_resolution(row, file_sha256),
         }
-        for row in state.pending_journal()
+        for row in rows
     ]
 
 
@@ -486,7 +571,7 @@ def _errno_name(error):
 
 
 def _create_backup(snapshot, now):
-    stamp = datetime.fromtimestamp(now, UTC).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.fromtimestamp(now, UTC).strftime(_BACKUP_STAMP)
     base = snapshot.target.name + _BACKUP_INFIX + stamp
     for attempt in range(100):
         path = snapshot.target.parent / (base if attempt == 0 else f"{base}-{attempt}")
@@ -649,22 +734,59 @@ def rollback_plan(state, snapshot, now):
     return RollbackPlan(row=row, previous_pin=row.old_pin, backup_name=row.backup_name, target=owner)
 
 
+def _is_generated_backup_name(target_name, name):
+    """Whether ``_create_backup`` can give ``name`` to a backup of ``target_name``: a real UTC time and a counter."""
+    pattern = re.escape(target_name + _BACKUP_INFIX) + r"([0-9]{8}T[0-9]{6}Z)(?:-[1-9][0-9]?)?"
+    match = re.fullmatch(pattern, name)
+    if match is None:
+        return False
+    try:
+        datetime.strptime(match.group(1), _BACKUP_STAMP)
+    except ValueError:  # the shape of a stamp, but no such time: 20260230T010000Z or 20260101T250000Z
+        return False
+    return True
+
+
+def _read_regular_file(path):
+    """The bytes of ``path``, which must be a regular file itself.
+
+    The file is opened without following a symbolic link and without waiting for a writer, so a link or a FIFO in
+    place of a backup is an ``OSError`` here and never a read of another file or a hang.
+    """
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
 def _check_backup(snapshot, row):
     """The named backup must exist, hold the recorded bytes and contain the recorded previous pin."""
     name = row.backup_name
-    if name != Path(name).name or not name.startswith(snapshot.target.name + _BACKUP_INFIX):
-        raise StateRefusal(PIN_RECORD_DIVERGED, "the journal names a backup that is not next to the file")
+    # Only a name that ``_create_backup`` makes is opened or shown: anything else in the row is damage or a hand
+    # edit, and it is named by the row id, never echoed.
+    if not _is_generated_backup_name(snapshot.target.name, name):
+        raise StateRefusal(
+            PIN_RECORD_DIVERGED, f"journal row {row.id} names a backup that this tool does not make next to the file"
+        )
     try:
-        data = (snapshot.target.parent / name).read_bytes()
+        data = _read_regular_file(snapshot.target.parent / name)
     except OSError:
-        raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} cannot be read") from None
+        raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} cannot be read as a regular file") from None
     if sha256_of(data) != row.backup_sha256:
         raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} no longer has its recorded sha256")
     try:
         pin = tomllib.loads(data.decode("utf-8"))["aws"]["launch_template_version"]
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError):
+    # ``ValueError`` covers a bad encoding, bad TOML and an integer longer than Python converts.
+    except (ValueError, KeyError, TypeError, RecursionError):
         raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} cannot be parsed for its pin") from None
-    if pin != row.old_pin or row.contained_pin != row.old_pin:
+    # An integer only: ``3.0`` equals ``3`` but the strict loader refuses it, so it is not the recorded pin.
+    if type(pin) is not int or pin != row.old_pin or row.contained_pin != row.old_pin:
         raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} does not contain the recorded previous pin")
 
 
@@ -701,9 +823,19 @@ def promote(config, *, state, clock, events, version=None, rollback=False, write
     it as the form needs and closes it. Without ``write`` the command reads only
     local files (the state file, the deployment TOML and the backup that a
     journal row names) and builds no client. The state is opened for reading
-    only: nothing is created or written, and a pending journal row is reported
-    with the resolution that the file hash implies, not resolved. A refusal is
-    raised.
+    only: nothing is created, locked or written, and a pending journal row is
+    reported with the resolution that the file hash implies, not resolved. The
+    candidate, the rollback target and the plan are those that ``--write`` finds
+    after it resolves the row: the command resolves the rows on a copy of the
+    state in memory and drops the copy. A row that the file matches by neither
+    hash is not resolved, as ``--write`` refuses to resolve it, so the command
+    plans against that row as it is. Once there is a candidate or a rollback
+    row to show, the write check is the first planning refusal that ``--write``
+    meets for the files and rows as read (a lock that another command holds at
+    the time of the write is not foreseen).
+    Without one, the selection refusal is raised before the directory, zone-pin
+    and divergence checks, so in a state that holds two refusals the command can
+    name another one than ``--write`` names first. A refusal is raised.
 
     A local file-system error in the write path is the refusal
     ``PROMOTE_WRITE_FAILED``, and its detail names the errno and no path.
@@ -726,10 +858,14 @@ def promote(config, *, state, clock, events, version=None, rollback=False, write
     ``event_write:<code>``, an errno name or an exception type and never a path.
     ``notes`` is empty when the event was written.
     """
-    snapshot = read_snapshot(config)
     if write:
-        return _write(snapshot, state, clock, events, version, rollback)
-    return _preview(snapshot, state, clock, version, rollback)
+        return _write(read_snapshot(config), state, clock, events, version, rollback)
+    # The preview holds the file open until it has checked it again after the copy of the state.
+    snapshot = read_snapshot(config, hold=True)
+    try:
+        return _preview(snapshot, state, clock, version, rollback)
+    finally:
+        os.close(snapshot.held)
 
 
 def _missing_state(rollback):
@@ -753,8 +889,12 @@ def _check_edit(snapshot, new_pin):
     check_reparse(snapshot, new_text, new_pin)
 
 
+def _diverged(pending):
+    return any(item["implied_resolution"] == "diverged" for item in pending)
+
+
 def _check_no_divergence(pending):
-    if any(item["implied_resolution"] == "diverged" for item in pending):
+    if _diverged(pending):
         raise StateRefusal(PROMOTION_JOURNAL_DIVERGED, "the file matches neither hash of a pending journal row")
 
 
@@ -776,16 +916,40 @@ def _try_change(snapshot, new_pin):
 
 
 def _preview(snapshot, state, clock, version, rollback):
-    now = clock()
     config = snapshot.config
     if not state.connect_readonly():
         raise _missing_state(rollback)
     try:
-        pending = pending_report(state, snapshot.sha256)
-        plan, refusal = try_rollback_plan(state, snapshot, now)
+        planned = state.detached_copy()
+    finally:
+        state.close()
+    # The file was read before the copy. A promotion that renamed the file in between would leave the preview
+    # resolving its row against the old hash, so the file is checked again: the copy lies between two reads of the
+    # same file with the same bytes, or the preview refuses. Nothing is locked for this.
+    if not _is_unchanged(snapshot):
+        planned.close()
+        raise ImageRefusal(
+            PROMOTE_FILE_CHANGED, "the file changed while the preview read it and the state; run the preview again"
+        )
+    pending = []
+    try:
+        # The report of the pending rows comes first, so a refusal still carries it; then every row, as the write
+        # checks them before it resolves a pending row, so a damaged row refuses both alike.
+        pending = pending_report(planned, snapshot.sha256, readable_only=True)
+        planned.journal_check()
+        # ``--write`` resolves a pending row before it plans, so the preview plans against the rows as that leaves
+        # them. The copy takes the resolution and the file never does. A row that matches neither hash is not
+        # resolved, as the write refuses to resolve it: the copy keeps that row, and ``_check_no_divergence`` puts
+        # it in the write check. Any other refusal of the resolution is the write's too, so it is raised here.
+        if not _diverged(pending):
+            resolve_pending(planned, snapshot.sha256)
+        # The clock is read once the state is copied and resolved: evidence that a refresh wrote just before the copy
+        # is not in the future of this preview, as it is not in the future of the write, which reads the clock then.
+        now = clock()
+        plan, refusal = try_rollback_plan(planned, snapshot, now)
         report = {"pending_journal": pending, "rollback": describe_rollback(plan, refusal)}
         if rollback:
-            row = state.journal_last_complete(kind="promotion")
+            row = planned.journal_last_complete(kind="promotion")
             if row is None:
                 raise refusal
             # The checks of ``--rollback --write``, in the order it runs them. It writes the previous pin
@@ -804,7 +968,7 @@ def _preview(snapshot, state, clock, version, rollback):
                 "write_check": _write_check(first),
                 **report,
             }
-        build = select_candidate(state, config.deployment, version)
+        build = select_candidate(planned, config.deployment, version)
         refusal = _first_refusal(
             lambda: check_directory(snapshot.target),
             lambda: check_zone_pins(snapshot.raw),
@@ -817,12 +981,18 @@ def _preview(snapshot, state, clock, version, rollback):
             "action": "promote",
             "evidence": evidence(build, now),
             "pin_change": _try_change(snapshot, build.template_version),
-            "previous_pin": _pin_report(state, snapshot),
+            "previous_pin": _pin_report(planned, snapshot),
             "write_check": _write_check(refusal),
             **report,
         }
+    except Refusal as refusal:
+        # A refused preview still says that a row is pending and how the hash resolves it: the refusal can be
+        # the consequence of that resolution, and the row on disk stays pending until a write resolves it.
+        if pending:
+            refusal.report = {**refusal.report, "pending_journal": pending}
+        raise
     finally:
-        state.close()
+        planned.close()
 
 
 def _pin_report(state, snapshot):
@@ -888,6 +1058,8 @@ def _write(snapshot, state, clock, events, version, rollback):
                 )
             check_zone_pins(snapshot.raw)
             config = snapshot.config
+            # Every row first: a damaged completed row must stop the write here, not after the file changed.
+            state.journal_check()
             resolved = resolve_pending(state, snapshot.sha256)
             now = clock()
             if rollback:

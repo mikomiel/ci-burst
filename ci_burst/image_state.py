@@ -291,6 +291,31 @@ class ImageState:
         self._read_only = True
         return True
 
+    def detached_copy(self):
+        """A copy of the open database in memory, as an ``ImageState`` of its own: a view to plan against.
+
+        The copy has no file and no writer lock, and a write to it changes nothing on disk, so a caller may
+        resolve a journal row on it to see what the next write would see. It does not follow the file after
+        this call, and the caller closes it; closing it leaves this state open. The data comes through this
+        connection, so a read-only connection leaves the file, its directory and its lock as they were. A
+        source that another process holds locked is refused as ``IMAGE_STATE_UNREADABLE``, as a read of it
+        is: ``backup`` alone would retry it without end.
+        """
+        source = self._require()
+        memory = sqlite3.connect(":memory:", isolation_level=None)
+        memory.row_factory = sqlite3.Row
+        try:
+            source.backup(memory, progress=_give_up_on_a_locked_source)
+        except sqlite3.DatabaseError as error:
+            memory.close()
+            raise StateRefusal("IMAGE_STATE_UNREADABLE", type(error).__name__) from None
+        except BaseException:
+            memory.close()
+            raise
+        copy = _DetachedState(self.directory, clock=self._clock)
+        copy._connection = memory
+        return copy
+
     def close(self):
         if self._connection is not None:
             self._connection.close()
@@ -642,12 +667,58 @@ class ImageState:
 
     def journal(self, journal_id):
         row = self._require().execute("SELECT * FROM promotion_journal WHERE id = ?", (journal_id,)).fetchone()
-        return Journal(**dict(row)) if row else None
+        return _journal_row(row) if row else None
+
+    def _refuse_a_journal_outside_the_schema(self):
+        """Refuse when any row's kind or status is outside the schema.
+
+        A query that selects by status or kind would skip such a row, and a damaged ``pending`` row that is skipped
+        is a promotion that nothing resolves and a rollback target that retention does not protect. The refusal
+        names the row, never the value.
+        """
+        kinds = ", ".join("?" for _ in JOURNAL_KINDS)
+        statuses = ", ".join("?" for _ in JOURNAL_STATUSES)
+        row = (
+            self._require()
+            .execute(
+                "SELECT id FROM promotion_journal WHERE typeof(kind) != 'text' OR typeof(status) != 'text'"
+                f" OR kind NOT IN ({kinds}) OR status NOT IN ({statuses}) ORDER BY id LIMIT 1",
+                (*JOURNAL_KINDS, *JOURNAL_STATUSES),
+            )
+            .fetchone()
+        )
+        if row is not None:
+            raise StateRefusal("IMAGE_STATE_UNREADABLE", f"promotion journal row {int(row['id'])} is malformed")
+
+    def journal_check(self):
+        """Refuse unless every journal row is one this module writes; ``IMAGE_STATE_UNREADABLE`` names the first.
+
+        An applying run checks the whole journal before its pass, so a damaged completed row that retention or
+        cleanup would read later stops the run before any client is built or anything in the account changes.
+        """
+        self._refuse_a_journal_outside_the_schema()
+        for row in self._require().execute("SELECT * FROM promotion_journal ORDER BY id"):
+            _journal_row(row)
+
+    def pending_journal_readable(self):
+        """The ``pending`` rows that are well formed, oldest first, without refusing for any other row.
+
+        Only for a report that goes with a refusal: a decision reads ``pending_journal``, which refuses instead.
+        """
+        rows = self._require().execute("SELECT * FROM promotion_journal WHERE status = 'pending' ORDER BY id")
+        readable = []
+        for row in rows:
+            try:
+                readable.append(_journal_row(row))
+            except StateRefusal:
+                continue
+        return readable
 
     def pending_journal(self):
         """Every ``pending`` row, oldest first."""
+        self._refuse_a_journal_outside_the_schema()
         rows = self._require().execute("SELECT * FROM promotion_journal WHERE status = 'pending' ORDER BY id")
-        return [Journal(**dict(row)) for row in rows]
+        return [_journal_row(row) for row in rows]
 
     def journal_last_complete(self, kind=None):
         """The newest ``complete`` row, or ``None``: its ``old_pin`` is the pin it replaced.
@@ -655,6 +726,7 @@ class ImageState:
         Without ``kind`` the row is of either kind, which is what the deletion
         rule needs. A rollback asks for ``kind="promotion"``.
         """
+        self._refuse_a_journal_outside_the_schema()
         clause, arguments = ("", ()) if kind is None else (" AND kind = ?", (kind,))
         row = (
             self._require()
@@ -664,7 +736,7 @@ class ImageState:
             )
             .fetchone()
         )
-        return Journal(**dict(row)) if row else None
+        return _journal_row(row) if row else None
 
     def journal_last(self):
         """The newest row of any status and kind, or ``None``.
@@ -728,6 +800,52 @@ class ImageState:
         if self._connection is None:
             raise StateRefusal("IMAGE_STATE_UNAVAILABLE")
         return self._connection
+
+
+def _journal_row(row):
+    """A ``Journal`` from a row, or the refusal of a row whose pins or names are not what this module writes.
+
+    SQLite's ``INTEGER`` and ``TEXT`` affinities do not reject other types, so a hand-edited or damaged file can
+    hold text or a blob where a pin belongs, a blob where a hash belongs, or a kind or a status outside the
+    schema. Every column is checked for the type that this module stores in it. Such a value is never passed on:
+    it would reach a detail or the output verbatim, or compare unequal to every hash and change a resolution. The
+    refusal names no value.
+    """
+    data = dict(row)
+    pins_ok = all(type(data[key]) is int and data[key] >= 1 for key in ("old_pin", "new_pin", "contained_pin"))
+    texts = ("kind", "status", "old_file_sha256", "new_file_sha256", "backup_name", "backup_sha256")
+    texts_ok = all(type(data[key]) is str for key in texts)
+    texts_ok = texts_ok and (data["candidate_id"] is None or type(data["candidate_id"]) is str)
+    texts_ok = texts_ok and all(type(data[key]) in (int, float) for key in ("created_at", "updated_at"))
+    # The schema's CHECK holds kind and status to these values, but a file written without it, or with checks
+    # turned off, need not.
+    enums_ok = texts_ok and data["kind"] in JOURNAL_KINDS and data["status"] in JOURNAL_STATUSES
+    if not (pins_ok and enums_ok):
+        raise StateRefusal("IMAGE_STATE_UNREADABLE", f"promotion journal row {int(data['id'])} is malformed")
+    return Journal(**data)
+
+
+class _DetachedState(ImageState):
+    """The copy that ``detached_copy`` returns.
+
+    It has no other writer, so it takes no lock and never opens the file: ``connect``, ``connect_readonly`` and
+    ``acquire_writer`` do nothing.
+    """
+
+    def connect(self):
+        return self  # a closed copy stays closed: reopening would open the file that this one was copied from
+
+    def acquire_writer(self):
+        return self  # there is no writer to exclude, and the lock file belongs to the file
+
+    def connect_readonly(self):
+        return self._connection is not None  # never the file: a closed copy stays closed
+
+
+def _give_up_on_a_locked_source(status, remaining, total):
+    """The ``progress`` callback of ``backup``, which retries a locked source until it is free. A read gives up."""
+    if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        raise sqlite3.OperationalError("database is locked")
 
 
 def _user_version(connection):

@@ -15,6 +15,7 @@ files are left as the real process would leave them. Every value is synthetic.
 import contextlib
 import errno
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -84,6 +85,24 @@ def changed_lines(before, after):
         for number, (first, second) in enumerate(zip(old, new, strict=True), start=1)
         if first != second
     ]
+
+
+
+@contextlib.contextmanager
+def _deadline(seconds):
+    """Fail the test instead of hanging it when the body blocks for ``seconds``."""
+    import signal
+
+    def expired(signum, frame):
+        raise AssertionError(f"blocked for {seconds} s")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 class PromoteCase(CliCase):
@@ -207,6 +226,13 @@ class PromoteCase(CliCase):
             if line.startswith("launch_template_version"):
                 return number
         raise AssertionError("no pin line")
+
+    def huge_pin_in_the_backup(self):
+        """The first backup with a pin longer than Python converts to an integer, and its hash recorded to match."""
+        backup = self.backups()[0]
+        data = backup.read_bytes().replace(b"launch_template_version = 3", b"launch_template_version = 1" + b"0" * 5000)
+        backup.write_bytes(data)
+        self.corrupt_journal(1, backup_sha256=sha(data))
 
     def corrupt_journal(self, journal_id, **fields):
         """A change of a journal row that only damage or a hand edit of the state file could make."""
@@ -511,6 +537,284 @@ class PreviewTests(PromoteCase):
         self.assertEqual(payload["rollback"]["reason"], "PIN_RECORD_DIVERGED")
         self.assertEqual(payload["write_check"].get("reason"), "PIN_RECORD_DIVERGED")
         self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
+
+    # -- a pending row: the preview plans as the write does after it resolves the row ---------
+    #
+    # Each test below runs the preview first and then the write, and compares the two. The write resolves the row
+    # for real, so what it does is the reference for what the preview must say.
+
+    def show_changing_nothing(self, *arguments):
+        """``image promote`` without ``--write``. It leaves every file, table and event as it was and takes no lock."""
+        locks = (self.lock_file(), self.state_dir / "image-state.sqlite.lock")
+        for lock in locks:
+            lock.unlink(missing_ok=True)  # a lock file is made on demand, so one that is absent must stay absent
+        tree, fingerprint = snapshot_tree(self.dir), self.fingerprint()
+        result = self.show(*arguments)
+        self.assertEqual(snapshot_tree(self.dir), tree)
+        self.assertEqual(self.fingerprint(), fingerprint)
+        self.assertFalse(any(lock.exists() for lock in locks))
+        return result
+
+    def crash_a_second_promotion(self, crash):
+        """A to B completed, then B to C crashed (``crash`` is a crash helper): the row of B to C is pending."""
+        self.seed()
+        self.refresh()
+        self.promoted()
+        self.seed("build-c", 6, 0xC1, age=300, source_pin=5)
+        self.clock.advance(60)
+        crash("--version", "6")
+
+    def test_a_rollback_preview_plans_the_rollback_of_a_promotion_that_the_write_completes_first(self):
+        self.crash_a_second_promotion(self.crash_after_rename)
+        self.assertEqual(self.pin_in_file(), 6)
+        code, payload = self.show_changing_nothing("--rollback")
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "rollback"))
+        self.assertEqual(
+            [(item["journal_id"], item["implied_resolution"]) for item in payload["pending_journal"]], [(2, "complete")]
+        )
+        self.assertEqual(payload["write_check"], {"ok": True})
+        self.assertEqual(
+            payload["pin_change"], {"line": self.pin_line_number(), "from": self.pin_to(6), "to": self.pin_to(5)}
+        )
+        self.assertEqual((payload["rollback"]["available"], payload["rollback"]["to_pin"]), (True, 5))
+        code, written = self.write_pin("--rollback")
+        self.assertEqual((code, written["decision"], written["to_pin"]), (0, "rolled_back", 5))
+        self.assertEqual(written["resolved"], [{"journal_id": 2, "kind": "promotion", "resolution": "complete"}])
+        self.assertEqual(written["change"], payload["pin_change"])
+        self.assertEqual(self.pin_in_file(), 5)
+
+    def test_a_backup_replaced_by_a_link_or_a_fifo_is_neither_followed_nor_waited_for(self):
+        self.crash_a_second_promotion(self.crash_after_rename)
+        backup = self.config_dir / self.journal_rows()[-1]["backup_name"]
+        elsewhere = self.dir / "elsewhere"
+        elsewhere.mkdir()
+        original = elsewhere / "kept-backup"
+        shutil.copyfile(backup, original)
+        cases = {
+            "a link to the same bytes": lambda: backup.symlink_to(original),
+            "a FIFO with no writer": lambda: os.mkfifo(backup, 0o600),
+        }
+        for name, replace in cases.items():
+            with self.subTest(name):
+                backup.unlink()
+                replace()
+                with _deadline(20):  # a read of a FIFO with no writer would block here
+                    code, payload = self.show("--rollback")
+                self.assertEqual((code, payload["decision"]), (0, "preview"))
+                rollback = payload["rollback"]
+                self.assertEqual((rollback["available"], rollback["reason"]), (False, "PIN_RECORD_DIVERGED"))
+                self.assertIn("regular file", rollback["detail"])
+                self.assertFalse(payload["write_check"]["ok"])
+
+    def test_a_rollback_preview_with_no_earlier_promotion_plans_the_rollback_that_the_write_makes_after_the_row(self):
+        self.seed()
+        self.refresh()
+        self.crash_after_rename()  # the first promotion: the file holds its pin, and its row is pending
+        code, payload = self.show_changing_nothing("--rollback")
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "rollback"))
+        self.assertEqual(payload["write_check"], {"ok": True})
+        self.assertEqual(payload["pin_change"]["from"], self.pin_to(5))
+        self.assertEqual(payload["pin_change"]["to"], self.pin_to(PIN))
+        code, written = self.write_pin("--rollback")
+        self.assertEqual((code, written["decision"], written["to_pin"]), (0, "rolled_back", PIN))
+        self.assertEqual(written["change"], payload["pin_change"])
+
+    def test_a_rollback_preview_with_no_earlier_promotion_names_the_refusal_that_the_write_meets_after_the_row(self):
+        self.seed()
+        self.crash_after_rename()  # no pass read the previous pin, so the rollback has no recorded target
+        code, payload = self.show_changing_nothing("--rollback")
+        self.assertEqual((code, payload["action"]), (0, "rollback"))
+        self.assertEqual(payload["write_check"].get("reason"), "ROLLBACK_PREVIOUS_NOT_RECORDED")
+        self.assertEqual(payload["rollback"]["reason"], "ROLLBACK_PREVIOUS_NOT_RECORDED")
+        code, written = self.write_pin("--rollback")
+        self.assertEqual((code, written["error"]["reason"]), (2, "ROLLBACK_PREVIOUS_NOT_RECORDED"))
+        self.assertEqual(payload["write_check"], {"ok": False, **written["error"]})
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["complete"], "the resolution stays")
+
+    def test_a_rollback_preview_plans_as_if_a_row_that_the_file_shows_aborted_were_aborted(self):
+        self.crash_a_second_promotion(self.crash_before_rename)
+        self.assertEqual(self.pin_in_file(), 5)
+        code, payload = self.show_changing_nothing("--rollback")
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "rollback"))
+        self.assertEqual([item["implied_resolution"] for item in payload["pending_journal"]], ["aborted"])
+        self.assertEqual(payload["write_check"], {"ok": True})
+        self.assertEqual(payload["pin_change"]["from"], self.pin_to(5))
+        self.assertEqual(payload["pin_change"]["to"], self.pin_to(PIN))
+        code, written = self.write_pin("--rollback")
+        self.assertEqual((code, written["decision"], written["to_pin"]), (0, "rolled_back", PIN))
+        self.assertEqual(written["resolved"], [{"journal_id": 2, "kind": "promotion", "resolution": "aborted"}])
+        self.assertEqual(written["change"], payload["pin_change"])
+
+    def test_a_rollback_preview_with_nothing_to_roll_back_after_the_resolution_refuses_as_the_write_does(self):
+        self.seed()
+        self.crash_before_rename()  # the only row is aborted, so no promotion ever completed
+        code, payload = self.show_changing_nothing("--rollback")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "ROLLBACK_NO_PROMOTION"))
+        code, written = self.write_pin("--rollback")
+        self.assertEqual((code, written["error"]), (2, payload["error"]))
+
+    def test_a_promotion_preview_after_a_crash_past_the_rename_refuses_as_the_write_does(self):
+        self.seed()
+        self.crash_after_rename()  # the file holds build-b's pin, the row is pending and build-b is still a candidate
+        previews = {}
+        for arguments in ((), ("--version", "5")):
+            code, payload = self.show_changing_nothing(*arguments)
+            self.assertEqual(code, 2, payload)
+            # The row on disk is still pending: the refused preview says so, with the resolution the hash implies.
+            self.assertEqual([item["implied_resolution"] for item in payload["pending_journal"]], ["complete"])
+            previews[arguments] = payload["error"]
+        self.assertEqual(
+            [error["reason"] for error in previews.values()], ["PROMOTE_NO_CANDIDATE", "PROMOTE_VERSION_NOT_CANDIDATE"]
+        )
+        # The first write resolves the row for real, and the second meets the journal that the previews planned against.
+        for arguments, error in previews.items():
+            with self.subTest(arguments=arguments):
+                code, written = self.write_pin(*arguments)
+                self.assertEqual((code, written["error"]), (2, error))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["complete"])
+
+    def test_a_preview_refuses_when_the_file_changes_between_its_read_and_the_copy_of_the_state(self):
+        self.seed()
+        copy = ImageState.detached_copy
+
+        def copy_then_change_the_file(state):
+            copied = copy(state)
+            self.config_path.write_bytes(self.config_path.read_bytes() + b"# a promotion renamed the file here\n")
+            return copied
+
+        def copy_then_replace_the_file_with_the_same_bytes(state):
+            # A promotion and then a rollback: two atomic replacements that end with the bytes the preview read.
+            copied = copy(state)
+            replacement = self.config_path.with_name("deployment.toml.replaced")
+            replacement.write_bytes(self.config_path.read_bytes())
+            os.replace(replacement, self.config_path)
+            return copied
+
+        def copy_then_replace_the_file_with_a_fifo(state):
+            copied = copy(state)
+            self.config_path.unlink()
+            os.mkfifo(self.config_path, 0o600)
+            return copied
+
+        def copy_then_make_the_path_a_loop_of_links(state):
+            copied = copy(state)
+            self.config_path.unlink()
+            loop = self.config_path.with_name("deployment.toml.loop")
+            loop.symlink_to(self.config_path.name)
+            self.config_path.symlink_to(loop.name)
+            return copied
+
+        def copy_then_write_a_file_that_does_not_load(state):
+            copied = copy(state)
+            self.config_path.write_bytes(self.config_path.read_bytes() + b'"x; an unknown key" = 1\n')
+            return copied
+
+        original = self.config_path.read_bytes()
+        for change in (
+            copy_then_change_the_file,
+            copy_then_replace_the_file_with_the_same_bytes,
+            copy_then_replace_the_file_with_a_fifo,
+            copy_then_make_the_path_a_loop_of_links,
+            copy_then_write_a_file_that_does_not_load,
+        ):
+            with self.subTest(change=change.__name__):
+                self.config_path.with_name("deployment.toml.loop").unlink(missing_ok=True)
+                self.config_path.unlink(missing_ok=True)
+                self.config_path.write_bytes(original)
+                with mock.patch.object(ImageState, "detached_copy", change), _deadline(10):
+                    code, payload = self.show()
+                self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"), payload)
+                self.assertNotIn("unknown key", json.dumps(payload))
+        self.config_path.with_name("deployment.toml.loop").unlink(missing_ok=True)
+        self.config_path.unlink(missing_ok=True)
+        self.config_path.write_bytes(original)
+        descriptors = len(os.listdir("/proc/self/fd"))
+        code, payload = self.show()  # with nothing changing, the next preview plans
+        self.assertEqual((code, payload["decision"]), (0, "preview"), payload)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors, "the held file is closed")
+
+    def test_evidence_that_a_refresh_writes_just_before_the_copy_is_not_in_the_future_of_the_preview(self):
+        self.seed()
+        copy = ImageState.detached_copy
+
+        def refresh_then_copy(state):
+            # ``image status --refresh`` commits fresh verification between the preview's file read and its copy.
+            self.clock.advance(30)
+            self.change("build-b", verified_at=self.clock.now)
+            return copy(state)
+
+        with mock.patch.object(ImageState, "detached_copy", refresh_then_copy):
+            code, payload = self.show()
+        self.assertEqual((code, payload["decision"]), (0, "preview"), payload)
+        self.assertEqual(payload["write_check"], {"ok": True})
+        code, written = self.write_pin()
+        self.assertEqual((code, written["decision"]), (0, "promoted"), written)
+
+    def test_a_damaged_completed_row_refuses_the_preview_and_the_write_alike_and_changes_nothing(self):
+        self.crash_a_second_promotion(self.crash_before_rename)  # A to B completed; B to C is pending, then aborted
+        for damage in ({"old_pin": "x; not a pin"}, {"kind": "x; not a kind"}):
+            with self.subTest(damage=damage):
+                self.check_a_damaged_completed_row(damage)
+
+    def check_a_damaged_completed_row(self, damage):
+        connection = sqlite3.connect(self.state_dir / "image-state.sqlite")
+        try:
+            connection.execute("PRAGMA ignore_check_constraints = ON")  # what a damaged file can hold
+            connection.execute("UPDATE promotion_journal SET old_pin = 3, kind = 'promotion' WHERE id = 1")
+            for column, value in damage.items():
+                connection.execute(f"UPDATE promotion_journal SET {column} = ? WHERE id = 1", (value,))
+            connection.commit()
+        finally:
+            connection.close()
+        code, payload = self.show_changing_nothing("--version", "6")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_STATE_UNREADABLE"), payload)
+        # The valid pending row is still reported, with the resolution that its hash implies.
+        self.assertEqual(
+            [(item["journal_id"], item["implied_resolution"]) for item in payload["pending_journal"]], [(2, "aborted")]
+        )
+        fingerprint = self.fingerprint()  # the files (the lock file apart), the rows and the events
+        code, written = self.write_pin("--version", "6")
+        self.assertEqual((code, written["error"]), (2, payload["error"]))
+        self.assertNotIn("not a", json.dumps(written))
+        self.assertNotIn("not a", json.dumps(payload))
+        self.assertEqual(self.fingerprint(), fingerprint)
+
+    def test_a_backup_whose_pin_cannot_be_converted_does_not_stop_a_promotion_preview(self):
+        self.seed("build-b", 5, 0xB1, age=900)
+        self.seed("build-c", 6, 0xC1, age=300)
+        self.change("build-b", source_pin=4)
+        self.crash_after_rename()  # the row of the promotion to 6 is pending; the preview completes it on a copy
+        self.huge_pin_in_the_backup()
+        code, payload = self.show_changing_nothing()
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "promote"), payload)
+        self.assertEqual((payload["rollback"]["available"], payload["rollback"]["reason"]), (False, "PIN_RECORD_DIVERGED"))
+
+    def test_a_promotion_preview_picks_the_candidate_that_the_write_picks_after_the_resolution(self):
+        self.seed("build-b", 5, 0xB1, age=900)
+        self.seed("build-c", 6, 0xC1, age=300)
+        self.change("build-b", source_pin=4)  # told apart from build-c by the pin that its record names
+        self.crash_after_rename()  # the write picks build-c, the newest: the file holds 6 and the row is pending
+        self.assertEqual(self.pin_in_file(), 6)
+        code, payload = self.show_changing_nothing()
+        self.assertEqual((code, payload["decision"], payload["action"]), (0, "preview", "promote"))
+        self.assertEqual([item["implied_resolution"] for item in payload["pending_journal"]], ["complete"])
+        self.assertEqual(payload["evidence"]["build_id"], "build-b", "build-c is promoted once the row is resolved")
+        self.assertEqual(payload["pin_change"]["to"], self.pin_to(5))
+        self.assertEqual(payload["write_check"]["reason"], "PIN_MOVED")
+        self.assertIn("derived from version 4", payload["write_check"]["detail"])
+        code, written = self.write_pin()
+        self.assertEqual((code, {"ok": False, **written["error"]}), (2, payload["write_check"]))
+
+    def test_a_preview_over_a_pending_row_takes_no_lock_and_waits_for_none(self):
+        self.crash_a_second_promotion(self.crash_after_rename)
+        expected = self.show("--rollback")
+        self.assertEqual((expected[0], expected[1]["write_check"]), (0, {"ok": True}))
+        holder = ImageState(self.state_dir, clock=self.clock)
+        holder.connect()
+        self.addCleanup(holder.close)
+        holder.acquire_writer()
+        with image_promote.file_lock(self.config_path.resolve()):
+            self.assertEqual(self.show("--rollback"), expected)
 
 
 # -- 6.3: what a write refuses ---------------------------------------------------------
@@ -1657,11 +1961,15 @@ class RollbackTests(PromoteCase):
     def test_a_backup_that_holds_another_pin_is_refused_even_with_a_matching_hash(self):
         self.promote_a_refreshed_pin()
         backup = self.backups()[0]
-        other = backup.read_bytes().replace(b"launch_template_version = 3", b"launch_template_version = 4")
-        backup.write_bytes(other)
-        self.corrupt_journal(1, backup_sha256=sha(other))
-        error = self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
-        self.assertIn("does not contain the recorded previous pin", error["detail"])
+        original = backup.read_bytes()
+        # 4 is another pin; 3.0 equals the recorded 3 as a number but is not an integer pin.
+        for value in (b"4", b"3.0"):
+            with self.subTest(value=value):
+                other = original.replace(b"launch_template_version = 3", b"launch_template_version = " + value)
+                backup.write_bytes(other)
+                self.corrupt_journal(1, backup_sha256=sha(other))
+                error = self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
+                self.assertIn("does not contain the recorded previous pin", error["detail"])
 
     def test_a_row_whose_contained_pin_is_not_its_previous_pin_is_refused(self):
         self.promote_a_refreshed_pin()
@@ -1680,11 +1988,30 @@ class RollbackTests(PromoteCase):
         self.promote_a_refreshed_pin()
         outside = self.dir / "deployment.toml.bak.outside"
         outside.write_bytes(self.backups()[0].read_bytes())
-        for name in ("../deployment.toml.bak.outside", "other.toml.bak.20260101T000000Z", "deployment.toml"):
+        names = (
+            "../deployment.toml.bak.outside",
+            "other.toml.bak.20260101T000000Z",
+            "deployment.toml",
+            "deployment.toml.bak.outside",  # the right prefix, but not a name that a backup is given
+            "deployment.toml.bak.20260101T000000Z\x00",  # a NUL would make the open raise ValueError
+            "deployment.toml.bak.20260101T000000Z/../x",
+            "deployment.toml.bak.20260230T010000Z",  # the shape of a stamp, but February has no 30th
+            "deployment.toml.bak.20260101T250000Z",
+            "deployment.toml.bak.20260101T000000Z-0",
+        )
+        for name in names:
             with self.subTest(name=name):
                 self.corrupt_journal(1, backup_name=name)
                 error = self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
-                self.assertIn("not next to the file", error["detail"])
+                self.assertIn("journal row 1", error["detail"])
+                self.assertIn("next to the file", error["detail"])
+                self.assertNotIn(name, error["detail"])
+
+    def test_a_backup_whose_pin_cannot_be_converted_is_refused(self):
+        self.promote_a_refreshed_pin()
+        self.huge_pin_in_the_backup()
+        error = self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
+        self.assertIn("cannot be parsed for its pin", error["detail"])
 
     def test_the_backup_of_a_newer_aborted_row_is_never_read(self):
         self.promote_a_refreshed_pin()

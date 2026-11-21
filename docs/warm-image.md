@@ -166,11 +166,15 @@ command. This section owns the workflow.
    basis digest.
 2. When a build is due, it streams the archive of that commit into a private bucket
    prefix, renders the user data from the `[image.warm]` values and the shipped
-   script, and launches one builder from the build launch template.
+   script, and launches one builder from the build launch template. A pass deadline
+   before the launch leaves the build for the next pass, which checks its inputs
+   again before it stages it
+   ([operations.md](operations.md#when-a-build-starts)).
 3. The builder runs this script. The controller reads the builder's console. In the
    pass that first sees `IMAGE_READY`, it creates the image from the running
    builder, waits for the image to be `available`, terminates the builder and
-   deletes the archive. A build that has no verdict by `build_deadline_seconds` ends
+   makes one delete call for the archive (a refused call is noted
+   `archive:delete_failed`). A build that has no verdict by `build_deadline_seconds` ends
    `failed`.
 4. It creates a new version of the worker launch template that copies the pinned
    version and changes `ImageId` only, reads both versions back and compares them.

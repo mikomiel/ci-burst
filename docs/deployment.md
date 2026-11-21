@@ -424,7 +424,10 @@ anything is written. `/etc/ci-burst` cannot serve, because it holds the credenti
 directories and the env-files. The build line mounts the same directory read-only
 instead of the file: a promotion replaces the file atomically, and a mount of the
 single file keeps serving the old one to a build container that is still running
-([container.md](container.md#run-the-image-commands)). Give the file its own
+([container.md](container.md#run-the-image-commands)). Such a container refuses
+with `PROMOTE_FILE_STALE`, or with `IMAGE_DELETION_UNSAFE` at a deletion, instead
+of acting on the old file, as long as no hard link keeps the old file named: do
+not keep hard links to the TOML. Give the file its own
 directory, owned by the container user so the container can create files in it:
 
 ```sh

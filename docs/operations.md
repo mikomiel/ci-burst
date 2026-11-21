@@ -705,7 +705,24 @@ Two refusals belong to the start itself and count no failure:
 and again just before the launch. A wrong input is raised, not answered, and
 nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge
 (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
-or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`).
+or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
+before the template, so an unsafe template never hides a missing gate. A pass that
+finds a build in flight runs and settles it even without a gate; a launch that
+pass would then make is refused with `IMAGE_GATE_REQUIRED`, answered `refused`,
+and counts no failure.
+
+A pass deadline can end a pass after the build row is written and before the
+builder is launched. The next pass stages that build again, and first checks its
+inputs: the basis files at the row's own commit, the warm and gate commands,
+`strip_components` and the script must still give the row's digest. A different
+digest ends the row `failed` with `IMAGE_INPUTS_CHANGED`; a file that lost the
+opt-out of a row inserted under `allow_no_gate` ends it with
+`IMAGE_GATE_REQUIRED`. Both are answered `refused`, count no failure and try to
+delete the row's archive. A refused read of a basis file, a `404` included, ends
+the pass and leaves the row for the next pass: the commit cannot have lost the
+file, so a `404` there can be an unavailable route, and the build deadline bounds
+the retries. `lifetime_seconds` and `snapshot_seconds` are not in the digest: a
+stage that launches renders them from the file as it reads it then.
 
 A build that has no verdict by `build_deadline_seconds` ends `failed`. A failed
 build sets a cooldown of `failure_cooldown_seconds`. After
@@ -757,7 +774,10 @@ commands and tests only its exit status. A pass shows that the cache is enough o
 if the gate command itself fails on a download;
 [warm-image.md](warm-image.md#the-candidate-and-what-the-gate-proves) owns what the
 gate does and does not prove. The build records at launch whether a gate was
-configured, and `[image.warm]` must not change while a build is active. A candidate
+configured, and only that record counts: a gate added or removed after the launch
+does not change the candidate. A change to the warm or gate commands while a build
+waits for its stage ends that build as `IMAGE_INPUTS_CHANGED` instead of launching
+it under other inputs. A candidate
 does not prove that the image is safe, that the packages in it are trustworthy, or
 that your jobs pass on it. Read the evidence, run a canary
 ([warm-image.md](warm-image.md#canary-and-cutover)) and decide.
@@ -803,6 +823,14 @@ from the hash of the TOML: the old hash means the rename did not happen
 (`aborted`), the new hash means it did (`complete`). A hash that matches neither
 refuses with `PROMOTION_JOURNAL_DIVERGED` and changes nothing.
 
+These commands read the TOML through a mount of its directory. A container that
+mounted the file itself keeps the inode it mounted, and a promotion elsewhere
+replaces the file by a rename: that container then reads the old file. Each read
+checks, after the bytes are in, that the open file still has a name, and refuses
+with `PROMOTE_FILE_STALE` when it has none, so no journal row is resolved and no
+pin is written from a stale view. A replaced file that another hard link still
+names is not detected: do not keep hard links to the deployment TOML.
+
 #### Promote reason codes
 
 A refusal names the item and the recorded value, never a secret.
@@ -831,6 +859,7 @@ only a preview with nothing to show (`PROMOTE_NO_CANDIDATE`,
 | `PROMOTE_BUSY` | another promotion holds the lock file; it is never waited for | wait, then run the command again |
 | `PROMOTE_WRITE_FAILED` | a local file step failed; the detail names the errno and no path | fix the directory (space, mode, owner) and run the command again |
 | `PROMOTION_JOURNAL_DIVERGED` | the TOML matches neither hash of a pending journal row | restore the TOML from the backup the row names, then run a resolving command |
+| `PROMOTE_FILE_STALE` | the open TOML has no name left: the container mounted the file itself and a rename elsewhere replaced it | mount the directory of the file, not the file, and run again |
 | `PIN_RECORD_DIVERGED` | the pin or the backup no longer matches what the newest completed promotion recorded | set the pin by hand to the intended version, then `image status --refresh` |
 | `ROLLBACK_NO_PROMOTION` | no completed promotion is recorded, or no state file exists | set the pin by hand |
 | `ROLLBACK_PREVIOUS_NOT_RECORDED` | the previous version and its image are not recorded as read | `image status --refresh`, then roll back |
@@ -1025,7 +1054,11 @@ deployment alone
 an image that a crash left behind, and records a tagged image that has no row as an
 unverified candidate that is never pinned. Each removal adds to
 `ci_burst_image_leaked_resources_total`. The bucket lifecycle rule on the staging
-prefix is a backstop only: ci-burst deletes the archive when the build ends.
+prefix is a backstop only: when a build ends, ci-burst makes one delete call for
+the archive key that its row records. A refused call is noted
+`archive:delete_failed` and leaves the deletion unconfirmed; the row keeps its
+end state. An upload that finished before its key was recorded leaves no key, and
+the reconcile sweep or the lifecycle rule removes that object.
 
 A builder that outlives its lifetime is a defect. Find it by its
 `ci-burst:image-build` tag and terminate it by its exact instance id.
@@ -1035,10 +1068,16 @@ A builder that outlives its lifetime is a defect. Find it by its
 The image of a failed build is removed by the deletion rule, except that the image
 of a build whose row records `TEMPLATE_DRIFT` is kept for 24 hours first.
 Retention keeps at least `retain` usable images, removes only images older than
-`retain_min_age_seconds`, and never removes the image behind the pin, a zone pin,
-the previous pin, the pins of a pending promotion, the candidate or the active
-build. When it cannot resolve that protected set it deletes nothing
-(`IMAGE_DELETION_UNSAFE`). Retention reads the pin from the TOML on every pass, so a
+`retain_min_age_seconds`, and never removes a protected image: the image behind
+the pin, a zone pin, the previous pin, the new pin of the newest completed
+promotion or rollback, both pins of every journal row since that one (a failed
+promotion that a pass resolved from a stale file still names the live pin), the
+pins of a pending promotion, the candidate or the active build. `retain` is a
+floor for retention, not a cap: the protected set can hold more images. When it
+cannot resolve that set it deletes nothing (`IMAGE_DELETION_UNSAFE`), and a
+deployment file that is a stale view of a replaced file is one such case. A
+journal row whose pin is not a version number is refused when the journal is
+read (`IMAGE_STATE_UNREADABLE`), before retention runs. Retention reads the pin from the TOML on every pass, so a
 build container must not run across a promotion
 ([container.md](container.md#run-the-image-commands)).
 
@@ -1077,7 +1116,8 @@ The trigger rules and the two start refusals are in
 | Code | Meaning |
 | --- | --- |
 | `IMAGE_UNTIL_DONE_NEEDS_APPLY` | `--until-done` without `--apply` |
-| `IMAGE_GATE_REQUIRED` | `[image.warm].gate_command` is empty and `allow_no_gate` is `false` |
+| `IMAGE_GATE_REQUIRED` | `[image.warm].gate_command` is empty and `allow_no_gate` is `false`. Raised before any client is built when no build is in flight; a pass that settles a build in flight answers it `refused` for the launch it would make, and a stage done again ends its row `failed` with it |
+| `IMAGE_INPUTS_CHANGED` | a stage done again found that the basis files at the row's commit, the warm or gate commands, `strip_components` or the script no longer give the row's digest. Answered `refused`; the row ends `failed`, its archive delete is attempted and no failure is counted |
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the image token while the branch or a basis file was read. The same answer to the archive request of a staging run ends the build `failed` |
 | `IMAGE_BRANCH_UNPROTECTED` | the configured branch is not protected on the forge |
 | `IMAGE_BASIS_PATH_MISSING` | a `basis_paths` file is not in the repository at the head sha |
@@ -1087,7 +1127,7 @@ The trigger rules and the two start refusals are in
 | `IMAGE_STATE_LOCKED` | another pass or refresh holds the writer lock of the state file |
 | `IMAGE_STATE_VERSION_UNSUPPORTED`, `IMAGE_STATE_UNREADABLE` | the state file has a schema this version does not know, or cannot be opened as the state file; keep the file and do not edit it |
 | `IMAGE_PROFILE_MISSING`, `IMAGE_PROFILE_INVALID` | the image role profile is missing or breaks the profile rules of [deployment.md](deployment.md#image-build-role-and-source-identity-optional); a provider failure, exit `1` |
-| `IMAGE_DELETION_UNSAFE` | the deletion rule could not resolve the images it must protect, so it deleted nothing; it appears inside the `retention` part of a pass result (`deletion` in a plan) and does not fail the command |
+| `IMAGE_DELETION_UNSAFE` | the deletion rule could not resolve the images it must protect, or read the deployment file through a stale view, so it deleted nothing; it appears inside the `retention` part of a pass result (`deletion` in a plan) and does not fail the command |
 
 ## Labels
 

@@ -2683,14 +2683,30 @@ class FailureTests(PipelineCase):
         self.assert_inputs_changed(result, first)
         self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
 
-    def test_a_resumed_stage_for_which_the_commit_lacks_a_basis_path_ends_the_row_without_a_failure(self):
+    def test_a_resumed_stage_whose_basis_path_is_answered_missing_leaves_the_row(self):
+        # The commit is immutable and held the path when the row was written, so a 404 can come from an unavailable
+        # route as well as from a removed path: it ends no row, and the next pass reads again.
         first = self.unstaged_build()
-        # The file now names a second basis path. The commit of the row does not hold it, so the digest is not the row's.
+        self.source.errors["raw_file"] = ObservationRefusal("IMAGE_BASIS_PATH_MISSING")
+        mark = len(self.world.calls)
+        self.refused(self.apply, "IMAGE_BASIS_PATH_MISSING")
+        self.assertNotIn("create_multipart_upload", self.world.names(mark))
+        self.assertNotIn("delete_object", self.world.names(mark))
+        self.assert_unstaged(self.only_build())
+        self.assertEqual(self.only_build().id, first.id)
+
+    def test_a_basis_path_that_the_commit_lacks_ends_the_row_only_at_its_build_deadline(self):
+        first = self.unstaged_build()
+        # The file now names a second basis path that the commit of the row does not hold.
         paths = 'basis_paths = ["example.lock"]'
         self.assertIn(paths, render_toml())
         self.configure(render_toml().replace(paths, 'basis_paths = ["example.lock", "other.lock"]'))
-        result = self.apply()
-        self.assert_inputs_changed(result, first)
+        self.refused(self.apply, "IMAGE_BASIS_PATH_MISSING")
+        self.assert_unstaged(self.only_build())
+        self.clock.advance(first.deadline_at - self.clock() + 1)
+        self.apply()
+        build = self.only_build()
+        self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "CONSOLE_BLIND"))
 
     def test_a_resumed_stage_whose_forge_read_fails_raises_and_leaves_the_row_unstaged(self):
         first = self.unstaged_build()

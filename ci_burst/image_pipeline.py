@@ -108,7 +108,7 @@ from pathlib import Path
 
 from . import image, image_console, image_deletion
 from .aws import BASIS_DIGEST_TAG, BUILD_ID_TAG, BUILDER_STATES, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
-from .errors import DeadlineRefusal, ImageRefusal, ObservationRefusal, ProviderRefusal, Refusal
+from .errors import DeadlineRefusal, ImageRefusal, ProviderRefusal, Refusal
 from .export import _label, _write_atomic
 from .forgejo import require_protected
 from .image_state import ACTIVE_STATES, BUILD_STATES, Control
@@ -1398,21 +1398,18 @@ class _Pass:
 
         ``_decide`` hashed the files at the branch head, the warm settings and the script into that digest. This is the
         same digest over the files at the commit of the row, since the head can have moved, with the settings and the
-        script as this pass reads them. A path that the commit does not hold is a changed input too: the settings name
-        the paths. The forge client puts no deadline on a read, so ``_basis_files`` reads the clock before each request
+        script as this pass reads them. A basis path that the forge answers as missing (a 404) is not proof that the
+        inputs changed: the commit is immutable and held every path when the row was written, and a 404 can come from
+        an unavailable route too. That refusal is raised like any other, the row stays for the next pass, and the
+        build deadline bounds the retries. The forge client puts no deadline on a read, so ``_basis_files`` reads the clock before each request
         and this reads it once more once the files are in, because the last read can pass the deadline too: a pass
         whose deadline passed during the reads ends no row, whatever they showed. Any other refusal of a read is
         raised, and the row stays for the next pass.
         """
-        try:
-            files = self.p._basis_files(self._source(), build.source_sha, self.deadline)
-        except ObservationRefusal as refusal:
-            if refusal.reason != "IMAGE_BASIS_PATH_MISSING":
-                raise
-            files = None
+        files = self.p._basis_files(self._source(), build.source_sha, self.deadline)
         if self.clock() >= self.deadline:
             raise DeadlineRefusal("the basis files")
-        if files is None or self.p._digest(files, self.script) != build.basis_digest:
+        if self.p._digest(files, self.script) != build.basis_digest:
             raise ImageRefusal(IMAGE_INPUTS_CHANGED, "the inputs of the build changed since its row was written")
 
     def _end_refused(self, build, reason):

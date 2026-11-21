@@ -364,7 +364,7 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **THEN** it counts toward `max_builds_per_day` and `min_build_interval_seconds` like any other row
 
 ### Requirement: A stage done again launches only under the inputs of its row
-A pass that stages a build again MUST first recompute the digest over the basis files at the row's own commit, the warm and gate commands, `strip_components` and the script. If it differs from the row's, or the commit lacks a basis path, the pass MUST launch no builder and MUST end the row `failed` with `IMAGE_INPUTS_CHANGED` as a refused start: it tries to delete the archive and counts no failure. A pass whose deadline passes during those reads MUST leave the row for the next pass.
+A pass that stages a build again MUST first recompute the digest over the basis files at the row's own commit, the warm and gate commands, `strip_components` and the script. If it differs from the row's, the pass MUST launch no builder and MUST end the row `failed` with `IMAGE_INPUTS_CHANGED` as a refused start: it tries to delete the archive and counts no failure. A pass whose deadline passes during those reads MUST leave the row for the next pass.
 
 #### Scenario: The gate command changes before the stage is done again
 - **WHEN** a build row is inserted with a gate command, the pass deadline ends its stage and the configuration then holds no gate command
@@ -384,9 +384,10 @@ A pass that stages a build again MUST first recompute the digest over the basis 
 - **THEN** the pass tries to delete that archive and makes no new upload
 - **AND** a refused delete is noted `archive:delete_failed` and the deletion is unconfirmed
 
-#### Scenario: A basis path is missing at the row's commit
-- **WHEN** the configuration names a basis path that the row's commit does not hold
-- **THEN** the row ends `failed` with `IMAGE_INPUTS_CHANGED` and no failure is counted
+#### Scenario: The forge answers a basis path of the row's commit as missing
+- **WHEN** the raw-file read of a basis path at the row's commit answers that the path is missing
+- **THEN** the pass ends with `IMAGE_BASIS_PATH_MISSING`, ends no row and launches no builder
+- **AND** the row stays for the next pass, and its build deadline bounds the retries
 
 #### Scenario: The branch head moves
 - **WHEN** the protected branch head moves after the row was inserted and the files at the row's commit still give its digest

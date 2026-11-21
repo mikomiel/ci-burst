@@ -788,9 +788,6 @@ def _journal_row(row):
     """
     data = dict(row)
     pins_ok = all(type(data[key]) is int and data[key] >= 1 for key in ("old_pin", "new_pin", "contained_pin"))
-    # The one writer records the pin that the file held as both: a row where they differ was changed afterwards, and
-    # either value could then name the wrong image to resolve or to protect from retention.
-    pins_ok = pins_ok and data["contained_pin"] == data["old_pin"]
     texts_ok = all(type(data[key]) is str for key in ("kind", "status", "backup_name", "backup_sha256"))
     # The schema's CHECK holds kind and status to these values, but a file written without it, or with checks
     # turned off, need not.

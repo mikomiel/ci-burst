@@ -1776,9 +1776,7 @@ class RollbackTests(PromoteCase):
     def test_a_row_whose_contained_pin_is_not_its_previous_pin_is_refused(self):
         self.promote_a_refreshed_pin()
         self.corrupt_journal(1, contained_pin=4)
-        # The journal read refuses the row before the rollback plans with it.
-        error = self.refusal(("--rollback",), "IMAGE_STATE_UNREADABLE")
-        self.assertEqual(error["detail"], "promotion journal row 1 is malformed")
+        self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
 
     def test_a_backup_that_is_not_toml_is_refused(self):
         self.promote_a_refreshed_pin()

@@ -384,7 +384,7 @@ class JournalLastCompleteTests(ImageStateCase):
         with self.state.transaction():
             self.state.journal_complete(first.id)
         self.assertEqual(self.state.journal_last_complete().old_pin, 3)
-        second = self.add_journal(kind="rollback", old_pin=4, new_pin=3, contained_pin=4, candidate_id=None)
+        second = self.add_journal(kind="rollback", old_pin=4, new_pin=3, contained_pin=3, candidate_id=None)
         with self.state.transaction():
             self.state.journal_complete(second.id)
         newest = self.state.journal_last_complete()

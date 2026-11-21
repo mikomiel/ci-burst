@@ -249,8 +249,11 @@ environment and cache variables, the same source root and the same network. It
 blocks only the instance-metadata addresses for that account, and it tests only the
 exit status of the gate command. Whether a pass shows that the cache is enough
 therefore depends on the command: write it to fail when it would download, with the
-tool's offline switch, as the [examples](#examples) do. A gate that does so proves
-cache behavior and no more. It does not prove that the image is safe: it says
+tool's offline switch, as the [examples](#examples) do. An offline switch covers
+the tool's own fetches only: an install or lifecycle script that it runs, such as an
+npm `postinstall` that fetches a binary, can still download and succeed, so check
+those steps offline separately. A gate that does so proves cache behavior and no
+more. It does not prove that the image is safe: it says
 nothing about the software the commands installed, the content of the archive or the
 base image. A candidate is a verified cache, not an approved image. Read its
 evidence with `image status` and run a canary
@@ -541,7 +544,8 @@ shared cache.
 # WARM_COMMANDS
 npm ci
 
-# WARM_GATE_COMMAND: reinstall from the cache with the network forbidden.
+# WARM_GATE_COMMAND: reinstall from the npm cache without registry fetches.
+# --offline does not stop a lifecycle script from downloading; check those apart.
 rm -rf node_modules && npm ci --offline
 ```
 

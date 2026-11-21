@@ -315,8 +315,11 @@ configuration that the container loaded when it started. So finish or stop a run
 `image run --apply --until-done` container before `promote --write`,
 `promote --rollback --write` or a hand edit of the pin, and start a fresh container
 afterwards: the state file keeps the active build, and the fresh container resumes
-it. Do not widen the mount to `/etc/ci-burst`, which holds the credential
-directories.
+it. A hand edit of the pin takes no lock, so before one also pause any scheduler
+of image runs and wait until no `image run --apply` is running: a pass that has
+already planned its deletions does not read the pin again, and can remove the
+image you are about to pin. Do not widen the mount to `/etc/ci-burst`, which holds
+the credential directories.
 
 To promote a candidate, or to roll back, run the promotion line, after you have
 finished or stopped a running build container as above. `promote` is local: it makes

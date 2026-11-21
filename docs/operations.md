@@ -740,7 +740,10 @@ file, so a `404` there can be an unavailable route, and the build deadline bound
 the retries. `lifetime_seconds` and `snapshot_seconds` are not in the digest: a
 stage that launches renders them from the file as it reads it then.
 
-A build that has no verdict by `build_deadline_seconds` ends `failed`. A failed
+A build that has no verdict by `build_deadline_seconds` ends `failed`, provided
+the pass can read the builder's console: a console read that the provider refuses
+raises before the deadline is checked
+([#203](https://github.com/mikomiel/ci-burst/issues/203)). A failed
 build sets a cooldown of `failure_cooldown_seconds`. After
 `max_consecutive_failures` failed builds in a row the state is `blocked`. A
 refusal is not a failure and does not count. Only a build that reaches `candidate`
@@ -829,7 +832,9 @@ that your jobs pass on it. Read the evidence, run a canary
 `promote` is local. It makes no AWS or forge call, builds no client and holds no
 credential, so its container has no network and no credential mount
 ([container.md](container.md#run-the-image-commands)). A pin that you edit by hand
-bypasses all of these checks, including the drift check; the next
+bypasses all of these checks, including the drift check, and takes no lock: pause
+any scheduler of image runs and wait until no `image run --apply` is running
+before you make one ([container.md](container.md#run-the-image-commands)). The next
 `image status --refresh` records the pin so that it can serve as a rollback
 target, but it does not verify what you wrote.
 
@@ -1076,8 +1081,9 @@ the key name nor the writer of the object, so the prefix must belong to this
 deployment alone
 ([deployment.md](deployment.md#the-image-tables-optional)). It adopts a builder or
 an image that a crash left behind, and records a tagged image that has no row as an
-unverified candidate that is never pinned. Each removal adds to
-`ci_burst_image_leaked_resources_total`. The bucket lifecycle rule on the staging
+unverified candidate that is never pinned. Removals of leaked resources add to
+`ci_burst_image_leaked_resources_total`; the termination of an overdue builder of an
+active build does not, so do not use the counter to account for those. The bucket lifecycle rule on the staging
 prefix is a backstop only: when a build ends, ci-burst makes one delete call for
 the archive key that its row records. A refused call is noted
 `archive:delete_failed` and leaves the deletion unconfirmed; the row keeps its
@@ -1121,7 +1127,7 @@ code ends a build `failed`.
 
 | Reason of a `failed` build | Meaning |
 | --- | --- |
-| `WARM_FAILED` | the builder printed a failure marker: a warm command or the gate failed. The event carries a framed tail |
+| `WARM_FAILED` | the builder printed a failure marker: the script failed, for example in the archive fetch, a warm command or the gate. Read the cause in the framed tail of the event or the console |
 | `IMAGE_MARKER_DIGEST_MISMATCH` | the builder reports another archive digest than the staged one |
 | `MARKER_TIMEOUT` | no ready marker by the build deadline, or the marker was first read at or after it |
 | `CONSOLE_BLIND` | the console returned no text by the deadline, or the launch fell at or after it. A console read that the provider refuses is not settled this way: the pass raises and the build does not advance ([#203](https://github.com/mikomiel/ci-burst/issues/203)) |

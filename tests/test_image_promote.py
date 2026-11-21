@@ -1746,11 +1746,15 @@ class RollbackTests(PromoteCase):
     def test_a_backup_that_holds_another_pin_is_refused_even_with_a_matching_hash(self):
         self.promote_a_refreshed_pin()
         backup = self.backups()[0]
-        other = backup.read_bytes().replace(b"launch_template_version = 3", b"launch_template_version = 4")
-        backup.write_bytes(other)
-        self.corrupt_journal(1, backup_sha256=sha(other))
-        error = self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
-        self.assertIn("does not contain the recorded previous pin", error["detail"])
+        original = backup.read_bytes()
+        # 4 is another pin; 3.0 equals the recorded 3 as a number but is not an integer pin.
+        for value in (b"4", b"3.0"):
+            with self.subTest(value=value):
+                other = original.replace(b"launch_template_version = 3", b"launch_template_version = " + value)
+                backup.write_bytes(other)
+                self.corrupt_journal(1, backup_sha256=sha(other))
+                error = self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
+                self.assertIn("does not contain the recorded previous pin", error["detail"])
 
     def test_a_row_whose_contained_pin_is_not_its_previous_pin_is_refused(self):
         self.promote_a_refreshed_pin()
@@ -1769,11 +1773,21 @@ class RollbackTests(PromoteCase):
         self.promote_a_refreshed_pin()
         outside = self.dir / "deployment.toml.bak.outside"
         outside.write_bytes(self.backups()[0].read_bytes())
-        for name in ("../deployment.toml.bak.outside", "other.toml.bak.20260101T000000Z", "deployment.toml"):
+        names = (
+            "../deployment.toml.bak.outside",
+            "other.toml.bak.20260101T000000Z",
+            "deployment.toml",
+            "deployment.toml.bak.outside",  # the right prefix, but not a name that a backup is given
+            "deployment.toml.bak.20260101T000000Z\x00",  # a NUL would make the open raise ValueError
+            "deployment.toml.bak.20260101T000000Z/../x",
+        )
+        for name in names:
             with self.subTest(name=name):
                 self.corrupt_journal(1, backup_name=name)
                 error = self.refusal(("--rollback",), "PIN_RECORD_DIVERGED")
-                self.assertIn("not next to the file", error["detail"])
+                self.assertIn("journal row 1", error["detail"])
+                self.assertIn("next to the file", error["detail"])
+                self.assertNotIn(name, error["detail"])
 
     def test_the_backup_of_a_newer_aborted_row_is_never_read(self):
         self.promote_a_refreshed_pin()

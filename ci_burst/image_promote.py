@@ -650,6 +650,11 @@ def rollback_plan(state, snapshot, now):
     return RollbackPlan(row=row, previous_pin=row.old_pin, backup_name=row.backup_name, target=owner)
 
 
+def _backup_name_pattern(target_name):
+    """The names that ``_create_backup`` gives a backup of ``target_name``: a UTC stamp and an optional counter."""
+    return re.compile(re.escape(target_name + _BACKUP_INFIX) + r"[0-9]{8}T[0-9]{6}Z(?:-[1-9][0-9]?)?")
+
+
 def _read_regular_file(path):
     """The bytes of ``path``, which must be a regular file itself.
 
@@ -671,8 +676,12 @@ def _read_regular_file(path):
 def _check_backup(snapshot, row):
     """The named backup must exist, hold the recorded bytes and contain the recorded previous pin."""
     name = row.backup_name
-    if name != Path(name).name or not name.startswith(snapshot.target.name + _BACKUP_INFIX):
-        raise StateRefusal(PIN_RECORD_DIVERGED, "the journal names a backup that is not next to the file")
+    # Only a name that ``_create_backup`` makes is opened or shown: anything else in the row is damage or a hand
+    # edit, and it is named by the row id, never echoed.
+    if not _backup_name_pattern(snapshot.target.name).fullmatch(name):
+        raise StateRefusal(
+            PIN_RECORD_DIVERGED, f"journal row {row.id} names a backup that this tool does not make next to the file"
+        )
     try:
         data = _read_regular_file(snapshot.target.parent / name)
     except OSError:
@@ -683,7 +692,8 @@ def _check_backup(snapshot, row):
         pin = tomllib.loads(data.decode("utf-8"))["aws"]["launch_template_version"]
     except (UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError):
         raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} cannot be parsed for its pin") from None
-    if pin != row.old_pin or row.contained_pin != row.old_pin:
+    # An integer only: ``3.0`` equals ``3`` but the strict loader refuses it, so it is not the recorded pin.
+    if type(pin) is not int or pin != row.old_pin or row.contained_pin != row.old_pin:
         raise StateRefusal(PIN_RECORD_DIVERGED, f"the backup {name} does not contain the recorded previous pin")
 
 

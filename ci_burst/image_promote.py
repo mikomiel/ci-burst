@@ -236,8 +236,13 @@ def implied_resolution(row, file_sha256):
     return "diverged"
 
 
-def pending_report(state, file_sha256):
-    """Every pending row with the resolution that the file hash implies. Reads only."""
+def pending_report(state, file_sha256, *, readable_only=False):
+    """Every pending row with the resolution that the file hash implies. Reads only.
+
+    With ``readable_only`` a damaged row anywhere in the journal does not refuse: the report then lists the
+    well-formed pending rows, for a preview whose whole-journal check refuses next.
+    """
+    rows = state.pending_journal_readable() if readable_only else state.pending_journal()
     return [
         {
             "journal_id": row.id,
@@ -246,7 +251,7 @@ def pending_report(state, file_sha256):
             "new_pin": row.new_pin,
             "implied_resolution": implied_resolution(row, file_sha256),
         }
-        for row in state.pending_journal()
+        for row in rows
     ]
 
 
@@ -841,7 +846,7 @@ def _preview(snapshot, state, clock, version, rollback):
     try:
         # The report of the pending rows comes first, so a refusal still carries it; then every row, as the write
         # checks them before it resolves a pending row, so a damaged row refuses both alike.
-        pending = pending_report(planned, snapshot.sha256)
+        pending = pending_report(planned, snapshot.sha256, readable_only=True)
         planned.journal_check()
         # ``--write`` resolves a pending row before it plans, so the preview plans against the rows as that leaves
         # them. The copy takes the resolution and the file never does. A row that matches neither hash is not

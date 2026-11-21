@@ -700,6 +700,20 @@ class ImageState:
         for row in self._require().execute("SELECT * FROM promotion_journal ORDER BY id"):
             _journal_row(row)
 
+    def pending_journal_readable(self):
+        """The ``pending`` rows that are well formed, oldest first, without refusing for any other row.
+
+        Only for a report that goes with a refusal: a decision reads ``pending_journal``, which refuses instead.
+        """
+        rows = self._require().execute("SELECT * FROM promotion_journal WHERE status = 'pending' ORDER BY id")
+        readable = []
+        for row in rows:
+            try:
+                readable.append(_journal_row(row))
+            except StateRefusal:
+                continue
+        return readable
+
     def pending_journal(self):
         """Every ``pending`` row, oldest first."""
         self._refuse_a_journal_outside_the_schema()

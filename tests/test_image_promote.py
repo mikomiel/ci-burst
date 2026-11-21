@@ -662,7 +662,20 @@ class PreviewTests(PromoteCase):
 
     def test_a_damaged_completed_row_refuses_the_preview_and_the_write_alike_and_changes_nothing(self):
         self.crash_a_second_promotion(self.crash_before_rename)  # A to B completed; B to C is pending, then aborted
-        self.corrupt_journal(1, old_pin="x; not a pin")
+        for damage in ({"old_pin": "x; not a pin"}, {"kind": "x; not a kind"}):
+            with self.subTest(damage=damage):
+                self.check_a_damaged_completed_row(damage)
+
+    def check_a_damaged_completed_row(self, damage):
+        connection = sqlite3.connect(self.state_dir / "image-state.sqlite")
+        try:
+            connection.execute("PRAGMA ignore_check_constraints = ON")  # what a damaged file can hold
+            connection.execute("UPDATE promotion_journal SET old_pin = 3, kind = 'promotion' WHERE id = 1")
+            for column, value in damage.items():
+                connection.execute(f"UPDATE promotion_journal SET {column} = ? WHERE id = 1", (value,))
+            connection.commit()
+        finally:
+            connection.close()
         code, payload = self.show_changing_nothing("--version", "6")
         self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_STATE_UNREADABLE"), payload)
         # The valid pending row is still reported, with the resolution that its hash implies.
@@ -672,7 +685,8 @@ class PreviewTests(PromoteCase):
         fingerprint = self.fingerprint()  # the files (the lock file apart), the rows and the events
         code, written = self.write_pin("--version", "6")
         self.assertEqual((code, written["error"]), (2, payload["error"]))
-        self.assertNotIn("not a pin", json.dumps(written))
+        self.assertNotIn("not a", json.dumps(written))
+        self.assertNotIn("not a", json.dumps(payload))
         self.assertEqual(self.fingerprint(), fingerprint)
 
     def test_a_backup_whose_pin_cannot_be_converted_does_not_stop_a_promotion_preview(self):

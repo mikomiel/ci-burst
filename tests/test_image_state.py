@@ -66,9 +66,9 @@ class ImageStateCase(unittest.TestCase):
             "candidate_id": "build-1",
             "backup_name": "config.toml.bak.20260101T000000Z",
             "backup_sha256": "1" * 64,
-            "contained_pin": 3,
         }
         values.update(overrides)
+        values.setdefault("contained_pin", values["old_pin"])  # the promotion records the file's pin as both
         with self.state.transaction():
             return self.state.journal_insert(**values)
 
@@ -1038,6 +1038,24 @@ class DetachedCopyTests(ImageStateCase):
                         read()
                     self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
                     self.assertNotIn("not a pin", raised.exception.detail)
+
+    def test_a_journal_row_whose_previous_pin_differs_from_the_pin_its_backup_holds_is_refused(self):
+        self.add_journal()  # old_pin and contained_pin 3, as the promotion writes them
+        for column in ("old_pin", "contained_pin"):
+            with self.subTest(column=column):
+                self.state.close()
+                connection = sqlite3.connect(self.state.path)
+                try:
+                    connection.execute("UPDATE promotion_journal SET old_pin = 3, contained_pin = 3")
+                    connection.execute(f"UPDATE promotion_journal SET {column} = 2")
+                    connection.commit()
+                finally:
+                    connection.close()
+                self.state.connect()
+                for read in (self.state.pending_journal, lambda: self.state.journal(1)):
+                    with self.assertRaises(StateRefusal) as raised:
+                        read()
+                    self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
 
     def test_a_journal_row_with_a_kind_or_status_outside_the_schema_is_refused_and_not_echoed(self):
         self.add_journal()

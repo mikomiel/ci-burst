@@ -2833,6 +2833,29 @@ class FailureTests(PipelineCase):
         self.assertEqual(self.world.launches, [])
         self.assertEqual(self.world.arguments("run_instances"), [])
 
+    def lost_opt_out_with(self, ruin):
+        """A resumed stage whose file lost the opt-out while ``ruin`` also breaks the build template."""
+        self.configure(render_toml(gate=NO_GATE))
+        first = self.unstaged_build_with_an_archive()
+        self.configure(render_toml(gate=""))
+        ruin()
+        result = self.apply()
+        self.assert_refused(result, "IMAGE_GATE_REQUIRED")
+        build = self.only_build()
+        self.assertEqual((build.state, build.reason_code), ("failed", "IMAGE_GATE_REQUIRED"))
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
+    def test_a_lost_opt_out_is_reported_before_an_unsafe_template(self):
+        unsafe = copy.deepcopy(SAFE_BUILDER)
+        unsafe["IamInstanceProfile"] = {"Name": "sentinel-profile"}
+        self.lost_opt_out_with(lambda: self.world.set_version(BUILDER, 1, unsafe))
+
+    def test_a_lost_opt_out_is_reported_before_a_group_read_that_is_refused(self):
+        self.lost_opt_out_with(
+            lambda: self.world.fail("describe_security_groups", ProviderError("UnauthorizedOperation"))
+        )
+
     def resumed_stage_with_100_seconds_left(self):
         """A build that waits for its stage to be done again, and the clock 100 seconds short of its deadline.
 

@@ -1368,15 +1368,19 @@ class _Pass:
         either check leaves the row as it is for the next pass; any other refusal of a read is raised and leaves it
         too.
 
-        The checks of a launch (``_start_refusal``) run last, the gate requirement among them. The file can lose its
-        gate command and the opt-out while the row waits, and the digest does not hold the opt-out: a row inserted
-        under it gives the same digest once it is gone. That row ends with ``IMAGE_GATE_REQUIRED`` and no failure,
-        and no builder is launched.
+        The gate requirement runs between the two, before the template is read. The file can lose its gate command
+        and the opt-out while the row waits, and the digest does not hold the opt-out: a row inserted under it gives
+        the same digest once it is gone. That row ends with ``IMAGE_GATE_REQUIRED`` and no failure, and no builder is
+        launched. The other checks of a launch (``_start_refusal``) run last.
         """
         if self.clock() >= build.deadline_at:
             return self._fail(build, image_console.CONSOLE_BLIND, builder_alive=False)
         try:
             self._check_inputs_unchanged(build)
+            if self.p._gate_missing():
+                # Before the template read: a withdrawn opt-out is the refusal this row owes, and an unsafe template
+                # or a refused read of its groups would otherwise mask it.
+                raise ImageRefusal(IMAGE_GATE_REQUIRED)
             self.p._check_build_template(self.aws, self.deadline)
         except DeadlineRefusal:
             self.notes.append("pass_deadline_exceeded")

@@ -180,7 +180,7 @@ A build MUST start only when the digest differs from the pin's tag and the minim
 - **AND** `run --apply --force` skips the interval but still applies the daily cap
 
 ### Requirement: The source archive is staged privately, bounded and deleted
-The command MUST stream the archive for the resolved sha through a hashing wrapper into a multipart upload under the configured bucket and prefix, and MUST NOT write the archive to disk. The size cap `source.max_archive_bytes` MUST abort the upload and delete the object. The command MUST delete the archive at the terminal state of the build, and the bucket lifecycle rule MUST be documented as a backstop only. The command MUST NOT create the bucket or change its configuration.
+The command MUST stream the archive for the resolved sha through a hashing wrapper into a multipart upload under the configured bucket and prefix, and MUST NOT write the archive to disk. The size cap `source.max_archive_bytes` MUST abort the upload and delete the object. The command MUST make one delete call for the archive at the terminal state of the build, and the bucket lifecycle rule MUST be documented as a backstop only. The command MUST NOT create the bucket or change its configuration.
 
 #### Scenario: The delete at a terminal state is refused
 - **WHEN** a build reaches a terminal state and the provider refuses the delete of its archive
@@ -198,7 +198,7 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 
 #### Scenario: The build ends
 - **WHEN** a build reaches `candidate` or `failed`
-- **THEN** its archive object is deleted
+- **THEN** the pass makes one delete call for its archive object
 
 ### Requirement: The archive key joins the prefix and the build id with one slash
 The archive key MUST be the configured prefix, exactly one `/` and `<build-id>.tar.gz`, whether the configured prefix ends with no slash, one slash or several. The listing of stray archives MUST use the same prefix with its one slash, so that it never reaches a sibling prefix.
@@ -284,7 +284,7 @@ The builder MUST launch only from the build launch template at its pinned versio
 #### Scenario: A pass that stages a build again
 - **WHEN** a pass stages again a build that has no builder and no staged archive
 - **THEN** it runs the precheck again before it uploads anything
-- **AND** an unsafe template ends the row as `failed` with `IMAGE_BUILD_TEMPLATE_UNSAFE`, deletes its archive, answers `refused` and counts no failure
+- **AND** an unsafe template ends the row as `failed` with `IMAGE_BUILD_TEMPLATE_UNSAFE`, tries to delete its archive, answers `refused` and counts no failure
 
 #### Scenario: A profile is attached at launch
 - **WHEN** a request would attach an instance profile to a builder
@@ -328,7 +328,7 @@ At most one builder MUST exist for a deployment. A unique index keyed on the dep
 - **THEN** the AWS precheck refuses the launch
 
 ### Requirement: A refused start is not a failed build
-A refused start MUST NOT count as a failed build. The refusal itself MUST add no failure, start no cooldown and set no `blocked`, and a clearing that the trigger decision already made MUST stay. A refusal before the build row exists MUST write no row and no archive. A refusal once the row exists MUST end the row as `failed` with the refusal code and MUST delete its archive. Such a row MUST still count toward `max_builds_per_day` and `min_build_interval_seconds`.
+A refused start MUST NOT count as a failed build. The refusal itself MUST add no failure, start no cooldown and set no `blocked`, and a clearing that the trigger decision already made MUST stay. A refusal before the build row exists MUST write no row and no archive. A refusal once the row exists MUST end the row as `failed` with the refusal code and MUST try to delete its archive. Such a row MUST still count toward `max_builds_per_day` and `min_build_interval_seconds`.
 
 #### Scenario: A check refuses before the row exists
 - **WHEN** the session has less life than `presign_seconds`, or a builder of the deployment exists, before the build row is written
@@ -346,17 +346,17 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 
 #### Scenario: The session runs short during the upload
 - **WHEN** the build row exists and the session has less life than `presign_seconds` once the archive is staged
-- **THEN** the row ends `failed` with `IMAGE_CREDENTIAL_SHORT`, its archive is deleted and no builder is launched
+- **THEN** the row ends `failed` with `IMAGE_CREDENTIAL_SHORT`, the pass tries to delete its archive and no builder is launched
 - **AND** the pass answers `refused` and counts no failure
 
 #### Scenario: A builder appears before the launch
 - **WHEN** a builder of the deployment exists at the check before the launch call
-- **THEN** the row ends `failed` with `IMAGE_BUILD_ALREADY_ACTIVE`, its archive is deleted and no builder is launched
+- **THEN** the row ends `failed` with `IMAGE_BUILD_ALREADY_ACTIVE`, the pass tries to delete its archive and no builder is launched
 - **AND** the pass answers `refused`, counts no failure and leaves that builder to the next pass's reconcile
 
 #### Scenario: A resumed stage is refused
 - **WHEN** a pass stages again a build that has no builder and no staged archive, and the check before the upload refuses
-- **THEN** the row ends `failed` with the refusal code and any archive that the row names is deleted
+- **THEN** the row ends `failed` with the refusal code and the pass tries to delete any archive that the row names
 - **AND** no new upload is made and no failure is counted
 
 #### Scenario: A refused row counts toward the limits
@@ -427,7 +427,7 @@ Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run
 #### Scenario: An unstaged build reaches its deadline
 - **WHEN** the build deadline has passed and the row has no builder and no `archive_sha256`
 - **THEN** the build fails with `CONSOLE_BLIND` and no builder is launched
-- **AND** any archive that the row names is deleted
+- **AND** the pass tries to delete any archive that the row names
 
 #### Scenario: Until-done without apply
 - **WHEN** an operator passes `--until-done` without `--apply`
@@ -535,7 +535,7 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 #### Scenario: A resumed stage outlasts the deadline
 - **WHEN** the build deadline passes during the upload of a resumed stage, or during the reads between the upload and the launch call
 - **THEN** no builder is launched and the build fails with `CONSOLE_BLIND`
-- **AND** the archive that the row names is deleted
+- **AND** the pass tries to delete the archive that the row names
 
 #### Scenario: A failed build recovers
 - **WHEN** the basis digest changes or an operator runs `run --apply --force`

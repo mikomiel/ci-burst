@@ -48,6 +48,7 @@ import re
 import stat
 import tomllib
 from contextlib import contextmanager, suppress
+import dataclasses
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -106,6 +107,7 @@ class Snapshot:
     uid: int
     gid: int
     identity: tuple  # what tells the file the bytes were read from from any other: see ``_identity``
+    held: int | None = None  # with ``hold``, the descriptor the bytes were read through, still open
 
     @property
     def pin(self):
@@ -115,21 +117,43 @@ class Snapshot:
 # -- reading --------------------------------------------------------------------------
 
 
-def read_snapshot(config):
+def read_snapshot(config, *, hold=False):
     """Read the deployment file once, through the strict loader, and keep its bytes.
 
     The path is followed to the file it names, so the directory that is checked,
     locked and written is the directory the bytes live in. Every pin fact of one
     command comes from these bytes.
+
+    With ``hold`` the descriptor stays open in ``held`` and the caller closes it: while it is open the file's inode
+    cannot be given to another file, so a later check of the path tells this file from any replacement.
     """
     target = Path(config.path).resolve()
     try:
-        with open(target, "rb") as handle:  # the metadata and the bytes of one open file
-            metadata = os.fstat(handle.fileno())
-            data = handle.read()
-        text = data.decode("utf-8")
+        descriptor = os.open(target, os.O_RDONLY | os.O_CLOEXEC)
     except FileNotFoundError:
         raise ConfigRefusal("CONFIG_MISSING", str(config.path)) from None
+    except OSError as error:
+        raise ConfigRefusal("CONFIG_UNREADABLE", f"{config.path}: {error}") from None
+    try:
+        snapshot = _read_open_file(config, target, descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    if hold:
+        return dataclasses.replace(snapshot, held=descriptor)
+    os.close(descriptor)
+    return snapshot
+
+
+def _read_open_file(config, target, descriptor):
+    """The snapshot of the file open at ``descriptor``: its metadata and its bytes come from that one open file."""
+    try:
+        metadata = os.fstat(descriptor)
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError) as error:
         raise ConfigRefusal("CONFIG_UNREADABLE", f"{config.path}: {error}") from None
     try:
@@ -175,12 +199,14 @@ def _is_unchanged(snapshot):
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode) or _identity(metadata) != snapshot.identity:
                 return False
+            if snapshot.held is not None and _identity(os.fstat(snapshot.held)) != _identity(metadata):
+                return False  # the held file is no longer the one the path names, or it changed
             chunks = []
             while chunk := os.read(descriptor, 1 << 16):
                 chunks.append(chunk)
         finally:
             os.close(descriptor)
-    except OSError:
+    except (OSError, RuntimeError):  # ``resolve`` raises ``RuntimeError`` for a loop of links
         return False
     return sha256_of(b"".join(chunks)) == snapshot.sha256
 
@@ -818,10 +844,14 @@ def promote(config, *, state, clock, events, version=None, rollback=False, write
     ``event_write:<code>``, an errno name or an exception type and never a path.
     ``notes`` is empty when the event was written.
     """
-    snapshot = read_snapshot(config)
     if write:
-        return _write(snapshot, state, clock, events, version, rollback)
-    return _preview(snapshot, state, clock, version, rollback)
+        return _write(read_snapshot(config), state, clock, events, version, rollback)
+    # The preview holds the file open until it has checked it again after the copy of the state.
+    snapshot = read_snapshot(config, hold=True)
+    try:
+        return _preview(snapshot, state, clock, version, rollback)
+    finally:
+        os.close(snapshot.held)
 
 
 def _missing_state(rollback):
@@ -872,7 +902,6 @@ def _try_change(snapshot, new_pin):
 
 
 def _preview(snapshot, state, clock, version, rollback):
-    now = clock()
     config = snapshot.config
     if not state.connect_readonly():
         raise _missing_state(rollback)
@@ -900,6 +929,9 @@ def _preview(snapshot, state, clock, version, rollback):
         # it in the write check. Any other refusal of the resolution is the write's too, so it is raised here.
         if not _diverged(pending):
             resolve_pending(planned, snapshot.sha256)
+        # The clock is read once the state is copied and resolved: evidence that a refresh wrote just before the copy
+        # is not in the future of this preview, as it is not in the future of the write, which reads the clock then.
+        now = clock()
         plan, refusal = try_rollback_plan(planned, snapshot, now)
         report = {"pending_journal": pending, "rollback": describe_rollback(plan, refusal)}
         if rollback:

@@ -683,6 +683,14 @@ class PreviewTests(PromoteCase):
             os.mkfifo(self.config_path, 0o600)
             return copied
 
+        def copy_then_make_the_path_a_loop_of_links(state):
+            copied = copy(state)
+            self.config_path.unlink()
+            loop = self.config_path.with_name("deployment.toml.loop")
+            loop.symlink_to(self.config_path.name)
+            self.config_path.symlink_to(loop.name)
+            return copied
+
         def copy_then_write_a_file_that_does_not_load(state):
             copied = copy(state)
             self.config_path.write_bytes(self.config_path.read_bytes() + b'"x; an unknown key" = 1\n')
@@ -693,19 +701,41 @@ class PreviewTests(PromoteCase):
             copy_then_change_the_file,
             copy_then_replace_the_file_with_the_same_bytes,
             copy_then_replace_the_file_with_a_fifo,
+            copy_then_make_the_path_a_loop_of_links,
             copy_then_write_a_file_that_does_not_load,
         ):
             with self.subTest(change=change.__name__):
+                self.config_path.with_name("deployment.toml.loop").unlink(missing_ok=True)
                 self.config_path.unlink(missing_ok=True)
                 self.config_path.write_bytes(original)
                 with mock.patch.object(ImageState, "detached_copy", change), _deadline(10):
                     code, payload = self.show()
                 self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"), payload)
                 self.assertNotIn("unknown key", json.dumps(payload))
+        self.config_path.with_name("deployment.toml.loop").unlink(missing_ok=True)
         self.config_path.unlink(missing_ok=True)
         self.config_path.write_bytes(original)
+        descriptors = len(os.listdir("/proc/self/fd"))
         code, payload = self.show()  # with nothing changing, the next preview plans
         self.assertEqual((code, payload["decision"]), (0, "preview"), payload)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors, "the held file is closed")
+
+    def test_evidence_that_a_refresh_writes_just_before_the_copy_is_not_in_the_future_of_the_preview(self):
+        self.seed()
+        copy = ImageState.detached_copy
+
+        def refresh_then_copy(state):
+            # ``image status --refresh`` commits fresh verification between the preview's file read and its copy.
+            self.clock.advance(30)
+            self.change("build-b", verified_at=self.clock.now)
+            return copy(state)
+
+        with mock.patch.object(ImageState, "detached_copy", refresh_then_copy):
+            code, payload = self.show()
+        self.assertEqual((code, payload["decision"]), (0, "preview"), payload)
+        self.assertEqual(payload["write_check"], {"ok": True})
+        code, written = self.write_pin()
+        self.assertEqual((code, written["decision"]), (0, "promoted"), written)
 
     def test_a_damaged_completed_row_refuses_the_preview_and_the_write_alike_and_changes_nothing(self):
         self.crash_a_second_promotion(self.crash_before_rename)  # A to B completed; B to C is pending, then aborted

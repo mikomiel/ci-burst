@@ -977,8 +977,12 @@ Every path that deregisters an image or deletes a snapshot (retention and every 
 - **WHEN** the deployment file that a pass reads is a view of a file that a rename replaced before or during the read, and the open file has no link left (`st_nlink == 0`) once its bytes are read
 - **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE` and no path deletes anything
 
-#### Scenario: A pin of an unsettled row cannot be read
-- **WHEN** a pin of a journal row newer than the newest completed one is not a version number, or its version cannot be read or names no literal image
+#### Scenario: A pin of an unsettled row is malformed
+- **WHEN** a pin of a journal row newer than the newest completed one is not a positive version number
+- **THEN** reading the journal refuses with `IMAGE_STATE_UNREADABLE` before the deletion rule runs, and no path deletes anything
+
+#### Scenario: A pin of an unsettled row cannot be resolved
+- **WHEN** a pin of a journal row newer than the newest completed one is a valid version number whose version cannot be read or names no literal image
 - **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE` and no path deletes anything
 
 ### Requirement: Every image deletion is verified and fails closed

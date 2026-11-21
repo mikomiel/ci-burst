@@ -9,6 +9,26 @@ The version, this file and the release tag are maintained by
 conventional commits on `main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases)
 owns the release boundary. Do not edit a released section by hand.
 
+## [0.12.0](https://github.com/mikomiel/ci-burst/compare/v0.11.0...v0.12.0) (2026-11-21)
+
+
+### Added
+
+* **aws:** add the image-build provider ([#175](https://github.com/mikomiel/ci-burst/issues/175)) ([95702d4](https://github.com/mikomiel/ci-burst/commit/95702d4589869af18324432bdae14f2481d0c521))
+* **forgejo:** read the image source with a dedicated token ([#174](https://github.com/mikomiel/ci-burst/issues/174)) ([bfe81a1](https://github.com/mikomiel/ci-burst/commit/bfe81a1c0c29841aeca086f7a8a934a517828198))
+* **iam:** add the image-build role policy and its tests ([#170](https://github.com/mikomiel/ci-burst/issues/170)) ([5d0f137](https://github.com/mikomiel/ci-burst/commit/5d0f137e013e3fdfdbfb2e673eb507fa9650312b))
+* **image:** build pipeline - bounded passes, supervisor, reconcile, events ([#187](https://github.com/mikomiel/ci-burst/issues/187)) ([ba40a84](https://github.com/mikomiel/ci-burst/commit/ba40a84df577a31101bec1e3485d0a4986dc4d93))
+* **image:** image plan, run, status and promote commands (tasks 6.1-6.7) ([#188](https://github.com/mikomiel/ci-burst/issues/188)) ([71a5211](https://github.com/mikomiel/ci-burst/commit/71a521169cb36036ba9361f1980e826540eb15eb))
+* **image:** marker reader, inert version check, failure bounds, deletion rule ([#186](https://github.com/mikomiel/ci-burst/issues/186)) ([369d78c](https://github.com/mikomiel/ci-burst/commit/369d78cfbdaa98c72acff7d701b517bc2dcbe720))
+* **image:** pure build inputs - basis digest, build decision, user data ([#182](https://github.com/mikomiel/ci-burst/issues/182)) ([0ec0c48](https://github.com/mikomiel/ci-burst/commit/0ec0c48e2a6f01f6fcfb560cf77a8718407bab24))
+
+
+### Fixed
+
+* **forgejo:** refuse raw parser errors and truncated bodies ([#179](https://github.com/mikomiel/ci-burst/issues/179)) ([82238d3](https://github.com/mikomiel/ci-burst/commit/82238d3f423cd85500f6d18fb8c9cc43b628e3b3))
+* **image:** cover strip_components in the basis digest ([#191](https://github.com/mikomiel/ci-burst/issues/191)) ([60a88ab](https://github.com/mikomiel/ci-burst/commit/60a88ab4421b5146b5ff22f5537540fec916654d)), closes [#185](https://github.com/mikomiel/ci-burst/issues/185)
+* **image:** promote preview plans as the write would after resolving a pending row ([#193](https://github.com/mikomiel/ci-burst/issues/193)) ([77d80fb](https://github.com/mikomiel/ci-burst/commit/77d80fb43ad18724aefcae809217195b2208556a))
+
 ## [0.11.0](https://github.com/mikomiel/ci-burst/compare/v0.10.0...v0.11.0) (2026-11-18)
 
 

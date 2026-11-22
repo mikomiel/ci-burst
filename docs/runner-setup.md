@@ -230,7 +230,7 @@ operator-owned prerequisite; this repository carries the build recipe at
 [`deploy/runner/image/provision.sh`](../deploy/runner/image/provision.sh) and
 the operator steps at
 [`deploy/runner/image/README.md`](../deploy/runner/image/README.md), but it
-neither builds nor publishes the image. The build inputs are portable and
+neither builds nor publishes the base image. The build inputs are portable and
 listed there: a fresh Debian 13 arm64 base, root on the builder, egress to the
 Debian apt repositories, GitHub, `nodejs.org`, `code.forgejo.org` and the
 Python package index (`pypi.org` and `files.pythonhosted.org`), including the
@@ -273,7 +273,10 @@ parameterised example; if your deployment needs different values, fork it and
 publish your own version (see [Worker bootstrap](#worker-bootstrap)).
 
 An optional warm-cache layer, added on top of this image so jobs do not download
-their packages on every worker, is described in [warm-image.md](warm-image.md).
+their packages on every worker, is described in [warm-image.md](warm-image.md). It
+covers the opt-in automated build (the `image` commands) and the manual runbook, and
+it is the one owner of both. The automated build starts from the cold base image
+that its own build launch template names, so the image above stays the base.
 
 ### Worker bootstrap
 

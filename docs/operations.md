@@ -20,6 +20,12 @@ immutable GitHub Releases. Image builds, deployment, and live Forgejo
 qualification each have their own approval and evidence. A green validation
 run establishes source behavior.
 
+The scaling path never builds an image. An optional image path, off by default,
+builds a candidate warm image on request; see
+[Automated warm-image build](#automated-warm-image-build). It is a separate
+identity and a separate command group, and it never moves the pin that `apply`
+launches from.
+
 ## Configuration
 
 Configuration is one TOML file. It carries product input, never a credential;
@@ -69,6 +75,10 @@ a `controller.max_instances` outside `1..12`, a
 `controller.claim_grace_seconds` outside `60..1800` or not an integer, a
 malformed zone-candidate list (`ZONE_CANDIDATES_INVALID`) and a malformed
 instance-type list (`INSTANCE_TYPES_INVALID`) are refused.
+
+The optional `[image]` tables configure the automated warm-image build and are
+absent by default. [deployment.md](deployment.md#the-image-tables-optional) owns
+their keys, ranges and defaults.
 
 ### Availability-zone candidates
 
@@ -177,7 +187,10 @@ mutated), `1` for a provider or cleanup failure. A cleanup pass that refused at
 least one owned resource is `cleanup_degraded`, a cleanup failure, and exits
 `1`. Every command prints one JSON document with stable reason codes. `plan`,
 `status` and `export` perform no cloud mutation and no ledger write; `apply` is
-the only launch path; `reap` never needs Forgejo or the scaling ledger.
+the only worker launch path; `reap` never needs Forgejo or the scaling ledger.
+The `image` group has its own commands and the same three exit codes; see
+[Image commands](#image-commands). `image run --apply` launches one build
+instance, never a worker.
 
 ## Worker evidence
 
@@ -494,12 +507,16 @@ passing the matrix does not re-qualify a server the operator has not run.
 
 ## Worker image and launch template
 
-The image and template are operator-owned prerequisites. ci-burst launches a
-pinned template; it does not build images, configure networks or distribute
-registration credentials. A complete setup guide, with the IAM role, SSM
-SecureString parameter, network choices and bootstrap, is
-[runner-setup.md](runner-setup.md). The controller refuses a template that is not
-usable:
+The image and template are operator-owned prerequisites. The scaling path
+launches a pinned template; it does not build images, configure networks or
+distribute registration credentials. You build the warm image by hand
+([warm-image.md](warm-image.md#manual-runbook)) or, when the optional `[image]`
+tables are enabled, with the [`image` commands](#image-commands) of the
+[automated build](#automated-warm-image-build). The automated build ends in an
+inert candidate template version; only `image promote --write` moves the pin. A
+complete setup guide, with the IAM role, SSM SecureString parameter, network
+choices and bootstrap, is [runner-setup.md](runner-setup.md). The controller
+refuses a template that is not usable:
 
 - numeric `launch_template_version`, never an alias;
 - literal `ImageId`, never `resolve:ssm:` or another indirection;
@@ -554,6 +571,444 @@ makes the other candidates ineligible instead of overriding that pin.
 
 Changing the image or bootstrap means a new template version and a
 configuration change; an approved version is not edited in place.
+
+## Automated warm-image build
+
+The `image` command group builds a candidate warm image from the head of one
+protected branch and records it as an inert launch-template version. It is
+opt-in. With `[image]` absent or `enabled = false`, every `image` command prints
+`{"decision": "disabled"}` before it opens a state file, builds a client or
+reads the network. The scaling path never calls it, and nothing in it moves the
+pin that `apply` launches from: a person does that with `image promote --write`.
+
+Each topic has one owner:
+
+| Topic | Owner |
+| --- | --- |
+| the `[image]` tables, the image role profile, the image token and the dedicated TOML directory | [deployment.md](deployment.md) |
+| the build workflow, the gate and the manual runbook | [warm-image.md](warm-image.md) |
+| the one-off container line of each command | [container.md](container.md#run-the-image-commands) |
+| the commands, exit codes, the `blocked` state and the reason codes of each step | this section |
+| the permissions of the image role | [deploy/iam/image-build-policy.json](../deploy/iam/image-build-policy.json) |
+| the preparation record before the first real build, which is not authorization | [pilot-checklist.md](pilot-checklist.md#9-automated-warm-image-build-optional) |
+
+Run the commands on the scaler host. The reaper host holds no image credential
+and takes no part. Nothing in this repository schedules an image build: you start
+one, or you schedule it yourself.
+
+### Image commands
+
+```sh
+python -m ci_burst image plan    --config deployment.toml   # read-only: would a build start?
+python -m ci_burst image run     --config deployment.toml   # the same read-only decision
+python -m ci_burst image run     --config deployment.toml --apply [--until-done] [--force]
+python -m ci_burst image status  --config deployment.toml [--refresh]
+python -m ci_burst image promote --config deployment.toml [--version N | --rollback] [--write]
+```
+
+| Command | Reads | Writes |
+| --- | --- | --- |
+| `image plan`, `image run` | the forge with the image token, the provider with the image role (describe calls only), the state file read-only | nothing; it never creates the state file |
+| `image run --apply` | the same | the state file, the event file and the metrics file; at the provider one builder, its archive, one image, one launch-template version and the deletions of the deletion rule |
+| `image status` | local files only | the check time, in a state file that exists |
+| `image status --refresh` | local files, and describe calls with the image role | the verification evidence in the state file |
+| `image promote` | local files only | nothing |
+| `image promote --write` | local files only | one key of the TOML, its backup, its lock file, the state file and one event |
+
+`image plan` says whether a build would start and, if not, which condition
+stopped it. It also prints the 12-character source sha and basis digest, the image
+behind the pin, the result of the build-template checks, the size of the user data
+against its limit and what the deletion rule would remove. `image run` without
+`--apply` prints the same decision and applies `--force` to it, so it shows what a
+forced run would decide.
+
+`image run --apply` runs one pass under the writer lock of the state file
+(`IMAGE_STATE_LOCKED` while another pass holds it). The pass has a deadline of 240
+seconds, which parts of the pass check: the provider reads, the archive stream and
+its upload, and the polling of the builder, which stops 30 seconds before the
+deadline so that retention can still run. It is not a wall-clock limit. The read of
+the branch and the reads of the basis files (one request each, up to 32 files) are
+not interrupted by it: a request that has begun runs to its end, but no further
+basis read starts once the deadline has passed. The describe calls that record the
+pin evidence after the pass get no deadline. For the forge reads, `forgejo.timeout_seconds` bounds a silent server on
+each request, not a slow one. Each provider call keeps the client's own timeouts
+(10 seconds to connect, 30 seconds to read, one attempt). A pass can therefore
+outlast 240 seconds: if you need a hard bound, set a timeout in the scheduler that
+runs the pass. A build lasts longer than a pass, so every pass resumes the build
+the state file names. A pass reconciles first, then starts a build when one is due
+or advances the active one (`building`, then `imaging`, then `candidate` or
+`failed`), then runs retention. `--until-done` repeats passes, 30 seconds apart, until the build is `candidate` or
+`failed` or a pass has nothing in flight (a refusal, an unchanged digest). It needs
+`--apply` and refuses without it (`IMAGE_UNTIL_DONE_NEEDS_APPLY`, before the
+configuration is read). A pass that raises ends the loop. The exit status does not
+tell whether a build is still in flight: a pass can commit a result and then raise,
+so read `image status` before the next run. `--force` counts for the first pass only.
+
+An applying run first resolves the pending promotion row that a crashed
+`promote --write` left, from the hash of the TOML, and after its pass it records
+what the provider says about the live pin and the rollback target. The result
+carries both as `journal_resolved` and `pin_evidence`.
+
+`image status` prints `decision: status` with the active and last build, the
+candidate and its evidence, the pin and any zone pins, the rollback target and why
+it is or is not available, a local report of protected images built from the
+state file and the TOML, the counters
+(`consecutive_failures`, `builds_last_day`, `cooldown_until`, `last_check_at`), the
+`blocked` explanation and any pending promotion row. The protected report is not
+the deletion rule: it omits the new pin of the newest completed journal row and
+the pins of settled rows since it, which retention protects, and it can list a
+candidate that a refresh recorded as `TEMPLATE_DRIFT`, which retention does not
+protect for being the candidate (a pin that names its image still protects it). The `deletion` part of `image plan` gives the current dry-run deletion
+decision. Plain `status` makes no provider call. `status --refresh` makes describe calls for the live pin, the
+rollback target and the newest verified candidates, and records whether each
+version and image still exists and whether the candidate version differs from its
+source in any field but `ImageId`. A promotion decides from that record, so run
+the refresh before you promote. It prints `decision: refreshed` and lists the
+versions it recorded and any that no longer exist.
+
+Exit codes follow the other commands:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | a completed decision: `disabled`, `digest_unchanged`, `start` (a plan), `building`, `imaging`, `candidate`, `status`, `refreshed`, `preview`, `promoted`, `rolled_back` |
+| `2` | a refusal: a raised refusal, printed as `{"error": ...}`, or a result with `decision: refused`. It names what the run declined; it does not say that the run changed nothing (see below). An option error, such as `--version` together with `--rollback`, also exits `2` and prints usage on standard error |
+| `1` | a build that ended `failed`, a provider failure (a provider refusal that escapes an image command), or `UNEXPECTED` |
+
+Exit `0` from `image run --apply` does not mean a build finished: `building` and
+`imaging` also exit `0`. Read `decision`.
+
+A refusal prevents what its reason code names: the start of a build, a promotion,
+a write. It does not undo what the run did before it declined. An applying pass
+reconciles first, so before it refuses a start (`IMAGE_MIN_INTERVAL`,
+`IMAGE_DAILY_CAP` or another answer of [When a build starts](#when-a-build-starts))
+it can have ended a leftover builder, deleted a stray archive, run retention and
+written the state file, the event file and the metrics textfile. When the pass
+returns its refusal as a result, the run also records the pin evidence; the
+`reconcile`, `retention` and `pin_evidence` of the result say what it did. A refusal
+that a pass raises can follow the same reconcile. On the promotion path,
+`PROMOTE_WRITE_FAILED` can follow the rename of the TOML
+([Promote reason codes](#promote-reason-codes)).
+
+### When a build starts
+
+A pass decides in this order, and the first check that fails answers. Clearing
+comes first: `--force` clears `blocked` and any recorded failure cooldown, and a
+basis digest that differs from the last failed build's clears `blocked` and the
+cooldown with it.
+
+| Order | Check | Answer when it stops the build | `--force` |
+| --- | --- | --- | --- |
+| 1 | the basis digest equals the digest tag of the image behind the pin | `digest_unchanged` (an answer, exit `0`) | skipped |
+| 2 | the newest build row of any state, a refused one included, started less than `min_build_interval_seconds` ago | `refused`, `IMAGE_MIN_INTERVAL` | skipped |
+| 3 | `max_builds_per_day` build rows of any state started in the last 24 hours | `refused`, `IMAGE_DAILY_CAP` | not skipped |
+| 4 | a failure cooldown is running | `refused`, `IMAGE_FAILURE_COOLDOWN` | cleared first |
+| 5 | the state is `blocked` | `refused`, `IMAGE_BLOCKED` | cleared first |
+| 6 | a builder exists that reconcile ended in this pass; in `image plan` and a run without `--apply`, also an active build or builder (an applying pass with an active build resumes it and answers its state) | `refused`, `IMAGE_BUILD_ALREADY_ACTIVE` | not skipped |
+
+Two refusals belong to the start itself and count no failure:
+`IMAGE_CREDENTIAL_SHORT` (the role session would not outlive the archive URL, or its expiry is unknown, see
+[deployment.md](deployment.md#image-build-role-and-source-identity-optional)) and
+`IMAGE_BUILD_ALREADY_ACTIVE`. A pass checks both before it writes the build row
+and again just before the launch. A wrong input is raised, not answered, and
+nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge on the branch or
+basis reads (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
+or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
+before the template, so an unsafe template never hides a missing gate. A stage done
+again is the exception for its input rechecks: a changed digest, a missing gate or
+opt-out, and an unsafe template verdict end its row and are answered `refused`
+(below), while a refused basis-file read is raised and leaves the row. Once those
+rechecks pass, the stage runs the same staging and launch checks as a first stage:
+a start refusal such as `IMAGE_CREDENTIAL_SHORT` ends the row `refused` without a
+failure, and a definite refusal of the archive request ends it as a failed build,
+counted, with exit `1`. A pass that
+finds a build in flight runs and settles it even without a gate; a launch that
+pass would then make is refused with `IMAGE_GATE_REQUIRED`, answered `refused`,
+and counts no failure.
+
+A pass deadline can end a pass after the build row is written and before the
+builder is launched. The next pass stages that build again. Past the build deadline
+it ends the build `failed` with `CONSOLE_BLIND` instead, a counted failure; before
+it, the pass first checks its inputs: the basis files at the row's own commit, the warm and gate commands,
+`strip_components` and the script must still give the row's digest. A different
+digest ends the row `failed` with `IMAGE_INPUTS_CHANGED`. The gate command is in
+the digest, so removing a configured gate ends the row this way too. A file that
+lost the opt-out of a row inserted under `allow_no_gate` keeps the digest and ends
+the row with `IMAGE_GATE_REQUIRED`; an unsafe build template then ends it with
+`IMAGE_BUILD_TEMPLATE_UNSAFE`. Each is answered `refused`, counts no failure, writes
+no `image_build_failed` event and tries to delete the row's archive. A refused read of a basis file, a `404` included, ends
+the pass and leaves the row for the next pass: the commit cannot have lost the
+file, so a `404` there can be an unavailable route. A pass past the build deadline
+that reaches its deadline check ends the row instead. `lifetime_seconds` and `snapshot_seconds` are not in the digest: a
+stage that launches renders them from the file as it reads it then.
+
+A build that has no verdict by `build_deadline_seconds` ends `failed` in a pass that
+reaches the deadline check. The deadline is not a hard bound: a pass that raises
+first, in reconcile or on a refused console read
+([#203](https://github.com/mikomiel/ci-burst/issues/203)), leaves the build in
+flight, and an `imaging` build whose image a later read finds `available` can still
+become a candidate. A failed
+build sets a cooldown of `failure_cooldown_seconds`. After
+`max_consecutive_failures` failed builds in a row the state is `blocked`. A
+refusal is not a failure and does not count. Only a build that reaches `candidate`
+resets the count.
+
+#### The blocked state
+
+`blocked` means the image path stopped itself after repeated failures. It is not
+an outage: `apply` and the pin are untouched. While it lasts, the metric
+`ci_burst_image_blocked` is `1`, and a pass that reaches check 5 of the table above
+answers `refused` with `IMAGE_BLOCKED`. The checks before it answer first: an
+unchanged digest answers `digest_unchanged`, and the minimum interval, the daily cap
+and a running failure cooldown answer `IMAGE_MIN_INTERVAL`, `IMAGE_DAILY_CAP` and
+`IMAGE_FAILURE_COOLDOWN`. A blocked state therefore does not always show as
+`IMAGE_BLOCKED` in a pass: read `ci_burst_image_blocked` or `image status`. The
+event `image_blocked` is written once, by the failure that set it.
+
+1. Find the cause. The `image_build_failed` events name the reason, and a
+   `WARM_FAILED` event carries a framed tail of the builder's output.
+2. Fix the cause: the warm commands, the gate, the build template, the forge
+   token, the image role.
+3. Clear it in one of two ways. Change the repository so that the basis digest
+   differs from the last failed build's, then run `image run --apply
+   --until-done`; or run `image run --apply --until-done --force` without a
+   change. `image plan` and `image run` without `--apply` show the clearing
+   (`clear_control`) but persist nothing.
+
+Clearing does not reset the failure count. The first failure after a recovery
+blocks the state again, so a recovered build has one attempt.
+
+### Candidate and promotion
+
+A build that works ends as a candidate: an image tagged for this deployment, and a
+new version of the worker launch template (`aws.launch_template_name`) that copies
+the version the TOML pins now and changes `ImageId` only. The pass reads both
+versions back and compares the whole `LaunchTemplateData`. A difference in any
+field but `ImageId` ends the build `failed` with `TEMPLATE_DRIFT`; the event names
+the fields and never a value. The new version is inert. It is not the default
+version, and no worker launches from it until a person promotes it. The builder
+starts from the cold base image that the build template names and never from the
+warm image, so a warm image is never built on a warm image.
+
+A build reaches `candidate` only after the builder printed its ready marker, and
+the builder prints it only after every warm command and the gate command, when one
+is configured, exited `0`. The script runs the gate on the same network as the warm
+commands and tests only its exit status. A pass shows that the cache is enough only
+if the gate command itself fails on a download;
+[warm-image.md](warm-image.md#the-candidate-and-what-the-gate-proves) owns what the
+gate does and does not prove. The build records at launch whether a gate was
+configured, and only that record counts: a gate added or removed after the launch
+does not change the candidate. A change to the warm or gate commands while a build
+waits for its stage ends that build as `IMAGE_INPUTS_CHANGED` instead of launching
+it under other inputs. A candidate
+does not prove that the image is safe, that the packages in it are trustworthy, or
+that your jobs pass on it. Read the evidence, run a canary
+([warm-image.md](warm-image.md#canary-and-cutover)) and decide.
+
+1. `image status --refresh` records the evidence that a promotion needs: the image
+   is `available`, the version exists, the drift is `clean`, and the record is
+   fresh. A promotion refuses a record older than `promote_max_age_seconds`
+   (`IMAGE_VERIFICATION_STALE`).
+2. `image promote --config deployment.toml` prints `decision: preview`: the
+   candidate evidence, the single line that would change (`pin_change`), the pin it
+   would replace, any pending promotion row and a `write_check`. The `write_check`
+   runs the checks of `--write` in order and reports `ok` or the first refusal.
+   Without a state file the command refuses (`PROMOTE_NO_CANDIDATE`). Add
+   `--version N` to choose the candidate that owns template version `N`.
+3. `image promote --config deployment.toml --version N --write` edits the pin. Use
+   the same `--version N` for the preview and the write, and canary the image of
+   that version ([warm-image.md](warm-image.md#canary-and-cutover)): without it, the
+   write selects the newest verified candidate again, which a pass that finished in
+   between can have changed. From the final preview through the write, pause any
+   scheduler of image runs and let no `image run --apply` of any kind run, so that
+   no new candidate appears and retention does not prune the chosen image. Finish
+   or stop a running `image run --apply --until-done` container first, and start a
+   fresh one afterwards ([container.md](container.md#run-the-image-commands)): a running
+   build container loaded the pin when it started, and its later passes would mix
+   that pin with the new file. The same holds for a rollback and for a hand edit of
+   the pin. The command takes the lock file of the TOML and the writer lock of the
+   state file, verifies the candidate against the record, replaces the one
+   `launch_template_version` assignment in `[aws]`, and requires the strict loader
+   to accept the new text with that key as the only difference. It then writes a
+   temporary file and a backup named `<toml>.bak.<UTC stamp>`, commits the journal
+   row, replaces the file atomically and marks the row complete. One
+   `image_promoted` event follows. The command keeps the file mode of the TOML.
+   Changing its owner is best-effort. A `[[aws.availability_zones]]` entry with its
+   own `launch_template_version` is refused (`PROMOTE_ZONE_PIN`).
+4. The next `apply` loads the new pin and uses it for new admissions. An `apply`
+   that is already running keeps the pin it loaded. A launch intent that was recorded before the edit is retried with its original request, so it can still launch on the old image. Watch the first workers in the
+   worker evidence above before you treat the image as live.
+
+`promote` is local. It makes no AWS or forge call, builds no client and holds no
+credential, so its container has no network and no credential mount
+([container.md](container.md#run-the-image-commands)). A pin that you edit by hand
+bypasses all of these checks, including the drift check, and takes no lock: pause
+any scheduler of image runs and wait until no `image run --apply` is running
+before you make one ([container.md](container.md#run-the-image-commands)). The next
+`image status --refresh` records the pin so that it can serve as a rollback
+target, but it does not verify what you wrote.
+
+A crashed `promote --write` leaves a pending journal row. The next
+`promote --write`, `promote --rollback --write` or `image run --apply` resolves it
+from the hash of the TOML: the old hash means the rename did not happen
+(`aborted`), the new hash means it did (`complete`). A hash that matches neither
+refuses with `PROMOTION_JOURNAL_DIVERGED` and changes nothing.
+
+These commands read the TOML through a mount of its directory. A container that
+mounted the file itself keeps the inode it mounted, and a promotion elsewhere
+replaces the file by a rename: that container then reads the old file. Each read
+checks, after the bytes are in, that the open file still has a name, and refuses
+with `PROMOTE_FILE_STALE` when it has none, so no journal row is resolved and no
+pin is written from a stale view. A replaced file that another hard link still
+names is not detected: do not keep hard links to the deployment TOML.
+
+#### Promote reason codes
+
+A refusal names the item and the recorded value, never a secret.
+`PROMOTE_DIRECTORY_NOT_DEDICATED` also lists up to five of the foreign entry names
+in the directory, so that you can move them. With `--write` every refusal is
+raised and exits `2`. Without `--write`, the checks that
+depend on the record are planned against the snapshot the preview read and
+reported in `write_check`. That is not a promise that the write will succeed, and
+a preview can still be refused: when it has nothing to show
+(`PROMOTE_NO_CANDIDATE`, `PROMOTE_VERSION_NOT_CANDIDATE`, `ROLLBACK_NO_PROMOTION`),
+when the TOML changes while it reads (`PROMOTE_FILE_CHANGED`), or before the
+plan when the file is a stale view or the journal cannot be read.
+
+| Code | Meaning | What to do |
+| --- | --- | --- |
+| `PROMOTE_NO_CANDIDATE` | no verified candidate is recorded, or no state file exists | run a build, then `image status` |
+| `PROMOTE_VERSION_NOT_CANDIDATE` | `--version` names a version that no candidate row owns, such as a pin set by hand | choose a version from `image status`, or edit the pin by hand |
+| `PROMOTE_IMAGE_NOT_AVAILABLE` | the record shows the image as not `available` or as `missing` | `image status --refresh`; rebuild if the image is gone |
+| `PROMOTE_VERSION_NOT_RECORDED` | the record does not show the launch-template version as existing | `image status --refresh`; rebuild if the version is gone |
+| `PROMOTE_DRIFT_NOT_CLEAN` | the record shows a drift result other than `clean` | do not promote this candidate; find what differs, then rebuild |
+| `PROMOTE_GATE_NOT_PASSED` | the build did not pass a configured gate, or it ran with no gate and `allow_no_gate` is `false` | configure a gate and rebuild, or set `allow_no_gate` on purpose |
+| `IMAGE_VERIFICATION_STALE` | the record has no verification time, lies in the future, or is older than `promote_max_age_seconds` | `image status --refresh`, then promote again |
+| `PIN_MOVED` | the TOML pins a version other than the one this candidate was copied from | run a new build; its candidate is copied from the current pin |
+| `PROMOTE_ZONE_PIN` | a zone entry carries its own `launch_template_version` | edit the file by hand and keep every pin consistent |
+| `PROMOTE_PIN_LINE_AMBIGUOUS` | the edit did not find exactly one plain `launch_template_version = <digits>` line inside `[aws]` | edit the file by hand |
+| `PROMOTE_REPARSE_FAILED` | the strict loader refused the new text, or it differs from the old in more than the pin | edit the file by hand; nothing was written |
+| `PROMOTE_FILE_CHANGED` | the file changed after it was read, or the path leads to another file than the one checked and locked | run the command again; nothing was written |
+| `PROMOTE_DIRECTORY_NOT_DEDICATED` | the directory holds more than the TOML, its `.bak.*` backups, its lock file and its promote temporary file, or it cannot be listed | give the TOML a dedicated directory ([deployment.md](deployment.md#the-dedicated-toml-directory)) |
+| `PROMOTE_BUSY` | another promotion holds the lock file; it is never waited for | wait, then run the command again |
+| `PROMOTE_WRITE_FAILED` | a local file step failed; the detail names the errno and no path | fix the directory (space, mode, owner) and run the command again |
+| `PROMOTION_JOURNAL_DIVERGED` | the TOML matches neither hash of a pending journal row | stop scaling `apply` and every image run, and leave the TOML and the state file as they are. There is no dedicated resolve-only command, and a pass from a restored backup can act on the wrong state or images ([#205](https://github.com/mikomiel/ci-burst/issues/205)). Do not resolve it with `image run --apply`; keep the image path disabled until #205 gives a local resolve-only path |
+| `PROMOTE_FILE_STALE` | the open TOML has no name left: the container mounted the file itself and a rename elsewhere replaced it | mount the directory of the file, not the file, and run again |
+| `PIN_RECORD_DIVERGED` | the pin or the backup no longer matches what the newest completed promotion recorded | set the pin by hand to the intended version, then `image status --refresh` |
+| `ROLLBACK_NO_PROMOTION` | no completed promotion is recorded, or no state file exists | set the pin by hand |
+| `ROLLBACK_PREVIOUS_NOT_RECORDED` | the previous version and its image are not recorded as read | `image status --refresh`, then roll back |
+| `ROLLBACK_PREVIOUS_MISSING` | the record shows that the previous version or its image no longer exists | choose another version by hand, or rebuild |
+
+A `PROMOTE_WRITE_FAILED` that reports a failed directory flush after the rename is
+the one case where the pin may have moved: the row stays `pending` and the next
+resolving command decides from the file hash.
+
+### Rolling back an image
+
+The pin is one line of the TOML, so a rollback is a promotion in the other
+direction. Finish or stop a running build container first, and start a fresh one
+afterwards, as for a promotion.
+
+```sh
+python -m ci_burst image status  --config deployment.toml --refresh
+python -m ci_burst image promote --config deployment.toml --rollback          # preview
+python -m ci_burst image promote --config deployment.toml --rollback --write
+```
+
+`--rollback` restores the pin that the newest completed promotion replaced. It
+uses the backup that row names, and no newer one. It refuses unless the file still
+pins the version that promotion wrote, the backup still has its recorded hash and
+contains the recorded previous pin, and the previous version and its image were
+read as existing and `available` within `promote_max_age_seconds`. It writes the
+previous pin with the same single-key edit, so other changes that you made to the
+TOML since then stay. The `rollback` object of `image status` reports either the target and its
+evidence or the reason a rollback is not available now. It does not check every write precondition, such
+as a zone pin (`PROMOTE_ZONE_PIN`); read `write_check` in the output of
+`image promote --rollback` without `--write` for those.
+
+If no rollback is available, set the pin by hand to a version whose image exists.
+The rest of rollback is the same as for the scaling path (see
+[Scheduler, cleanup and rollback](#scheduler-cleanup-and-rollback)): the pin is
+read by `apply`, so the next pass admits new workers on the restored image, except
+in a zone whose entry carries its own `launch_template_version`: check every zone
+pin. A launch intent that was recorded before the edit is retried with its original
+request, so it can still launch on the old image. When the old image must not run
+again, contain it as an incident instead: stop `apply` admission, keep cleanup
+running, and reconcile the existing workers and intents
+([Scheduler, cleanup and rollback](#scheduler-cleanup-and-rollback)). To stop the
+image path itself, set `enabled = false`: every image command then answers
+`disabled`, and the scaling path is unaffected. The edit disables fresh
+invocations only: a running `image run --apply --until-done` container keeps the
+configuration it loaded at its start, so stop that container too, and wait until no
+`image run --apply` of any kind is running: a single pass that loaded the enabled
+file can still be staging and launch after the edit. A builder that is running then
+is no longer ended by a pass. Its own timer exists only if its user data ran, so
+confirm that each builder that carries both `ci-burst:image-build = true` and
+`ci-burst:deployment = <your deployment>` is terminated (next section) instead of
+assuming that it stops itself.
+
+### Image events and metrics
+
+Applying passes append events to `image-events.ndjson` in the image state
+directory and write the Prometheus textfile `image-metrics.prom` there. The
+reference of the events, the series and example alert rules is a separate change.
+
+### Leaked builders and the backstop
+
+A builder is an on-demand instance of the build launch template, tagged
+`ci-burst:image-build`. It never carries `ci-burst:managed`, so `reap`,
+`controller.max_instances` and worker discovery do not see it. Two things on the
+instance itself end a leaked builder without any controller: the warm script arms
+its own lifetime timer first (`image.warm.lifetime_seconds`), and the template
+terminates the instance on shutdown. Both hold when the controller host is down or
+the image path is disabled, but only if the user data ran: a builder whose script
+never started has no timer, and terminate-on-shutdown does not start a shutdown.
+To find such a builder, filter on both `ci-burst:image-build = true` and `ci-burst:deployment = <your deployment>`, then terminate the exact instance id.
+
+When passes do run, every applying pass reconciles before it does anything else.
+It terminates every tagged builder that is not the active build's, and the active
+build's own once its deadline has passed. It deletes any object under the archive
+prefix that is not the active archive and is older than one hour; it checks neither
+the key name nor the writer of the object, so the prefix must belong to this
+deployment alone
+([deployment.md](deployment.md#the-image-tables-optional)). It adopts a builder or
+an image that a crash left behind, and records a tagged image that has no row as an
+unverified candidate that is never pinned. Removals of leaked resources add to
+`ci_burst_image_leaked_resources_total`; the termination of an overdue builder of an
+active build does not, so do not use the counter to account for those. The bucket lifecycle rule on the staging
+prefix is a backstop only: when a build ends, ci-burst makes one delete call for
+the archive key that its row records. A refused call is noted
+`archive:delete_failed` and leaves the deletion unconfirmed; the row keeps its
+end state. An upload that finished before its key was recorded leaves no key, and
+the reconcile sweep or the lifecycle rule removes that object.
+
+A builder that outlives its lifetime is a defect. To remove it, filter on both `ci-burst:image-build = true` and `ci-burst:deployment = <your deployment>`, then terminate the exact instance id: the
+image-build tag alone can match the builder of another deployment in the same
+account and Region.
+
+#### Retention
+
+The image of a failed build is removed by the deletion rule, except that the image
+of a build whose row records `TEMPLATE_DRIFT` is kept for 24 hours first.
+Retention prunes only while the images it counts number more than `retain`, so
+`retain` bounds how far it prunes; it does not promise that many usable images
+exist. It removes only images older than
+`retain_min_age_seconds`, and never removes a protected image: the image behind
+the pin, a zone pin, the previous pin, the new pin of the newest completed
+promotion or rollback, both pins of every journal row since that one (a failed
+promotion that a pass resolved from a stale file still names the live pin), the
+pins of a pending promotion, the newest verified candidate (unless a refresh recorded it as `TEMPLATE_DRIFT`: then only a pin that names its image protects it) or the active build. `retain` is not a
+cap: the protected set can hold more images. When it
+cannot resolve that set it deletes nothing (`IMAGE_DELETION_UNSAFE`), and a
+deployment file that is a stale view of a replaced file is one such case. A
+journal row whose pin is not a version number is refused when the journal is
+read (`IMAGE_STATE_UNREADABLE`), before retention runs. Retention reads the pin from the TOML on every pass, so a
+build container must not run across a promotion
+([container.md](container.md#run-the-image-commands)).
+
+### Image reason codes
+
+A refused or failed `image` command names its code in `reason`. The sections
+above give the codes of each step; the full reference table is a separate change.
 
 ## Labels
 
@@ -1107,8 +1562,10 @@ because nothing says which operation owned it.
 
 ## Identities
 
-Use two routes, both machine identities; never copy a human login cache and
-never place credentials on a worker.
+Use separate machine identities; never copy a human login cache and never place
+credentials on a worker. The scaling and cleanup identities serve the two
+production paths. The optional image path adds an image-build identity and a
+forge token of its own.
 
 - **Scaling identity**: read instance, template and Spot-price data; launch up
   to the configured fleet size; create the ownership tags; request termination.
@@ -1117,10 +1574,29 @@ never place credentials on a worker.
 - **Cleanup identity**: describe and terminate owned instances only. It must
   work without Forgejo, without the scaling database and without launch
   permission.
+- **Image-build identity** (only when `[image]` is enabled): a role that a
+  source identity on the scaler host assumes for one-hour sessions through an SDK
+  profile. It describes instances, images, snapshots, launch templates, their
+  versions and security groups, and reads the console of builders. It launches
+  only the build launch template, with no instance profile. It creates, tags and
+  terminates builders and images tagged for this deployment, adds versions to the
+  worker launch template and changes nothing else on it, deregisters tagged
+  images and deletes tagged snapshots, and reads and writes only the archive
+  prefix of the staging bucket. It cannot launch a worker or set a default
+  template version. Its permissions are in
+  [`deploy/iam/image-build-policy.json`](../deploy/iam/image-build-policy.json).
+  You apply them; the controller applies none of them.
+- **Image forge token**: a dedicated read-only token, read from its own
+  environment variable and used only by the image path. The token of `apply`
+  (`forgejo.token_env`) is never used for it
+  ([deployment.md](deployment.md#the-image-token)).
+- Promotion holds no identity. `image promote` is local and has no credential.
 
 Scope resource permissions to the deployment's tags where the provider
-supports it, and review the policy before a pilot. The controller never
-creates IAM resources, networks, images or bootstrap-secret infrastructure.
+supports it, and review the policy before a pilot. The scaling and cleanup
+identities never create IAM resources, networks, images or bootstrap-secret
+infrastructure. The image-build identity creates images, snapshots, an archive
+object and template versions, and no IAM resource or network.
 
 ## Scheduler, cleanup and rollback
 
@@ -1165,7 +1641,8 @@ Rollback order:
 4. terminate only proven owned resources and confirm their terminal state;
 5. revert source through a reviewed change; do not rewrite published history.
 
-Stopping cleanup is not part of rollback.
+Stopping cleanup is not part of rollback. Rolling back the image pin is a
+separate, local step: see [Rolling back an image](#rolling-back-an-image).
 
 ## Status semantics
 
@@ -1240,9 +1717,12 @@ types, up to `controller.max_instances` (1..12) owned instances, one writer and
 one ledger. Ordered fallback is supported only for a definite insufficient
 capacity rejection, within one admission and at most once per configured pool. Not
 supported: concurrent controllers, multiple ledgers, warm pools, On-Demand
-fallback, automatic zone or Region discovery and substitution, provider
-selection, job retries, workflow rewrites, image construction and secret
-distribution.
+fallback for workers, automatic zone or Region discovery and substitution,
+provider selection, job retries, workflow rewrites and secret distribution.
+Image construction is supported only through the optional `image` commands: one
+repository, one branch, one build at a time, and a candidate that a person
+promotes. Automatic promotion is not supported, and this repository ships no
+timer or unit for an image build.
 
 Observation has its own bound. Its per-run console-read budget is independent of
 `controller.max_instances`: a supported drain above the ceiling is reported, not

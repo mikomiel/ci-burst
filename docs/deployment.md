@@ -7,9 +7,9 @@ the order in which everything is installed. The details stay with their owners:
 | Document | Owns |
 | --- | --- |
 | [runner-setup.md](runner-setup.md) | worker IAM role, registration credential, network placement, launch template, user data |
-| [warm-image.md](warm-image.md) | the optional warm-cache layer for the worker image: runbook and per-ecosystem examples |
-| [container.md](container.md) | image build, host paths, container mounts, credential files, systemd units |
-| [operations.md](operations.md) | configuration contract, queue contract, cost scope, identities, rollback, status semantics |
+| [warm-image.md](warm-image.md) | the optional warm-cache layer for the worker image: the automated build, the manual fallback runbook and per-ecosystem examples |
+| [container.md](container.md) | image build, host paths, container mounts, credential files, systemd units, the one-off image commands |
+| [operations.md](operations.md) | configuration contract, queue contract, cost scope, identities, the image commands and their evidence, rollback, status semantics |
 | [pilot-checklist.md](pilot-checklist.md) | the preparation record you fill in, which is not authorization |
 | [../SECURITY.md](../SECURITY.md) | the threat model and what ci-burst deliberately does not do |
 
@@ -138,14 +138,28 @@ into the credential file on the host that uses it (Step 4) and never into a
 repository, a terminal history, a chat or a ticket. Both keys are long-lived:
 rotate them on your own schedule and record the rotation with the deployment.
 
-### Image-build role and source identity (optional, not yet used by a command)
+### Image-build role and source identity (optional)
 
-The OpenSpec change `automated-warm-image-build` plans controller-built warm
-images. No shipped command uses these identities yet, and the manual runbook in
-[warm-image.md](warm-image.md) stays the supported path. Create nothing here
-until the image commands ship and you have run the policy verification gates
-from that change. You apply all of this IAM yourself: the controller creates
-and changes none of it and has no IAM client.
+The optional automated warm-image build, `ci-burst image`, uses its own AWS
+identity. The commands exist in source and are opt-in: while `[image]` is absent
+or `enabled = false`, every image command loads the configuration and answers
+`disabled`, before it opens a state file or a network connection. No live build
+has been qualified. The verification gates G1 to G13 of the
+`automated-warm-image-build` change are your steps, so create this IAM only when
+you intend to run them. They do not all come before enabling. Record G1 to G5, G9,
+G10, G12 and G13 first: they need only the IAM and the provider APIs, not an
+enabled build, and `[image].enabled` stays false until they are recorded. G6 is
+recorded in two parts: `image plan` shows that the token reads the branch and its
+protected flag, every basis file and the first chunk of the archive, and a
+separate inspection of the archive before the first build shows its layout and what
+`export-ignore` drops, which `image plan` does not (it reads one chunk and closes
+the stream). G7 and G11 come from the first enabled build, and G8 only after a
+timer unit exists and is qualified; this repository ships none today. The
+[pilot checklist](pilot-checklist.md#9-automated-warm-image-build-optional) lists
+them in that order.
+The manual runbook in [warm-image.md](warm-image.md#manual-runbook) stays the
+fallback. You apply all of this IAM yourself: the controller creates and changes
+none of it and has no IAM client.
 
 The role's permissions are in
 [deploy/iam/image-build-policy.json](../deploy/iam/image-build-policy.json).
@@ -174,8 +188,10 @@ tag condition for that action, and none of the verification gates G1 to G13 in
 the design covers it directly; the nearest is G7 (console blind-probe cause).
 Treat it as an evidence gap: check it with the IAM policy simulator or a real
 call before enabling. If the condition does not match, the Allow does not apply
-and the console read is refused, so a build would fail closed with
-`CONSOLE_BLIND`. Do not widen the grant to `instance/*` without the tag to work
+and the console read is refused. The code does not settle that as `CONSOLE_BLIND`:
+each pass raises the provider refusal and exits nonzero, and the build does not
+advance ([#203](https://github.com/mikomiel/ci-burst/issues/203)); watch for a
+build that stays `building` in `image status`. Do not widen the grant to `instance/*` without the tag to work
 around that; record the result and decide with the maintainer.
 
 Images and snapshots may carry the keys `ci-burst:image-build`,
@@ -240,8 +256,43 @@ duration_seconds  = 3600
 role_session_name = ci-burst-image
 ```
 
+Both profiles live in one directory, the image role profile directory. Step 4
+creates it and the image container mounts it read-only; no other unit mounts it.
+It holds two standard AWS shared files. `config` holds the `[profile
+image-build]` block above. `credentials` holds the source key under the name that
+`source_profile` gives, written without the word `profile`:
+
+```ini
+[image-build-source]
+aws_access_key_id = <from the access key>
+aws_secret_access_key = <shown once>
+```
+
+`[image].profile` names the role profile (`image-build` here) and must differ from
+`aws.profile`: the image path never uses the scaling profile. The controller
+accepts it only as an assume-role route that ends in static keys. The role profile
+needs `role_arn` and `source_profile`. The `source_profile` chain may span at most
+five profiles and must end in a profile that holds both static keys. No profile in
+the chain may name `credential_source`, `web_identity_token_file`,
+`credential_process`, `login_session` or an `sso_` key. Anything else is refused
+as `IMAGE_PROFILE_INVALID`, and a missing profile name as `IMAGE_PROFILE_MISSING`,
+before the SDK asks for a credential. The image commands build an EC2 client and
+an S3 client and no IAM client. Every pass builds a new SDK session, so a role
+that cannot be assumed (an expired source key, a trust policy that denies it)
+fails that pass with the provider's error code, not with a stale session.
+
+A pass starts a build only when the assumed session is known to outlive
+`[image.source].presign_seconds`, the life of the archive URL it gives the
+builder. Otherwise, including when the expiry is unknown, it answers `refused` with `IMAGE_CREDENTIAL_SHORT`, counts no
+failure and starts nothing. The default of 1800 seconds fits the 3600-second
+session; a value near 3600 does not.
+
 The source key is long-lived. Rotate it on your own schedule, at least every 90
-days, and record the date with the deployment.
+days, and record the date with the deployment. Replace it by replacing the
+`credentials` file in the image role profile directory and then deactivating the
+old key; the next pass builds a new session from the new file. If you change the
+external ID, change the role's trust policy and the `config` file in the same
+step.
 
 ## 4. Prepare the two hosts
 
@@ -309,9 +360,116 @@ The env-file is visible in `podman inspect`; treat inspect access on the scaler
 as token access, keep the file mode `0600`, and rotate the token if that access
 changes hands. See [container.md](container.md) § "Forgejo token".
 
+### The image build paths (optional)
+
+Skip this subsection and the next two unless you will run `ci-burst image`. No
+unit or timer runs the image commands: you run them as one-off containers on the
+scaler host, and nothing here changes the apply, reap or export units. The reaper
+host takes none of it. [container.md](container.md#run-the-image-commands) owns
+the container lines and the mount of each command. These paths are new, and the
+names are examples that Step 5 repeats in the TOML:
+
+| Path | Purpose |
+| --- | --- |
+| `/var/lib/ci-burst-warm-image` | the image state directory: the image state file, its lock, the event file, the metrics textfile and the counters |
+| `/etc/ci-burst/aws-image` | the image role profile directory: the `config` and `credentials` files of the section above |
+| `/etc/ci-burst/forgejo-image.env` | the image token, as a podman env-file |
+| `/etc/ci-burst-deployment` | the dedicated TOML directory: the build line mounts it read-only and `promote --write` writes in it |
+
+```sh
+install -d -o 10001 -g 10001 -m 0700 /var/lib/ci-burst-warm-image
+install -d -o root -g 10001 -m 0750 /etc/ci-burst/aws-image
+install -o root -g 10001 -m 0640 image-config /etc/ci-burst/aws-image/config
+install -o root -g 10001 -m 0640 image-source-credentials /etc/ci-burst/aws-image/credentials
+install -o root -g root -m 0600 forgejo-image.env /etc/ci-burst/forgejo-image.env
+```
+
+`image-config` holds the `[profile image-build]` block and `image-source-credentials`
+holds the source key, both from the section above. The image state directory must
+differ from the scaling ledger's directory (the parent of `[state] database`) and
+lie neither inside it nor around it, so the image container never sees the ledger;
+the loader refuses anything else as `CONFIG_INVALID`.
+
+### The image token
+
+The image path reads the repository source with its own token and never with the
+token of `apply`: `[image.source].token_env` must name a different variable from
+`forgejo.token_env`, and the loader refuses the file otherwise. Create a read-only
+access token for it, ideally of a dedicated account that is a read-only
+collaborator of the repository, and put it in its own env-file:
+
+```sh
+CI_BURST_FORGEJO_IMAGE_TOKEN=<token>
+```
+
+The variable name is the value of `[image.source].token_env`; the name above is an
+example. The image commands read the branch, which must be protected, the basis
+files at its head and the source archive. A `401` or `403` on any of them is
+`IMAGE_SOURCE_FORBIDDEN`. ci-burst reads no scope from the token and this guide
+names none for it: record the scope the token was created with, and the account
+that owns it, in your own deployment records, as the
+[pilot checklist](pilot-checklist.md#9-automated-warm-image-build-optional) asks.
+The first live read is yours to qualify: `image plan` with `enabled = true` reads
+the branch, every basis file and the first chunk of the archive. Treat the file
+like `forgejo.env`: mode `0600`, visible in `podman inspect`, rotated on your own
+schedule.
+
+### The dedicated TOML directory
+
+`image promote --write` edits one line of the deployment TOML and writes beside
+it: a backup named `<file>.bak.<UTC stamp>`, the lock file `<file>.lock` and the
+temporary file `<file>.promote-tmp`. Its container mounts the directory of the
+file writable, so that directory must hold only the TOML, its `.bak.*` backups,
+its lock file and its promote temporary file. Any other entry, a subdirectory or a
+symbolic link included, is refused as `PROMOTE_DIRECTORY_NOT_DEDICATED` before
+anything is written. `/etc/ci-burst` cannot serve, because it holds the credential
+directories and the env-files. The build line mounts the same directory read-only
+instead of the file: a promotion replaces the file atomically, and a mount of the
+single file keeps serving the old one to a build container that is still running
+([container.md](container.md#run-the-image-commands)). The stale-file check
+protects journal resolution (`PROMOTE_FILE_STALE`) and every image and snapshot
+deletion (`IMAGE_DELETION_UNSAFE`, which skips the deletions and does not end the
+pass), as long as no hard link keeps the old file named: do not keep hard links to
+the TOML. It does not stop a running `--until-done` container, which keeps the
+settings and the pin it loaded at its start, so finish or stop it before a
+promotion. Give the file its own
+directory, owned by the container user so the container can create files in it:
+
+```sh
+install -d -o 10001 -g 10001 -m 0755 /etc/ci-burst-deployment
+install -o root -g root -m 0644 deployment.toml /etc/ci-burst-deployment/deployment.toml
+```
+
+Every consumer of the file on the scaler host must read it from the new path: the
+apply and export units, the refresh script and your manual runs. Otherwise a
+promotion moves a pin that the consumer never sees. Each shipped unit mounts the
+host file at the container path `/etc/ci-burst/deployment.toml` and passes
+`--config /etc/ci-burst/deployment.toml`. Change only the host side of that one
+`--volume`: a systemd drop-in that clears `ExecStart=` and repeats the unit's
+command with the new host path, as `deploy/ci-burst-reap-host-network.conf` does
+for the network, and the `CI_BURST_CONFIG` variable for the refresh script. The
+container side and `--config` stay as they are. Then remove the old file, so that
+no second copy keeps an old pin. A container that is running keeps the file it
+started with, and the next run of each unit reads the new pin. The shipped units
+are not changed by the image feature.
+
+A promotion edits the file of the host that runs it. The reaper host keeps its own
+copy, and Step 5 asks for identical content on both hosts, so copy the new pin
+there after a promotion.
+
+If you do not want `--write`, leave it out. `image promote` without it prints the
+evidence and the one-line diff, and you edit the pin by hand, in this directory. A
+pin you edit by hand is not checked: the drift check and the other verification
+checks run in `promote`, and a hand-written pin bypasses them. Before a promotion,
+a rollback or a hand edit, finish or stop a running build container, and start a
+fresh one afterwards.
+
 ## 5. Write the deployment TOML
 
-`/etc/ci-burst/deployment.toml` on both hosts, identical content:
+`/etc/ci-burst/deployment.toml` on both hosts, identical content. If you use the
+image feature, the scaler's copy lives at `/etc/ci-burst-deployment/deployment.toml`
+instead ([The dedicated TOML directory](#the-dedicated-toml-directory)); use that host path on the
+scaler in this step and in every later command that mounts the file:
 
 ```toml
 deployment = "example-ci-burst"
@@ -442,6 +600,147 @@ order, and add that candidate's subnet to the policy's `RunInstances` resources
 in the same change: the policy — not the TOML — is what decides which placements
 are allowed, so a candidate the policy omits is a denied launch rather than a
 fallback. A zone without a subnet cannot be used at all.
+
+### The `[image]` tables (optional)
+
+Add `[image]` only for the automated warm-image build. While the table is absent
+or `enabled = false`, every `image` command answers `disabled`. A table that is
+present is checked either way: an unknown key or an out-of-range value is
+`CONFIG_INVALID` before you enable it, and the required keys below are enforced
+only when `enabled = true`. Start with `enabled = false`, run `image plan` and
+confirm the answer `disabled`. Set it to `true` only as the approved step that
+[pilot-checklist.md](pilot-checklist.md#9-automated-warm-image-build-optional)
+lists, after the IAM gates. The names below are synthetic:
+
+```toml
+[image]
+enabled = false
+profile = "image-build"
+state_directory = "/var/lib/ci-burst-warm-image"
+
+[image.source]
+branch = "main"
+token_env = "CI_BURST_FORGEJO_IMAGE_TOKEN"
+basis_paths = ["uv.lock", "package-lock.json"]
+
+[image.warm]
+commands = ["uv sync --frozen", "npm ci"]
+# Offline switches stop the tools' own fetches, not a lifecycle script's download.
+gate_command = "rm -rf .venv node_modules && UV_OFFLINE=1 uv sync --frozen && npm ci --offline"
+
+[image.build]
+launch_template_name = "example-ci-burst-image-build"
+launch_template_version = 1
+
+[image.storage]
+bucket = "example-ci-burst-image-staging"
+prefix = "warm-image-source/"
+```
+
+`[image]` itself:
+
+| Key | Range | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | `true` or `false` | `false` | the opt-in |
+| `profile` | non-empty string | required | the SDK profile of the image role; it must differ from `aws.profile` |
+| `state_directory` | absolute path | required | the image state directory; it differs from the ledger's directory and lies neither inside it nor around it |
+| `min_build_interval_seconds` | `3600..604800` | `86400` | the least time since the newest build row of any state, a refused one included; `--force` skips it |
+| `max_builds_per_day` | `1..6` | `2` | builds that may start in 24 hours; `--force` does not skip it |
+| `build_deadline_seconds` | `900..14400` | `2700` | a build with no verdict by then ends `failed` in a pass that reaches the deadline check; a pass that raises earlier, such as on a refused console read ([#203](https://github.com/mikomiel/ci-burst/issues/203)), leaves it in flight |
+| `failure_cooldown_seconds` | `600..172800` | `21600` | the wait after a failed build |
+| `max_consecutive_failures` | `1..10` | `3` | consecutive failed builds that set `blocked` |
+| `retain` | `2..6` | `3` | the image count at which retention stops pruning |
+| `retain_min_age_seconds` | `3600..2592000` | `86400` | retention takes only an image older than this |
+| `promote_max_age_seconds` | `3600..2592000` | `172800` | the oldest verification that `promote --write` accepts |
+
+`[image.source]`:
+
+| Key | Range | Default | Meaning |
+| --- | --- | --- | --- |
+| `branch` | a branch name | `main` | the branch whose head is built; it must be protected |
+| `token_env` | an `ENV_NAME` | required | the variable that holds the image token; it differs from `forgejo.token_env` |
+| `basis_paths` | 1 to 32 paths | required | files in the archive whose content decides whether a build is due; no `..`, no leading `/` |
+| `max_archive_bytes` | `1048576..2147483648` | `268435456` | the size cap of the streamed archive |
+| `presign_seconds` | `300..3600` | `1800` | the life of the archive URL given to the builder |
+| `strip_components` | `0` or `1` | `1` | the leading path components that extraction drops from every archive member |
+
+`[image.warm]`:
+
+| Key | Range | Default | Meaning |
+| --- | --- | --- | --- |
+| `commands` | non-empty array of non-empty strings | required | the warm commands, one per entry |
+| `gate_command` | a string | empty | the gate command; empty means no gate. The script runs it like a warm command, on the same network, and tests only its exit status, so write it to fail on a download ([warm-image.md](warm-image.md#the-candidate-and-what-the-gate-proves)) |
+| `allow_no_gate` | `true` or `false` | `false` | accept an empty gate |
+| `lifetime_seconds` | `600..14400` | `3600` | the builder's own lifetime bound |
+| `snapshot_seconds` | `60..3600` | `1800` | how long the script sleeps after the marker; the lifetime timer or the controller can end the builder sooner |
+
+`[image.build]`:
+
+| Key | Range | Default | Meaning |
+| --- | --- | --- | --- |
+| `launch_template_name` | a launch template name | required | the build template; it differs from `aws.launch_template_name` |
+| `launch_template_version` | `1..10000` | required | the numeric version of the build template that the builder launches from |
+
+`[image.storage]`:
+
+| Key | Range | Default | Meaning |
+| --- | --- | --- | --- |
+| `bucket` | a bucket name | required | the private staging bucket |
+| `prefix` | a key prefix, no `..`, no leading `/` | required | the archive key is the prefix, one `/` and `<build id>.tar.gz`, however many slashes you write at the end. The prefix must be exclusive to this deployment (see the notes below) |
+
+Notes on the values:
+
+- `basis_paths`: name every file the warm commands read to decide what to
+  install, the lockfiles first. A file that is not listed does not make a build
+  due when it changes. The `image-build` capability spec of the
+  `automated-warm-image-build` change owns the exact inputs of the digest.
+- `commands` and `gate_command` become the builder's `WARM_COMMANDS` and
+  `WARM_GATE_COMMAND`; [warm-image.md](warm-image.md#inputs) owns their meaning
+  and its examples show one pair per ecosystem. An entry with a control character
+  is refused. With an empty `gate_command` and `allow_no_gate = false`, `image plan`
+  and an applying pass with no build in flight refuse with `IMAGE_GATE_REQUIRED`;
+  a pass that finds a build in flight settles it and refuses only the launch it
+  would make ([operations.md](operations.md#when-a-build-starts)). The rendered user
+  data must stay under 16384 bytes; `image plan` prints its size, measured with a
+  synthetic URL of 4096 characters, and a longer one is a refusal there
+  (`IMAGE_USERDATA_TOO_LARGE`, exit `2`). A real presigned URL can be longer, so an
+  applying run can still hit the limit while it renders: that build ends `failed`
+  with the same code and exit `1`. Leave headroom, and move long command lists into
+  a script in the repository and list that script in `basis_paths`.
+- Do not change `[image.warm]` (`commands`, `gate_command`, `allow_no_gate`) while a
+  build is active, that is `building` or `imaging` in `image status`: wait until it
+  is `candidate` or `failed`
+  ([warm-image.md](warm-image.md#the-candidate-and-what-the-gate-proves)).
+- `strip_components` follows the forge's archive layout, which wraps the source in
+  one directory. Keep `1` unless you have confirmed the layout your forge returns.
+  Confirm it by listing the archive yourself: `image plan` reads one chunk of it
+  and shows neither the layout nor what `export-ignore` drops.
+- `build_deadline_seconds` ends a build that has no verdict in a pass that reaches
+  the deadline check; it is not a hard bound, because a pass that raises earlier
+  leaves the build in flight. The builder's own `lifetime_seconds` timer powers it
+  off if no pass ends it. A `blocked` state
+  begins after `max_consecutive_failures` failed builds in a row; refusals are not
+  failures. [operations.md](operations.md#image-commands) owns the states and their
+  recovery.
+- The build launch template is yours to create. The controller reads the
+  version `[image.build]` names, and the security groups it names, before every
+  start. It refuses with `IMAGE_BUILD_TEMPLATE_UNSAFE`, naming the property and
+  never a value, unless the template has: no instance profile and no market
+  options (an on-demand builder), IMDSv2 required with a hop limit of 1, terminate
+  on shutdown, a literal image id, EBS volumes that are `gp3` and deleted on
+  termination, and at least one security group, none of which has an inbound rule.
+  The image id of that template is the cold base image: the builder starts from it,
+  never from the warm image.
+- The staging bucket and its lifecycle rule are yours: when a build ends, ci-burst
+  makes one delete call for the archive key that its row records, and the
+  lifecycle rule is a backstop only. Give each
+  deployment a prefix of its own that nothing else uses: no other deployment, tool
+  or person writes under it, and no prefix of another deployment is the same as
+  yours, inside it or around it. Every applying pass deletes each object under the
+  prefix that is more than one hour old, except the archive of the active build,
+  and it checks neither the name of the key nor who wrote the object. A prefix
+  shared with another deployment, or the example prefix reused in a shared bucket,
+  can delete that deployment's archive or unrelated objects.
 
 ### Change the deployment name
 
@@ -601,7 +900,10 @@ Check the timers with `systemctl list-timers 'ci-burst-*'`. Do not start
 `apply` yet: the next two steps qualify it first.
 
 Run one command by hand before trusting the timer. The shape is in
-[container.md](container.md) § "Run one command manually":
+[container.md](container.md) § "Run one command manually". With the image feature,
+replace the host side of the deployment-file `--volume` with
+`/etc/ci-burst-deployment/deployment.toml`; the container side and `--config` stay
+as they are:
 
 ```sh
 podman run --rm --init --network ci-burst --name ci-burst-manual --read-only \

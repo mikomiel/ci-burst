@@ -19,6 +19,10 @@ public project licensed under GPL-3.0-only.
   metrics textfile, so a launch that never registers is visible as an event
   rather than as a queue that does not move. The reader is bounded, holds no
   queue credential and copies no arbitrary console text.
+- Optionally, and off by default, builds a warm worker image on request with the
+  `image` commands. They end in an inert candidate launch-template version, and a
+  person promotes it by editing the pin. The scaling path never builds an image
+  and never moves its own pin.
 
 The product source is implemented, covered by standard-library tests and
 released. A release is source history, not a deployment: this repository
@@ -42,12 +46,27 @@ python -m ci_burst export --config deployment.toml --metrics-file ci-burst.prom
 python -m ci_burst reap   --config deployment.toml [--apply]
 ```
 
+The optional warm-image build has its own commands, which answer `disabled` until
+the `[image]` tables are enabled:
+
+```sh
+python -m ci_burst image plan    --config deployment.toml
+python -m ci_burst image run     --config deployment.toml [--apply [--until-done]] [--force]
+python -m ci_burst image status  --config deployment.toml [--refresh]
+python -m ci_burst image promote --config deployment.toml [--version N | --rollback] [--write]
+```
+
 A minimal configuration is in [docs/operations.md](docs/operations.md), which
 also owns the queue contract, the worker image/template contract, labels,
 cost scope, identities, rollback and status semantics. To build the
 operator-owned worker prerequisites, including the IAM role, SSM parameter and
 bootstrap, follow [docs/runner-setup.md](docs/runner-setup.md); an optional warm-cache
-layer for that image is in [docs/warm-image.md](docs/warm-image.md). Once those exist, the
+layer for that image, built by hand or with the opt-in `image` commands, is in
+[docs/warm-image.md](docs/warm-image.md). The commands, exit codes and reason
+codes of the `image` group are in
+[docs/operations.md](docs/operations.md#automated-warm-image-build), and their
+container lines are in [docs/container.md](docs/container.md#run-the-image-commands).
+Once those exist, the
 [deployment walkthrough](docs/deployment.md) sequences the control-plane
 identities, hosts, configuration, scheduling and live qualification. The
 [pilot checklist](docs/pilot-checklist.md) is a preparation record, not

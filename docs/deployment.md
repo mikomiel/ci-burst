@@ -644,7 +644,7 @@ prefix = "warm-image-source/"
 | `enabled` | `true` or `false` | `false` | the opt-in |
 | `profile` | non-empty string | required | the SDK profile of the image role; it must differ from `aws.profile` |
 | `state_directory` | absolute path | required | the image state directory; it differs from the ledger's directory and lies neither inside it nor around it |
-| `min_build_interval_seconds` | `3600..604800` | `86400` | the least time between the starts of two builds; `--force` skips it |
+| `min_build_interval_seconds` | `3600..604800` | `86400` | the least time since the newest build row of any state, a refused one included; `--force` skips it |
 | `max_builds_per_day` | `1..6` | `2` | builds that may start in 24 hours; `--force` does not skip it |
 | `build_deadline_seconds` | `900..14400` | `2700` | a build with no verdict by then ends `failed` in a pass that reaches the deadline check; a pass that raises earlier, such as on a refused console read ([#203](https://github.com/mikomiel/ci-burst/issues/203)), leaves it in flight |
 | `failure_cooldown_seconds` | `600..172800` | `21600` | the wait after a failed build |

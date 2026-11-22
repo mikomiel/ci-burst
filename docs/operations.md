@@ -885,7 +885,7 @@ plan when the file is a stale view or the journal cannot be read.
 | `PROMOTE_DIRECTORY_NOT_DEDICATED` | the directory holds more than the TOML, its `.bak.*` backups, its lock file and its promote temporary file, or it cannot be listed | give the TOML a dedicated directory ([deployment.md](deployment.md#the-dedicated-toml-directory)) |
 | `PROMOTE_BUSY` | another promotion holds the lock file; it is never waited for | wait, then run the command again |
 | `PROMOTE_WRITE_FAILED` | a local file step failed; the detail names the errno and no path | fix the directory (space, mode, owner) and run the command again |
-| `PROMOTION_JOURNAL_DIVERGED` | the TOML matches neither hash of a pending journal row | copy the current TOML outside the dedicated directory first. The backup the row names is the whole file before the promotion, so check it against the row's recorded hash, restore it, run a resolving command, and then reapply any later edit you still want |
+| `PROMOTION_JOURNAL_DIVERGED` | the TOML matches neither hash of a pending journal row | keep scaling `apply` and every image run stopped. Copy the current TOML outside the dedicated directory. The backup that the row names is the whole file before the promotion; the pending report shows neither its name nor the hashes, so read `backup_name` and `old_file_sha256` from the `promotion_journal` table of the state file, read-only. Restore the backup and check its hash. No command only resolves the row ([#205](https://github.com/mikomiel/ci-burst/issues/205)): `image run --apply` resolves it and then runs a full pass whose retention reads the restored file, so an image that only a later edit pins (such as a zone pin) is not protected in that pass; when one exists, keep the image runs stopped until #205 is fixed. Reapply the later edits only after the row is resolved |
 | `PROMOTE_FILE_STALE` | the open TOML has no name left: the container mounted the file itself and a rename elsewhere replaced it | mount the directory of the file, not the file, and run again |
 | `PIN_RECORD_DIVERGED` | the pin or the backup no longer matches what the newest completed promotion recorded | set the pin by hand to the intended version, then `image status --refresh` |
 | `ROLLBACK_NO_PROMOTION` | no completed promotion is recorded, or no state file exists | set the pin by hand |
@@ -932,10 +932,13 @@ running, and reconcile the existing workers and intents
 image path itself, set `enabled = false`: every image command then answers
 `disabled`, and the scaling path is unaffected. The edit disables fresh
 invocations only: a running `image run --apply --until-done` container keeps the
-configuration it loaded at its start, so stop that container too. A builder that is
-already running is then no longer ended by a pass. Its own timer exists only if its
-user data ran, so confirm that each tagged builder of the deployment is terminated
-(next section) instead of assuming that it stops itself.
+configuration it loaded at its start, so stop that container too, and wait until no
+`image run --apply` of any kind is running: a single pass that loaded the enabled
+file can still be staging and launch after the edit. A builder that is running then
+is no longer ended by a pass. Its own timer exists only if its user data ran, so
+confirm that each builder that carries both `ci-burst:image-build = true` and
+`ci-burst:deployment = <your deployment>` is terminated (next section) instead of
+assuming that it stops itself.
 
 ### Image events and metrics
 
@@ -953,7 +956,8 @@ its own lifetime timer first (`image.warm.lifetime_seconds`), and the template
 terminates the instance on shutdown. Both hold when the controller host is down or
 the image path is disabled, but only if the user data ran: a builder whose script
 never started has no timer, and terminate-on-shutdown does not start a shutdown.
-Check for such a builder by its tag and terminate it.
+Check for such a builder by both tags, `ci-burst:image-build = true` and
+`ci-burst:deployment`, and terminate it.
 
 When passes do run, every applying pass reconciles before it does anything else.
 It terminates every tagged builder that is not the active build's, and the active

@@ -530,12 +530,13 @@ hand or promote an automated candidate; the cutover for a candidate is
 2. Confirm the job finds the warm cache and downloads little, and that its result
    matches a job on the current version.
 3. Compare job duration for the same jobs on the cold and the warm version, and
-   record it. Only then cut over: for an automated candidate, run
-   `image promote --version N --write`; for an image built by hand, do the rollout
-   in the image README, set the deployment configuration's
-   `launch_template_version` to the new version and run the
-   toolchain check on a launched worker ([Build](../deploy/runner/image/README.md#build)
-   steps 4 and 5).
+   record it. Only then move the pin: for an automated candidate, run
+   `image promote --version N --write`; for an image built by hand, set the
+   deployment configuration's `launch_template_version` to the new version, as the
+   rollout in the image README describes.
+4. On both paths, run the toolchain check on a launched worker as the job user
+   ([Build](../deploy/runner/image/README.md#build) steps 4 and 5). A cache canary
+   does not exercise every tool.
 
 Moving the version back is the rollback.
 

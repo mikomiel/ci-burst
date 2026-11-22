@@ -210,9 +210,10 @@ you choose as `<base-image-id>`.
 python -m ci_burst image plan    --config deployment.toml
 python -m ci_burst image run     --config deployment.toml --apply --until-done
 python -m ci_burst image status  --config deployment.toml --refresh
-python -m ci_burst image promote --config deployment.toml
-# run the canary from a test identity or deployment first (Canary and cutover)
-python -m ci_burst image promote --config deployment.toml --write
+python -m ci_burst image promote --config deployment.toml --version N
+# run the canary of version N from a test identity or deployment first
+# (Canary and cutover), with no image run --apply running until the write
+python -m ci_burst image promote --config deployment.toml --version N --write
 python -m ci_burst image promote --config deployment.toml --rollback --write
 ```
 

@@ -814,9 +814,14 @@ that your jobs pass on it. Read the evidence, run a canary
    runs the checks of `--write` in order and reports `ok` or the first refusal.
    Without a state file the command refuses (`PROMOTE_NO_CANDIDATE`). Add
    `--version N` to choose the candidate that owns template version `N`.
-3. `image promote --config deployment.toml --write` edits the pin. Finish or stop a
-   running `image run --apply --until-done` container first, and start a fresh one
-   afterwards ([container.md](container.md#run-the-image-commands)): a running
+3. `image promote --config deployment.toml --version N --write` edits the pin. Use
+   the same `--version N` for the preview, the canary and the write: without it, the
+   write selects the newest verified candidate again, which a pass that finished in
+   between can have changed. From the final preview through the write, pause any
+   scheduler of image runs and let no `image run --apply` of any kind run, so that
+   no new candidate appears and retention does not prune the chosen image. Finish
+   or stop a running `image run --apply --until-done` container first, and start a
+   fresh one afterwards ([container.md](container.md#run-the-image-commands)): a running
    build container loaded the pin when it started, and its later passes would mix
    that pin with the new file. The same holds for a rollback and for a hand edit of
    the pin. The command takes the lock file of the TOML and the writer lock of the
@@ -885,7 +890,7 @@ plan when the file is a stale view or the journal cannot be read.
 | `PROMOTE_DIRECTORY_NOT_DEDICATED` | the directory holds more than the TOML, its `.bak.*` backups, its lock file and its promote temporary file, or it cannot be listed | give the TOML a dedicated directory ([deployment.md](deployment.md#the-dedicated-toml-directory)) |
 | `PROMOTE_BUSY` | another promotion holds the lock file; it is never waited for | wait, then run the command again |
 | `PROMOTE_WRITE_FAILED` | a local file step failed; the detail names the errno and no path | fix the directory (space, mode, owner) and run the command again |
-| `PROMOTION_JOURNAL_DIVERGED` | the TOML matches neither hash of a pending journal row | keep scaling `apply` and every image run stopped. Copy the current TOML outside the dedicated directory. The backup that the row names is the whole file before the promotion; the pending report shows neither its name nor the hashes, so read `backup_name` and `old_file_sha256` from the `promotion_journal` table of the state file, read-only. Restore the backup and check its hash. No command only resolves the row ([#205](https://github.com/mikomiel/ci-burst/issues/205)): `image run --apply` resolves it and then runs a full pass whose retention reads the restored file, so an image that only a later edit pins (such as a zone pin) is not protected in that pass; when one exists, keep the image runs stopped until #205 is fixed. Reapply the later edits only after the row is resolved |
+| `PROMOTION_JOURNAL_DIVERGED` | the TOML matches neither hash of a pending journal row | stop scaling `apply` and every image run, and leave the TOML and the state file as they are. No command resolves the row without also running a full pass or a new promotion, and a pass from a restored backup can act on the wrong state or images ([#205](https://github.com/mikomiel/ci-burst/issues/205)). Do not resolve it with `image run --apply`; keep the image path disabled until #205 gives a local resolve-only path |
 | `PROMOTE_FILE_STALE` | the open TOML has no name left: the container mounted the file itself and a rename elsewhere replaced it | mount the directory of the file, not the file, and run again |
 | `PIN_RECORD_DIVERGED` | the pin or the backup no longer matches what the newest completed promotion recorded | set the pin by hand to the intended version, then `image status --refresh` |
 | `ROLLBACK_NO_PROMOTION` | no completed promotion is recorded, or no state file exists | set the pin by hand |
@@ -956,8 +961,7 @@ its own lifetime timer first (`image.warm.lifetime_seconds`), and the template
 terminates the instance on shutdown. Both hold when the controller host is down or
 the image path is disabled, but only if the user data ran: a builder whose script
 never started has no timer, and terminate-on-shutdown does not start a shutdown.
-Check for such a builder by both tags, `ci-burst:image-build = true` and
-`ci-burst:deployment`, and terminate it.
+To find such a builder, filter on both `ci-burst:image-build = true` and `ci-burst:deployment = <your deployment>`, then terminate the exact instance id.
 
 When passes do run, every applying pass reconciles before it does anything else.
 It terminates every tagged builder that is not the active build's, and the active
@@ -976,8 +980,9 @@ the archive key that its row records. A refused call is noted
 end state. An upload that finished before its key was recorded leaves no key, and
 the reconcile sweep or the lifecycle rule removes that object.
 
-A builder that outlives its lifetime is a defect. Find it by its
-`ci-burst:image-build` tag and terminate it by its exact instance id.
+A builder that outlives its lifetime is a defect. To remove it, filter on both `ci-burst:image-build = true` and `ci-burst:deployment = <your deployment>`, then terminate the exact instance id: the
+image-build tag alone can match the builder of another deployment in the same
+account and Region.
 
 #### Retention
 

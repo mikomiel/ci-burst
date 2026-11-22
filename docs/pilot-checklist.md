@@ -122,7 +122,9 @@ come before enabling are recorded: G1 to G5, G9, G10, G12 and G13, and the check
 that the tagged `GetConsoleOutput` grant applies to a builder
 ([deployment.md](deployment.md#image-build-role-and-source-identity-optional)),
 which no numbered gate covers. A refused console read leaves a build in flight
-instead of ending it ([#203](https://github.com/mikomiel/ci-burst/issues/203)). The other
+instead of ending it ([#203](https://github.com/mikomiel/ci-burst/issues/203)). Also
+keep it false until a local resolve-only path for a diverged promotion journal
+exists ([#205](https://github.com/mikomiel/ci-burst/issues/205)). The other
 gates are recorded later, in the items that name them: G6 after enabling and
 before the first build, G7 and G11 from the first build, and G8 only once a timer
 unit exists. Record the evidence in your own deployment records, not in this
@@ -195,9 +197,12 @@ repository.
 - [ ] You reviewed the candidate: `image promote` without `--write` printed its
       evidence and you read it
       ([operations.md](operations.md#candidate-and-promotion)). Before
-      `promote --write`, a rollback or a hand edit of the pin, you finished or
-      stopped any running `--until-done` container, and afterwards you started a
-      fresh one ([container.md](container.md#run-the-image-commands)).
+      `promote --write`, a rollback or a hand edit of the pin, you paused any
+      scheduler of image runs, let no `image run --apply` of any kind run from the
+      final preview through the write, and afterwards started a fresh build
+      container if you need one ([container.md](container.md#run-the-image-commands)).
+      You used the same explicit `--version N` for the preview, the canary and the
+      write.
       Before the pin changed, one canary job completed on the new version from a
       test identity or a test deployment
       ([warm-image.md](warm-image.md#canary-and-cutover)): `promote --write`

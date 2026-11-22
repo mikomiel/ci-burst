@@ -308,8 +308,8 @@ neither the profile directory nor the token.
 
 The line mounts the directory, never the file. `promote --write` replaces the TOML
 atomically, and a mount of the single file keeps serving the file that was there
-when the container started. With the directory mounted, the file that a promotion
-replaced is the file that retention reads on its next pass: retention reloads the
+when the container started. With the directory mounted, retention reads the replacement
+file that a promotion wrote on its next pass: retention reloads the
 TOML on every pass, to find the pins it must keep. The rest of a run keeps the
 configuration that the container loaded when it started. So finish or stop a running
 `image run --apply --until-done` container before `promote --write`,

@@ -222,8 +222,8 @@ shows. The first command is read-only. The last one writes the TOML, and the
 promotion container has no network and no credential. A rollback is a separate
 recovery step, not part of this sequence: preview it with
 `image promote --rollback` and read its target first, because it restores the pin
-that the newest completed promotion replaced, which a refused later promotion does
-not change
+that the newest completed promotion replaced, and a later command, even one that
+refuses, can complete a pending promotion and so change that target
 ([operations.md](operations.md#rolling-back-an-image)). `promote --write` changes the
 production pin at once, so the canary of
 [Canary and cutover](#canary-and-cutover) comes before it.
@@ -530,8 +530,10 @@ hand or promote an automated candidate; the cutover for a candidate is
 2. Confirm the job finds the warm cache and downloads little, and that its result
    matches a job on the current version.
 3. Compare job duration for the same jobs on the cold and the warm version, and
-   record it. Only then do the rollout in the image README: set the deployment
-   configuration's `launch_template_version` to the new version and run the
+   record it. Only then cut over: for an automated candidate, run
+   `image promote --version N --write`; for an image built by hand, do the rollout
+   in the image README, set the deployment configuration's
+   `launch_template_version` to the new version and run the
    toolchain check on a launched worker ([Build](../deploy/runner/image/README.md#build)
    steps 4 and 5).
 

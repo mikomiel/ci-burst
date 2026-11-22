@@ -324,8 +324,9 @@ the credential directories.
 To promote a candidate, or to roll back, run the promotion line. Before the final
 preview, pause any scheduler of image runs and wait until no `image run --apply`
 of any kind is running, and keep it so through the write. Name the candidate with
-`--version N` in both the preview and the write, and run the canary on that same
-template version: without `--version`, each command selects the newest verified
+`--version N` in both the preview and the write, and canary the image of that
+version from a separate test launch template
+([warm-image.md](warm-image.md#canary-and-cutover)): without `--version`, each command selects the newest verified
 candidate again. `promote` is local: it makes
 no AWS or forge call and holds no credential, so its container has no network, no
 credential mount and no env-file, and a read-only root filesystem:

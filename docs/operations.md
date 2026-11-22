@@ -815,7 +815,8 @@ that your jobs pass on it. Read the evidence, run a canary
    Without a state file the command refuses (`PROMOTE_NO_CANDIDATE`). Add
    `--version N` to choose the candidate that owns template version `N`.
 3. `image promote --config deployment.toml --version N --write` edits the pin. Use
-   the same `--version N` for the preview, the canary and the write: without it, the
+   the same `--version N` for the preview and the write, and canary the image of
+   that version ([warm-image.md](warm-image.md#canary-and-cutover)): without it, the
    write selects the newest verified candidate again, which a pass that finished in
    between can have changed. From the final preview through the write, pause any
    scheduler of image runs and let no `image run --apply` of any kind run, so that

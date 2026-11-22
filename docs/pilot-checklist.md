@@ -201,10 +201,10 @@ repository.
       scheduler of image runs, let no `image run --apply` of any kind run from the
       final preview through the write, and afterwards started a fresh build
       container if you need one ([container.md](container.md#run-the-image-commands)).
-      You used the same explicit `--version N` for the preview, the canary and the
-      write.
-      Before the pin changed, one canary job completed on the new version in
-      an isolated test deployment, whose workers register with their own registration scope and labels that no production job targets
+      You used the same explicit `--version N` for the preview and the write, and
+      the canary tested the image of that version.
+      Before the pin changed, one canary job completed on the image of the new
+      version, launched from a separate test launch template that uses the image of version N, with a test-only bootstrap, instance profile, registration scope and labels that no production job targets
       ([warm-image.md](warm-image.md#canary-and-cutover)): `promote --write`
       replaces the production pin at once, and the next scheduled `apply` can
       launch from it. Only then `promote --write` ran in the isolated container,

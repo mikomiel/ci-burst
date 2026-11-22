@@ -321,8 +321,12 @@ already planned its deletions does not read the pin again, and can remove the
 image you are about to pin. Do not widen the mount to `/etc/ci-burst`, which holds
 the credential directories.
 
-To promote a candidate, or to roll back, run the promotion line, after you have
-finished or stopped a running build container as above. `promote` is local: it makes
+To promote a candidate, or to roll back, run the promotion line. Before the final
+preview, pause any scheduler of image runs and wait until no `image run --apply`
+of any kind is running, and keep it so through the write. Name the candidate with
+`--version N` in both the preview and the write, and run the canary on that same
+template version: without `--version`, each command selects the newest verified
+candidate again. `promote` is local: it makes
 no AWS or forge call and holds no credential, so its container has no network, no
 credential mount and no env-file, and a read-only root filesystem:
 
@@ -332,7 +336,7 @@ podman run --rm --init --network none --name ci-burst-promote-manual \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
   --volume /etc/ci-burst-deployment:/etc/ci-burst-deployment:rw \
   --volume /var/lib/ci-burst-warm-image:/var/lib/ci-burst-warm-image:rw \
-  localhost/ci-burst:latest image promote --config /etc/ci-burst-deployment/deployment.toml --write
+  localhost/ci-burst:latest image promote --config /etc/ci-burst-deployment/deployment.toml --version N --write
 ```
 
 The line has two writable host mounts and no more. The dedicated TOML directory is
@@ -346,8 +350,9 @@ directories. The explicit option stays because Podman mounts a writable tmpfs on
 `/tmp` of a read-only container anyway, and the option caps that one at 64 MiB and
 forbids execution in it.
 
-Leave out `--write` to print the evidence and the one-line diff with the same
-mounts, and add `--rollback` to restore the previous pin. The directory must hold
+Leave out `--write`, and keep `--version N`, to print the evidence and the one-line
+diff with the same mounts. For a rollback, use `--rollback` in place of
+`--version N`. The directory must hold
 only the TOML, its `.bak.*` backups, its lock file and its promote temporary file,
 or the command refuses with `PROMOTE_DIRECTORY_NOT_DEDICATED`
 ([deployment.md](deployment.md#the-dedicated-toml-directory)). The shipped units

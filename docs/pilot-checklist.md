@@ -203,8 +203,8 @@ repository.
       container if you need one ([container.md](container.md#run-the-image-commands)).
       You used the same explicit `--version N` for the preview, the canary and the
       write.
-      Before the pin changed, one canary job completed on the new version from a
-      test identity or a test deployment
+      Before the pin changed, one canary job completed on the new version in
+      an isolated test deployment, whose workers register with their own registration scope and labels that no production job targets
       ([warm-image.md](warm-image.md#canary-and-cutover)): `promote --write`
       replaces the production pin at once, and the next scheduled `apply` can
       launch from it. Only then `promote --write` ran in the isolated container,

@@ -212,15 +212,18 @@ python -m ci_burst image run     --config deployment.toml --apply --until-done
 python -m ci_burst image status  --config deployment.toml --refresh
 # pause image runs: no image run --apply of any kind until after the write
 python -m ci_burst image promote --config deployment.toml --version N
-# run the canary of version N from a test identity or deployment first
+# run the canary of version N in an isolated test deployment first
 # (Canary and cutover)
 python -m ci_burst image promote --config deployment.toml --version N --write
-python -m ci_burst image promote --config deployment.toml --rollback --write
 ```
 
 Run each as a one-off container, as [container.md](container.md#run-the-image-commands)
-shows. The first command is read-only. The last two write the TOML, and the
-promotion container has no network and no credential. `promote --write` changes the
+shows. The first command is read-only. The last one writes the TOML, and the
+promotion container has no network and no credential. A rollback is a separate
+recovery step, not part of this sequence: preview it with
+`image promote --rollback` and read its target first, because it restores the pin
+of the newest completed promotion, not of a promotion that was refused
+([operations.md](operations.md#rolling-back-an-image)). `promote --write` changes the
 production pin at once, so the canary of
 [Canary and cutover](#canary-and-cutover) comes before it.
 
@@ -517,8 +520,10 @@ does not enforce it or check for its evidence. It comes first whether you build 
 hand or promote an automated candidate; the cutover for a candidate is
 `image promote --write` instead of a hand edit of the pin.
 
-1. Point a test identity or a test deployment at the new version and run a job
-   from a test repository through it.
+1. Point an isolated test deployment, whose workers register with their own registration scope and labels that no production job targets, at the new version and run a job from a test repository through
+   it. A different launch identity is not enough: the version copies the
+   production template, and its bootstrap registers the worker as a production
+   runner that can take a production job.
 2. Confirm the job finds the warm cache and downloads little, and that its result
    matches a job on the current version.
 3. Compare job duration for the same jobs on the cold and the warm version, and

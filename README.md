@@ -51,7 +51,7 @@ the `[image]` tables are enabled:
 
 ```sh
 python -m ci_burst image plan    --config deployment.toml
-python -m ci_burst image run     --config deployment.toml [--apply [--until-done] [--force]]
+python -m ci_burst image run     --config deployment.toml [--apply [--until-done]] [--force]
 python -m ci_burst image status  --config deployment.toml [--refresh]
 python -m ci_burst image promote --config deployment.toml [--version N | --rollback] [--write]
 ```

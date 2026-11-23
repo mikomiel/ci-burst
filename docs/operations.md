@@ -1001,7 +1001,7 @@ command rewrites the file. Every series carries the `deployment` label.
 | `ci_burst_image_blocked` | gauge | `1` while builds are blocked |
 | `ci_burst_image_candidate_waiting_seconds` | gauge | seconds since the newest verified candidate was last verified; `0` when none waits. `image status --refresh` restarts it, and the series shows that at the next applying pass |
 | `ci_burst_image_stale_seconds` | gauge | age of the image behind the configured pin, from the latest pin read that a pass saved; a pass that fails can publish an older read, even one of a previous pin |
-| `ci_burst_image_leaked_resources_total{kind}` | counter | leaked resources that a pass removed: a `builder` or an `archive` that reconcile removed, and some `image` and `snapshot` removals by the deletion rule of resources that no build made, such as a tagged image with no row. It does not count every such removal; the `image_pruned` events summarize the removals of each pass when they are written |
+| `ci_burst_image_leaked_resources_total{kind}` | counter | leaked resources that a pass removed: a `builder` or an `archive` that reconcile removed, and some `image` and `snapshot` removals by the deletion rule of resources that no build made, such as a tagged image with no row. It does not count every such removal; each `image_pruned` event, when it is written, summarizes one deletion sweep, and a pass can run more than one |
 | `ci_burst_image_last_run_timestamp_seconds` | gauge | Unix time of the last successful textfile write, by a pass that returned a decision or one that raised |
 
 Three things look alike and are not the same:
@@ -1190,7 +1190,7 @@ passing plan does not rule these out.
 | `IMAGE_MARKER_DIGEST_MISMATCH` | the builder reports another archive digest than the staged one |
 | `MARKER_TIMEOUT` | no ready marker by the build deadline, or the marker was first read at or after it while the builder was still running |
 | `CONSOLE_BLIND` | the console returned no text by the deadline, or the launch fell at or after it. A console read that the provider refuses is not settled this way: the pass raises and the build does not advance ([#203](https://github.com/mikomiel/ci-burst/issues/203)) |
-| `IMAGE_BUILDER_GONE` | the builder of the build was gone, or was never recorded, before an image was created |
+| `IMAGE_BUILDER_GONE` | the builder of the build was gone, or was never recorded, while the build had no recorded image; an image may still exist, and the deletion rule handles it as the image of a failed build |
 | `IMAGE_NOT_AVAILABLE` | the image failed, or was not `available` by the deadline |
 | `TEMPLATE_DRIFT` | the candidate version differs from the pin in a field other than `ImageId`, or does not carry the build's image; `drift_fields` names them |
 | `FORGEJO_ARCHIVE_TOO_LARGE` | the forge stream of the archive passed `max_archive_bytes` while it was staged. A passing `image plan` does not rule it out, because the plan reads only the first chunk |

@@ -807,11 +807,30 @@ class StatusTests(CliCase):
         self.build_candidate()
         before = self.dump()
         error = sqlite3.OperationalError("attempt to write a readonly database")
-        with mock.patch.object(ImageState, "control_set", side_effect=error):
+        with mock.patch.object(ImageState, "record_check_time", side_effect=error):
             code, payload = self.invoke("image", "status")
         self.assertEqual((code, payload["decision"], payload["check_recorded"]), (0, "status", False))
         self.assertNotIn("error", payload)
         self.assertEqual(self.dump(), before)
+
+    def test_a_failure_to_release_the_state_after_the_check_write_still_reports_the_write(self):
+        self.build_candidate()
+        release = ImageState.release_writer
+        failures = []
+
+        def failing_release(state):
+            held = state._lock_fd is not None
+            release(state)
+            if held and not failures:
+                failures.append(True)
+                raise OSError("synthetic release failure")
+
+        self.clock.advance(60)
+        with mock.patch.object(ImageState, "release_writer", failing_release):
+            code, payload = self.invoke("image", "status")
+        self.assertEqual(failures, [True])
+        self.assertEqual((code, payload["decision"], payload["check_recorded"]), (0, "status", True))
+        self.assertEqual(self.dump()["control"][0]["last_check_at"], self.clock())
 
     def test_a_pending_row_is_reported_with_the_resolution_its_hash_implies_and_is_not_resolved(self):
         self.pin_current()

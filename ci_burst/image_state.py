@@ -807,6 +807,10 @@ class ImageState:
         self._require().execute(f"UPDATE control SET {assignments} WHERE id = 1", tuple(fields.values()))
         return self.control_get()
 
+    def record_check_time(self, now):
+        """Write ``control.last_check_at`` and read nothing back, so the result reflects the write alone."""
+        self._require().execute("UPDATE control SET last_check_at = ? WHERE id = 1", (now,))
+
     def _require(self):
         if self._connection is None:
             raise StateRefusal("IMAGE_STATE_UNAVAILABLE")

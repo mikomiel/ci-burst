@@ -176,16 +176,22 @@ def _record_check(state, now):
 
     The write is best-effort, so a database error (for example a read-only state
     file) reports ``check_recorded: false`` and does not fail the read-only status.
+    The answer reflects the write alone: nothing is read back, and a failure to close
+    the connection or release the lock afterwards, which cannot undo a committed
+    write, is ignored here too.
     """
     try:
         state.connect()
         state.acquire_writer()
-        state.control_set(last_check_at=now)
+        state.record_check_time(now)
+        recorded = True
     except (StateRefusal, OSError, sqlite3.Error):
-        return False
-    finally:
+        recorded = False
+    try:
         state.close()
-    return True
+    except (OSError, sqlite3.Error):
+        pass
+    return recorded
 
 
 # -- the describe-only refresh ----------------------------------------------------------

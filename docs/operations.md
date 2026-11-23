@@ -963,9 +963,9 @@ directory. The file is `0600` and append-only; `promote --write` appends its
 (UTC), `deployment`, `event` and the fields below. A value is an id, a 12-character
 digest, a count or a code, and never a URL. Only `image_build_failed` carries
 console text, as `framed_tail`: the framed, sanitized and bounded end of the
-builder's output, in which text that contains `://`, a presigned query string and
-the recorded archive key are replaced by `[archive-url]`. Nothing else is
-redacted, so a warm or gate command must not print a secret.
+builder's output. In that sanitized tail, text that contains `://`, a presigned
+query string and a literal match of the recorded archive key are replaced by
+`[archive-url]`. Nothing else is redacted, so a warm or gate command must not print a secret.
 
 | Event | Written when | Fields |
 | --- | --- | --- |
@@ -1000,8 +1000,8 @@ command rewrites the file. Every series carries the `deployment` label.
 | `ci_burst_image_consecutive_failures` | gauge | failed builds since the last `candidate` |
 | `ci_burst_image_blocked` | gauge | `1` while builds are blocked |
 | `ci_burst_image_candidate_waiting_seconds` | gauge | seconds since the newest verified candidate was last verified; `0` when none waits. `image status --refresh` restarts it, and the series shows that at the next applying pass |
-| `ci_burst_image_stale_seconds` | gauge | age of the image behind the configured pin; absent when no creation time is known for it. A pass that fails can publish the creation time that an earlier pass read |
-| `ci_burst_image_leaked_resources_total{kind}` | counter | leaked resources that a pass removed: a `builder` or an `archive` that reconcile removed, and some `image` and `snapshot` removals by the deletion rule of resources that no build made, such as a tagged image with no row. It does not count every such removal: read `image_pruned` for all of them |
+| `ci_burst_image_stale_seconds` | gauge | age of the image behind the configured pin, from the latest pin read that a pass saved; a pass that fails can publish an older read, even one of a previous pin |
+| `ci_burst_image_leaked_resources_total{kind}` | counter | leaked resources that a pass removed: a `builder` or an `archive` that reconcile removed, and some `image` and `snapshot` removals by the deletion rule of resources that no build made, such as a tagged image with no row. It does not count every such removal; the `image_pruned` events summarize the removals of each pass when they are written |
 | `ci_burst_image_last_run_timestamp_seconds` | gauge | Unix time of the last successful textfile write, by a pass that returned a decision or one that raised |
 
 Three things look alike and are not the same:
@@ -1190,7 +1190,7 @@ passing plan does not rule these out.
 | `IMAGE_MARKER_DIGEST_MISMATCH` | the builder reports another archive digest than the staged one |
 | `MARKER_TIMEOUT` | no ready marker by the build deadline, or the marker was first read at or after it while the builder was still running |
 | `CONSOLE_BLIND` | the console returned no text by the deadline, or the launch fell at or after it. A console read that the provider refuses is not settled this way: the pass raises and the build does not advance ([#203](https://github.com/mikomiel/ci-burst/issues/203)) |
-| `IMAGE_BUILDER_GONE` | before an image was created, a pass found the builder gone (not listed after a 60-second grace, listed in a state other than `pending`, `running`, `stopping` or `stopped`, or ended by reconcile at the deadline), or a staged build has no recorded builder; a ready marker read in the same pass does not change that |
+| `IMAGE_BUILDER_GONE` | the builder of the build was gone, or was never recorded, before an image was created |
 | `IMAGE_NOT_AVAILABLE` | the image failed, or was not `available` by the deadline |
 | `TEMPLATE_DRIFT` | the candidate version differs from the pin in a field other than `ImageId`, or does not carry the build's image; `drift_fields` names them |
 | `FORGEJO_ARCHIVE_TOO_LARGE` | the forge stream of the archive passed `max_archive_bytes` while it was staged. A passing `image plan` does not rule it out, because the plan reads only the first chunk |
@@ -1199,12 +1199,12 @@ passing plan does not rule these out.
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the archive request |
 | a forge or provider code | any other refusal that ended the build as described above, such as `FORGEJO_UNAVAILABLE` or `AWS_REFUSED` |
 
-Cleanup after an oversize or failed upload is best-effort: once an upload exists,
-ci-burst tries to abort it and delete the object, and either call can fail without
+Cleanup after an oversize or failed upload is best-effort: once it has an upload
+id, ci-burst tries to abort it and delete the object, and either call can fail without
 changing the reason code. Do not assume that nothing is left. The reconcile sweep
 deletes stray objects under the prefix only once they are older than one hour, and
-an incomplete multipart upload is not an object: give the bucket a lifecycle rule
-that aborts incomplete multipart uploads
+an incomplete multipart upload is not an object: give the staging prefix a
+lifecycle rule that aborts incomplete multipart uploads
 ([deployment.md](deployment.md#the-image-tables-optional)).
 
 The codes below are refusals, not failed builds. A refusal counts nothing toward

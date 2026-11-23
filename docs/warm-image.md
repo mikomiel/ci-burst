@@ -158,8 +158,8 @@ this section still applies, because the builder runs the same script with the sa
 inputs, the same cache environment and the same examples.
 
 Each topic has one owner. [operations.md](operations.md#automated-warm-image-build)
-owns the commands, exit codes, the `blocked` state and the reason codes of each
-step; the reference of events and metrics is a separate change (task 7.8). [deployment.md](deployment.md#the-image-tables-optional) owns the
+owns the commands, exit codes, the `blocked` state, the reason codes, the events
+and the metrics. [deployment.md](deployment.md#the-image-tables-optional) owns the
 configuration, the image role profile, the token and the dedicated TOML directory.
 [container.md](container.md#run-the-image-commands) owns the container line of each
 command. This section owns the workflow.

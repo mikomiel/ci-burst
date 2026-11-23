@@ -659,7 +659,12 @@ the deletion rule: it omits the new pin of the newest completed journal row and
 the pins of settled rows since it, which retention protects, and it can list a
 candidate that a refresh recorded as `TEMPLATE_DRIFT`, which retention does not
 protect for being the candidate (a pin that names its image still protects it). The `deletion` part of `image plan` gives the current dry-run deletion
-decision. Plain `status` makes no provider call. `status --refresh` makes describe calls for the live pin, the
+decision. Plain `status` makes no provider call. It records the check time
+best-effort and reports `check_recorded: false` when no state file exists, a pass
+holds the writer lock, or the write fails with an OS error. A database error on
+that write ends the command with `UNEXPECTED` instead
+([#208](https://github.com/mikomiel/ci-burst/issues/208)).
+`counters.last_check_at` shows the time from before this call. `status --refresh` makes describe calls for the live pin, the
 rollback target and the newest verified candidates, and records whether each
 version and image still exists and whether the candidate version differs from its
 source in any field but `ImageId`. A promotion decides from that record, so run
@@ -923,7 +928,11 @@ previous pin with the same single-key edit, so other changes that you made to th
 TOML since then stay. The `rollback` object of `image status` reports either the target and its
 evidence or the reason a rollback is not available now. It does not check every write precondition, such
 as a zone pin (`PROMOTE_ZONE_PIN`); read `write_check` in the output of
-`image promote --rollback` without `--write` for those.
+`image promote --rollback` without `--write` for those. While a crashed
+`promote --write` has left a pending row, the two can disagree:
+`image status --refresh` takes the target from completed rows only, and the
+preview simulates the resolution of the pending row. Once the row is resolved,
+run the refresh and the preview again before you roll back.
 
 If no rollback is available, set the pin by hand to a version whose image exists.
 The rest of rollback is the same as for the scaling path (see
@@ -1106,7 +1115,10 @@ the key name nor the writer of the object, so the prefix must belong to this
 deployment alone
 ([deployment.md](deployment.md#the-image-tables-optional)). It adopts a builder or
 an image that a crash left behind, and records a tagged image that has no row as an
-unverified candidate that is never pinned. Removals of leaked resources add to
+unverified candidate that is never pinned. Such a row has the reason
+`IMAGE_ORPHAN_RECORDED`, no verification time and no template version:
+`image status` can show it as `last_build`, but never as the `candidate`, and
+`promote` cannot select it. Removals of leaked resources add to
 `ci_burst_image_leaked_resources_total`; the termination of an overdue builder of an
 active build does not, so do not use the counter to account for those. The bucket lifecycle rule on the staging
 prefix is a backstop only: when a build ends, ci-burst makes one delete call for

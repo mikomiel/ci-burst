@@ -21,6 +21,8 @@ changes no row. The state file and its lock are created before the reads when
 they are absent, because the lock must be held across them.
 """
 
+import sqlite3
+
 from . import image
 from .errors import ProviderRefusal, StateRefusal
 from .image_pipeline import _summary
@@ -170,12 +172,16 @@ def _image_of(state, deployment, version):
 
 
 def _record_check(state, now):
-    """Record the check time. A status that cannot (a pass holds the lock, a read-only directory) still reports."""
+    """Record the check time. A status that cannot (a pass holds the lock, a read-only directory) still reports.
+
+    The write is best-effort, so a database error (for example a read-only state
+    file) reports ``check_recorded: false`` and does not fail the read-only status.
+    """
     try:
         state.connect()
         state.acquire_writer()
         state.control_set(last_check_at=now)
-    except (StateRefusal, OSError):
+    except (StateRefusal, OSError, sqlite3.Error):
         return False
     finally:
         state.close()

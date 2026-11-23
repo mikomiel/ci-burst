@@ -661,9 +661,7 @@ candidate that a refresh recorded as `TEMPLATE_DRIFT`, which retention does not
 protect for being the candidate (a pin that names its image still protects it). The `deletion` part of `image plan` gives the current dry-run deletion
 decision. Plain `status` makes no provider call. It records the check time
 best-effort and reports `check_recorded: false` when no state file exists, a pass
-holds the writer lock, or the write fails with an OS error. A database error on
-that write ends the command with `UNEXPECTED` instead
-([#208](https://github.com/mikomiel/ci-burst/issues/208)).
+holds the writer lock, or the write fails with an OS or database error.
 `counters.last_check_at` shows the time from before this call. `status --refresh` makes describe calls for the live pin, the
 rollback target and the newest verified candidates, and records whether each
 version and image still exists and whether the candidate version differs from its

@@ -803,6 +803,16 @@ class StatusTests(CliCase):
         self.assertEqual((code, payload["decision"], payload["check_recorded"]), (0, "status", False))
         self.assertEqual(self.dump(), before)
 
+    def test_a_database_error_on_the_check_write_reports_check_recorded_false_and_exits_zero(self):
+        self.build_candidate()
+        before = self.dump()
+        error = sqlite3.OperationalError("attempt to write a readonly database")
+        with mock.patch.object(ImageState, "control_set", side_effect=error):
+            code, payload = self.invoke("image", "status")
+        self.assertEqual((code, payload["decision"], payload["check_recorded"]), (0, "status", False))
+        self.assertNotIn("error", payload)
+        self.assertEqual(self.dump(), before)
+
     def test_a_pending_row_is_reported_with_the_resolution_its_hash_implies_and_is_not_resolved(self):
         self.pin_current()
         self.add_pending(old_sha=self.file_sha(), new_sha="1" * 64)

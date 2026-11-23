@@ -4196,6 +4196,12 @@ class TelemetryTests(PipelineCase):
         self.assertIsNone(self.metric("ci_burst_image_last_build_timestamp_seconds", outcome="failed"))
         self.assertEqual(self.metric("ci_burst_image_build_duration_seconds"), 390.0)
         self.assertEqual(self.metric("ci_burst_image_console_latency_seconds"), 300.0)
+        text = (self.state_dir / image_pipeline.METRICS_FILE).read_text(encoding="utf-8")
+        self.assertIn(
+            "# HELP ci_burst_image_console_latency_seconds"
+            " Seconds from the build start to the latest sighting of the marker on the console.\n",
+            text,
+        )
         self.assertEqual(self.metric("ci_burst_image_consecutive_failures"), 0.0)
         self.assertEqual(self.metric("ci_burst_image_blocked"), 0.0)
         self.assertEqual(self.metric("ci_burst_image_candidate_waiting_seconds"), 0.0)

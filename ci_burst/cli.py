@@ -260,11 +260,10 @@ def _resolve_journal(config, state):
     changed the account. With no state file there is nothing to resolve, and
     nothing is created here: a refusal that needs no network leaves no file behind.
     """
-    if not state.connect_readonly():
+    if not state.probe_for_write():
         return []
-    state.close()  # reopen for writing: a read-only connection cannot be upgraded
+    state.acquire_writer()  # before the writable open, which rolls back a hot journal
     state.connect()
-    state.acquire_writer()
     state.journal_check()
     return image_promote.resolve_pending(state, image_promote.read_snapshot(config).sha256)
 

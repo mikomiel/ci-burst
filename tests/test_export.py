@@ -612,6 +612,7 @@ class ExporterTests(ExportCase):
                 region="eu-central-1",
                 account="111122223333",
                 price_micros=20_000,
+                admitted_lifetime_seconds=3600,
             )
         ledger.set_state("op-1", "running", instance_id="i-0123456789abcdef0")
         ledger.close()
@@ -1417,6 +1418,7 @@ class ExporterTests(ExportCase):
             window_start=0.0,
             region="eu-central-1",
             account="111122223333",
+            admitted_lifetime_seconds=3600,
         )
         ledger.close()
         connection = sqlite3.connect(database)

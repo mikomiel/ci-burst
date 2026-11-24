@@ -379,7 +379,7 @@ from the ephemeral counts, while the queue counts still include every job with
 the supported labels. Nothing here links a registration to a job attempt or
 claims an assignment; the job result remains Forgejo's.
 
-The controller writes the counts to the ledger (`fleet_observations`, schema 4,
+The controller writes the counts to the ledger (`fleet_observations`, added in schema 4,
 one row per successful pass, pruned after seven days) and keeps the previous
 pass when the read fails. It reads the snapshot only after the admission
 decision is fixed, and after the launch when the pass launches; it skips the
@@ -1717,13 +1717,17 @@ token cannot describe two requests. A resumed intent is retried exactly as
 frozen and never falls through, because a rejected retry cannot prove the
 earlier request created nothing.
 
-Two bounds refuse rather than launch: an unresolved intent older than the
-24-hour client-token validity, and an intent whose configured lifetime has
-already elapsed. Both keep the unresolved ownership and block admission until
-an operator resolves them. When more than one launch intent is unresolved,
+Three bounds refuse rather than launch: an unresolved intent older than the
+24-hour client-token validity, an intent whose configured lifetime has already
+elapsed, and an intent whose recorded admitted lifetime differs from the
+configured `aws.max_lifetime_seconds`, or that records none because the row
+predates ledger schema 5 (#138). Each intent stores the lifetime it was
+admitted under, so the refusal does not infer it from `expires_at` and
+`created_at`. All three keep the unresolved
+ownership and block admission until an operator resolves them. When more than one launch intent is unresolved,
 `apply` retries them in creation order and stops at the first intent whose age
-exceeds the client-token window, whose lifetime elapsed, or whose retry is not
-accepted. Intents after the deciding one are not sent and retain their existing
+exceeds the client-token window, whose lifetime elapsed or differs, or whose
+retry is not accepted. Intents after the deciding one are not sent and retain their existing
 ledger state for the next apply.
 
 Every attempted intent produces one `resumes` record in creation order. A
@@ -1737,11 +1741,12 @@ whatever the outcome; `instance_id` is `null` until a launch is confirmed, and
 | `uncertain` | `[]` | `null` | provider refusal | from the operation | `[]` |
 | `refused` | `["unresolved_intent_expired"]` | `null` | absent | from the operation | `[]` |
 | `refused` | `["unresolved_intent_lifetime_elapsed"]` | `null` | absent | from the operation | `[]` |
+| `refused` | `["unresolved_intent_lifetime_mismatch"]` | `null` | absent | from the operation | `[]` |
 
 Every record also carries `operation`. The top level carries the deciding
 intent's `operation`, `decision`, `expires_at` and `reservation`; its
 `instance_id` appears only when that intent was confirmed, its `reasons` only for
-the two expiry refusals, and its `refusal` only for an uncertain retry. The top
+the three refusals above, and its `refusal` only for an uncertain retry. The top
 level carries no `attempts` field, and a resume sends one frozen request, so a
 record's `attempts` is always empty.
 
@@ -1879,8 +1884,17 @@ Three different times bound one admission pass:
   deployment that needs a longer pass must raise this unit timeout;
   `pass_deadline_seconds` is not offered above `290`.
 - `aws.max_lifetime_seconds` is the worker instance's own lifetime, not the
-  pass duration. It may be shorter than a pass on a deliberately short-lived
-  worker; it must remain longer than the worker needs to run one job.
+  pass duration. `apply` admits only when it is `3600`, the value that the
+  worker bootstrap arms for its shutdown and its job bound, so the expiry tag
+  and the cost reservation of a new worker use the bootstrap's duration (#138).
+  Another value makes the controller refuse `apply` with
+  `WORKER_LIFETIME_MISMATCH` before it takes the writer lock or opens the
+  ledger; `reap`, `status`, `export` and `plan` keep working, so set
+  the value to `3600` and admission resumes. An unresolved intent whose
+  recorded admitted lifetime is another value, or that records none because it
+  predates ledger schema 5, is not sent again: `apply` refuses it with
+  `unresolved_intent_lifetime_mismatch` and keeps admission blocked until an
+  operator resolves it, like the other unresolved-intent refusals below.
 
 `reap`, `status` and `export` keep their existing behaviour and do not take the
 pass deadline. `reap --apply` runs from its own unit and timer on the cleanup

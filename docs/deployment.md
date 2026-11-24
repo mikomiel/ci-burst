@@ -735,7 +735,9 @@ Notes on the values:
 - The staging bucket must not have versioning enabled. A delete in a versioned bucket
   only adds a delete marker and leaves the source archive as a noncurrent version,
   so the deletion that ci-burst records as done would not remove the archive.
-  ci-burst does not check this setting.
+  ci-burst does not check this setting. Suspending versioning does not remove the
+  noncurrent versions that already exist. The rule also applies to an old bucket that
+  build rows still name.
 - The staging bucket and its lifecycle rule are yours: the row of a build records
   the bucket and the key before the upload starts. When the build ends, ci-burst
   deletes that object, and a refused delete stays owed and is retried by every

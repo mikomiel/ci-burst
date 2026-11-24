@@ -1166,8 +1166,14 @@ the bounded owed deletions and nothing else: it reads no pin, builders, stray
 archives or images of the provider, applies no retention, reads no file of the
 forge, and answers `refused` with `IMAGE_GATE_REQUIRED`. A refusal of one of those
 reads therefore cannot hide the result. The pin fields that it did not read are
-`null` in the result, as is `retention`. When nothing is owed, the same file is
-refused before any client is built.
+`null` in the result, as is `retention`, and the result carries `cleanup_only: true`.
+The command line then stamps no pin evidence (`pin_evidence` is
+`{"recorded": false, "reason": "IMAGE_CLEANUP_ONLY"}`), so the run makes no describe
+call either. When nothing is owed, the same file is refused before any client is built.
+
+The sweep of stray archives leaves every owed archive alone, including one that the
+bound deferred in this pass: only the owed deletion retries it, within the bound, and
+records the attempt.
 
 A builder that outlives its lifetime is a defect. To remove it, filter on both `ci-burst:image-build = true` and `ci-burst:deployment = <your deployment>`, then terminate the exact instance id: the
 image-build tag alone can match the builder of another deployment in the same

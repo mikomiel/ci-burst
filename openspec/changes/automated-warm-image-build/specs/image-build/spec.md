@@ -634,6 +634,7 @@ The gate requirement MUST guard a launch. `plan`, and an applying pass with no b
 - **WHEN** no build is in flight at the start of a pass, the configuration holds no gate command and no opt-out, a finished build owes an archive deletion and the provider refuses the pin read and the listings
 - **THEN** the pass deletes the archive, records `archive_deleted_at` and answers `refused` with `IMAGE_GATE_REQUIRED`
 - **AND** it reads no pin, builders, stray archives, images, retention or forge file, and the pin fields that it did not read and `retention` are empty in the result
+- **AND** the command line stamps no pin evidence after it
 
 #### Scenario: A new build is refused under a withdrawn gate
 - **WHEN** a pass runs because a build was in flight, that build ended before the pass took the lock, and the configuration holds no gate command and no opt-out
@@ -716,6 +717,11 @@ Every pass MUST reconcile before any transition, and its first call MUST end the
 #### Scenario: A stray archive
 - **WHEN** an object older than one hour sits under the prefix and is not the active archive
 - **THEN** reconcile deletes it
+
+#### Scenario: The sweep leaves an owed archive to the bounded retry
+- **WHEN** an object older than one hour sits under the prefix and a finished build owes its deletion, whether the pass retried it, it was refused or the bound deferred it
+- **THEN** the sweep does not delete it, and only the owed retry does, within its bound
+- **AND** a stray object that no row names is still deleted by the sweep
 
 #### Scenario: An overdue builder
 - **WHEN** the build deadline has passed and the active build has a builder

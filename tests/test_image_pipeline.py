@@ -3629,13 +3629,16 @@ class ArchiveOwedTests(PipelineCase):
 class OwedArchiveBoundTests(PipelineCase):
     """The owed deletions of one pass are bounded, take turns, and never hide the rest of the pass."""
 
-    def owe(self, count, *, stuck=()):
-        """``count`` finished builds that each owe an archive, oldest first. A key in ``stuck`` is refused for good."""
+    def owe(self, count, *, stuck=(), modified=NOW):
+        """``count`` finished builds that each owe an archive, oldest first. A key in ``stuck`` is refused for good.
+
+        The objects were last modified at ``modified``.
+        """
         keys = []
         for number in range(count):
             key = f"{PREFIX}owed-{number:02d}.tar.gz"
             self.add_build(f"owed-{number:02d}", age=5 * DAY - number * 60, archive_bucket=BUCKET, archive_key=key)
-            self.world.objects[key] = (b"archive", NOW)
+            self.world.objects[key] = (b"archive", modified)
             keys.append(key)
         refused = {keys[number] for number in stuck}
 
@@ -3680,6 +3683,25 @@ class OwedArchiveBoundTests(PipelineCase):
         self.assertEqual(len(owed), 3)
         self.assertIn("archive:delete_deferred", result["notes"])
         self.assertEqual(result["decision"], "candidate", result)
+
+    def test_the_stray_sweep_leaves_an_owed_object_to_the_bounded_retry_and_still_deletes_a_true_stray(self):
+        # The objects are older than an hour, which is what the sweep takes for a stray.
+        old = NOW - 2 * HOUR
+        keys = self.owe(12, stuck=range(6), modified=old)
+        stray = f"{PREFIX}no-row-owns-this.tar.gz"
+        self.world.objects[stray] = (b"archive", old)
+        self.apply()
+        attempts = [call["Key"] for call in self.world.arguments("delete_object")]
+        # Eight owed deletions, the six refused among them, and the sweep's one true stray: nothing else.
+        self.assertEqual(sorted(attempts), sorted([*keys[:OWED_ARCHIVES_PER_PASS], stray]))
+        self.assertNotIn(stray, self.world.objects)
+        # The four that the bound deferred are still there, and so are the six that were refused.
+        self.assertTrue(set(keys[OWED_ARCHIVES_PER_PASS:]) <= set(self.world.objects))
+        self.assertTrue(set(keys[:6]) <= set(self.world.objects))
+        self.assertEqual(
+            [row.id for row in self.query(lambda state: state.archives_owed(DEPLOYMENT))],
+            [f"owed-{number:02d}" for number in (8, 9, 10, 11, 0, 1, 2, 3, 4, 5)],
+        )
 
     def test_a_backlog_within_the_bound_defers_nothing(self):
         self.owe(OWED_ARCHIVES_PER_PASS)

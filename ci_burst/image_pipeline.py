@@ -90,7 +90,8 @@ cleanup pass: it runs the bounded owed deletions, and then answers ``refused`` w
 the gate requirement. It reads nothing else, neither the pin, the builders, the
 stray archives, the images and the retention of the provider nor any file of the
 forge, so an unrelated refusal of those reads cannot hide its result. The pin
-fields that it did not read are ``None`` and ``retention`` is ``None``.
+fields that it did not read are ``None``, ``retention`` is ``None`` and the result carries ``cleanup_only: true``,
+so that the command line stamps no pin evidence.
 
 The pass deadline bounds the reads of the forge too. The forge client puts no
 deadline on a read of a basis file, so the clock is read before each request:
@@ -1159,7 +1160,7 @@ class _Pass:
         else from the provider (no pin, no builders, no stray archives, no images, no retention) and nothing from the
         forge, so an unrelated refusal of those reads cannot hide the result. Without a gate, a pass with nothing in
         flight was refused before any client was built, so skipping them loses nothing. The result keeps its shape:
-        the pin fields that were not read are ``None`` and ``retention`` is ``None``.
+        the pin fields that were not read are ``None``, ``retention`` is ``None`` and ``cleanup_only`` is true.
         """
         summary = self._reconcile_summary()
         self._delete_owed(summary)
@@ -1187,6 +1188,8 @@ class _Pass:
             "retention": None,
             "control": _control_summary(self.s.control_get()),
             "notes": self.notes,
+            #: Tells the caller that no pin was read: the command line stamps no pin evidence after this pass.
+            "cleanup_only": True,
         }
 
     def _check_event(self, decision, reason, build, pin):
@@ -1236,9 +1239,12 @@ class _Pass:
             summary["builders_terminated"] += len(foreign)
             self.terminated_foreign = len(foreign)
             self.tele.leak("builder", len(foreign))
-        # Stray archives: not the active archive, and older than an hour.
+        # Stray archives: not the active archive, not one that a finished build still owes (whether or not the
+        # bound reached it in this pass: its retries and their timestamps belong to ``_delete_owed``), and older
+        # than an hour.
         storage = self.cfg.storage
         keep = {active.archive_key} if active is not None and active.archive_key else set()
+        keep.update(row.archive_key for row in s.archives_owed(dep) if row.archive_bucket == storage.bucket)
         for stored in aws.list_objects(storage.bucket, _archive_prefix(storage.prefix), deadline=self.deadline):
             if stored.key in keep or stored.last_modified is None:
                 continue

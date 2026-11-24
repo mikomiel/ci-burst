@@ -618,7 +618,7 @@ def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock):
         # The same check as the preview's: ``--config`` must still lead to this file, with the same identity and
         # bytes. A hash of the resolved target alone misses a link that now leads to another file.
         if not _is_unchanged(snapshot):
-            raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed after it was read; nothing was written")
+            raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed after it was read; the pin was not changed")
         with state.transaction():
             if kind == "promotion":
                 _record_previous_pin(state, snapshot)
@@ -1102,7 +1102,7 @@ def _write(snapshot, state, clock, events, version, rollback, *, owner):
             # the file must still be this snapshot first, or a stale hash could mark a row aborted that a later
             # check then refuses to build on.
             if not _is_unchanged(snapshot):
-                raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed after it was read; nothing was written")
+                raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed after it was read; the pin was not changed")
             resolved = resolve_pending(state, snapshot.sha256)
             now = clock()
             if rollback:

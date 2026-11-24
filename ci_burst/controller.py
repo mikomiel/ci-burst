@@ -212,6 +212,9 @@ class Controller:
         """Take one bounded admission and launch decision."""
         result = self._base("apply")
         self.config.require_live_contract()
+        # Before the writer lock and the ledger: an intent recorded or resent under another lifetime would carry an
+        # expiry that the worker's own timers do not keep (#138).
+        self.config.require_worker_lifetime()
         deadline = self.clock() + self.config.controller.pass_deadline_seconds
         # The writer lock precedes the connect: an earlier-schema file is copied
         # and upgraded by that connect, and that mutation may not race a second
@@ -891,6 +894,7 @@ class Controller:
                     price_micros=selected.quote.price_micros,
                     admitted_incidental_per_hour_micros=self.cost.incidental_per_hour_micros,
                     admitted_buffer_micros=self.cost.buffer_micros,
+                    admitted_lifetime_seconds=self.config.aws.max_lifetime_seconds,
                 )
             # Intent is committed before the request, so a lost response is
             # recoverable and never a reason to allocate a second operation for
@@ -1089,6 +1093,13 @@ class Controller:
                 # unresolved ownership and block admission instead.
                 attempt["decision"] = "refused"
                 attempt["reasons"] = ["unresolved_intent_lifetime_elapsed"]
+            elif operation.admitted_lifetime_seconds != self.config.aws.max_lifetime_seconds:
+                # Admitted under another aws.max_lifetime_seconds, or under none
+                # on record (a row from before schema 5): its frozen expiry tag
+                # would not match the worker's own timers (#138). Fail closed:
+                # keep the unresolved ownership and block admission instead.
+                attempt["decision"] = "refused"
+                attempt["reasons"] = ["unresolved_intent_lifetime_mismatch"]
             else:
                 self._send(operation, operation.request(), attempt, "resumed", first_attempt=False)
             record = {

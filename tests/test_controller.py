@@ -109,13 +109,16 @@ class ControllerCase(unittest.TestCase):
         instance_id="i-seed",
         request=None,
         age=0,
+        admitted_lifetime_seconds=3600,
     ):
         """Seed one operation that was created ``age`` seconds ago.
 
         The whole timeline of the row moves back with its creation, so it has
         the lifetime and the cost of a worker created at that time. A row with
         no age is created at the clock's current time and so, in the state
-        ``starting`` or ``running``, is inside the claim grace.
+        ``starting`` or ``running``, is inside the claim grace. The row records
+        the configured lifetime it was admitted under; pass another value, or
+        ``None`` for a row from before schema 5, to seed a mismatch.
         """
         created = self.clock.now - age
         ledger = Ledger(self.config.state.database, clock=lambda: created).connect()
@@ -130,6 +133,7 @@ class ControllerCase(unittest.TestCase):
                 window_start=current_window(created, self.config.budget.window_seconds),
                 region=self.config.aws.region,
                 account="111122223333",
+                admitted_lifetime_seconds=admitted_lifetime_seconds,
             )
         if state != "intent" or instance_id:
             ledger.set_state(operation_id, state, instance_id=instance_id)
@@ -226,14 +230,17 @@ class PlanTests(ControllerCase):
         self.assertEqual(result["budget"]["remaining"].startswith("-"), True)
 
     def test_admission_recomputes_time_after_a_slow_quote_read(self):
-        config = load(write_config(self.root, config={"aws": {"max_lifetime_seconds": 60}}))
+        # A read longer than the lifetime itself cannot happen in one pass: the pass deadline, at most 290 seconds,
+        # ends it first. The slow read stays short, and the expiry must still count from the end of the read.
         aws = FakeAws(spot_quote=quote(clock=self.clock))
+        started = self.clock.now
         aws.on_quote = lambda: self.clock.advance(70)
-        controller = self.build(observation=observation_demand(), aws=aws, config=config)
+        controller = self.build(observation=observation_demand(), aws=aws)
         result = controller.apply()
         self.assertEqual(result["decision"], "launched")
         operation = self.reopened().operation(result["operation"])
         self.assertGreater(operation.expires_at, self.clock.now)
+        self.assertEqual(operation.expires_at, started + 70 + 3600)
 
     def test_a_slow_quote_read_cannot_keep_stale_price_evidence(self):
         aws = FakeAws(spot_quote=quote(clock=self.clock))
@@ -1672,7 +1679,7 @@ class FleetTests(ControllerCase):
             )
         )
 
-    def seed_intent(self, operation_id, *, expires_at, reservation):
+    def seed_intent(self, operation_id, *, expires_at, reservation, admitted_lifetime_seconds=3600):
         """Seed one unresolved intent, advancing the clock after each seed."""
         self.seed(
             state="intent",
@@ -1680,6 +1687,7 @@ class FleetTests(ControllerCase):
             operation_id=operation_id,
             expires_at=expires_at,
             reservation=reservation,
+            admitted_lifetime_seconds=admitted_lifetime_seconds,
         )
         self.clock.advance(1)
 
@@ -1784,17 +1792,9 @@ class FleetTests(ControllerCase):
         )
 
     def test_a_later_worker_is_not_committed_after_the_shared_expiry_elapses(self):
-        config = load(
-            write_config(
-                self.root,
-                config={
-                    "controller": {"max_instances": 2},
-                    "aws": {"max_lifetime_seconds": 60},
-                },
-            )
-        )
+        config = load(write_config(self.root, config={"controller": {"max_instances": 2}}))
         controller = self.build(observation=observation_demand(2), config=config)
-        self.aws.on_run = lambda request: self.clock.advance(70)
+        self.aws.on_run = lambda request: self.clock.advance(3700)
         result = controller.apply()
         self.assertEqual(result["decision"], "launched")
         self.assertIn("admission_expired", result["reasons"])
@@ -2001,11 +2001,12 @@ class FleetTests(ControllerCase):
         self.assertEqual({operation.state for operation in operations}, {"starting"})
 
     def test_resume_uncertainty_keeps_the_deciding_intents_own_expiry(self):
+        # Distinct expiries within the configured lifetime, so that each intent is told apart and is sent.
         first_expiry = self.clock.now + 3600
         self.seed_intent("third", expires_at=first_expiry, reservation=440_000)
-        second_expiry = self.clock.now + 7200
+        second_expiry = self.clock.now + 3540
         self.seed_intent("second", expires_at=second_expiry, reservation=540_000)
-        self.seed_intent("first", expires_at=self.clock.now + 10800, reservation=640_000)
+        self.seed_intent("first", expires_at=self.clock.now + 3480, reservation=640_000)
         controller = self.build(observation=observation_demand())
         runs = []
 
@@ -2056,6 +2057,81 @@ class FleetTests(ControllerCase):
         self.assertEqual(ledger.operation("third").instance_id, resumed["instance_id"])
         self.assertEqual(ledger.operation("second").state, "uncertain")
         self.assertEqual(ledger.operation("first").state, "intent")
+
+    def assert_resume_refused_for_lifetime(self, operation_id, expires_at):
+        """Apply with one seeded intent and check the refusal left it untouched."""
+        before = self.reopened().operation(operation_id)
+        controller = self.build(observation=observation_demand())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["unresolved_intent_lifetime_mismatch"])
+        self.assertEqual(result["operation"], operation_id)
+        self.assertEqual(result["expires_at"], expires_at)
+        self.assertEqual([call for call in self.aws.calls if call[0] == "run_spot"], [])
+        self.assertEqual(self.aws.mutations(), [])
+        after = self.reopened().operation(operation_id)
+        self.assertEqual(after.state, "intent", "the unresolved ownership stays")
+        self.assertEqual(after.request_json, before.request_json)
+        self.assertEqual(after.client_token, before.client_token)
+        self.assertEqual(after, before)
+
+    def test_resume_refuses_an_intent_admitted_under_another_lifetime(self):
+        # An intent that an earlier configuration admitted for 1800 seconds keeps its frozen expiry tag. Once the file
+        # says 3600, apply passes the CLI check, but the intent's tag would not match the worker's own timers (#138).
+        for seconds in (1800, 7200):
+            with self.subTest(seconds=seconds):
+                self.setUp()
+                expiry = self.clock.now + seconds
+                self.seed_intent("earlier", expires_at=expiry, reservation=440_000, admitted_lifetime_seconds=seconds)
+                self.assert_resume_refused_for_lifetime("earlier", expiry)
+
+    def test_resume_refuses_an_intent_that_records_no_lifetime(self):
+        # A row from before schema 5 records no admitted lifetime, and its expiry less its creation time cannot stand
+        # in for one: 3400 seconds is a 3400-second intent or a 3600-second one written 200 seconds into its pass.
+        for seconds in (3400, 3600):
+            with self.subTest(seconds=seconds):
+                self.setUp()
+                expiry = self.clock.now + seconds
+                self.seed_intent("legacy", expires_at=expiry, reservation=440_000, admitted_lifetime_seconds=None)
+                self.assertIsNone(self.reopened().operation("legacy").admitted_lifetime_seconds)
+                self.assert_resume_refused_for_lifetime("legacy", expiry)
+
+    def test_resume_sends_an_intent_admitted_under_the_configured_lifetime_whenever_it_was_written(self):
+        # Written 400 seconds into its pass, so its expiry is 3200 seconds after its creation: the recorded lifetime,
+        # not the arithmetic on the timestamps, decides.
+        expiry = self.clock.now + 3600 - 400
+        self.seed_intent("current", expires_at=expiry, reservation=440_000)
+        before = self.reopened().operation("current")
+        self.assertEqual(before.admitted_lifetime_seconds, 3600)
+        self.assertEqual(before.expires_at - before.created_at, 3200)
+        result = self.build(observation=observation_demand()).apply()
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1)
+        self.assertEqual(result["resumes"][0]["decision"], "resumed")
+        self.assertEqual(result["resumes"][0]["expires_at"], expiry)
+
+    def test_apply_refuses_another_worker_lifetime_before_any_state_or_provider_call(self):
+        config = load(write_config(self.root, config={"aws": {"max_lifetime_seconds": 1800}}))
+        controller = self.build(observation=observation_demand(), config=config)
+        with self.assertRaises(ConfigRefusal) as raised:
+            controller.apply()
+        self.assertEqual(raised.exception.reason, "WORKER_LIFETIME_MISMATCH")
+        self.assertEqual(self.aws.calls, [])
+        database = config.state.database
+        self.assertFalse(database.exists(), "no ledger was created")
+        self.assertFalse(Path(str(database) + ".lock").exists(), "no writer lock was taken")
+        # Only admission refuses: the other commands still run under the same file.
+        planned = controller.plan()
+        self.assertEqual(planned["decision"], "would_launch")
+        self.assertEqual(self.build(config=config).status()["command"], "status")
+        self.assertEqual(self.build(config=config).reap()["decision"], "planned")
+        self.assertFalse(database.exists(), "nothing but apply may create the ledger")
+
+    def test_a_new_admission_records_the_configured_lifetime(self):
+        result = self.build(observation=observation_demand()).apply()
+        self.assertEqual(result["decision"], "launched")
+        operation = self.reopened().operation(result["launches"][0]["operation"])
+        self.assertEqual(operation.admitted_lifetime_seconds, 3600)
+        self.assertEqual(operation.expires_at - operation.created_at, 3600)
 
     def test_resume_stops_at_an_intent_whose_lifetime_elapsed(self):
         first_expiry = self.clock.now + 3600
@@ -2745,8 +2821,8 @@ class CostTrackingTests(ControllerCase):
         path = write_config(
             self.root,
             config={
-                "budget": {"allowance": "0.1503"},
-                "aws": {"max_spot_price": "0.2000", "max_lifetime_seconds": 1800},
+                "budget": {"allowance": "0.3003"},
+                "aws": {"max_spot_price": "0.2000"},
                 "controller": {"max_instances": 2},
             },
         )
@@ -2763,18 +2839,19 @@ class CostTrackingTests(ControllerCase):
                 client_token="ci-burst-a",
                 request={"seed": True},
                 request_sha256="0" * 64,
-                expires_at=self.clock.now + 1800,
-                reservation_micros=100_001,
+                expires_at=self.clock.now + 3600,
+                reservation_micros=200_001,
                 window_start=current_window(self.clock.now, config.budget.window_seconds),
                 region=config.aws.region,
                 account="111122223333",
                 price_micros=100_000,
+                admitted_lifetime_seconds=3600,
             )
         ledger.set_instance("a", "i-a")
         ledger.set_launch_time("a", self.clock.now)
         ledger.set_state("a", "running", instance_id="i-a")
         ledger.close()
-        self.clock.advance(1800)
+        self.clock.advance(3600)
         controller = self.build(
             observation=observation_demand(2),
             aws=FakeAws(spot_quote=quote(price_micros=200_000, clock=self.clock)),
@@ -2790,11 +2867,11 @@ class CostTrackingTests(ControllerCase):
         self.clock.advance(INSTANCE_RETENTION_SECONDS + 1)
         controller.apply()
         ledger = self.reopened()
-        self.assertEqual(ledger.operation("a").settled_micros, 50_000)
-        self.assertEqual(ledger.operation(second).settled_micros, 100_000)
+        self.assertEqual(ledger.operation("a").settled_micros, 100_000)
+        self.assertEqual(ledger.operation(second).settled_micros, 200_000)
         window = current_window(self.clock.now, config.budget.window_seconds)
         totals = ledger.window_totals(window, controller.cost, self.clock.now)
-        self.assertEqual(totals["spend"], 150_000)
+        self.assertEqual(totals["spend"], 300_000)
         self.assertLessEqual(totals["spend"], config.budget.allowance)
 
     def test_a_lowered_ceiling_keeps_the_commitment_above_settlement(self):
@@ -2829,6 +2906,7 @@ class CostTrackingTests(ControllerCase):
                 region=config.aws.region,
                 account="111122223333",
                 price_micros=200_000,
+                admitted_lifetime_seconds=3600,
             )
         ledger.set_instance("a", "i-a")
         ledger.set_launch_time("a", launched)
@@ -2903,15 +2981,26 @@ class CostTrackingTests(ControllerCase):
                 'non_compute_allowance = "0.50"', 'non_compute_allowance = "0.000001"'
             )
         )
-        controller = self.build(
+        lowered = self.build(
             observation=observation_demand(2),
             aws=FakeAws(spot_quote=quote(price_micros=200_000, clock=self.clock)),
             config=load(lowered_path),
         )
         self.aws.instances_result = []
         # The admitted worker keeps its own 3_600-second expiry window, so the
-        # lowered configuration cannot release its remaining commitment.
-        self.assertEqual(controller.apply()["launch_count"], 0)
+        # lowered configuration cannot release its remaining commitment. Apply
+        # refuses a lifetime other than 3600, so the lowered file is read by
+        # plan, which prices the same ledger.
+        planned = lowered.plan()
+        self.assertEqual(planned["launch_count"], 0)
+        self.assertEqual(planned["budget"]["committed"], "0.200002")
+        # The worker's cost is its own elapsed 600 seconds, settled by the
+        # configuration that admitted it.
+        controller = self.build(
+            observation=observation_demand(2),
+            aws=FakeAws(spot_quote=quote(price_micros=200_000, clock=self.clock)),
+            config=config,
+        )
         self.aws.instances_result = [
             replace(
                 instance(instance_id=worker["instance_id"], operation=worker["operation"], state="terminated"),
@@ -2919,7 +3008,6 @@ class CostTrackingTests(ControllerCase):
             )
         ]
         controller.apply()
-        # It also keeps its elapsed cost: 600 seconds, not the lowered 60-second cap.
         self.assertEqual(self.reopened().operation(worker["operation"]).settled_micros, 33_334)
 
     def test_a_failed_migration_releases_the_writer_lock(self):
@@ -2993,8 +3081,8 @@ class CostTrackingTests(ControllerCase):
                 self.root,
                 config={
                     "controller": {"max_instances": 2},
-                    "aws": {"max_spot_price": "0.060000", "max_lifetime_seconds": 60},
-                    "budget": {"allowance": "0.002002", "non_compute_allowance": "0.000001"},
+                    "aws": {"max_spot_price": "0.060000"},
+                    "budget": {"allowance": "0.120002", "non_compute_allowance": "0.000001"},
                 },
             )
         )
@@ -3006,11 +3094,12 @@ class CostTrackingTests(ControllerCase):
         result = controller.apply()
         self.assertEqual(result["decision"], "launched")
         self.assertEqual(result["launch_count"], 2)
-        self.assertEqual(controller.cost.per_launch_micros(), 1_001)
+        self.assertEqual(controller.cost.per_launch_micros(), 60_001)
         totals = self.totals(controller)
-        # Each worker commits its one billed minute plus its buffer, once.
+        # Each worker's one billed minute is part of its 3600 seconds, not added
+        # to them: it commits its full lifetime plus its buffer, once.
         self.assertEqual(totals["spend"], 2_000)
-        self.assertEqual(totals["committed"], 2_002)
+        self.assertEqual(totals["committed"], 120_002)
 
     def test_a_later_worker_in_a_batch_gets_no_inferred_floor(self):
         # One admission gives the batch a shared expiry, but each operation is
@@ -3093,18 +3182,15 @@ class CostTrackingTests(ControllerCase):
         connection.close()
         live = instance(instance_id="i-live", operation="live", expires_at=now + 3000)
 
-        def config_with(*, max_spot_price, max_lifetime_seconds):
+        def config_with(*, max_spot_price):
             # Drop the optional buffer row: the backfill then records zero, which
             # keeps the reproducer's arithmetic exact.
             rendered = write_config(
                 self.root,
                 config={
                     "controller": {"max_instances": 2},
-                    "aws": {
-                        "max_spot_price": max_spot_price,
-                        "max_lifetime_seconds": max_lifetime_seconds,
-                    },
-                    "budget": {"allowance": "0.55"},
+                    "aws": {"max_spot_price": max_spot_price},
+                    "budget": {"allowance": "1.10"},
                 },
             )
             rendered.write_text(
@@ -3118,7 +3204,7 @@ class CostTrackingTests(ControllerCase):
 
         migrating = self.build(
             observation=observation_empty(),
-            config=config_with(max_spot_price="0.0400", max_lifetime_seconds=3600),
+            config=config_with(max_spot_price="0.0400"),
         )
         migrating.aws.instances_result = [live]
         self.assertEqual(migrating.apply()["decision"], "wait")
@@ -3129,13 +3215,13 @@ class CostTrackingTests(ControllerCase):
         )
         raised = self.build(
             observation=observation_demand(1),
-            config=config_with(max_spot_price="0.5900", max_lifetime_seconds=60),
+            config=config_with(max_spot_price="0.5900"),
             aws=FakeAws(spot_quote=quote(price_micros=20_000, clock=self.clock)),
         )
         raised.aws.instances_result = [live]
         result = raised.apply()
         # 0.590000 stays committed; the released 0.495001 would have afforded a
-        # 0.009834 launch out of the 0.550000 allowance.
+        # 0.590000 launch out of the 1.100000 allowance, which 0.510000 cannot.
         self.assertEqual(result["budget"]["committed"], "0.590000")
         self.assertEqual(result["decision"], "refused")
         self.assertIn("budget_allowance_exhausted", result["reasons"])

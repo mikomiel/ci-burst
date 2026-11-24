@@ -546,7 +546,9 @@ reports the overrun. A deployment that needs a longer pass must raise the
 unit's `TimeoutStartSec`; `pass_deadline_seconds` is not offered above `290`.
 The pass budget is not the worker lifetime: `aws.max_lifetime_seconds` bounds
 the instance itself, and with the shipped defaults the order is
-`240 < 300 < 3600`. `reap`, `status` and `export` are not bounded by it.
+`240 < 300 < 3600`. `apply` admits only when the value is `3600`, the lifetime
+`deploy/runner/bootstrap.sh` arms on the instance (`WORKER_LIFETIME_MISMATCH`
+otherwise; [operations.md](operations.md#scheduler-cleanup-and-rollback)). `reap`, `status` and `export` are not bounded by it.
 § Scheduler, cleanup and rollback in
 [operations.md](operations.md#scheduler-cleanup-and-rollback) owns the full
 relation to the systemd unit and the transport timeouts.
@@ -1076,6 +1078,7 @@ conditions). Reverting the source is a reviewed change, not a history rewrite.
 | `INSTANCE_TYPES_INVALID` | the instance-type list is malformed, repeated, empty or longer than four |
 | `FORGEJO_TOKEN_MISSING` | the env-file is not mounted or lacks the variable |
 | `FORGEJO_CONTRACT_UNQUALIFIED` | `qualification` is still `fixtures-only`; `apply` is refused |
+| `WORKER_LIFETIME_MISMATCH` | `aws.max_lifetime_seconds` is not `3600`, the lifetime the worker bootstrap arms; the controller refuses `apply` before it takes the writer lock or opens the ledger |
 | `FORGEJO_UNEXPECTED_SHAPE` | the endpoint returned something other than an array or `null` |
 | `AWS_SDK_UNAVAILABLE` | the `boto3` runtime dependency is not installed in the command's environment |
 | `AWS_REFUSED` | the identity lacks a permission, or a condition (tag, template, subnet) does not match |

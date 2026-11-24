@@ -2001,11 +2001,12 @@ class FleetTests(ControllerCase):
         self.assertEqual({operation.state for operation in operations}, {"starting"})
 
     def test_resume_uncertainty_keeps_the_deciding_intents_own_expiry(self):
+        # Distinct expiries within the configured lifetime, so that each intent is told apart and is sent.
         first_expiry = self.clock.now + 3600
         self.seed_intent("third", expires_at=first_expiry, reservation=440_000)
-        second_expiry = self.clock.now + 7200
+        second_expiry = self.clock.now + 3540
         self.seed_intent("second", expires_at=second_expiry, reservation=540_000)
-        self.seed_intent("first", expires_at=self.clock.now + 10800, reservation=640_000)
+        self.seed_intent("first", expires_at=self.clock.now + 3480, reservation=640_000)
         controller = self.build(observation=observation_demand())
         runs = []
 
@@ -2056,6 +2057,33 @@ class FleetTests(ControllerCase):
         self.assertEqual(ledger.operation("third").instance_id, resumed["instance_id"])
         self.assertEqual(ledger.operation("second").state, "uncertain")
         self.assertEqual(ledger.operation("first").state, "intent")
+
+    def test_resume_refuses_an_intent_written_under_another_lifetime(self):
+        # An intent that an earlier configuration wrote with 1800 seconds keeps its frozen expiry tag. Once the file
+        # says 3600, apply passes the CLI check, but the intent's tag would not match the worker's own timers (#138).
+        for seconds in (1800, 7200):
+            with self.subTest(seconds=seconds):
+                self.setUp()
+                expiry = self.clock.now + seconds
+                self.seed_intent("legacy", expires_at=expiry, reservation=440_000)
+                controller = self.build(observation=observation_demand())
+                result = controller.apply()
+                self.assertEqual(result["decision"], "refused")
+                self.assertEqual(result["reasons"], ["unresolved_intent_lifetime_mismatch"])
+                self.assertEqual(result["operation"], "legacy")
+                self.assertEqual(result["expires_at"], expiry)
+                self.assertEqual([call for call in self.aws.calls if call[0] == "run_spot"], [])
+                self.assertEqual(self.aws.mutations(), [])
+                operation = self.reopened().operation("legacy")
+                self.assertEqual(operation.state, "intent", "the unresolved ownership stays")
+                self.assertEqual(operation.expires_at, expiry)
+
+    def test_resume_sends_an_intent_whose_lifetime_is_the_configured_one_up_to_its_pass(self):
+        expiry = self.clock.now + 3600 - 200  # written 200 seconds into its pass
+        self.seed_intent("current", expires_at=expiry, reservation=440_000)
+        result = self.build(observation=observation_demand()).apply()
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1)
+        self.assertEqual(result["resumes"][0]["decision"], "resumed")
 
     def test_resume_stops_at_an_intent_whose_lifetime_elapsed(self):
         first_expiry = self.clock.now + 3600

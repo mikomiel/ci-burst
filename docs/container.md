@@ -886,9 +886,12 @@ topology.
   no operation in state `intent` or `uncertain`; a refused legacy intent has no
   supported recovery in the product. A host whose `ci-burst-refresh.timer`
   follows `origin/main` replaces the image by itself within minutes of a merge,
-  so on such a host the drain comes before the change that brings schema 5 is
-  merged, or the refresh timer is stopped until the drain is verified; keep
-  cleanup running either way. If one is found after the upgrade, keep
+  so on such a host either drain before the change that brings schema 5 is
+  merged, with admission stopped from the final check until the new image is
+  promoted, or stop `ci-burst-refresh.timer` and wait until
+  `ci-burst-refresh.service` is inactive before the merge, because stopping the
+  timer does not stop a refresh that is already running; verify the drain, then
+  start the timer again. Keep cleanup running either way. If one is found after the upgrade, keep
   admission stopped, keep cleanup running, do not delete or edit the row, and
   escalate: an empty owned inventory does not prove that its request was never
   sent. `plan`, `status` and `export` accept versions 1

@@ -317,10 +317,13 @@ class ImageState:
         return copy
 
     def close(self):
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
-        self.release_writer()
+        """Close the connection and release the writer lock. The lock is released even when the close raises."""
+        connection, self._connection = self._connection, None
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            self.release_writer()
 
     @property
     def available(self):

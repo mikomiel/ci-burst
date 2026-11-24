@@ -882,11 +882,16 @@ topology.
   earlier schema is refused with `unresolved_intent_lifetime_mismatch` until an
   operator resolves it. `plan`, `status` and `export` accept versions 1
   through 5 and never create or migrate the file, so they keep reading an
-  earlier schema until the first writable run. Rolling the image back after an
-  upgrade requires restoring the matching copy first, because the previous
-  release refuses a schema it does not know: `.pre-v5.` returns the schema-4
-  file, and `.pre-v4.` returns the schema-1, -2 or -3 file that the schema-4
-  step started from. The version-1 upgrade also changes the
+  earlier schema until the first writable run. The previous release refuses a
+  schema it does not know, so rolling the image back after an upgrade needs
+  the matching copy: `.pre-v5.` returns the schema-4 file, and `.pre-v4.`
+  returns the schema-1, -2 or -3 file that the schema-4 step started from. A
+  copy holds nothing written after it: restore it only while admission is
+  stopped and no `apply` has run since the upgrade, so `state.operations` still
+  lists exactly the rows the copy holds. Once an `apply` has admitted or
+  settled an operation, the copy would drop that launch and its spend: keep
+  admission stopped, keep the current ledger and the upgraded image, and
+  escalate instead of rolling back. The version-1 upgrade also changes the
   operator-visible budget shape: the JSON `budget` block reports `spend`,
   `committed` and `remaining` instead of `consumed`, and
   `ci_burst_ledger_consumed_micros` is replaced by `ci_burst_spend_micros` plus

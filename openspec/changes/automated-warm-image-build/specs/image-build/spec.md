@@ -210,14 +210,18 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 - **AND** the deletion stays owed, with `archive_deleted_at` empty, and the bucket lifecycle rule stays the backstop
 
 #### Scenario: A backlog of owed deletions is bounded
-- **WHEN** more archive deletions are owed than one pass may start, or refused deletions take the time budget of the pass
-- **THEN** the pass starts at most 8 deletions, and none once 60 seconds of the pass have gone, reading the clock before each
-- **AND** the pass notes `archive:delete_deferred`
+- **WHEN** more archive deletions are owed than one pass may start, or refused deletions take the time that the pass leaves
+- **THEN** the pass starts at most 8 deletions after its own work, and none once the pass deadline is less than 40 seconds away (the read timeout of the SDK client plus a margin), reading the clock before each
+- **AND** the pass notes `archive:delete_deferred`, and a row refused in this pass is not tried again in it
 
-#### Scenario: An active build keeps the pass
-- **WHEN** a build is active and a finished build owes an archive deletion that times out
-- **THEN** the pass runs no owed deletion and notes `archive:delete_deferred`, so the stage that the active build needs fits the pass
-- **AND** a later pass with no active build retries the deletion, and the end of the active build deletes its own archive
+#### Scenario: The owed deletions come after the work of the pass
+- **WHEN** a finished build owes an archive deletion that times out and the pass has a decision, a stage or a build to run
+- **THEN** the pass does that work first, so the row insert and the stage fit the pass, and the owed deletion runs on the time that is left or is deferred
+
+#### Scenario: A pass that ends on a refusal still retries the owed deletions
+- **WHEN** a pass ends on a refused provider read, such as the listing of builders of an overdue build
+- **THEN** the owed deletions still run in the tail of the pass, at the bucket and key that their rows record, and set `archive_deleted_at`
+- **AND** the refusal that ended the pass is raised unchanged, and a failure of the tail replaces neither it nor the result
 
 #### Scenario: A refused deletion takes its turn
 - **WHEN** an owed deletion is refused
@@ -713,7 +717,7 @@ A `CreateImage` call with an unknown outcome MUST NOT fail the build before the 
 - **THEN** the build fails with the code of the refusal and the failure path ends the builder
 
 ### Requirement: Reconcile runs first and cleans leaks
-Every pass MUST reconcile before any transition, and its first call MUST end the builder of an active build that is past its build deadline, as a non-leak. Reconcile MUST then retry owed archive deletions within a bound when no build is active, terminate every other builder-tagged instance, delete objects under the prefix that are not the active archive and are older than one hour, and, before any start, clean the images of failed builds only under the image deletion rule.
+Every pass MUST reconcile before any transition, and its first call MUST end the builder of an active build that is past its build deadline, as a non-leak. Reconcile MUST then terminate every other builder-tagged instance, delete objects under the prefix that are not the active archive and are older than one hour, and, before any start, clean the images of failed builds only under the image deletion rule. Owed archive deletions MUST run last, on the time the pass leaves.
 
 #### Scenario: A leaked builder
 - **WHEN** a builder is tagged for the deployment and the state file has no matching active build

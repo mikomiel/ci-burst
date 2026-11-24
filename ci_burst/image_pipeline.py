@@ -72,13 +72,13 @@ The archive of a build is deleted when the build ends, from the bucket and the
 key its row recorded, and the row records the time (``archive_deleted_at``). A
 deletion that fails stays owed: ``ImageState.archives_owed`` lists the finished
 builds that name an archive and have no such time, and the reconcile of every
-pass that has no active build retries them first. A pass with an active build runs
-none of them and notes ``archive:delete_deferred``: its stage and its polling need
-the pass, and one delete that times out would use up 30 seconds of it every pass.
-The build deadline bounds the wait, and the end of the build deletes its own
-archive. A pass starts at most ``OWED_ARCHIVES_PER_PASS`` of them
-and none once ``OWED_ARCHIVE_SECONDS`` of the pass have gone, so a backlog of slow
-refused deletions cannot use up the pass. A refused
+pass retries them last (``_Pass._owed_tail``). The end of a build deletes its own
+archive at once. A pass starts at most ``OWED_ARCHIVES_PER_PASS`` of them
+after its own work, on the time that work leaves, and also when the pass ended on a
+refusal: none starts once the pass deadline is less than ``OWED_DELETE_RESERVE_SECONDS``
+away. A backlog of slow refused deletions cannot take the time that a stage, a decision
+or a build needs. If passes never leave that time, the bucket lifecycle rule stays the
+backstop. A refused
 one records the attempt time (``archive_delete_tried_at``) and goes behind the
 rows not yet tried, so it cannot keep a newer row from its turn. Rows that the
 bound left are noted ``archive:delete_deferred``.
@@ -131,7 +131,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import image, image_console, image_deletion
-from .aws import BASIS_DIGEST_TAG, BUILD_ID_TAG, BUILDER_STATES, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
+from .aws import (
+    BASIS_DIGEST_TAG,
+    BUILD_ID_TAG,
+    BUILDER_STATES,
+    DEPLOYMENT_TAG,
+    IMAGE_BUILD_TAG,
+    READ_TIMEOUT_SECONDS,
+)
 from .errors import DeadlineRefusal, ImageRefusal, ProviderRefusal, Refusal
 from .export import _label, _write_atomic
 from .forgejo import require_protected
@@ -151,10 +158,12 @@ SUPERVISOR_SLEEP_SECONDS = 30
 #: An object under the staging prefix that is not the active archive goes once it
 #: is strictly older than this.
 STRAY_ARCHIVE_AGE_SECONDS = 3600
-#: One pass starts at most this many owed archive deletions, and none once ``OWED_ARCHIVE_SECONDS`` of the pass have
-#: gone: a backlog of slow refused deletions must not use up the pass that an active build needs.
+#: One pass starts at most this many owed archive deletions, after its own work and on the time that work leaves. A
+#: deletion starts only while the clock is before the pass deadline minus ``OWED_DELETE_RESERVE_SECONDS``: the read
+#: timeout of the SDK client, which one delete can use up, and a margin. A backlog of slow refused deletions cannot
+#: take the time that a stage, a decision or a build needs.
 OWED_ARCHIVES_PER_PASS = 8
-OWED_ARCHIVE_SECONDS = 60
+OWED_DELETE_RESERVE_SECONDS = READ_TIMEOUT_SECONDS + 10
 
 #: EC2 can answer "no such instance" for a few seconds after ``RunInstances``. A
 #: builder that is not listed within this long of being recorded is not treated
@@ -1093,20 +1102,53 @@ class _Pass:
         #: The reason a check refused the start of a build, else ``None``. The pass then answers ``refused``.
         self.refused = None
         self.check = {}
+        #: The reconcile summary of the result, which the owed tail adds its count to. It is not the result's until
+        #: reconcile has made it.
+        self.summary = self._reconcile_summary()
+        #: True once the owed deletions ran: the cleanup-only pass runs them inside its own work.
+        self.owed_done = False
 
     def run(self):
         try:
             result = self._run()
         except BaseException:
-            # The counters and the metrics also describe a pass that raised. A
-            # failure of their own must not hide the failure that ended the pass.
+            # The owed deletions, the counters and the metrics also belong to a pass that raised. A failure of
+            # their own must not hide the failure that ended the pass.
             try:
+                self._owed_tail()
                 self._publish(checked=False)
             except Exception:  # noqa: BLE001 - the original error is re-raised below
                 pass
             raise
+        self._owed_tail()
         self._publish(checked=True)
         return result
+
+    def _owed_tail(self):
+        """The last step of every pass: the owed archive deletions, on the time that the pass's own work left.
+
+        It runs after the work whether that returned or raised, so a pass that ended on a refusal (an overdue build
+        whose listing is denied, say) still retries them. It never changes the result or the error of the work: the
+        count and the notes join the result that was built (``self.summary`` and ``self.notes`` are the objects
+        in it), and a failure of its own is noted and goes no further. The cleanup-only pass ran its own.
+        """
+        if self.owed_done or self.aws is None:
+            return
+        try:
+            self._delete_owed(self.summary)
+            if self.summary["owed_archives_deleted"]:
+                self.tele.event(
+                    "image_reconciled",
+                    builders_terminated=0,
+                    archives_deleted=0,
+                    owed_archives_deleted=self.summary["owed_archives_deleted"],
+                    images_recorded=0,
+                    builder_adopted=False,
+                    image_adopted=False,
+                    build_id=None,
+                )
+        except Exception:  # noqa: BLE001 - the tail must not replace the result or the error of the pass
+            self._note("archive:delete_tail_failed")
 
     def _publish(self, *, checked):
         """Write the check time (after a pass that finished), the counters and the metrics."""
@@ -1121,6 +1163,7 @@ class _Pass:
         if self.p._gate_missing() and self.s.active_build(self.dep) is None:
             return self._cleanup_only()
         reconcile = self._reconcile()
+        self.summary = reconcile
         pin = self.p._pin_facts(self.aws, self.deadline)
         if pin.image_id is not None:
             self.s.pin_observe(pin.version, pin.image_id)
@@ -1218,14 +1261,8 @@ class _Pass:
         # The first step of the pass, before any read that can fail: the builder of a build that is past its
         # deadline goes. The state machine below ends the build itself, with the code of the deadline.
         self._end_overdue(active, now, summary)
-        # The archives of finished builds whose deletion is still owed, before the first read of the provider that
-        # can fail: a later refusal must not leave them for another pass. A refused deletion stays owed.
-        if active is None:
-            self._delete_owed(summary)
-        elif s.archives_owed(dep):
-            # A build is active: its stage and its polling need the pass, and one delete that times out would use up
-            # 30 seconds of it every pass. The owed rows wait. The build deadline bounds the wait.
-            self._note("archive:delete_deferred")
+        # The archives that finished builds still owe are not deleted here: a delete that times out would take
+        # 30 seconds of the work that follows. ``_owed_tail`` runs them after it.
         # Builders. The state machine owns the active build's builder. Every
         # other builder is terminated. A builder tagged with the active build's
         # id that the row does not know yet is the one a crash between
@@ -1334,15 +1371,19 @@ class _Pass:
     def _delete_owed(self, summary):
         """Retry the owed archive deletions, within the bound of the pass.
 
-        At most ``OWED_ARCHIVES_PER_PASS`` start, and none once ``OWED_ARCHIVE_SECONDS`` of the pass have gone; the
-        clock is read before each one. ``ImageState.archives_owed`` lists the rows never tried first, then the least
-        recently tried, so a deletion that stays refused cannot keep a newer row from its turn. Rows that the bound
-        left are noted as ``archive:delete_deferred``.
+        At most ``OWED_ARCHIVES_PER_PASS`` start, and none once the pass deadline is less than
+        ``OWED_DELETE_RESERVE_SECONDS`` away; the clock is read before each one. ``ImageState.archives_owed`` lists
+        the rows never tried first, then the least recently tried, so a deletion that stays refused cannot keep a
+        newer row from its turn. A row that was refused in this pass is not tried again in it. Rows that the bound left
+        are noted as ``archive:delete_deferred``.
         """
+        self.owed_done = True
         deleted = 0
         started = 0
         for owed in self.s.archives_owed(self.dep):
-            if started >= OWED_ARCHIVES_PER_PASS or self.clock() >= self.started_at + OWED_ARCHIVE_SECONDS:
+            if owed.archive_delete_tried_at is not None and owed.archive_delete_tried_at >= self.started_at:
+                continue  # refused in this pass already, for instance at the end of its own build: not again
+            if started >= OWED_ARCHIVES_PER_PASS or self.clock() >= self.deadline - OWED_DELETE_RESERVE_SECONDS:
                 self._note("archive:delete_deferred")
                 break
             started += 1

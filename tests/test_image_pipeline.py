@@ -48,7 +48,12 @@ from ci_burst.aws import (
 from ci_burst.config import load
 from ci_burst.errors import ObservationRefusal, ProviderRefusal, Refusal
 from ci_burst.forgejo import BranchHead
-from ci_burst.image_pipeline import OWED_ARCHIVES_PER_PASS, ImagePipeline
+from ci_burst.image_pipeline import (
+    OWED_ARCHIVES_PER_PASS,
+    OWED_DELETE_RESERVE_SECONDS,
+    PASS_DEADLINE_SECONDS,
+    ImagePipeline,
+)
 from ci_burst.image_state import ImageState
 
 from support import Clock, write_config
@@ -3536,6 +3541,7 @@ class ArchiveOwedTests(PipelineCase):
         self.assertEqual(list(self.world.objects), [first.archive_key])
         self.assertEqual(self.query(lambda state: state.archives_owed(DEPLOYMENT)), [failed])
         # The file lost its gate and nothing is in flight. The pass still runs, because a deletion is owed.
+        self.clock.advance(60)
         self.configure(render_toml(gate=""))
         source_mark, world_mark = len(self.source.calls), len(self.world.calls)
         result = self.apply()
@@ -3581,12 +3587,13 @@ class ArchiveOwedTests(PipelineCase):
         self.assertEqual(result["reconcile"]["owed_archives_deleted"], 0)
         self.assertNotIn("delete_object", self.world.names(mark))
 
-    def test_an_owed_deletion_is_tried_before_the_provider_read_that_fails(self):
+    def test_an_owed_deletion_is_tried_after_the_work_of_a_pass_that_ends_on_a_refused_read(self):
         first = self.unstaged_with_an_archive()
         self.world.fail("delete_object", ProviderError("RequestLimitExceeded"), times=1)
         self.clock.advance(BUILD_DEADLINE)
         self.apply()
         self.assertIsNone(self.only_build().archive_deleted_at)
+        self.clock.advance(60)
         self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)
         self.refused(self.apply, "AWS_UNCERTAIN")
         self.assertEqual(self.world.objects, {})
@@ -3643,32 +3650,62 @@ class OwedArchiveBoundTests(PipelineCase):
         refused = {keys[number] for number in stuck}
 
         def refuse(arguments):
+            if "/owed-" in arguments["Key"]:
+                self.starts.append(self.clock())
             self.clock.advance(self.seconds_per_delete)
             if arguments["Key"] in refused:
                 raise ProviderError("RequestLimitExceeded")
 
         self.seconds_per_delete = 1
+        self.starts = []
         self.world.hooks["delete_object"] = refuse
         return keys
 
-    def test_a_backlog_larger_than_the_bound_starts_no_more_deletions_than_the_bound_and_a_build_still_starts(self):
+    def assert_owed_deletes_follow_the_work(self, mark):
+        """Every owed deletion of the pass came after the last call of the pass's own work."""
+        names = self.world.names(mark)
+        owed = [
+            index
+            for index, (name, call) in enumerate(self.world.calls[mark:])
+            if name == "delete_object" and "/owed-" in call["Key"]
+        ]
+        self.assertTrue(owed)
+        own = [index for index, name in enumerate(names) if name in ("run_instances", "get_console_output")]
+        self.assertGreater(min(owed), max(own))
+
+    def test_a_backlog_larger_than_the_bound_starts_no_more_deletions_than_the_bound_after_the_work(self):
         self.owe(12, stuck=range(12))
+        self.world.console_plan = [(30.0, READY)]
         result = self.apply()
-        self.assertEqual(len(self.world.arguments("delete_object")), OWED_ARCHIVES_PER_PASS)
+        self.assertEqual(len(self.owed_deletes(0)), OWED_ARCHIVES_PER_PASS)
         self.assertIn("archive:delete_deferred", result["notes"])
-        # The pass went on: the build started and its builder was launched.
+        # The pass did its own work first: the build started, was launched and ended.
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assert_owed_deletes_follow_the_work(0)
+
+    def test_a_pass_whose_work_uses_the_pass_leaves_no_time_for_an_owed_deletion(self):
+        self.owe(3, stuck=range(3))
+        result = self.apply()
         self.assertEqual(result["decision"], "building", result)
+        self.assertEqual(self.owed_deletes(0), [])
+        self.assertIn("archive:delete_deferred", result["notes"])
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
 
-    def test_slow_refused_deletions_stop_at_the_time_budget_and_a_build_still_starts(self):
+    def test_slow_refused_deletions_never_start_inside_the_reserve_before_the_pass_deadline(self):
         self.owe(12, stuck=range(12))
-        self.seconds_per_delete = 25
+        self.world.console_plan = [(30.0, READY)]
+        self.seconds_per_delete = 40
+        started_at = self.clock()
         result = self.apply()
-        # The clock is read before each one: 0, 25 and 50 seconds are inside the budget, 75 is not.
-        self.assertEqual(len(self.world.arguments("delete_object")), 3)
+        limit = started_at + PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS
+        self.assertTrue(self.starts)
+        self.assertTrue(all(start < limit for start in self.starts), (self.starts, limit))
+        # The bound that stopped them was the reserve, not the cap: the next start would have been inside it.
+        self.assertLess(len(self.starts), OWED_ARCHIVES_PER_PASS)
+        self.assertGreaterEqual(self.starts[-1] + self.seconds_per_delete, limit)
         self.assertIn("archive:delete_deferred", result["notes"])
-        self.assertEqual(result["decision"], "building", result)
-        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(result["decision"], "candidate", result)
 
     def test_an_active_build_advances_in_a_pass_that_meets_a_slow_refused_backlog(self):
         self.owe(12, stuck=range(12))
@@ -3679,16 +3716,11 @@ class OwedArchiveBoundTests(PipelineCase):
         self.world.console_plan = [(30.0, READY)]
         mark = len(self.world.calls)
         result = self.apply()
-        # No owed deletion runs while a build is active: the stage and the polling need the pass.
-        self.assertEqual(self.owed_deletes(mark), [])
-        self.assertIn("archive:delete_deferred", result["notes"])
+        # The build advanced first, to its end, and the owed deletions took the time that was left.
         self.assertEqual(result["decision"], "candidate", result)
-        # A later pass has no active build and retries the backlog, within the bound.
-        self.seconds_per_delete = 1
-        mark = len(self.world.calls)
-        later = self.apply()
-        self.assertEqual(len(self.owed_deletes(mark)), OWED_ARCHIVES_PER_PASS)
-        self.assertIn("archive:delete_deferred", later["notes"])
+        self.assert_owed_deletes_follow_the_work(mark)
+        self.assertLessEqual(len(self.owed_deletes(mark)), OWED_ARCHIVES_PER_PASS)
+        self.assertIn("archive:delete_deferred", result["notes"])
 
     def owed_deletes(self, mark):
         return [call for name, call in self.world.calls[mark:] if name == "delete_object" and "/owed-" in call["Key"]]
@@ -3722,13 +3754,16 @@ class OwedArchiveBoundTests(PipelineCase):
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
         self.assertEqual(self.owed_deletes(mark), [])
         self.assertIn("archive:delete_deferred", result["notes"])
-        # The build ends in a pass of its own, and the owed row still waits there: the build was active when it began.
+        # The build ends in the next pass. The owed row is tried after that work, on the time it leaves.
         del self.world.hooks["create_multipart_upload"]
         self.world.console_plan = [(30.0, READY)]
+        mark = len(self.world.calls)
         ended = self.apply()
         self.assertEqual(ended["decision"], "candidate", ended)
-        self.assertEqual(self.owed_deletes(mark), [])
-        # After the build ended, a pass with no active build retries the owed row, and it settles.
+        self.assertEqual(len(self.owed_deletes(mark)), 1)
+        self.assert_owed_deletes_follow_the_work(mark)
+        # The next pass settles it.
+        self.clock.advance(60)
         seconds["per_delete"] = 0
         del self.world.hooks["delete_object"]
         self.pin_current()
@@ -3746,8 +3781,14 @@ class OwedArchiveBoundTests(PipelineCase):
         keys = self.owe(12, stuck=range(6), modified=old)
         stray = f"{PREFIX}no-row-owns-this.tar.gz"
         self.world.objects[stray] = (b"archive", old)
+        self.world.console_plan = [(30.0, READY)]
         self.apply()
-        attempts = [call["Key"] for call in self.world.arguments("delete_object")]
+        # The build's own archive goes at the end of the build: it is neither owed nor a stray.
+        attempts = [
+            call["Key"]
+            for call in self.world.arguments("delete_object")
+            if "/owed-" in call["Key"] or call["Key"] == stray
+        ]
         # Eight owed deletions, the six refused among them, and the sweep's one true stray: nothing else.
         self.assertEqual(sorted(attempts), sorted([*keys[:OWED_ARCHIVES_PER_PASS], stray]))
         self.assertNotIn(stray, self.world.objects)
@@ -3761,6 +3802,7 @@ class OwedArchiveBoundTests(PipelineCase):
 
     def test_a_backlog_within_the_bound_defers_nothing(self):
         self.owe(OWED_ARCHIVES_PER_PASS)
+        self.world.console_plan = [(30.0, READY)]
         result = self.apply()
         self.assertEqual(result["reconcile"]["owed_archives_deleted"], OWED_ARCHIVES_PER_PASS)
         self.assertNotIn("archive:delete_deferred", result["notes"])
@@ -3786,6 +3828,53 @@ class OwedArchiveBoundTests(PipelineCase):
             [row.id for row in self.query(lambda state: state.archives_owed(DEPLOYMENT))],
             [f"owed-{number:02d}" for number in (6, 7, 8, 0, 1, 2, 3, 4, 5)],
         )
+
+    def test_a_slow_failing_owed_delete_does_not_starve_the_insert_of_the_next_build(self):
+        # The basis read of the decision takes 200 of the 240 seconds of the pass.
+        self.owe(1, stuck=[0])
+        self.seconds_per_delete = 30
+        self.source.on_read = lambda: self.clock.advance(200)
+        result = self.apply()
+        self.assertEqual(result["decision"], "building", result)
+        build = [row for row in self.builds() if not row.id.startswith("owed-")]
+        self.assertEqual([row.state for row in build], ["building"])
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        # The owed delete came after the decision and the launch, or was deferred: never before them.
+        names = self.world.names()
+        if "delete_object" in names:
+            self.assertGreater(names.index("delete_object"), names.index("run_instances"))
+        self.assertIn("archive:delete_deferred", result["notes"])
+
+    def test_a_pass_that_ends_on_a_refused_read_still_deletes_what_is_owed_and_raises_the_same_refusal(self):
+        old_bucket = "example-old-staging"
+        key = f"{PREFIX}owed-old.tar.gz"
+        self.add_build("owed-old", archive_bucket=old_bucket, archive_key=key)
+        self.world.objects[key] = (b"archive", NOW)
+
+        def refuse(arguments):
+            raise ProviderError("RequestLimitExceeded")
+
+        # Whatever the first pass tries with the row, the old bucket refuses it.
+        self.world.hooks["delete_object"] = refuse
+        self.apply()
+        del self.world.hooks["delete_object"]
+        # The build is active, and the pass that follows finds it overdue and the listing of builders denied.
+        self.assertEqual(self.query(lambda state: state.active_build(DEPLOYMENT)).state, "building")
+        self.clock.advance(BUILD_DEADLINE)
+        self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)
+        refusal = self.refused(self.apply, "AWS_UNCERTAIN")
+        self.assertEqual(refusal.detail, "ProviderError")
+        self.assertEqual(self.world.arguments("delete_object")[-1], {"Bucket": old_bucket, "Key": key})
+        (owed,) = [row for row in self.builds() if row.id == "owed-old"]
+        self.assertIsNotNone(owed.archive_deleted_at)
+        self.assertNotIn(key, self.world.objects)
+
+    def test_a_failure_of_the_tail_does_not_replace_the_refusal_of_the_pass(self):
+        self.owe(1)
+        self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)
+        with mock.patch.object(image_pipeline._Pass, "_delete_owed", side_effect=RuntimeError("tail broke")):
+            refusal = self.refused(self.apply, "AWS_UNCERTAIN")
+        self.assertEqual(refusal.detail, "ProviderError")
 
     def test_a_pass_with_no_gate_and_nothing_in_flight_runs_only_the_owed_deletions(self):
         (key,) = self.owe(1)

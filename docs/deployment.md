@@ -740,8 +740,8 @@ Notes on the values:
   build rows still name.
 - The staging bucket and its lifecycle rule are yours: the row of a build records
   the bucket and the key before the upload starts. When the build ends, ci-burst
-  deletes that object, and a refused delete stays owed and is retried by every
-  later pass, so a change of `bucket` or `prefix` does not strand an object, as
+  deletes that object, and a refused delete stays owed and is retried at the end of
+  every later pass, on the time the pass leaves, so a change of `bucket` or `prefix` does not strand an object, as
   long as the image role may still delete at the old location: its policy scopes
   `s3:DeleteObject` to `<bucket>/<prefix>*`, and a delete that the provider refuses
   stays owed, and is noted `archive:delete_failed` in every pass, until the grant

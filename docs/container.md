@@ -881,7 +881,13 @@ topology.
   `aws.max_lifetime_seconds` an intent was admitted under, and backfills
   nothing: every existing row keeps `NULL`, so an unresolved intent from an
   earlier schema is refused with `unresolved_intent_lifetime_mismatch` until an
-  operator resolves it. `plan`, `status` and `export` accept versions 1
+  operator resolves it. Drain before the upgrade: stop admission as in rollback
+  step 1, run `status`, and replace the image only when `state.operations` lists
+  no operation in state `intent` or `uncertain`; a refused legacy intent has no
+  supported recovery in the product. If one is found after the upgrade, keep
+  admission stopped, keep cleanup running, do not delete or edit the row, and
+  escalate: an empty owned inventory does not prove that its request was never
+  sent. `plan`, `status` and `export` accept versions 1
   through 5 and never create or migrate the file, so they keep reading an
   earlier schema until the first writable run. The previous release refuses a
   schema it does not know, so rolling the image back after an upgrade needs

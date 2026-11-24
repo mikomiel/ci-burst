@@ -21,6 +21,7 @@ import io
 import json
 import sqlite3
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from ci_burst import cli, image, image_promote
@@ -331,6 +332,60 @@ class MountedFileTests(CliCase):
             self.assertNotIn(text, payload["error"]["detail"])
         self.assertEqual(snapshot_tree(self.dir), before)
         self.assertFalse(self.state_dir.exists())
+
+    def link_to_a_mount_point(self):
+        """``--config`` is a link to a mount-point file with the image path enabled; an ordinary file has it disabled."""
+        enabled = self.config_path.read_text(encoding="utf-8")
+        self.write_deployment(with_image=False)
+        disabled = self.config_path.read_text(encoding="utf-8")
+        mounted, plain, link = (self.config_dir / name for name in ("mounted.toml", "plain.toml", "link.toml"))
+        mounted.write_text(enabled, encoding="utf-8")
+        plain.write_text(disabled, encoding="utf-8")
+        link.symlink_to(mounted)
+        self.config_path = link
+        return link, mounted, plain
+
+    @staticmethod
+    def retarget(link, other):
+        link.unlink()
+        link.symlink_to(other)
+
+    def assert_refused_as_mounted_with_nothing_opened(self, code, payload):
+        self.assertEqual((code, payload["error"]["reason"]), (2, image_promote.IMAGE_CONFIG_MOUNTED))
+        self.assertFalse(self.state_dir.exists())
+        self.assertEqual((self.sessions, self.source_sessions, self.world.calls), ([], 0, []))
+
+    def test_a_link_to_a_mount_point_that_is_retargeted_after_the_load_is_still_refused(self):
+        # The settings of the command and the mount answer come from one read of one file: a later look at the path,
+        # which now leads to an ordinary file with the image path disabled, decides nothing (#202).
+        self.forbid_clients()
+        link, mounted, plain = self.link_to_a_mount_point()
+        real_load = cli.load
+
+        def load(path):
+            config = real_load(path)
+            self.retarget(link, plain)
+            return config
+
+        with (
+            mock.patch.object(cli, "load", load),
+            mock.patch.object(image_promote, "is_mount_point", lambda path: Path(path).resolve() == mounted.resolve()),
+        ):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assert_refused_as_mounted_with_nothing_opened(code, payload)
+
+    def test_a_link_that_is_retargeted_while_the_mount_table_is_asked_is_refused_as_mounted(self):
+        self.forbid_clients()
+        link, mounted, plain = self.link_to_a_mount_point()
+
+        def asked(path):
+            answer = Path(path).resolve() == mounted.resolve()
+            self.retarget(link, plain)
+            return answer
+
+        with mock.patch.object(image_promote, "is_mount_point", asked):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assert_refused_as_mounted_with_nothing_opened(code, payload)
 
     def test_a_disabled_image_table_still_answers_disabled(self):
         self.configure("\n[image]\nenabled = false\n")

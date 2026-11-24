@@ -1974,6 +1974,32 @@ class StaleViewTests(PromoteCase):
         with mock.patch.object(ImageState, "journal_insert", insert):
             yield target
 
+    @contextlib.contextmanager
+    def changed_after_the_journal_commit_returns(self, change):
+        """``change(target)`` runs once the transaction that inserted the ``pending`` row has committed and returned."""
+        target = Path(self.config.path).resolve()
+        real_insert, real_transaction = ImageState.journal_insert, ImageState.transaction
+        inserted, fired = [], []
+
+        def insert(state, **keywords):
+            inserted.append(True)
+            return real_insert(state, **keywords)
+
+        @contextlib.contextmanager
+        def transaction(state):
+            with real_transaction(state) as connection:
+                yield connection
+            if inserted and not fired and not state._in_transaction:  # the outer transaction is over: COMMIT returned
+                fired.append(True)
+                change(target)
+
+        with (
+            mock.patch.object(ImageState, "journal_insert", insert),
+            mock.patch.object(ImageState, "transaction", transaction),
+        ):
+            yield target
+        self.assertEqual(fired, [True])
+
     def test_the_verification_read_refuses_an_edit_that_lands_after_the_bytes_are_in(self):
         snapshot = image_promote.read_snapshot(self.config)
         self.assertTrue(image_promote._is_unchanged(snapshot))
@@ -1997,6 +2023,16 @@ class StaleViewTests(PromoteCase):
         self.assertEqual(target.read_bytes(), edited)
         self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
         self.assertEqual(len(self.backups()), 1)  # the row names it
+        self.assertEqual(sorted(path.name for path in target.parent.iterdir() if path.name.endswith(".promote-tmp")), [])
+
+    def test_an_edit_after_the_journal_commit_has_returned_is_not_overwritten_and_the_row_stays_pending(self):
+        edited = (Path(self.config.path).read_text(encoding="utf-8") + "\n# a hand edit\n").encode("utf-8")
+        with self.changed_after_the_journal_commit_returns(lambda target: target.write_bytes(edited)) as target:
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual(target.read_bytes(), edited)
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(len(self.backups()), 1)
         self.assertEqual(sorted(path.name for path in target.parent.iterdir() if path.name.endswith(".promote-tmp")), [])
 
     def test_a_replacement_during_the_journal_commit_is_not_overwritten_and_the_row_stays_pending(self):
@@ -2183,6 +2219,46 @@ class AuthoritativeReadTests(PromoteCase):
             self.assertNotIn(str(self.dir), raised.exception.detail)
             self.assertFalse(image_promote._is_unchanged(snapshot))
         self.assertTrue(image_promote._is_unchanged(snapshot))
+
+    def edited_while_the_mount_table_is_asked(self, *, on_call=1):
+        """``is_mount_point`` edits the file in place on its ``on_call``-th call and answers "no mount point"."""
+        target = Path(self.config.path).resolve()
+        edited_bytes = target.read_bytes() + b"\n# a hand edit\n"
+        calls = []
+
+        def asked(path):
+            calls.append(path)
+            if len(calls) == on_call:
+                target.write_bytes(edited_bytes)
+            return False
+
+        return mock.patch.object(image_promote, "is_mount_point", asked), edited_bytes
+
+    def test_an_edit_in_place_while_the_mount_table_is_asked_is_refused_by_every_read(self):
+        snapshot = image_promote.read_snapshot(self.config)
+        patch, _ = self.edited_while_the_mount_table_is_asked()
+        with patch, self.assertRaises(ImageRefusal) as raised:
+            image_promote.read_snapshot(self.config)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_CHANGED")
+        # The file is now edited, so the first snapshot is out of date by its identity whatever the read says.
+        self.assertFalse(image_promote._is_unchanged(snapshot))
+
+    def test_an_edit_while_the_mount_table_is_asked_makes_the_verification_refuse(self):
+        snapshot = image_promote.read_snapshot(self.config)
+        patch, _ = self.edited_while_the_mount_table_is_asked()
+        with patch:
+            self.assertFalse(image_promote._is_unchanged(snapshot))
+
+    def test_a_pending_row_is_not_resolved_when_the_file_is_edited_while_the_recovery_asks_the_mount_table(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        # The first question is the dispatch load of the command; the second is the read of the recovery snapshot.
+        patch, edited = self.edited_while_the_mount_table_is_asked(on_call=2)
+        with patch:
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(self.config_path.read_bytes(), edited)
 
     def test_a_replacement_while_the_mount_status_is_checked_is_refused_as_stale(self):
         # The bytes were read and the name held; the file is then replaced as the mount table is read. The answer

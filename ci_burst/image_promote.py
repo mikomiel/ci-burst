@@ -136,7 +136,7 @@ class AuthoritativeRead:
     held: int | None = None  # with ``hold``, the descriptor the bytes were read through, still open
 
 
-def read_authoritative(path, *, hold=False):
+def read_authoritative(path, *, hold=False, mount_applies=None):
     """The one read of the deployment file that a decision may rest on (#202).
 
     ``path`` is followed to the file it names, and that file is opened without following a link, and without waiting
@@ -147,12 +147,15 @@ def read_authoritative(path, *, hold=False):
       in place gives ``PROMOTE_FILE_CHANGED``;
     - it keeps a link, and both the resolved target and the path that was given still name it: a rename over the file
       gives ``PROMOTE_FILE_STALE``, even when a hard link keeps the old file;
-    - it is not a mount point (``IMAGE_CONFIG_MOUNTED``, and on Linux an unreadable mount table fails closed), and it is
-      still named once the mount table was read, so that the answer is about the file whose bytes these are.
+    - it is not a mount point (``IMAGE_CONFIG_MOUNTED``, and on Linux an unreadable mount table fails closed), and once
+      the mount table was read it is still named and still has the identity from before the first byte, so that the
+      answer is about the file whose bytes these are.
 
     A file that cannot be opened or read is a ``ConfigRefusal``. The caller maps the reason to its own refusal; none of
     the details names a path. A change after the last check, up to the use of the bytes, cannot be excluded: the
-    product cannot lock an operator's editor. With ``hold`` the descriptor stays open in ``held`` and the caller closes
+    product cannot lock an operator's editor. ``mount_applies(data)``, when given, is called with the bytes after the
+    first two checks: a false answer skips the mount check, for a caller whose settings (a deployment without the
+    image path) make the mount status of the file irrelevant. With ``hold`` the descriptor stays open in ``held`` and the caller closes
     it: while it is open the file's inode cannot be given to another file, so a later check tells this file from any
     replacement.
     """
@@ -164,7 +167,7 @@ def read_authoritative(path, *, hold=False):
     except (OSError, RuntimeError) as error:  # ``resolve`` raises ``RuntimeError`` for a loop of links
         raise ConfigRefusal("CONFIG_UNREADABLE", f"{path}: {error}") from None
     try:
-        result = _read_descriptor(descriptor, target, path)
+        result = _read_descriptor(descriptor, target, path, mount_applies)
     except BaseException:
         os.close(descriptor)
         raise
@@ -174,7 +177,7 @@ def read_authoritative(path, *, hold=False):
     return result
 
 
-def _read_descriptor(descriptor, target, path):
+def _read_descriptor(descriptor, target, path, mount_applies=None):
     """The checks of ``read_authoritative`` on the file open at ``descriptor``."""
     try:
         before = os.fstat(descriptor)
@@ -203,17 +206,23 @@ def _read_descriptor(descriptor, target, path):
         # The identity was taken before the first byte and again after the last: a difference means that the bytes
         # may be a mix of two contents, and a hash of them would resolve a pending row from a file that never was.
         raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed while it was read; run the command again")
-    check_not_mounted(target)
-    try:
-        # The mount table was read after the bytes: the answer counts only if the file is still the one it is about.
-        named = still_named(descriptor, target) and still_named(descriptor, path)
-    except OSError as error:
-        raise ConfigRefusal("CONFIG_UNREADABLE", f"{path}: {error}") from None
-    if not named:
-        raise ImageRefusal(PROMOTE_FILE_STALE, "the deployment file was replaced while its mount status was checked")
+    data = b"".join(chunks)
+    if mount_applies is None or mount_applies(data):
+        check_not_mounted(target)
+        try:
+            # The mount table was read after the bytes: the answer counts only if the file is still the one it is about.
+            named = still_named(descriptor, target) and still_named(descriptor, path)
+            # The query took time too: an edit in place during it keeps the inode and the name.
+            edited = _identity(os.fstat(descriptor)) != _identity(before)
+        except OSError as error:
+            raise ConfigRefusal("CONFIG_UNREADABLE", f"{path}: {error}") from None
+        if not named:
+            raise ImageRefusal(PROMOTE_FILE_STALE, "the deployment file was replaced while its mount status was checked")
+        if edited:
+            raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed while its mount status was checked; run again")
     return AuthoritativeRead(
         target=target,
-        data=b"".join(chunks),
+        data=data,
         identity=_identity(before),
         mode=stat.S_IMODE(before.st_mode),
         uid=before.st_uid,

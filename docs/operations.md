@@ -883,9 +883,13 @@ right before `promote --write` relies on a snapshot, the load that the deletion 
   mismatch refuses with `PROMOTE_FILE_STALE`, so no journal row is resolved and no pin is written from a
   stale view. A hard link that keeps the old file named does not hide the replacement, and neither does a
   `--config` that is a symbolic link switched to another file during the read.
-- **Mount.** It is not a mount point (`IMAGE_CONFIG_MOUNTED`), and it is still named after the mount table was
-  read, so the answer is about the file whose bytes were read. A mount point is refused on every such read, also
-  the one that supplies the hash of the recovery. Every `image` command also checks it before it opens the state.
+- **Mount.** It is not a mount point (`IMAGE_CONFIG_MOUNTED`), and after the mount table was read it is still
+  named and still has the identity from before the first byte (`PROMOTE_FILE_CHANGED` otherwise), so the answer
+  is about the file whose bytes were read. A mount point is refused on every such read, also the one that
+  supplies the hash of the recovery. The configuration that an `image` command starts from is read the same way, once,
+  before the state is opened: the settings and the mount answer come from the same open file, and no later look at
+  the path replaces them. A file whose settings leave the image path disabled is not asked and still answers
+  `disabled`.
 
 `promote --write` verifies the file this way twice: before it resolves a pending row, and again after the
 `pending` row is committed and right before the rename. A change in the second check leaves the row `pending`

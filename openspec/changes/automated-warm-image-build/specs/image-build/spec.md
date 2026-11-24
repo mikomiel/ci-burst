@@ -1148,6 +1148,14 @@ The `[image]` tables MUST refuse unknown keys and out-of-range values with `CONF
 - **THEN** every `image` command refuses with `IMAGE_CONFIG_MOUNTED` and exit 2 before it opens the state, and the detail names no path
 - **AND** no state file is created, and a disabled image path still answers `disabled`
 
+#### Scenario: The link to a mount point is retargeted after the read
+- **WHEN** `--config` is a link to a mount-point file with the image path enabled, and the link is switched to an ordinary file with the image path disabled once the command has read it
+- **THEN** `image run --apply` refuses with `IMAGE_CONFIG_MOUNTED`, creates no state file and makes no provider call, because the settings and the mount answer come from the same open file
+
+#### Scenario: The file is edited while the mount table is asked
+- **WHEN** the file is rewritten in place while the mount table is read for it
+- **THEN** the read refuses with `PROMOTE_FILE_CHANGED`, a verification of a snapshot of the old bytes fails, and a pending journal row stays `pending`
+
 #### Scenario: The mount table cannot be read
 - **WHEN** the image path is enabled on Linux and the mount table of the process cannot be read
 - **THEN** every `image` command refuses with `IMAGE_CONFIG_MOUNTED` before it opens the state, and the detail names no path

@@ -22,9 +22,9 @@ from pathlib import Path
 
 from . import image_promote, image_status
 from .aws import ImageAws
-from .config import load
+from .config import load, loads
 from .controller import Controller
-from .errors import ImageRefusal, ProviderRefusal, Refusal
+from .errors import ConfigRefusal, ImageRefusal, ProviderRefusal, Refusal
 from .export import Exporter
 from .forgejo import ForgejoSource
 from .image_pipeline import IMAGE_CONFIG_CHANGED, ImagePipeline, write_event
@@ -100,7 +100,7 @@ def main(argv=None):
     arguments = build_parser().parse_args(argv)
     try:
         _check_arguments(arguments)
-        config = load(arguments.config)
+        config = _load_image_config(arguments.config) if arguments.command == "image" else load(arguments.config)
         if arguments.command == "image":
             result = _image(config, arguments)
         elif arguments.command == "export":
@@ -193,11 +193,32 @@ class _Sessions:
         return self.last
 
 
+def _load_image_config(path):
+    """The configuration of an ``image`` command, from the one checked read of the file (``read_authoritative``).
+
+    The settings and the answer to "is this file a mount point" come from the same open file, so a link that leads to a
+    mount point cannot be switched to an ordinary file between the two. A file with the image path enabled that is a
+    mount point is refused (``IMAGE_CONFIG_MOUNTED``) before anything is opened. A file whose settings leave the image
+    path disabled is not asked: it still answers ``disabled``.
+    """
+    loaded = []
+
+    def enabled(data):
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ConfigRefusal("CONFIG_UNREADABLE", f"{path}: {error}") from None
+        loaded.append(loads(text, path))
+        return loaded[-1].image.enabled
+
+    image_promote.read_authoritative(path, mount_applies=enabled)
+    return loaded[-1]
+
+
 def _image(config, arguments):
     """Dispatch one ``image`` command. A deployment without the image path answers ``disabled`` at once."""
     if not config.image.enabled:
         return {"decision": "disabled"}
-    image_promote.check_not_mounted(config.path)
     state = ImageState(config.image.state_directory, clock=image_clock)
     command = arguments.image_command
     if command == "status":

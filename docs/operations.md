@@ -1141,8 +1141,12 @@ day. When a build ends, ci-burst deletes that object and records the time in
 `archive_deleted_at`. A refused call is noted `archive:delete_failed`; the row
 keeps its end state and the deletion stays owed. A finished build that names an
 archive and has no `archive_deleted_at` owes its deletion, and the reconcile of
-every applying pass retries it right after it ended an overdue builder, before
-any other provider read, until it succeeds. The result of the pass counts the
+every applying pass that has no active build retries it right after it ended an
+overdue builder, before any other provider read, until it succeeds. A pass with an
+active build runs none of these deletions and notes `archive:delete_deferred`: the
+build's stage and its polling need the pass, and one delete that times out would use
+up 30 seconds of it every pass. The owed rows wait until the build ends, which the
+build deadline bounds, and the end of the build deletes its own archive. The result of the pass counts the
 successes in `reconcile.owed_archives_deleted`, apart from the stray objects of
 `reconcile.archives_deleted`. S3 answers a delete of a key that was never written
 as done, so a row whose upload never happened settles at the first try. A delete
@@ -1152,7 +1156,7 @@ image role's policy no longer covers, stays owed: every pass notes
 grant to cover the old location. Do not edit the state file by hand.
 
 The retries are bounded, so that a backlog of slow refused deletions cannot use up
-the pass that an active build needs. A pass starts at most 8 owed deletions
+a pass. A pass starts at most 8 owed deletions
 (`OWED_ARCHIVES_PER_PASS`) and none once 60 seconds of the pass have gone
 (`OWED_ARCHIVE_SECONDS`); the clock is read before each one. When owed rows remain
 after the bound, the pass notes `archive:delete_deferred`. Each failed attempt records

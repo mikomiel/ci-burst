@@ -212,7 +212,12 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 #### Scenario: A backlog of owed deletions is bounded
 - **WHEN** more archive deletions are owed than one pass may start, or refused deletions take the time budget of the pass
 - **THEN** the pass starts at most 8 deletions, and none once 60 seconds of the pass have gone, reading the clock before each
-- **AND** the pass notes `archive:delete_deferred`, and an active build still advances in that pass
+- **AND** the pass notes `archive:delete_deferred`
+
+#### Scenario: An active build keeps the pass
+- **WHEN** a build is active and a finished build owes an archive deletion that times out
+- **THEN** the pass runs no owed deletion and notes `archive:delete_deferred`, so the stage that the active build needs fits the pass
+- **AND** a later pass with no active build retries the deletion, and the end of the active build deletes its own archive
 
 #### Scenario: A refused deletion takes its turn
 - **WHEN** an owed deletion is refused
@@ -708,7 +713,7 @@ A `CreateImage` call with an unknown outcome MUST NOT fail the build before the 
 - **THEN** the build fails with the code of the refusal and the failure path ends the builder
 
 ### Requirement: Reconcile runs first and cleans leaks
-Every pass MUST reconcile before any transition, and its first call MUST end the builder of an active build that is past its build deadline, as a non-leak. Reconcile MUST then retry owed archive deletions within a bound, terminate every other builder-tagged instance, delete objects under the prefix that are not the active archive and are older than one hour, and, before any start, clean the images of failed builds only under the image deletion rule.
+Every pass MUST reconcile before any transition, and its first call MUST end the builder of an active build that is past its build deadline, as a non-leak. Reconcile MUST then retry owed archive deletions within a bound when no build is active, terminate every other builder-tagged instance, delete objects under the prefix that are not the active archive and are older than one hour, and, before any start, clean the images of failed builds only under the image deletion rule.
 
 #### Scenario: A leaked builder
 - **WHEN** a builder is tagged for the deployment and the state file has no matching active build

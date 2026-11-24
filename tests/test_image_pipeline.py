@@ -3679,10 +3679,66 @@ class OwedArchiveBoundTests(PipelineCase):
         self.world.console_plan = [(30.0, READY)]
         mark = len(self.world.calls)
         result = self.apply()
-        owed = [call for name, call in self.world.calls[mark:] if name == "delete_object" and "/owed-" in call["Key"]]
-        self.assertEqual(len(owed), 3)
+        # No owed deletion runs while a build is active: the stage and the polling need the pass.
+        self.assertEqual(self.owed_deletes(mark), [])
         self.assertIn("archive:delete_deferred", result["notes"])
         self.assertEqual(result["decision"], "candidate", result)
+        # A later pass has no active build and retries the backlog, within the bound.
+        self.seconds_per_delete = 1
+        mark = len(self.world.calls)
+        later = self.apply()
+        self.assertEqual(len(self.owed_deletes(mark)), OWED_ARCHIVES_PER_PASS)
+        self.assertIn("archive:delete_deferred", later["notes"])
+
+    def owed_deletes(self, mark):
+        return [call for name, call in self.world.calls[mark:] if name == "delete_object" and "/owed-" in call["Key"]]
+
+    def test_a_restage_that_needs_most_of_the_pass_is_not_held_by_an_owed_delete_that_times_out(self):
+        key = f"{PREFIX}owed-slow.tar.gz"
+        self.add_build("owed-slow", archive_bucket=BUCKET, archive_key=key)
+        self.world.objects[key] = (b"archive", NOW)
+        seconds = {"per_delete": 0}
+
+        def refuse(arguments):
+            if arguments["Key"] == key:
+                self.clock.advance(seconds["per_delete"])
+                raise ProviderError("RequestTimeout")
+
+        self.world.hooks["delete_object"] = refuse
+        # The first pass owes the row too, and has no active build when it starts: the delete is refused at once.
+        self.world.hooks["generate_presigned_url"] = lambda arguments: self.clock.advance(400)
+        self.apply()
+        del self.world.hooks["generate_presigned_url"]
+        staged_again = [row for row in self.builds() if row.id != "owed-slow"][0]
+        seconds["per_delete"] = 30
+        # The restage needs 215 seconds of the 240 of the pass: 30 more for a delete would miss its deadline.
+        self.world.hooks["create_multipart_upload"] = lambda arguments: self.clock.advance(215)
+        self.world.console_plan = [(5.0, READY)]
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(self.only_build_named(staged_again.id).reason_code, "")
+        self.assertNotEqual(result["decision"], "failed", result)
+        self.assertNotIn("pass_deadline_exceeded", result["notes"])
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.owed_deletes(mark), [])
+        self.assertIn("archive:delete_deferred", result["notes"])
+        # The build ends in a pass of its own, and the owed row still waits there: the build was active when it began.
+        del self.world.hooks["create_multipart_upload"]
+        self.world.console_plan = [(30.0, READY)]
+        ended = self.apply()
+        self.assertEqual(ended["decision"], "candidate", ended)
+        self.assertEqual(self.owed_deletes(mark), [])
+        # After the build ended, a pass with no active build retries the owed row, and it settles.
+        seconds["per_delete"] = 0
+        del self.world.hooks["delete_object"]
+        self.pin_current()
+        later = self.apply()
+        self.assertEqual(later["reconcile"]["owed_archives_deleted"], 1)
+        self.assertNotIn(key, self.world.objects)
+
+    def only_build_named(self, build_id):
+        (row,) = [row for row in self.builds() if row.id == build_id]
+        return row
 
     def test_the_stray_sweep_leaves_an_owed_object_to_the_bounded_retry_and_still_deletes_a_true_stray(self):
         # The objects are older than an hour, which is what the sweep takes for a stray.

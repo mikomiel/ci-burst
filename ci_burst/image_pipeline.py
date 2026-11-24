@@ -72,9 +72,13 @@ The archive of a build is deleted when the build ends, from the bucket and the
 key its row recorded, and the row records the time (``archive_deleted_at``). A
 deletion that fails stays owed: ``ImageState.archives_owed`` lists the finished
 builds that name an archive and have no such time, and the reconcile of every
-pass retries them first. A pass starts at most ``OWED_ARCHIVES_PER_PASS`` of them
+pass that has no active build retries them first. A pass with an active build runs
+none of them and notes ``archive:delete_deferred``: its stage and its polling need
+the pass, and one delete that times out would use up 30 seconds of it every pass.
+The build deadline bounds the wait, and the end of the build deletes its own
+archive. A pass starts at most ``OWED_ARCHIVES_PER_PASS`` of them
 and none once ``OWED_ARCHIVE_SECONDS`` of the pass have gone, so a backlog of slow
-refused deletions cannot use up the pass that an active build needs. A refused
+refused deletions cannot use up the pass. A refused
 one records the attempt time (``archive_delete_tried_at``) and goes behind the
 rows not yet tried, so it cannot keep a newer row from its turn. Rows that the
 bound left are noted ``archive:delete_deferred``.
@@ -1216,7 +1220,12 @@ class _Pass:
         self._end_overdue(active, now, summary)
         # The archives of finished builds whose deletion is still owed, before the first read of the provider that
         # can fail: a later refusal must not leave them for another pass. A refused deletion stays owed.
-        self._delete_owed(summary)
+        if active is None:
+            self._delete_owed(summary)
+        elif s.archives_owed(dep):
+            # A build is active: its stage and its polling need the pass, and one delete that times out would use up
+            # 30 seconds of it every pass. The owed rows wait. The build deadline bounds the wait.
+            self._note("archive:delete_deferred")
         # Builders. The state machine owns the active build's builder. Every
         # other builder is terminated. A builder tagged with the active build's
         # id that the row does not know yet is the one a crash between

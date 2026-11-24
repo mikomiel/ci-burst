@@ -265,6 +265,29 @@ class ArchiveRecordTests(ImageStateCase):
         with self.assertRaises(StateRefusal) as raised:
             self.state.mark_archive_deleted("missing", 1.0)
         self.assertEqual(raised.exception.reason, "IMAGE_BUILD_UNKNOWN")
+        with self.assertRaises(StateRefusal) as raised:
+            self.state.mark_archive_delete_tried("missing", 1.0)
+        self.assertEqual(raised.exception.reason, "IMAGE_BUILD_UNKNOWN")
+
+    def test_the_owed_rows_come_never_tried_first_then_least_recently_tried_then_oldest(self):
+        for number in range(4):
+            build_id = f"build-{number}"
+            self.add_build(build_id)
+            self.state.advance_build(build_id, archive_bucket="example-bucket", archive_key=f"prefix/{build_id}.tar.gz")
+            self.end(build_id)
+            self.clock.advance(1)
+        ids = lambda: [row.id for row in self.state.archives_owed("example-deployment")]  # noqa: E731
+        self.assertEqual(ids(), ["build-0", "build-1", "build-2", "build-3"])
+        ended = self.state.build("build-0")
+        tried = self.state.mark_archive_delete_tried("build-0", 500.0)
+        self.assertEqual(tried.archive_delete_tried_at, 500.0)
+        # Only the attempt time changes: ``updated_at`` is the end of the build, which ``promote`` reports.
+        self.assertEqual(tried.updated_at, ended.updated_at)
+        self.assertEqual(ids(), ["build-1", "build-2", "build-3", "build-0"])
+        self.state.mark_archive_delete_tried("build-1", 400.0)
+        self.assertEqual(ids(), ["build-2", "build-3", "build-1", "build-0"])
+        self.state.mark_archive_delete_tried("build-1", 600.0)
+        self.assertEqual(ids(), ["build-2", "build-3", "build-0", "build-1"])
 
 
 class SingleFlightTests(ImageStateCase):

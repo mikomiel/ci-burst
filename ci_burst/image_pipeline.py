@@ -72,16 +72,25 @@ The archive of a build is deleted when the build ends, from the bucket and the
 key its row recorded, and the row records the time (``archive_deleted_at``). A
 deletion that fails stays owed: ``ImageState.archives_owed`` lists the finished
 builds that name an archive and have no such time, and the reconcile of every
-pass retries them first.
+pass retries them first. A pass starts at most ``OWED_ARCHIVES_PER_PASS`` of them
+and none once ``OWED_ARCHIVE_SECONDS`` of the pass have gone, so a backlog of slow
+refused deletions cannot use up the pass that an active build needs. A refused
+one records the attempt time (``archive_delete_tried_at``) and goes behind the
+rows not yet tried, so it cannot keep a newer row from its turn. Rows that the
+bound left are noted ``archive:delete_deferred``.
 
 The gate requirement (``IMAGE_GATE_REQUIRED``: neither a gate command nor the
 opt-out ``allow_no_gate``) guards a launch, not a build that has a row. ``plan``
 and an applying pass are refused before any client is built, except an applying
 pass whose state file holds a build in flight or an archive deletion that is
 owed: it settles them, and refuses every launch it would make, a new build or a
-stage that is done again, with the same code and no failure counted. With no
-build left to settle, that pass answers ``refused`` with the gate requirement
-and reads no file of the forge.
+stage that is done again, with the same code and no failure counted. A pass that
+starts with no build in flight (it runs only because a deletion is owed) is a
+cleanup pass: it runs the bounded owed deletions, and then answers ``refused`` with
+the gate requirement. It reads nothing else, neither the pin, the builders, the
+stray archives, the images and the retention of the provider nor any file of the
+forge, so an unrelated refusal of those reads cannot hide its result. The pin
+fields that it did not read are ``None`` and ``retention`` is ``None``.
 
 The pass deadline bounds the reads of the forge too. The forge client puts no
 deadline on a read of a basis file, so the clock is read before each request:
@@ -137,6 +146,10 @@ SUPERVISOR_SLEEP_SECONDS = 30
 #: An object under the staging prefix that is not the active archive goes once it
 #: is strictly older than this.
 STRAY_ARCHIVE_AGE_SECONDS = 3600
+#: One pass starts at most this many owed archive deletions, and none once ``OWED_ARCHIVE_SECONDS`` of the pass have
+#: gone: a backlog of slow refused deletions must not use up the pass that an active build needs.
+OWED_ARCHIVES_PER_PASS = 8
+OWED_ARCHIVE_SECONDS = 60
 
 #: EC2 can answer "no such instance" for a few seconds after ``RunInstances``. A
 #: builder that is not listed within this long of being recorded is not treated
@@ -1100,6 +1113,8 @@ class _Pass:
 
     def _run(self):
         self.aws = self.p._aws_factory()
+        if self.p._gate_missing() and self.s.active_build(self.dep) is None:
+            return self._cleanup_only()
         reconcile = self._reconcile()
         pin = self.p._pin_facts(self.aws, self.deadline)
         if pin.image_id is not None:
@@ -1108,9 +1123,8 @@ class _Pass:
         build = self.s.active_build(self.dep)
         verdict = None
         if build is None and self.p._gate_missing():
-            # This pass runs without a gate because a build was in flight when it started, or because a finished
-            # build still owed the deletion of its archive (``ImagePipeline._inputs``). Either way it is over by now,
-            # and a new build needs a gate: the pass answers with the requirement and reads no forge file.
+            # The build that let this pass run without a gate is over by now (``ImagePipeline._inputs``), and a new
+            # build needs a gate: the pass answers with the requirement and reads no forge file.
             self.refused = IMAGE_GATE_REQUIRED
         elif build is None:
             verdict, build = self._decide(pin)
@@ -1138,6 +1152,43 @@ class _Pass:
             "notes": self.notes,
         }
 
+    def _cleanup_only(self):
+        """The pass that runs without a gate and with no build in flight, only because a deletion is owed.
+
+        It runs the bounded owed deletions and answers ``refused`` with ``IMAGE_GATE_REQUIRED``. It reads nothing
+        else from the provider (no pin, no builders, no stray archives, no images, no retention) and nothing from the
+        forge, so an unrelated refusal of those reads cannot hide the result. Without a gate, a pass with nothing in
+        flight was refused before any client was built, so skipping them loses nothing. The result keeps its shape:
+        the pin fields that were not read are ``None`` and ``retention`` is ``None``.
+        """
+        summary = self._reconcile_summary()
+        self._delete_owed(summary)
+        if summary["owed_archives_deleted"]:
+            self.tele.event(
+                "image_reconciled",
+                builders_terminated=0,
+                archives_deleted=0,
+                owed_archives_deleted=summary["owed_archives_deleted"],
+                images_recorded=0,
+                builder_adopted=False,
+                image_adopted=False,
+                build_id=None,
+            )
+        pin = _Pin(self.p._config.aws.launch_template_version, None, None, None)
+        self.refused = IMAGE_GATE_REQUIRED
+        self._check_event(REFUSED, IMAGE_GATE_REQUIRED, None, pin)
+        return {
+            "decision": REFUSED,
+            "reason": IMAGE_GATE_REQUIRED,
+            "forced": self.force,
+            "build": None,
+            "pin": _pin_summary(pin),
+            "reconcile": summary,
+            "retention": None,
+            "control": _control_summary(self.s.control_get()),
+            "notes": self.notes,
+        }
+
     def _check_event(self, decision, reason, build, pin):
         self.tele.event(
             "image_check",
@@ -1155,25 +1206,14 @@ class _Pass:
         """Clean up first, before any transition. Nothing here depends on the forge."""
         s, aws, dep = self.s, self.aws, self.dep
         now = self.clock()
-        summary = {
-            "builders_terminated": 0,
-            "archives_deleted": 0,
-            "owed_archives_deleted": 0,
-            "images_recorded": 0,
-            "builder_adopted": False,
-            "image_adopted": False,
-            "failures": [],
-        }
+        summary = self._reconcile_summary()
         active = s.active_build(dep)
         # The first step of the pass, before any read that can fail: the builder of a build that is past its
         # deadline goes. The state machine below ends the build itself, with the code of the deadline.
         self._end_overdue(active, now, summary)
         # The archives of finished builds whose deletion is still owed, before the first read of the provider that
         # can fail: a later refusal must not leave them for another pass. A refused deletion stays owed.
-        for owed in s.archives_owed(dep):
-            if self._delete_archive(owed):
-                summary["owed_archives_deleted"] += 1
-        self.tele.leak("archive", summary["owed_archives_deleted"])
+        self._delete_owed(summary)
         # Builders. The state machine owns the active build's builder. Every
         # other builder is terminated. A builder tagged with the active build's
         # id that the row does not know yet is the one a crash between
@@ -1263,6 +1303,42 @@ class _Pass:
                 build_id=active.id if active is not None else None,
             )
         return summary
+
+    @staticmethod
+    def _reconcile_summary():
+        return {
+            "builders_terminated": 0,
+            "archives_deleted": 0,
+            "owed_archives_deleted": 0,
+            "images_recorded": 0,
+            "builder_adopted": False,
+            "image_adopted": False,
+            "failures": [],
+        }
+
+    def _delete_owed(self, summary):
+        """Retry the owed archive deletions, within the bound of the pass.
+
+        At most ``OWED_ARCHIVES_PER_PASS`` start, and none once ``OWED_ARCHIVE_SECONDS`` of the pass have gone; the
+        clock is read before each one. ``ImageState.archives_owed`` lists the rows never tried first, then the least
+        recently tried, so a deletion that stays refused cannot keep a newer row from its turn. Rows that the bound
+        left are noted as ``archive:delete_deferred``.
+        """
+        deleted = 0
+        started = 0
+        for owed in self.s.archives_owed(self.dep):
+            if started >= OWED_ARCHIVES_PER_PASS or self.clock() >= self.started_at + OWED_ARCHIVE_SECONDS:
+                self._note("archive:delete_deferred")
+                break
+            started += 1
+            if self._delete_archive(owed):
+                deleted += 1
+        summary["owed_archives_deleted"] += deleted
+        self.tele.leak("archive", deleted)
+
+    def _note(self, note):
+        if note not in self.notes:
+            self.notes.append(note)
 
     def _end_overdue(self, build, now, summary):
         """Terminate the builder of an active build whose deadline has come, once per pass.
@@ -1863,7 +1939,8 @@ class _Pass:
         try:
             self.aws.delete_object(build.archive_bucket, build.archive_key)
         except ProviderRefusal:
-            self.notes.append("archive:delete_failed")
+            self.s.mark_archive_delete_tried(build.id, self.clock())
+            self._note("archive:delete_failed")
             return False
         self.s.mark_archive_deleted(build.id, self.clock())
         return True

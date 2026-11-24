@@ -198,7 +198,9 @@ command. This section owns the workflow.
    the row (`archive_deleted_at`). A refused call is noted `archive:delete_failed`
    and the deletion stays owed: the reconcile of every later pass tries again
    until it succeeds, whatever the configured bucket and prefix are by then, and
-   even when the gate is withdrawn in between. The version is inert: it is not the
+   even when the gate is withdrawn in between. A pass starts a bounded number of
+   these retries, and a deletion that stays refused goes behind the others
+   ([operations.md](operations.md#leaked-builders-and-the-backstop)). The version is inert: it is not the
    default version, and no worker launches from it.
 5. A person reads the evidence and promotes the candidate with
    `image promote --write`, which edits one line of the deployment TOML. Nothing

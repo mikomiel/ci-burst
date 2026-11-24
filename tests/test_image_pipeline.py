@@ -48,7 +48,7 @@ from ci_burst.aws import (
 from ci_burst.config import load
 from ci_burst.errors import ObservationRefusal, ProviderRefusal, Refusal
 from ci_burst.forgejo import BranchHead
-from ci_burst.image_pipeline import ImagePipeline
+from ci_burst.image_pipeline import OWED_ARCHIVES_PER_PASS, ImagePipeline
 from ci_burst.image_state import ImageState
 
 from support import Clock, write_config
@@ -3624,6 +3624,114 @@ class ArchiveOwedTests(PipelineCase):
         self.assertEqual(result["reconcile"]["archives_deleted"], 0)
         (event,) = self.events("image_reconciled")
         self.assertEqual((event["owed_archives_deleted"], event["archives_deleted"]), (1, 0))
+
+
+class OwedArchiveBoundTests(PipelineCase):
+    """The owed deletions of one pass are bounded, take turns, and never hide the rest of the pass."""
+
+    def owe(self, count, *, stuck=()):
+        """``count`` finished builds that each owe an archive, oldest first. A key in ``stuck`` is refused for good."""
+        keys = []
+        for number in range(count):
+            key = f"{PREFIX}owed-{number:02d}.tar.gz"
+            self.add_build(f"owed-{number:02d}", age=5 * DAY - number * 60, archive_bucket=BUCKET, archive_key=key)
+            self.world.objects[key] = (b"archive", NOW)
+            keys.append(key)
+        refused = {keys[number] for number in stuck}
+
+        def refuse(arguments):
+            self.clock.advance(self.seconds_per_delete)
+            if arguments["Key"] in refused:
+                raise ProviderError("RequestLimitExceeded")
+
+        self.seconds_per_delete = 1
+        self.world.hooks["delete_object"] = refuse
+        return keys
+
+    def test_a_backlog_larger_than_the_bound_starts_no_more_deletions_than_the_bound_and_a_build_still_starts(self):
+        self.owe(12, stuck=range(12))
+        result = self.apply()
+        self.assertEqual(len(self.world.arguments("delete_object")), OWED_ARCHIVES_PER_PASS)
+        self.assertIn("archive:delete_deferred", result["notes"])
+        # The pass went on: the build started and its builder was launched.
+        self.assertEqual(result["decision"], "building", result)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    def test_slow_refused_deletions_stop_at_the_time_budget_and_a_build_still_starts(self):
+        self.owe(12, stuck=range(12))
+        self.seconds_per_delete = 25
+        result = self.apply()
+        # The clock is read before each one: 0, 25 and 50 seconds are inside the budget, 75 is not.
+        self.assertEqual(len(self.world.arguments("delete_object")), 3)
+        self.assertIn("archive:delete_deferred", result["notes"])
+        self.assertEqual(result["decision"], "building", result)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    def test_an_active_build_advances_in_a_pass_that_meets_a_slow_refused_backlog(self):
+        self.owe(12, stuck=range(12))
+        first = self.apply()
+        self.assertEqual(first["decision"], "building", first)
+        # Each refused deletion now takes 25 seconds: the whole backlog would use up the pass deadline.
+        self.seconds_per_delete = 25
+        self.world.console_plan = [(30.0, READY)]
+        mark = len(self.world.calls)
+        result = self.apply()
+        owed = [call for name, call in self.world.calls[mark:] if name == "delete_object" and "/owed-" in call["Key"]]
+        self.assertEqual(len(owed), 3)
+        self.assertIn("archive:delete_deferred", result["notes"])
+        self.assertEqual(result["decision"], "candidate", result)
+
+    def test_a_backlog_within_the_bound_defers_nothing(self):
+        self.owe(OWED_ARCHIVES_PER_PASS)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], OWED_ARCHIVES_PER_PASS)
+        self.assertNotIn("archive:delete_deferred", result["notes"])
+        self.assertEqual(self.query(lambda state: state.archives_owed(DEPLOYMENT)), [])
+
+    def test_a_permanently_refused_row_does_not_keep_a_newer_row_from_its_turn_on_a_later_pass(self):
+        # More refused rows than one pass can try, then one row that would succeed, the newest of them all.
+        stuck = OWED_ARCHIVES_PER_PASS + 1
+        keys = self.owe(stuck + 1, stuck=range(stuck))
+        self.configure(render_toml(gate=""))
+        self.apply()
+        self.assertEqual(len(self.world.arguments("delete_object")), OWED_ARCHIVES_PER_PASS)
+        self.assertIn(keys[-1], self.world.objects)
+        self.clock.advance(60)
+        result = self.apply()
+        # The pass tries the row never tried and the one that is not refused first, then the refused rows that were
+        # tried the longest ago. Rows 6 and 7 wait for their turn behind rows 0 to 5.
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1)
+        self.assertNotIn(keys[-1], self.world.objects)
+        newest = [row for row in self.builds() if row.archive_key == keys[-1]]
+        self.assertIsNotNone(newest[0].archive_deleted_at)
+        self.assertEqual(
+            [row.id for row in self.query(lambda state: state.archives_owed(DEPLOYMENT))],
+            [f"owed-{number:02d}" for number in (6, 7, 8, 0, 1, 2, 3, 4, 5)],
+        )
+
+    def test_a_pass_with_no_gate_and_nothing_in_flight_runs_only_the_owed_deletions(self):
+        (key,) = self.owe(1)
+        self.configure(render_toml(gate=""))
+        # Every read that the rest of a pass makes is refused. None of them may change the answer.
+        for method in (
+            "describe_launch_template_versions",
+            "describe_instances",
+            "list_objects_v2",
+            "describe_images",
+        ):
+            self.world.fail(method, ProviderError("RequestLimitExceeded"))
+        source_mark, world_mark = len(self.source.calls), len(self.world.calls)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_GATE_REQUIRED"), result)
+        self.assertEqual(self.world.names(world_mark), ["delete_object"])
+        self.assertNotIn(key, self.world.objects)
+        self.assertEqual(self.only_build().archive_deleted_at, self.clock())
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1)
+        self.assertEqual(result["pin"], {"version": PIN, "image_id": None, "basis_digest": None})
+        self.assertIsNone(result["retention"])
+        self.assertIsNone(result["build"])
+        self.assertEqual(self.source.calls[source_mark:], [])
+        self.assertEqual(self.events("image_check")[-1]["reason"], "IMAGE_GATE_REQUIRED")
 
 
 class RestageReadsNoBasisFileTests(PipelineCase):

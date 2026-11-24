@@ -209,6 +209,16 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 - **THEN** the pass notes `archive:delete_failed` and the row keeps its terminal state
 - **AND** the deletion stays owed, with `archive_deleted_at` empty, and the bucket lifecycle rule stays the backstop
 
+#### Scenario: A backlog of owed deletions is bounded
+- **WHEN** more archive deletions are owed than one pass may start, or refused deletions take the time budget of the pass
+- **THEN** the pass starts at most 8 deletions, and none once 60 seconds of the pass have gone, reading the clock before each
+- **AND** the pass notes `archive:delete_deferred`, and an active build still advances in that pass
+
+#### Scenario: A refused deletion takes its turn
+- **WHEN** an owed deletion is refused
+- **THEN** the row records the attempt time (`archive_delete_tried_at`) and the next pass tries the rows never tried first, then the least recently tried, then the oldest
+- **AND** a deletion that stays refused does not keep a newer owed row from being deleted
+
 #### Scenario: A retry comes before a provider read that fails
 - **WHEN** a pass owes a deletion and a later read of the provider in the same pass is refused
 - **THEN** the deletion was tried before that read
@@ -598,7 +608,7 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **AND** `promote --write` refuses with `PROMOTE_GATE_NOT_PASSED` while `allow_no_gate` is false
 
 ### Requirement: A missing gate refuses a launch and does not strand a build
-The gate requirement MUST guard a launch. `plan`, and an applying pass with no build in flight and no archive deletion owed, MUST refuse with `IMAGE_GATE_REQUIRED` before any client is built. An applying pass with either MUST run and settle it, and MUST refuse each launch with `IMAGE_GATE_REQUIRED`, counting no failure. A pass with no build left to settle MUST answer `refused` and read no file of the forge.
+The gate requirement MUST guard a launch. `plan`, and an applying pass with no build in flight and no archive deletion owed, MUST refuse with `IMAGE_GATE_REQUIRED` before any client is built. An applying pass with either MUST run and settle it, and MUST refuse each launch with `IMAGE_GATE_REQUIRED`, counting no failure. A pass that starts with no build in flight MUST run the bounded owed deletions only, then answer `refused`.
 
 #### Scenario: A build in flight is settled with no gate command and no opt-out
 - **WHEN** a build is `building` or `imaging` and the configuration then holds no gate command and no opt-out
@@ -617,8 +627,13 @@ The gate requirement MUST guard a launch. `plan`, and an applying pass with no b
 
 #### Scenario: An owed archive deletion is settled with no gate command and no opt-out
 - **WHEN** no build is in flight, a finished build owes the deletion of its archive and the configuration holds no gate command and no opt-out
-- **THEN** an applying pass runs, its reconcile deletes the archive and the pass starts no build
+- **THEN** an applying pass runs, deletes the archive and starts no build
 - **AND** the pass answers `refused` with `IMAGE_GATE_REQUIRED`, reads no file of the forge and counts no failure
+
+#### Scenario: A cleanup pass does not depend on other provider reads
+- **WHEN** no build is in flight at the start of a pass, the configuration holds no gate command and no opt-out, a finished build owes an archive deletion and the provider refuses the pin read and the listings
+- **THEN** the pass deletes the archive, records `archive_deleted_at` and answers `refused` with `IMAGE_GATE_REQUIRED`
+- **AND** it reads no pin, builders, stray archives, images, retention or forge file, and the pin fields that it did not read and `retention` are empty in the result
 
 #### Scenario: A new build is refused under a withdrawn gate
 - **WHEN** a pass runs because a build was in flight, that build ended before the pass took the lock, and the configuration holds no gate command and no opt-out
@@ -692,7 +707,7 @@ A `CreateImage` call with an unknown outcome MUST NOT fail the build before the 
 - **THEN** the build fails with the code of the refusal and the failure path ends the builder
 
 ### Requirement: Reconcile runs first and cleans leaks
-Every pass MUST reconcile before any transition, and its first call MUST end the builder of an active build that is past its build deadline, an `imaging` build included. That builder MUST NOT count as a leak. Reconcile MUST then retry owed archive deletions, terminate every other builder-tagged instance, delete objects under the prefix that are not the active archive and are older than one hour, and, before any start, clean the images of failed builds only under the image deletion rule.
+Every pass MUST reconcile before any transition, and its first call MUST end the builder of an active build that is past its build deadline, as a non-leak. Reconcile MUST then retry owed archive deletions within a bound, terminate every other builder-tagged instance, delete objects under the prefix that are not the active archive and are older than one hour, and, before any start, clean the images of failed builds only under the image deletion rule.
 
 #### Scenario: A leaked builder
 - **WHEN** a builder is tagged for the deployment and the state file has no matching active build

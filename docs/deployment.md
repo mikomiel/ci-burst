@@ -732,6 +732,10 @@ Notes on the values:
   termination, and at least one security group, none of which has an inbound rule.
   The image id of that template is the cold base image: the builder starts from it,
   never from the warm image.
+- The staging bucket must not have versioning enabled. A delete in a versioned bucket
+  only adds a delete marker and leaves the source archive as a noncurrent version,
+  so the deletion that ci-burst records as done would not remove the archive.
+  ci-burst does not check this setting.
 - The staging bucket and its lifecycle rule are yours: the row of a build records
   the bucket and the key before the upload starts. When the build ends, ci-burst
   deletes that object, and a refused delete stays owed and is retried by every

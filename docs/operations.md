@@ -727,9 +727,9 @@ counted, with exit `1`. A pass that
 finds a build in flight, or an archive deletion that a finished build still owes,
 runs and settles it even without a gate; a launch that pass would then make is
 refused with `IMAGE_GATE_REQUIRED`, answered `refused`, and counts no failure.
-When no build is left to settle, that pass reads no file of the forge and answers
-`refused` with `IMAGE_GATE_REQUIRED`, after its reconcile has deleted the owed
-archives.
+When it started with no build in flight, it is a cleanup pass: it runs the bounded
+owed deletions only and answers `refused` with `IMAGE_GATE_REQUIRED`, with no
+provider read besides them and no read of the forge.
 
 A pass deadline can end a pass after the build row is written and before the
 builder is launched. The next pass stages that build again. Past the build deadline
@@ -1151,11 +1151,23 @@ image role's policy no longer covers, stays owed: every pass notes
 `archive:delete_failed` for it, and a pass runs for it even without a gate. Widen the
 grant to cover the old location. Do not edit the state file by hand.
 
+The retries are bounded, so that a backlog of slow refused deletions cannot use up
+the pass that an active build needs. A pass starts at most 8 owed deletions
+(`OWED_ARCHIVES_PER_PASS`) and none once 60 seconds of the pass have gone
+(`OWED_ARCHIVE_SECONDS`); the clock is read before each one. When owed rows remain
+after the bound, the pass notes `archive:delete_deferred`. Each failed attempt records
+its time in the row (`archive_delete_tried_at`). The rows never tried go first, then
+the least recently tried, then the oldest, so a deletion that stays refused goes
+behind the newer ones and cannot keep them from their turn.
+
 A pass runs for an owed deletion even when the gate is withdrawn (`gate_command`
-empty and `allow_no_gate` false) and no build is in flight. It then deletes the
-owed archives, launches nothing, reads no file of the forge, and answers `refused`
-with `IMAGE_GATE_REQUIRED`. When nothing is owed either, the same file is refused
-before any client is built.
+empty and `allow_no_gate` false) and no build is in flight. That cleanup pass runs
+the bounded owed deletions and nothing else: it reads no pin, builders, stray
+archives or images of the provider, applies no retention, reads no file of the
+forge, and answers `refused` with `IMAGE_GATE_REQUIRED`. A refusal of one of those
+reads therefore cannot hide the result. The pin fields that it did not read are
+`null` in the result, as is `retention`. When nothing is owed, the same file is
+refused before any client is built.
 
 A builder that outlives its lifetime is a defect. To remove it, filter on both `ci-burst:image-build = true` and `ci-burst:deployment = <your deployment>`, then terminate the exact instance id: the
 image-build tag alone can match the builder of another deployment in the same
@@ -1240,7 +1252,7 @@ and the codes of `promote` in [Promote reason codes](#promote-reason-codes).
 | Code | Meaning |
 | --- | --- |
 | `IMAGE_UNTIL_DONE_NEEDS_APPLY` | `--until-done` without `--apply` |
-| `IMAGE_GATE_REQUIRED` | `[image.warm].gate_command` is empty and `allow_no_gate` is `false`. Raised before any client is built by `image plan` and a run without `--apply`, and by an applying pass when no build is in flight and no archive deletion is owed; a pass that settles a build in flight or an owed deletion answers it `refused` for the launch it would make, or when no build is left to settle (it reads no forge file then), and a stage done again of a row inserted under `allow_no_gate` ends its row `failed` with it (a row inserted with a gate command ends as `IMAGE_INPUTS_CHANGED`) |
+| `IMAGE_GATE_REQUIRED` | `[image.warm].gate_command` is empty and `allow_no_gate` is `false`. Raised before any client is built by `image plan` and a run without `--apply`, and by an applying pass when no build is in flight and no archive deletion is owed; a pass that settles a build in flight or an owed deletion answers it `refused` for the launch it would make, or when it started with no build in flight (a cleanup pass: owed deletions only, no other provider read, no forge read), and a stage done again of a row inserted under `allow_no_gate` ends its row `failed` with it (a row inserted with a gate command ends as `IMAGE_INPUTS_CHANGED`) |
 | `IMAGE_INPUTS_CHANGED` | a stage done again found that the recorded hashes of the basis files, the warm or gate commands, `strip_components` or the script no longer give the row's digest, or that `basis_paths` is no longer the recorded set. No basis file is read. Answered `refused`; the row ends `failed`, the delete of its archive is attempted when it recorded one, and no failure is counted |
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the image token while the branch or a basis file was read, or, in `image plan`, the first chunk of the archive. The same answer to the archive request of a staging run ends the build `failed` (first table) |
 | `IMAGE_BRANCH_UNPROTECTED` | the configured branch is not protected on the forge |
@@ -1250,7 +1262,7 @@ and the codes of `promote` in [Promote reason codes](#promote-reason-codes).
 | `IMAGE_SCRIPT_MISSING` | the container image does not hold the shipped warm script |
 | `pass_deadline_exceeded` | the 240-second budget of a pass ran out. It is raised in `image plan` and before a decision. Elsewhere it is a `notes` entry, alone (the row waits for the next pass) or after the name of a lookup that the pass then goes without (such as `image_lookup:` or `base_image:`), or the `refused` code of the `retention` or `deletion` part |
 | `IMAGE_STATE_LOCKED` | another pass, refresh or `promote --write` holds the writer lock of the state file; an applying run also meets it when it resolves a pending journal row |
-| `IMAGE_STATE_VERSION_UNSUPPORTED`, `IMAGE_STATE_UNREADABLE` | the state file has a schema this version does not know, or cannot be opened as the state file, or a build row holds damage that a pass reads (the recorded `basis_file_hashes` of a row that a stage done again checks); keep the file and do not edit it. Schema 2 added `archive_bucket`, `archive_deleted_at` and `basis_file_hashes` to `image_builds` and has no migration: remove a schema 1 state file from a pre-release run, since no deployment holds one with `[image]` enabled |
+| `IMAGE_STATE_VERSION_UNSUPPORTED`, `IMAGE_STATE_UNREADABLE` | the state file has a schema this version does not know, or cannot be opened as the state file, or a build row holds damage that a pass reads (the recorded `basis_file_hashes` of a row that a stage done again checks); keep the file and do not edit it. Schema 2 added `archive_bucket`, `archive_deleted_at`, `archive_delete_tried_at` and `basis_file_hashes` to `image_builds` and has no migration: remove a schema 1 state file from a pre-release run, since no deployment holds one with `[image]` enabled |
 | `IMAGE_STATE_RECOVERY_NEEDED` | a process stopped inside a commit and left a rollback journal (`image-state.sqlite-journal`) that a read-only open cannot roll back; `status`, `plan`, the previews and `run` without `--apply` refuse and leave it. A writing command rolls it back: `image run --apply`, `image promote --write` (with or without `--rollback`) or `image status --refresh` takes the writer lock before its writable open, which rolls the journal back, and then does what it always does (a run resolves a pending row and runs its pass; a promotion also writes the pin). Another holder of the lock gives `IMAGE_STATE_LOCKED` with the journal left as it is. Do not delete the journal file: it holds the pages that make the file consistent |
 | `IMAGE_PROFILE_INVALID` | the image role profile is missing or breaks the profile rules of [deployment.md](deployment.md#image-build-role-and-source-identity-optional); a provider failure, exit `1` |
 | `IMAGE_DELETION_UNSAFE` | the deletion rule could not resolve the images it must protect, or read the deployment file through a stale view, so it deleted nothing. It appears inside the `retention` part of a pass result (`deletion` in a plan) and does not fail the command; that part can carry another refusal code, such as a provider code, in the same way |

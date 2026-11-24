@@ -531,6 +531,31 @@ class ProtectedSetRefusalTests(DeletionCase):
         self.assertIn("replaced", refusal.detail)
         self.assertEqual(self.ec2.calls, [])
 
+    def test_a_link_switched_to_another_file_during_the_read_is_unsafe_and_reads_no_version(self):
+        # The path that was given is a link: it must still name the file that the bytes came from (#202).
+        target = Path(self.deployment_file)
+        other = self.directory / "other.toml"
+        other.write_bytes(target.read_bytes())
+        link = self.directory / "link.toml"
+        link.symlink_to(target)
+        real = os.read
+        switched = []
+
+        def read(descriptor, size):
+            if not switched:
+                switched.append(True)
+                moved = self.directory / "link.tmp"
+                moved.symlink_to(other)
+                os.replace(moved, link)
+            return real(descriptor, size)
+
+        with mock.patch("os.read", read), self.assertRaises(ImageRefusal) as raised:
+            protected_set(self.aws, link, previous_pin=None, pending_journal=(), candidate=None, active=None)
+        self.assertEqual(switched, [True])
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertIn("replaced", raised.exception.detail)
+        self.assertEqual(self.ec2.calls, [])
+
     def test_an_unreadable_version_is_unsafe_and_leaks_nothing(self):
         self.ec2.errors["describe_launch_template_versions"] = ProviderError("RequestLimitExceeded")
         refusal = self.refused()
@@ -676,6 +701,91 @@ class ConfigChangedTests(DeletionCase):
             protected = self.resolve()
         self.assertEqual(edited, [True])
         self.refused(protected)
+
+    def two_failed_images(self):
+        self.reset()
+        self.made(1, "failed")
+        self.made(2, "failed")
+        plan = self.plan("all")
+        self.assertEqual(
+            [(item["action"], item["image_id"]) for item in plan],
+            [("deregister", ami(1)), ("deregister", ami(2))],
+        )
+        return plan
+
+    def edit_file(self):
+        self.deployment_file.write_text(
+            self.deployment_file.read_text(encoding="utf-8") + "\n# a hand edit\n", encoding="utf-8"
+        )
+
+    def edit_after(self, method):
+        """The first call of ``method`` of the session works, then the deployment file is edited."""
+        real = getattr(self.aws, method)
+        done = []
+
+        def call(identifier):
+            result = real(identifier)
+            if not done:
+                done.append(True)
+                self.edit_file()
+            return result
+
+        return mock.patch.object(self.aws, method, call)
+
+    def test_an_edit_after_the_first_deregistration_keeps_the_second_image_and_reports_the_first(self):
+        plan = self.two_failed_images()
+        with self.edit_after("deregister_image"):
+            report = apply_deletions(self.aws, plan, apply=True)
+        self.assertEqual(
+            [(row["action"], row["image_id"], row["result"]) for row in report],
+            [
+                ("deregister", ami(1), "deregistered"),
+                ("delete_snapshot", ami(1), "refused"),
+            ],
+        )
+        self.assertEqual(report[-1]["code"], UNSAFE)
+        self.assertEqual(self.requests("deregister_image"), [{"ImageId": ami(1)}])
+        self.assertEqual(self.requests("delete_snapshot"), [])
+        self.assertIn(ami(2), self.stored_images())
+        self.assertIn(snap(2), self.stored_snapshots())
+
+    def test_an_edit_after_the_first_image_is_gone_keeps_the_second_image(self):
+        plan = self.two_failed_images()
+        with self.edit_after("delete_snapshot"):
+            report = apply_deletions(self.aws, plan, apply=True)
+        self.assertEqual(
+            [(row["action"], row["image_id"], row["result"]) for row in report],
+            [
+                ("deregister", ami(1), "deregistered"),
+                ("delete_snapshot", ami(1), "snapshot_deleted"),
+                ("deregister", ami(2), "refused"),
+            ],
+        )
+        self.assertEqual(report[-1]["code"], UNSAFE)
+        self.assertEqual(self.requests("deregister_image"), [{"ImageId": ami(1)}])
+        self.assertIn(ami(2), self.stored_images())
+
+    def test_an_unchanged_file_lets_the_whole_batch_run(self):
+        plan = self.two_failed_images()
+        report = apply_deletions(self.aws, plan, apply=True)
+        self.assertEqual(self.results(report).count(("deregister", "deregistered")), 2)
+        self.assertNotIn("refused", [row["result"] for row in report])
+
+    def test_a_dry_run_makes_no_check_and_no_call(self):
+        plan = self.two_failed_images()
+        self.edit_file()
+        report = apply_deletions(self.aws, plan, apply=False)
+        self.assertEqual({row["result"] for row in report}, {"planned"})
+        self.assertEqual(self.mutations(), [])
+
+    def test_a_copied_plan_keeps_the_check(self):
+        for copier in (copy.copy, copy.deepcopy):
+            with self.subTest(copier=copier.__name__):
+                plan = copier(self.two_failed_images())
+                self.edit_file()
+                report = apply_deletions(self.aws, plan, apply=True)
+                self.assertEqual([row["result"] for row in report], ["refused"])
+                self.assertEqual(self.mutations(), [])
 
     def test_a_file_that_is_gone_is_unsafe(self):
         protected = self.resolve()

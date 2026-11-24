@@ -1873,6 +1873,57 @@ class StaleViewTests(PromoteCase):
             (self.dir / "kept.toml").unlink()
         self.assertEqual(self.backups(), [])
 
+    @contextlib.contextmanager
+    def link_switched_during_the_read(self):
+        """``--config`` is a symbolic link to the file; the first read of the file points the link at another file.
+
+        The other file holds the same bytes, so the resolved target still names the open file, and only the path
+        that was given shows that the link moved (#202).
+        """
+        target = Path(self.config.path).resolve()
+        other = self.dir / "other.toml"
+        other.write_bytes(target.read_bytes())
+        link = self.dir / "link.toml"
+        link.symlink_to(target)
+        self.config_path = link
+        self.config = load(link)
+        inode = os.stat(target).st_ino
+        real = os.read
+        switched = []
+
+        def read(descriptor, size):
+            if not switched and os.fstat(descriptor).st_ino == inode:
+                switched.append(True)
+                moved = self.dir / "link.tmp"
+                moved.symlink_to(other)
+                os.replace(moved, link)
+            return real(descriptor, size)
+
+        with mock.patch("os.read", read):
+            yield target
+        self.assertEqual(switched, [True])
+
+    def test_a_link_that_is_switched_during_the_read_is_refused_as_stale(self):
+        with self.link_switched_during_the_read():
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.read_snapshot(self.config)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
+
+    def test_a_link_that_is_not_switched_is_read(self):
+        target = Path(self.config.path).resolve()
+        link = self.dir / "link.toml"
+        link.symlink_to(target)
+        snapshot = image_promote.read_snapshot(load(link))
+        self.assertEqual(snapshot.data, target.read_bytes())
+
+    def test_a_pending_row_is_not_resolved_through_a_link_that_is_switched_during_the_read(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        with self.link_switched_during_the_read():
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_STALE"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+
     def test_still_named_is_true_for_the_file_the_path_names_and_false_for_any_other(self):
         target = Path(self.config.path).resolve()
         descriptor = os.open(target, os.O_RDONLY)
@@ -2816,6 +2867,19 @@ class MountPointTests(unittest.TestCase):
         self.assertTrue(image_promote.is_mount_point(path))
         self.table.write_bytes(first)
         self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_a_mount_point_with_a_separator_that_is_not_a_line_feed_in_its_name_is_found(self):
+        # The kernel escapes a line feed only. U+2028, U+0085, a carriage return and the like stay in the name, and a
+        # reader that splits on every line boundary of Python cuts the line in two and misses the mount point.
+        for name in ("a\u2028b.toml", "a\u0085b.toml", "a\rb.toml", "a\x1cb.toml"):
+            with self.subTest(name=ascii(name)):
+                path = self.made(name)
+                self.table.write_bytes(
+                    b"29 1 0:5 / / rw - rootfs rootfs rw\n32 1 8:1 /b " + os.fsencode(path) + b" rw - ext4 /dev/example rw\n"
+                )
+                self.assertTrue(image_promote.is_mount_point(path))
+                self.table.write_bytes(b"29 1 0:5 / / rw - rootfs rootfs rw\n")
+                self.assertFalse(image_promote.is_mount_point(path))
 
     def test_a_short_or_empty_line_of_the_table_is_ignored(self):
         path = self.made()

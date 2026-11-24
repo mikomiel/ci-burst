@@ -443,6 +443,10 @@ Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run
 - **THEN** the run ends with `IMAGE_CONFIG_CHANGED` before that pass and launches nothing more
 - **AND** the state file keeps the build, and a fresh run resumes it with the file as it is
 
+#### Scenario: Until-done meets a changed file before it resolves a pending promotion
+- **WHEN** a promotion row is pending and the deployment file is edited after the command loaded it and before the row is resolved
+- **THEN** the run ends with `IMAGE_CONFIG_CHANGED`, not `PROMOTION_JOURNAL_DIVERGED`, and the row stays pending
+
 #### Scenario: Until-done meets a rewrite that changes no setting
 - **WHEN** the file is rewritten between passes and gives the same settings
 - **THEN** the loop goes on as it would without the rewrite
@@ -908,6 +912,10 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **WHEN** a rename replaces the file during the read while another hard link keeps the old file named, so that its link count stays above zero
 - **THEN** the command refuses with `PROMOTE_FILE_STALE`, because the path no longer names the open file, and writes nothing
 
+#### Scenario: A link that names the file switches during the read
+- **WHEN** `--config` is a symbolic link and it is switched to another file during the read, so that the file it resolved to is still named
+- **THEN** the command refuses with `PROMOTE_FILE_STALE` because the path as given no longer names the open file, and no pending row is resolved
+
 #### Scenario: The file names another state than the command opened
 - **WHEN** `[image].state_directory` (compared as written, without following a link) or `deployment` changes between the start of `promote` (with or without `--write`, `--rollback` included) and a read of the file it plans or writes from, the read under the locks of `--write` included
 - **THEN** the command refuses with `PROMOTE_STATE_CHANGED` and names no path
@@ -998,6 +1006,11 @@ Every path that deregisters an image or deletes a snapshot (retention and every 
 #### Scenario: The file changes after the protected set was resolved
 - **WHEN** the deployment file is edited or replaced after the set was resolved and before a plan is acted on
 - **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE`, because the device, inode, change and modification times or size differ, and nothing is deregistered or deleted
+
+#### Scenario: The file changes during a batch of deletions
+- **WHEN** the file is edited after the first image of a plan was deregistered, and the edit pins the second
+- **THEN** the file is checked again before each deregistration and each snapshot deletion, and the batch ends with `IMAGE_DELETION_UNSAFE` before the next call
+- **AND** the deletions that were made stay reported and counted, and the second image stays registered
 
 #### Scenario: A pin of an unsettled row is malformed
 - **WHEN** a pin of a journal row newer than the newest completed one is not a positive version number

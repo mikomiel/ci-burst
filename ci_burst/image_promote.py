@@ -160,7 +160,9 @@ def _read_open_file(config, target, descriptor):
         chunks = []
         while chunk := os.read(descriptor, 1 << 16):
             chunks.append(chunk)
-        linked = still_named(descriptor, target)
+        # The resolved target and the path that was given: a link that was switched to another file during the read
+        # leaves the target named, and only the given path then shows that the bytes are from the file it left.
+        linked = still_named(descriptor, target) and still_named(descriptor, config.path)
         data = b"".join(chunks)
         text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError) as error:
@@ -226,10 +228,12 @@ def is_mount_point(path):
     target = os.path.realpath(path)
     try:
         # The kernel writes a path as its bytes: ``surrogateescape`` is how Python spells a name that is not UTF-8.
-        table = _MOUNTINFO.read_text(encoding="utf-8", errors="surrogateescape")
+        # The bytes are decoded as they are (no newline translation), and a line ends at a line feed only: the kernel
+        # escapes that one, and leaves U+2028, a carriage return and the like in a name.
+        table = _MOUNTINFO.read_bytes().decode("utf-8", errors="surrogateescape")
     except OSError:
         return os.path.ismount(target)
-    for line in table.splitlines():
+    for line in table.split("\n"):
         fields = line.split(" ")
         if len(fields) > 4 and _unescape_mount_point(fields[4]) == target:
             return True

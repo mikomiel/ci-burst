@@ -4032,6 +4032,37 @@ class RetentionTests(PipelineCase):
         control = self.control()
         self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
 
+    def test_an_edit_during_the_batch_keeps_the_images_not_yet_removed_and_counts_those_that_were(self):
+        # The second image is pinned by hand while the first is deregistered: it stays registered (#202).
+        self.pin_current()
+        self.stale_failed_build("failed-one", 0xD1)
+        self.stale_failed_build("failed-two", 0xD2)
+        self.world.set_version(WORKER, 4, {"ImageId": ami(0xD2)})
+        real = WorldAws.deregister_image
+        edited = []
+
+        def deregister(session, image_id):
+            result = real(session, image_id)
+            if not edited:
+                edited.append(True)
+                text = self.config_path.read_text(encoding="utf-8")
+                self.config_path.write_text(
+                    text.replace(f"launch_template_version = {PIN}", "launch_template_version = 4"), encoding="utf-8"
+                )
+            return result
+
+        with mock.patch.object(WorldAws, "deregister_image", deregister):
+            result = self.apply()
+        # The failed-build path of reconcile runs the batch. Retention at the end resolves the new pin and keeps D2.
+        failed = result["reconcile"]["failed_images"]
+        self.assertEqual((failed["refused"], failed["deregistered"]), ("IMAGE_DELETION_UNSAFE", 1))
+        self.assertEqual(result["retention"]["deregistered"], 0)
+        self.assertEqual(self.world.arguments("deregister_image"), [{"ImageId": ami(0xD1)}])
+        self.assertIn(ami(0xD2), self.world.images)
+        self.assertEqual(self.events("image_pruned")[0]["deregistered"], 1)
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+
     def test_an_edit_of_the_file_after_the_plan_is_refused_in_a_dry_plan_too(self):
         self.stale_failed_build("failed-one", 0xD1)
         real = image_deletion.plan_deletions

@@ -238,6 +238,10 @@ def _apply(config, arguments, pipeline, sessions, state):
     resolution of a crashed promotion lives here (``_resolve_journal``).
     """
     try:
+        if arguments.until_done:
+            # Before the writable open and the resolution, which read the file again: an edit since this command
+            # loaded it must give ``IMAGE_CONFIG_CHANGED``, not a divergence of a row that the edit caused (#202).
+            pipeline.check_settings_unchanged()
         resolved = _resolve_journal(config, state)
         if arguments.until_done:
             result = pipeline.run_until_done(force=arguments.force)

@@ -86,6 +86,8 @@ DEREGISTER_UNCONFIRMED = "deregister_unconfirmed"
 SNAPSHOT_DELETED = "snapshot_deleted"
 SNAPSHOT_FAILED = "snapshot_failed"
 SNAPSHOT_KEPT = "snapshot_kept"
+#: The result of the one row that ends a batch the deployment file changed under (``IMAGE_DELETION_UNSAFE``).
+REFUSED = "refused"
 
 _DEREGISTERED_STATE = "deregistered"
 
@@ -388,6 +390,8 @@ def plan_deletions(images, snapshots, protected, *, deployment, mode, now, confi
         for image in eligible[:surplus]:
             plan.append(_image_item(RETENTION, image, _owner(image, deployment), None, by_snapshot, deployment))
     plan.sort(key=lambda item: (PATHS.index(item["path"]), item["image_id"] or "", item["snapshot_ids"]))
+    for item in plan:
+        item._protected = protected  # ``apply_deletions`` asks it before each call that removes something
     return plan
 
 
@@ -421,6 +425,14 @@ def apply_deletions(aws, plan, *, apply):
     ``deregister_failed``, ``deregister_unconfirmed``, ``snapshot_deleted``,
     ``snapshot_failed`` and ``snapshot_kept`` (not tried, because the image's
     deregistration was not confirmed).
+
+    Right before each deregistration and each snapshot deletion the deployment
+    file is checked again (``check_unchanged``): the provider reads and calls of
+    a batch take time, and an edit that pins an image later in the plan must keep
+    it. A file that changed ends the batch. The rows of the actions that were done
+    stay, and one last row with the result ``refused`` and the code
+    ``IMAGE_DELETION_UNSAFE`` names the action that was not made; nothing after
+    it runs (#202).
     """
     report = []
     for item in _decided_items(plan):
@@ -432,6 +444,9 @@ def apply_deletions(aws, plan, *, apply):
         confirmed = True
         if item["action"] == DEREGISTER:
             if apply:
+                if _changed(item):
+                    report.append(_row(item, DEREGISTER, REFUSED, code=IMAGE_DELETION_UNSAFE))
+                    return report
                 result, code = _deregister(aws, item["image_id"])
                 confirmed = result == DEREGISTERED
             else:
@@ -442,6 +457,11 @@ def apply_deletions(aws, plan, *, apply):
                 result, code = PLANNED, None
             elif not confirmed:
                 result, code = SNAPSHOT_KEPT, None
+            elif _changed(item):
+                report.append(
+                    _row(item, DELETE_SNAPSHOT, REFUSED, snapshot_id=snapshot_id, code=IMAGE_DELETION_UNSAFE)
+                )
+                return report
             else:
                 result, code = _delete_snapshot(aws, snapshot_id)
             report.append(_row(item, DELETE_SNAPSHOT, result, snapshot_id=snapshot_id, code=code))
@@ -456,6 +476,18 @@ def _unsafe(detail):
     return ImageRefusal(IMAGE_DELETION_UNSAFE, detail)
 
 
+def _changed(item):
+    """Whether the deployment file is no longer the one that the protected set of this item was resolved from."""
+    protected = getattr(item, "_protected", None)
+    if not _is_resolved(protected):
+        return True
+    try:
+        check_unchanged(protected)
+    except ImageRefusal:
+        return True
+    return False
+
+
 class _PlanItem(dict):
     """A plan item: a plain ``dict`` that also keeps a copy of what was decided.
 
@@ -464,7 +496,7 @@ class _PlanItem(dict):
     makes the item differ from it.
     """
 
-    __slots__ = ("_decided",)
+    __slots__ = ("_decided", "_protected")
 
     def unchanged(self):
         decided = getattr(self, "_decided", None)

@@ -354,6 +354,39 @@ class UntilDoneThroughTheCommandTests(CliCase):
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
         self.assertEqual(self.only_build().state, "building")
 
+    def test_a_file_edited_before_the_journal_is_resolved_gives_the_change_not_a_divergence(self):
+        # A row is pending, and the file is edited between the load of the command and the resolution: without the
+        # check, the resolution reads the new bytes and finds that they match neither hash of the row.
+        self.add_pending(old_sha="0" * 64, new_sha=self.file_sha())
+        real = cli.ImageState
+
+        def state(*arguments, **keywords):
+            text = self.config_path.read_text(encoding="utf-8")
+            self.config_path.write_text(text.replace(GATE, NO_GATE), encoding="utf-8")
+            return real(*arguments, **keywords)
+
+        before = self.dump()
+        with mock.patch.object(cli, "ImageState", state):
+            code, payload = self.invoke("image", "run", "--apply", "--until-done")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(self.dump(), before)
+        self.assertEqual((self.sessions, self.world.calls), ([], []))
+
+    def test_the_same_edit_without_until_done_is_still_a_divergence(self):
+        # The check belongs to the loop: a single pass keeps its behaviour.
+        self.add_pending(old_sha="0" * 64, new_sha=self.file_sha())
+        real = cli.ImageState
+
+        def state(*arguments, **keywords):
+            text = self.config_path.read_text(encoding="utf-8")
+            self.config_path.write_text(text.replace(GATE, NO_GATE), encoding="utf-8")
+            return real(*arguments, **keywords)
+
+        with mock.patch.object(cli, "ImageState", state):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTION_JOURNAL_DIVERGED"))
+
 
 class GuardTests(CliCase):
     def test_until_done_without_apply_is_refused_before_anything_is_called(self):

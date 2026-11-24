@@ -997,8 +997,12 @@ class ImagePipeline:
             # back a journal that another writer left between passes. The next pass opens again under the lock.
             self._state.close()
 
-    def _check_settings_unchanged(self):
-        """Refuse ``IMAGE_CONFIG_CHANGED`` when the deployment file no longer loads to the settings of this run."""
+    def check_settings_unchanged(self):
+        """Refuse ``IMAGE_CONFIG_CHANGED`` when the deployment file no longer loads to the settings of this run.
+
+        The command calls it before it resolves a pending promotion (``--until-done``), and the loop calls it before
+        every pass.
+        """
         try:
             current = load(self._config_path)
         except ConfigRefusal as refusal:
@@ -1027,7 +1031,7 @@ class ImagePipeline:
         while True:
             # Every pass runs on the settings the command loaded at its start. A file that says something else now
             # (a withdrawn gate, a new pin, another state directory) ends the loop, and a fresh run reads it (#202).
-            self._check_settings_unchanged()
+            self.check_settings_unchanged()
             result = self.run_pass(apply=True, force=force and first)
             first = False
             if result["decision"] not in IN_PROGRESS:
@@ -1852,4 +1856,8 @@ class _Pass:
                 failed=counts["failed"],
                 skipped=counts["skipped"],
             )
+        for row in report:
+            if row["result"] == image_deletion.REFUSED:
+                # The deployment file changed during the batch: the rows before this one were done and are counted.
+                counts["refused"] = row["code"]
         return counts

@@ -640,10 +640,13 @@ or advances the active one (`building`, then `imaging`, then `candidate` or
 `failed`), then runs retention. `--until-done` repeats passes, 30 seconds apart, until the build is `candidate` or
 `failed` or a pass has nothing in flight (a refusal, an unchanged digest). It needs
 `--apply` and refuses without it (`IMAGE_UNTIL_DONE_NEEDS_APPLY`, before the
-configuration is read). A pass that raises ends the loop. Before every pass the loop
-loads the deployment file again and ends with `IMAGE_CONFIG_CHANGED` when it no longer
-loads or gives other settings than the run loaded (a withdrawn gate, a new pin, another
-state directory); it launches nothing more, and a fresh run reads the file as it is now.
+configuration is read). A pass that raises ends the loop. Before it resolves a pending
+promotion, and then before every pass, the run loads the deployment file again and ends
+with `IMAGE_CONFIG_CHANGED` when it no longer loads or gives other settings than the run
+loaded (a withdrawn gate, a new pin, another state directory); it launches nothing more,
+and a fresh run reads the file as it is now. An edit after the command loaded the file
+therefore gives `IMAGE_CONFIG_CHANGED`, not `PROMOTION_JOURNAL_DIVERGED` for the row that
+the edit left unmatched.
 A rewrite that changes no setting does not end the loop. The exit status does not
 tell whether a build is still in flight: a pass can commit a result and then raise,
 so read `image status` before the next run. `--force` counts for the first pass only.
@@ -867,7 +870,9 @@ replaces the file by a rename: that container then reads the old file. Each read
 checks, after the bytes are in, that the open file still has a link and is still the
 file that the path names, and refuses with `PROMOTE_FILE_STALE` when it is not, so no
 journal row is resolved and no pin is written from a stale view. A hard link that keeps
-the old file named does not hide the replacement. Every `image` command also refuses
+the old file named does not hide the replacement, and neither does a `--config` that is
+a symbolic link switched to another file during the read: the path as given is checked
+as well as the file it resolved to. Every `image` command also refuses
 a file that is itself a mount point (`IMAGE_CONFIG_MOUNTED`) before it opens the state.
 
 #### Promote reason codes
@@ -1158,7 +1163,11 @@ promotion that a pass resolved from a stale file still names the live pin), the
 pins of a pending promotion, the newest verified candidate (unless a refresh recorded it as `TEMPLATE_DRIFT`: then only a pin that names its image protects it) or the active build. `retain` is not a
 cap: the protected set can hold more images. When it
 cannot resolve that set it deletes nothing (`IMAGE_DELETION_UNSAFE`), and a
-deployment file that is a stale view of a replaced file is one such case. A
+deployment file that is a stale view of a replaced file is one such case. The
+file is checked again right before each deregistration and each snapshot deletion: a
+file that changed since the set was resolved ends the batch there. What was done stays
+done and is counted, and the result of that part carries `"refused": "IMAGE_DELETION_UNSAFE"`
+next to the counts. A
 journal row whose pin is not a version number is refused when the journal is
 read (`IMAGE_STATE_UNREADABLE`), before retention runs. Retention reads the pin from the TOML on every pass, so a
 build container must not run across a promotion
@@ -1235,8 +1244,8 @@ and the codes of `promote` in [Promote reason codes](#promote-reason-codes).
 | `IMAGE_STATE_RECOVERY_NEEDED` | a process stopped inside a commit and left a rollback journal (`image-state.sqlite-journal`) that a read-only open cannot roll back; `status`, `plan`, the previews and `run` without `--apply` refuse and leave it. A writing command rolls it back: `image run --apply`, `image promote --write` (with or without `--rollback`) or `image status --refresh` takes the writer lock before its writable open, which rolls the journal back, and then does what it always does (a run resolves a pending row and runs its pass; a promotion also writes the pin). Another holder of the lock gives `IMAGE_STATE_LOCKED` with the journal left as it is. Do not delete the journal file: it holds the pages that make the file consistent |
 | `IMAGE_PROFILE_INVALID` | the image role profile is missing or breaks the profile rules of [deployment.md](deployment.md#image-build-role-and-source-identity-optional); a provider failure, exit `1` |
 | `IMAGE_CONFIG_MOUNTED` | the deployment file is itself a mount point (a bind mount of the file, which keeps serving the inode it mounted). Raised by every `image` command with the image path enabled, before the state is opened, exit `2`; the detail names no path. Mount the dedicated directory of the file, not the file |
-| `IMAGE_CONFIG_CHANGED` | `--until-done` loaded the deployment file again before a pass and found that it no longer loads or gives other settings than the run loaded. The loop ends before the pass and launches nothing more; the state file keeps the build. Run the command again to resume it with the file as it is now |
-| `IMAGE_DELETION_UNSAFE` | the deletion rule could not resolve the images it must protect, read the deployment file through a stale view (also a replacement that a hard link survives), or found the file changed after it resolved them, so it deleted nothing. It appears inside the `retention` part of a pass result (`deletion` in a plan) and does not fail the command; that part can carry another refusal code, such as a provider code, in the same way |
+| `IMAGE_CONFIG_CHANGED` | `--until-done` loaded the deployment file again before it resolved a pending promotion and before each pass, and found that it no longer loads or gives other settings than the run loaded. The loop ends before the pass and launches nothing more; the state file keeps the build. Run the command again to resume it with the file as it is now |
+| `IMAGE_DELETION_UNSAFE` | the deletion rule could not resolve the images it must protect, read the deployment file through a stale view (also a replacement that a hard link survives), or found the file changed after it resolved them (checked again before each deregistration and snapshot deletion, so a change during a batch ends it with the earlier deletions done and counted, `refused` beside the counts), so it deleted nothing more. It appears inside the `retention` part of a pass result (`deletion` in a plan) and does not fail the command; that part can carry another refusal code, such as a provider code, in the same way |
 | a forge or provider code | raised from a read before a build is staged: a `FORGEJO_*` code exits `2`, an `AWS_*` code exits `1` |
 
 Two reasons mark rows that no build made: `IMAGE_ORPHAN_RECORDED` is a tagged

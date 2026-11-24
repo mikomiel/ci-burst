@@ -317,10 +317,13 @@ class ImageState:
         return copy
 
     def close(self):
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
-        self.release_writer()
+        """Close the connection and release the writer lock. The lock is released even when the close raises."""
+        connection, self._connection = self._connection, None
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            self.release_writer()
 
     @property
     def available(self):
@@ -806,6 +809,10 @@ class ImageState:
         assignments = ", ".join(f"{column} = ?" for column in fields)
         self._require().execute(f"UPDATE control SET {assignments} WHERE id = 1", tuple(fields.values()))
         return self.control_get()
+
+    def record_check_time(self, now):
+        """Write ``control.last_check_at`` and read nothing back, so the result reflects the write alone."""
+        self._require().execute("UPDATE control SET last_check_at = ? WHERE id = 1", (now,))
 
     def _require(self):
         if self._connection is None:

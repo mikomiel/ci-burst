@@ -637,7 +637,7 @@ class _Telemetry:
             emit(
                 "ci_burst_image_console_latency_seconds",
                 "gauge",
-                "Seconds from the build start to the first sighting of the marker on the console.",
+                "Seconds from the build start to the latest sighting of the marker on the console.",
                 [({}, round(data["console_latency_seconds"], 3))],
             )
         emit(

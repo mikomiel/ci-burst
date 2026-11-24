@@ -1849,52 +1849,13 @@ Three different times bound one admission pass:
   deployment that needs a longer pass must raise this unit timeout;
   `pass_deadline_seconds` is not offered above `290`.
 - `aws.max_lifetime_seconds` is the worker instance's own lifetime, not the
-  pass duration. The loader accepts only `3600`, the value that the worker
-  bootstrap arms for its shutdown and its job bound, so the expiry tag and the
-  cost reservation of a new admission use the bootstrap's duration (#138). It
-  aligns the configured duration, not the start times: admission, the
-  bootstrap's shutdown timer and the job timeout each start their own clock.
-  See [Upgrading past the one-lifetime rule](#upgrading-past-the-one-lifetime-rule)
-  before you replace an image whose deployment file sets another value.
-
-### Upgrading past the one-lifetime rule
-
-A deployment file that sets `aws.max_lifetime_seconds` to a previously valid
-integer other than `3600` loaded before #138 and is refused after it
-(`CONFIG_INVALID`). Every command loads the file first, `reap` included, so a
-cleanup image that runs against such a file stops expiry cleanup. Before you
-replace the image on either host:
-
-1. On the controller host, stop `ci-burst-apply.timer`, then wait until
-   `ci-burst-apply.service` is inactive and no `ci-burst-apply` container
-   exists. Stopping the timer does not stop a pass that is already running,
-   and that pass can still record an intent with the old lifetime.
-2. Run `status` and read `state.operations`. An operation in state `intent` or
-   `uncertain` keeps its frozen request, its expiry tag and its reservation: if
-   the upgraded controller sends it, its worker carries the old expiry, and the
-   reaper honours that tag even while a job runs. `status` only reads, and
-   `reap` does not change the ledger, so neither clears such a row, and an
-   `apply` that settles it can admit a new worker in the same pass. There is no
-   settle-only command: if such a row exists, stop here, keep admission
-   stopped and the image unchanged, and escalate. Do not run `apply` to clear
-   it, and do not rewrite an intent's request or token.
-3. On both hosts, set `aws.max_lifetime_seconds = 3600` in the deployment file
-   that each one mounts.
-4. Replace the image through the refresh unit of each host
-   (`ci-burst-refresh.service`, with `ci-burst-refresh-cleanup.conf` on the
-   cleanup host). It builds a candidate, smoke-tests it against the host's own
-   file and credentials (`reap` without `--apply` on the cleanup host) and
-   retags `localhost/ci-burst:latest` only after the smoke passes, so the
-   scheduled units keep the known-good image until then. On the cleanup host
-   the smoke network must match the installed reap unit
-   ([container.md](container.md#keep-the-image-current)). Do not build straight
-   into `localhost/ci-burst:latest` on the cleanup host: its timer can run the
-   untested image before you check it.
-5. A refresh can end without a new image (for example while a rollback hold
-   exists). On each host, check that `/var/lib/ci-burst-image/deployed-sha`
-   names a commit that contains #138, and on the cleanup host that the next
-   scheduled `reap` run succeeded with that image.
-6. Start `ci-burst-apply.timer` again.
+  pass duration. `apply` admits only when it is `3600`, the value that the
+  worker bootstrap arms for its shutdown and its job bound, so the expiry tag
+  and the cost reservation of a new worker use the bootstrap's duration (#138).
+  Another value refuses `apply` with `WORKER_LIFETIME_MISMATCH` before the
+  ledger is opened; `reap`, `status`, `export` and `plan` keep working, so set
+  the value to `3600` and admission resumes. An intent recorded before that
+  keeps the expiry it was recorded with.
 
 `reap`, `status` and `export` keep their existing behaviour and do not take the
 pass deadline. `reap --apply` runs from its own unit and timer on the cleanup

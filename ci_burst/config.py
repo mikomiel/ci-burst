@@ -66,8 +66,7 @@ MAX_INSTANCE_TYPE_LENGTH = 64
 #: synchronous provider reads predictable.
 _MAX_INSTANCE_TYPES = 4
 #: The worker's own lifetime. ``deploy/runner/bootstrap.sh`` arms its shutdown and bounds its job with this
-#: literal, and ``aws.max_lifetime_seconds`` (the expiry tag and the cost reservation) must equal it: one
-#: clock, not two (#138). A test compares the two.
+#: literal; a test compares the two. ``apply`` admits only under it (``Config.require_worker_lifetime``, #138).
 WORKER_LIFETIME_SECONDS = 3600
 
 #: How many basis paths one image build may hash. Each path is one raw read
@@ -247,6 +246,20 @@ class Config:
     state: StateConfig
     image: ImageConfig = field(default_factory=ImageConfig)
 
+    def require_worker_lifetime(self):
+        """Refuse admission unless ``aws.max_lifetime_seconds`` is the lifetime the worker bootstrap arms.
+
+        The expiry tag and the cost reservation of a new worker come from the configured value, its shutdown and its
+        job bound from the bootstrap's literal: one clock, not two (#138). Only admission refuses, so ``reap``,
+        ``status``, ``export`` and ``plan`` keep working on a file that still holds another value.
+        """
+        if self.aws.max_lifetime_seconds != WORKER_LIFETIME_SECONDS:
+            raise ConfigRefusal(
+                "WORKER_LIFETIME_MISMATCH",
+                f"aws.max_lifetime_seconds must be {WORKER_LIFETIME_SECONDS}, the lifetime that the worker bootstrap "
+                "arms on the instance; apply admits nothing until it is",
+            )
+
     def require_live_contract(self):
         """Refuse live admission until the operator declares live evidence."""
         if self.forgejo.qualification != "live-verified":
@@ -293,18 +306,6 @@ def _integer(table, key, where, *, minimum, maximum, required=True):
         _fail(f"{where}.{key}", "must be an integer")
     if not minimum <= value <= maximum:
         _fail(f"{where}.{key}", f"must be between {minimum} and {maximum}")
-    return value
-
-
-def _worker_lifetime(aws_table):
-    value = aws_table.get("max_lifetime_seconds")
-    if value is None:
-        _fail("aws.max_lifetime_seconds", "is required")
-    if type(value) is not int or value != WORKER_LIFETIME_SECONDS:
-        _fail(
-            "aws.max_lifetime_seconds",
-            f"must be {WORKER_LIFETIME_SECONDS}, the lifetime that the worker bootstrap arms on the instance",
-        )
     return value
 
 
@@ -830,7 +831,7 @@ def loads(text, path):
         ),
         launch_template_version=launch_template_version,
         max_spot_price=_money(aws_table, "max_spot_price", "aws"),
-        max_lifetime_seconds=_worker_lifetime(aws_table),
+        max_lifetime_seconds=_integer(aws_table, "max_lifetime_seconds", "aws", minimum=60, maximum=86_400),
         price_max_age_seconds=_integer(
             aws_table, "price_max_age_seconds", "aws", minimum=60, maximum=86_400, required=False
         )

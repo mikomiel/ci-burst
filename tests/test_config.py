@@ -299,18 +299,17 @@ class ConfigTests(unittest.TestCase):
             load(path)
         self.assertIn("aws.max_lifetime_seconds", raised.exception.detail)
 
-    def test_refuses_a_lifetime_other_than_the_one_the_bootstrap_arms(self):
-        # One clock (#138): the expiry tag and the cost reservation come from this value, the shutdown and the job
-        # bound on the worker from the bootstrap's literal.
-        for seconds in (60, 1800, WORKER_LIFETIME_SECONDS - 1, WORKER_LIFETIME_SECONDS + 1, 7200, 86_400):
+    def test_the_loader_accepts_another_lifetime_and_only_admission_refuses_it(self):
+        # reap, status, export and plan must keep working on a file that still holds another value (#138).
+        for seconds in (60, 1800, 7200):
             with self.subTest(seconds=seconds):
-                path = write_config(self.root, config={"aws": {"max_lifetime_seconds": seconds}})
+                config = load(write_config(self.root, config={"aws": {"max_lifetime_seconds": seconds}}))
+                self.assertEqual(config.aws.max_lifetime_seconds, seconds)
                 with self.assertRaises(ConfigRefusal) as raised:
-                    load(path)
-                self.assertIn("aws.max_lifetime_seconds", raised.exception.detail)
+                    config.require_worker_lifetime()
+                self.assertEqual(raised.exception.reason, "WORKER_LIFETIME_MISMATCH")
                 self.assertIn(str(WORKER_LIFETIME_SECONDS), raised.exception.detail)
-        config = load(write_config(self.root, config={"aws": {"max_lifetime_seconds": WORKER_LIFETIME_SECONDS}}))
-        self.assertEqual(config.aws.max_lifetime_seconds, WORKER_LIFETIME_SECONDS)
+        load(write_config(self.root)).require_worker_lifetime()  # the shipped default is the bootstrap's value
 
     def test_the_lifetime_matches_every_clock_in_the_worker_bootstrap(self):
         bootstrap = (Path(__file__).resolve().parents[1] / "deploy" / "runner" / "bootstrap.sh").read_text()

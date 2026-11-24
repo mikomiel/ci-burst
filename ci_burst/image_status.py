@@ -21,6 +21,8 @@ changes no row. The state file and its lock are created before the reads when
 they are absent, because the lock must be held across them.
 """
 
+import sqlite3
+
 from . import image
 from .errors import ProviderRefusal, StateRefusal
 from .image_pipeline import _summary
@@ -170,17 +172,30 @@ def _image_of(state, deployment, version):
 
 
 def _record_check(state, now):
-    """Record the check time. A status that cannot (a pass holds the lock, a read-only directory) still reports."""
+    """Record the check time. A status that cannot (a pass holds the lock, a read-only directory) still reports.
+
+    The write is best-effort, so a database error (for example a read-only state
+    file) reports ``check_recorded: false`` and does not fail the read-only status.
+    The answer reflects the write alone: nothing is read back, and a failure to close
+    the connection or release the lock afterwards, which cannot undo a committed
+    write, is ignored here too.
+    """
+    recorded = False
     try:
-        state.acquire_writer()
+        state.acquire_writer()  # before the writable open, which rolls back a hot journal
         state.refuse_a_hot_journal()  # a read-only status never rolls a journal back
         state.connect()
-        state.control_set(last_check_at=now)
-    except (StateRefusal, OSError):
-        return False
+        state.record_check_time(now)
+        recorded = True
+    except (StateRefusal, OSError, sqlite3.Error):
+        pass
     finally:
-        state.close()
-    return True
+        # Always runs, an interruption included, so the lock is never left held.
+        try:
+            state.close()
+        except (OSError, sqlite3.Error):
+            pass
+    return recorded
 
 
 # -- the describe-only refresh ----------------------------------------------------------

@@ -188,10 +188,11 @@ tag condition for that action, and none of the verification gates G1 to G13 in
 the design covers it directly; the nearest is G7 (console blind-probe cause).
 Treat it as an evidence gap: check it with the IAM policy simulator or a real
 call before enabling. If the condition does not match, the Allow does not apply
-and the console read is refused. The code does not settle that as `CONSOLE_BLIND`:
-each pass raises the provider refusal and exits nonzero, and the build does not
-advance ([#203](https://github.com/mikomiel/ci-burst/issues/203)); watch for a
-build that stays `building` in `image status`. Do not widen the grant to `instance/*` without the tag to work
+and the console read is refused. Before the build deadline each pass then raises
+the provider refusal and exits nonzero; the pass that reaches the deadline ends the
+build `CONSOLE_BLIND`, which counts as a failure, and names the refusal in
+`notes` (`console_read:<reason>`). Watch for builds that fail `CONSOLE_BLIND` with
+that note. Do not widen the grant to `instance/*` without the tag to work
 around that; record the result and decide with the maintainer.
 
 Images and snapshots may carry the keys `ci-burst:image-build`,
@@ -646,7 +647,7 @@ prefix = "warm-image-source/"
 | `state_directory` | absolute path | required | the image state directory; it differs from the ledger's directory and lies neither inside it nor around it |
 | `min_build_interval_seconds` | `3600..604800` | `86400` | the least time since the newest build row of any state, a refused one included; `--force` skips it |
 | `max_builds_per_day` | `1..6` | `2` | builds that may start in 24 hours; `--force` does not skip it |
-| `build_deadline_seconds` | `900..14400` | `2700` | a build with no verdict by then ends `failed` in a pass that reaches the deadline check; a pass that raises earlier, such as on a refused console read ([#203](https://github.com/mikomiel/ci-burst/issues/203)), leaves it in flight |
+| `build_deadline_seconds` | `900..14400` | `2700` | a build with no verdict by then ends `failed` in a pass that reaches the deadline check; a pass that raises earlier, such as in reconcile, leaves it in flight; a console read refused at or after the deadline ends it `CONSOLE_BLIND` |
 | `failure_cooldown_seconds` | `600..172800` | `21600` | the wait after a failed build |
 | `max_consecutive_failures` | `1..10` | `3` | consecutive failed builds that set `blocked` |
 | `retain` | `2..6` | `3` | the image count at which retention stops pruning |
@@ -1078,6 +1079,8 @@ conditions). Reverting the source is a reviewed change, not a history rewrite.
 | `FORGEJO_UNEXPECTED_SHAPE` | the endpoint returned something other than an array or `null` |
 | `AWS_SDK_UNAVAILABLE` | the `boto3` runtime dependency is not installed in the command's environment |
 | `AWS_REFUSED` | the identity lacks a permission, or a condition (tag, template, subnet) does not match |
+| `AWS_CREDENTIALS_UNAVAILABLE` | the SDK could not resolve the profile or its credentials (for example an unknown profile, missing credentials or a malformed shared config); the requested AWS operation was not sent, and the detail is the error class only |
+| `AWS_SETUP_FAILED` | the SDK could not be imported, configured or build the session or a client for another reason; the requested AWS operation was not sent, and the detail is the error class only |
 | `AWS_UNCERTAIN` | the provider outcome is unknown; the recorded client token resumes the same operation |
 | `AWS_INVENTORY_INCOMPLETE` | the inventory response is not a complete, parseable result; no operation is settled and no replacement is admitted |
 | `UNRECORDED_OWNED_INSTANCE`, `OWNERSHIP_TAGS_MISSING`, `OPERATION_TAG_INVALID` | an owned instance needs reconciliation before another launch |

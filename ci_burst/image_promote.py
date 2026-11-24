@@ -485,9 +485,12 @@ def _flag(value):
 def plan_edit(text, new_pin):
     """Replace the one ``launch_template_version`` assignment of ``[aws]`` and nothing else.
 
-    Returns the new text and the change (the line number and the line before and
-    after). The text is split at line feeds only, so carriage returns and every
-    other byte stay as they are, and only the digits of the value are replaced.
+    Returns the new text and the change (the line number and the assignment
+    before and after). The change shows the key, the indentation and the value
+    only: a trailing comment stays in the file but is not reported, because it can
+    hold text that should not reach logs or tickets. The text is split at line
+    feeds only, so carriage returns and every other byte stay as they are, and
+    only the digits of the value are replaced.
     An assignment in a sub-table, a quoted or dotted key, an inline table or
     anything that is not a plain decimal value is not found, and the edit
     refuses: it is better to refuse than to guess. A scanner can be fooled by a
@@ -510,10 +513,9 @@ def plan_edit(text, new_pin):
             f"found {len(found)} plain launch_template_version assignments in the [aws] table; exactly one is needed",
         )
     number, match = found[0]
-    before = lines[number]
-    after = f"{match.group(1)}{new_pin}{match.group(3)}"
-    lines[number] = after
-    return "\n".join(lines), {"line": number + 1, "from": before.rstrip("\r"), "to": after.rstrip("\r")}
+    key, old_value, rest = match.groups()
+    lines[number] = f"{key}{new_pin}{rest}"
+    return "\n".join(lines), {"line": number + 1, "from": f"{key}{old_value}", "to": f"{key}{new_pin}"}
 
 
 def check_reparse(snapshot, new_text, new_pin):

@@ -1859,26 +1859,35 @@ Three different times bound one admission pass:
 
 ### Upgrading past the one-lifetime rule
 
-A deployment file that sets `aws.max_lifetime_seconds` to anything but `3600`
-loaded before #138 and is refused after it (`CONFIG_INVALID`). Every command
-loads the file first, `reap` included, so replacing the image on the cleanup
-host before the file is fixed stops expiry cleanup. Before you replace the
-image on either host:
+A deployment file that sets `aws.max_lifetime_seconds` to a previously valid
+integer other than `3600` loaded before #138 and is refused after it
+(`CONFIG_INVALID`). Every command loads the file first, `reap` included, so a
+cleanup image that runs against such a file stops expiry cleanup. Before you
+replace the image on either host:
 
-1. On the controller host and on the cleanup host, check the deployment file
-   each one mounts: `aws.max_lifetime_seconds` must be `3600`. Fix it first if it
-   is not.
-2. If the value was not `3600`, stop admission (stop `ci-burst-apply.timer`) and
-   wait until `status` lists no operation in state `intent` or `uncertain`
-   under `state.operations`. An intent recorded
-   before the change keeps its frozen request, its expiry tag and its
-   reservation: if it is sent after the upgrade, its worker carries the old
-   expiry, and the reaper honours that tag even if a job is still running.
-   Do not rewrite an intent's request or token.
-3. Build the new image, then run `reap` without `--apply` with it, against the
-   cleanup host's file, and confirm that it exits `0` before the cleanup unit
-   uses it. The scheduled refresh runs its own smoke check on the controller.
-4. Start `ci-burst-apply.timer` again.
+1. On the controller host, stop `ci-burst-apply.timer`, then wait until
+   `ci-burst-apply.service` is inactive and no `ci-burst-apply` container
+   exists. Stopping the timer does not stop a pass that is already running,
+   and that pass can still record an intent with the old lifetime.
+2. Run `status` and read `state.operations`. An operation in state `intent` or
+   `uncertain` keeps its frozen request, its expiry tag and its reservation: if
+   the upgraded controller sends it, its worker carries the old expiry, and the
+   reaper honours that tag even while a job runs. `status` only reads, and
+   `reap` does not change the ledger, so neither clears such a row. Keep
+   admission stopped and settle the row with the controller you are replacing
+   before you go on, as for any unresolved operation. Do not rewrite an
+   intent's request or token.
+3. On both hosts, set `aws.max_lifetime_seconds = 3600` in the deployment file
+   that each one mounts.
+4. Replace the image through the refresh unit of each host
+   (`ci-burst-refresh.service`, with `ci-burst-refresh-cleanup.conf` on the
+   cleanup host). It builds a candidate, smoke-tests it against the host's own
+   file and credentials (`reap` without `--apply` on the cleanup host) and
+   retags `localhost/ci-burst:latest` only after the smoke passes, so the
+   scheduled units keep the known-good image until then. Do not build straight
+   into `localhost/ci-burst:latest` on the cleanup host: its timer can run the
+   untested image before you check it.
+5. Start `ci-burst-apply.timer` again.
 
 `reap`, `status` and `export` keep their existing behaviour and do not take the
 pass deadline. `reap --apply` runs from its own unit and timer on the cleanup

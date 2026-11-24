@@ -813,7 +813,8 @@ that your jobs pass on it. Read the evidence, run a canary
    fresh. A promotion refuses a record older than `promote_max_age_seconds`
    (`IMAGE_VERIFICATION_STALE`).
 2. `image promote --config deployment.toml` prints `decision: preview`: the
-   candidate evidence, the single line that would change (`pin_change`), the pin it
+   candidate evidence, the pin assignment that would change (`pin_change`: the line
+   number and the assignment before and after, without a trailing comment), the pin it
    would replace, any pending promotion row and a `write_check`. The `write_check`
    runs the checks of `--write` in order and reports `ok` or the first refusal.
    Without a state file the command refuses (`PROMOTE_NO_CANDIDATE`). Add

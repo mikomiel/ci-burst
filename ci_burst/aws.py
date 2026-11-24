@@ -206,11 +206,12 @@ class Aws:
         """One resolved credential identity for identity and EC2 calls."""
         if self._session_cache is not None:
             return self._session_cache
-        try:
-            import boto3
-        except ImportError:
-            raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
-        self._session_cache = boto3.Session(profile_name=self._config.aws.profile)
+        with _setup_failures():
+            try:
+                import boto3
+            except ImportError:
+                raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
+            self._session_cache = boto3.Session(profile_name=self._config.aws.profile)
         return self._session_cache
 
     def _client_config(self):
@@ -223,14 +224,15 @@ class Aws:
     def _client(self):
         if self._client_cache is not None:
             return self._client_cache
-        # Resolve the guarded configuration first: a checkout without the SDK
-        # must refuse here, before the session is touched.
-        config = self._client_config()
-        self._client_cache = self._session().client(
-            "ec2",
-            region_name=self._config.aws.region,
-            config=config,
-        )
+        with _setup_failures():
+            # Resolve the guarded configuration first: a checkout without the SDK
+            # must refuse here, before the session is touched.
+            config = self._client_config()
+            self._client_cache = self._session().client(
+                "ec2",
+                region_name=self._config.aws.region,
+                config=config,
+            )
         return self._client_cache
 
     def _check_deadline(self, deadline, detail):
@@ -248,8 +250,9 @@ class Aws:
         """Return the AWS account the configured credential route reaches."""
         if self._account_cache is not None:
             return self._account_cache
-        config = self._client_config()
-        sts = self._session().client("sts", region_name=self._config.aws.region, config=config)
+        with _setup_failures():
+            config = self._client_config()
+            sts = self._session().client("sts", region_name=self._config.aws.region, config=config)
         try:
             response = sts.get_caller_identity()
         except Exception as error:  # noqa: BLE001 - classified below
@@ -392,8 +395,9 @@ class Aws:
         consoles = {}
         for instance_id in instance_ids:
             self._check_deadline(deadline, "GetConsoleOutput read")
+            client = self._client()  # its own refusal passes unchanged, outside the read's translation
             try:
-                response = self._client().get_console_output(InstanceId=instance_id, Latest=True)
+                response = client.get_console_output(InstanceId=instance_id, Latest=True)
             except Exception as error:  # noqa: BLE001 - classified below
                 if _error_code(error) == "InvalidInstanceID.NotFound":
                     continue
@@ -1298,6 +1302,42 @@ def _sdk_failures():
         raise
     except Exception as error:  # noqa: BLE001 - classified by _translate
         raise _translate(error) from None
+
+
+#: SDK failure classes, by name, that mean the credential route or its configuration cannot be used.
+CREDENTIAL_FAILURES = frozenset(
+    {
+        "ProfileNotFound",
+        "NoCredentialsError",
+        "PartialCredentialsError",
+        "CredentialRetrievalError",
+        "SSOTokenLoadError",
+        "SSOError",
+        "TokenRetrievalError",
+        "ConfigParseError",
+        "InvalidConfigError",
+    }
+)
+
+
+@contextlib.contextmanager
+def _setup_failures():
+    """Let only a refusal leave the worker adapter while it builds its session or a client.
+
+    No request has been sent at that point, so the failure is definite: a launch that never reached the
+    provider must not hold a slot as an uncertain one. A refusal passes unchanged. A credential or profile
+    failure (``CREDENTIAL_FAILURES``, by class name) becomes ``AWS_CREDENTIALS_UNAVAILABLE`` and any other
+    failure ``AWS_SETUP_FAILED``, each with the error's class name only: neither its text nor a code from a
+    response it carries, which can hold a profile name, a file path or free-form provider text.
+    """
+    try:
+        yield
+    except Refusal:
+        raise
+    except Exception as error:  # noqa: BLE001 - reduced to a code below
+        if any(kind.__name__ in CREDENTIAL_FAILURES for kind in type(error).__mro__):
+            raise ProviderRefusal("AWS_CREDENTIALS_UNAVAILABLE", type(error).__name__) from None
+        raise ProviderRefusal("AWS_SETUP_FAILED", type(error).__name__) from None
 
 
 def _error_code(error):

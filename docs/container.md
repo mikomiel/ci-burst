@@ -884,7 +884,11 @@ topology.
   operator resolves it. Drain before the upgrade: stop admission as in rollback
   step 1, run `status`, and replace the image only when `state.operations` lists
   no operation in state `intent` or `uncertain`; a refused legacy intent has no
-  supported recovery in the product. If one is found after the upgrade, keep
+  supported recovery in the product. A host whose `ci-burst-refresh.timer`
+  follows `origin/main` replaces the image by itself within minutes of a merge,
+  so on such a host the drain comes before the change that brings schema 5 is
+  merged, or the refresh timer is stopped until the drain is verified; keep
+  cleanup running either way. If one is found after the upgrade, keep
   admission stopped, keep cleanup running, do not delete or edit the row, and
   escalate: an empty owned inventory does not prove that its request was never
   sent. `plan`, `status` and `export` accept versions 1
@@ -893,8 +897,11 @@ topology.
   schema it does not know, so rolling the image back after an upgrade needs
   the matching copy: `.pre-v5.` returns the schema-4 file, and `.pre-v4.`
   returns the schema-1, -2 or -3 file as it was found. A
-  copy holds nothing written after it: restore it only while admission is
-  stopped and no `apply` has run since the upgrade, so `state.operations` still
+  copy holds nothing written after it. The `apply` pass that performs the
+  upgrade counts: it goes on to reconcile and can commit and send a launch in
+  the same pass. Restore a copy only while admission is stopped and the
+  evidence shows that no `apply`, the upgrading pass included, wrote an
+  operation or called the provider after the copy, so `state.operations` still
   lists exactly the rows the copy holds. Once an `apply` has admitted or
   settled an operation, the copy would drop that launch and its spend: keep
   admission stopped, keep the current ledger and the upgraded image, and

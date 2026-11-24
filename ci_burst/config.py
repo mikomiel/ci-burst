@@ -297,8 +297,10 @@ def _integer(table, key, where, *, minimum, maximum, required=True):
 
 
 def _worker_lifetime(aws_table):
-    value = _integer(aws_table, "max_lifetime_seconds", "aws", minimum=60, maximum=86_400)
-    if value != WORKER_LIFETIME_SECONDS:
+    value = aws_table.get("max_lifetime_seconds")
+    if value is None:
+        _fail("aws.max_lifetime_seconds", "is required")
+    if type(value) is not int or value != WORKER_LIFETIME_SECONDS:
         _fail(
             "aws.max_lifetime_seconds",
             f"must be {WORKER_LIFETIME_SECONDS}, the lifetime that the worker bootstrap arms on the instance",

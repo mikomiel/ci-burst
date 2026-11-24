@@ -1851,7 +1851,34 @@ Three different times bound one admission pass:
 - `aws.max_lifetime_seconds` is the worker instance's own lifetime, not the
   pass duration. The loader accepts only `3600`, the value that the worker
   bootstrap arms for its shutdown and its job bound, so the expiry tag and the
-  cost reservation never disagree with the instance (#138).
+  cost reservation of a new admission use the bootstrap's duration (#138). It
+  aligns the configured duration, not the start times: admission, the
+  bootstrap's shutdown timer and the job timeout each start their own clock.
+  See [Upgrading past the one-lifetime rule](#upgrading-past-the-one-lifetime-rule)
+  before you replace an image whose deployment file sets another value.
+
+### Upgrading past the one-lifetime rule
+
+A deployment file that sets `aws.max_lifetime_seconds` to anything but `3600`
+loaded before #138 and is refused after it (`CONFIG_INVALID`). Every command
+loads the file first, `reap` included, so replacing the image on the cleanup
+host before the file is fixed stops expiry cleanup. Before you replace the
+image on either host:
+
+1. On the controller host and on the cleanup host, check the deployment file
+   each one mounts: `aws.max_lifetime_seconds` must be `3600`. Fix it first if it
+   is not.
+2. If the value was not `3600`, stop admission (stop `ci-burst-apply.timer`) and
+   wait until `status` lists no operation in state `intent` or `uncertain`
+   under `state.operations`. An intent recorded
+   before the change keeps its frozen request, its expiry tag and its
+   reservation: if it is sent after the upgrade, its worker carries the old
+   expiry, and the reaper honours that tag even if a job is still running.
+   Do not rewrite an intent's request or token.
+3. Build the new image, then run `reap` without `--apply` with it, against the
+   cleanup host's file, and confirm that it exits `0` before the cleanup unit
+   uses it. The scheduled refresh runs its own smoke check on the controller.
+4. Start `ci-burst-apply.timer` again.
 
 `reap`, `status` and `export` keep their existing behaviour and do not take the
 pass deadline. `reap --apply` runs from its own unit and timer on the cleanup

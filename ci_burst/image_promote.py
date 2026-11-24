@@ -70,6 +70,7 @@ PROMOTE_PIN_LINE_AMBIGUOUS = "PROMOTE_PIN_LINE_AMBIGUOUS"
 PROMOTE_REPARSE_FAILED = "PROMOTE_REPARSE_FAILED"
 PROMOTE_FILE_CHANGED = "PROMOTE_FILE_CHANGED"
 PROMOTE_FILE_STALE = "PROMOTE_FILE_STALE"
+PROMOTE_STATE_CHANGED = "PROMOTE_STATE_CHANGED"
 #: Every ``image`` command refuses a deployment file that is itself a mount point (#202).
 IMAGE_CONFIG_MOUNTED = "IMAGE_CONFIG_MOUNTED"
 _MOUNTINFO = Path("/proc/self/mountinfo")
@@ -674,8 +675,10 @@ def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock):
         _remove(temporary)  # a crashed run left it; this run holds the lock
         _create(temporary, new_data, snapshot)
         backup = _create_backup(snapshot, clock())
-        if sha256_of(target.read_bytes()) != snapshot.sha256:
-            raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed after it was read; nothing was written")
+        # The same check as the preview's: ``--config`` must still lead to this file, with the same identity and
+        # bytes. A hash of the resolved target alone misses a link that now leads to another file.
+        if not _is_unchanged(snapshot):
+            raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed after it was read; the pin was not changed")
         with state.transaction():
             if kind == "promotion":
                 _record_previous_pin(state, snapshot)
@@ -921,13 +924,43 @@ def promote(config, *, state, clock, events, version=None, rollback=False, write
     ``notes`` is empty when the event was written.
     """
     if write:
-        return _write(read_snapshot(config), state, clock, events, version, rollback)
+        snapshot = read_snapshot(config)
+        check_state_owner(config, snapshot, state)
+        return _write(snapshot, state, clock, events, version, rollback, owner=config)
     # The preview holds the file open until it has checked it again after the copy of the state.
     snapshot = read_snapshot(config, hold=True)
     try:
+        check_state_owner(config, snapshot, state)
         return _preview(snapshot, state, clock, version, rollback)
     finally:
         os.close(snapshot.held)
+
+
+def check_state_owner(config, snapshot, state):
+    """Refuse ``PROMOTE_STATE_CHANGED`` unless ``state`` and the events belong to the file that ``snapshot`` read.
+
+    The command line picks the state directory, and binds the event writer to the deployment, from the file as it
+    loaded it at startup. Every pin fact comes from ``snapshot``, a later read. When the file changed its
+    ``[image].state_directory`` or its ``deployment`` in between, a preview would plan from another database than the
+    file names, and a write would journal the move where the next recovery command does not look (#199). The detail
+    names no path.
+    """
+    planned = snapshot.config
+    # The values are compared as the file writes them (the loader collapses ``.`` and doubled separators), not
+    # resolved: every fact about the owner then comes from the file's bytes, which the last check before the rename
+    # compares by hash. A link on the path is not followed; changing what it names, like changing the value, is a
+    # cutover for a time when no image command runs.
+    same_directory = (
+        planned.image.state_directory is not None
+        and planned.image.state_directory == config.image.state_directory
+        and Path(state.directory) == config.image.state_directory
+    )
+    if planned.deployment != config.deployment or not same_directory:
+        raise ImageRefusal(
+            PROMOTE_STATE_CHANGED,
+            "the deployment file names another state directory or deployment than the one this command opened; "
+            "run the command again; nothing was written",
+        )
 
 
 def _missing_state(rollback):
@@ -1094,7 +1127,7 @@ def _announce(events, done, *, build_id, image_id, rollback):
     return []
 
 
-def _write(snapshot, state, clock, events, version, rollback):
+def _write(snapshot, state, clock, events, version, rollback, *, owner):
     # Nothing is written until the checks that need only the file pass.
     check_directory(snapshot.target)
     check_zone_pins(snapshot.raw)
@@ -1103,10 +1136,10 @@ def _write(snapshot, state, clock, events, version, rollback):
     with file_lock(snapshot.target):
         try:
             state.acquire_writer()  # before the writable open, which rolls back a hot journal
-            state.connect()
             # The first read decided only the two refusals above. Every other fact comes from bytes
             # read now, with both locks held: a promotion that finished after the first read must
-            # not make its own pending row look aborted.
+            # not make its own pending row look aborted. The file is checked before the state is
+            # opened for writing, because that open rolls back a hot journal of the state it opens.
             checked = snapshot.target
             snapshot = read_snapshot(snapshot.config)
             if snapshot.target != checked:
@@ -1117,10 +1150,19 @@ def _write(snapshot, state, clock, events, version, rollback):
                     "the deployment path leads to another file than the one that was checked and locked; "
                     "nothing was written",
                 )
+            # The bytes read under the locks decide too: the state and the events must still be the ones they
+            # name. As at the first read, this comes before the zone pins.
+            check_state_owner(owner, snapshot, state)
             check_zone_pins(snapshot.raw)
+            state.connect()
             config = snapshot.config
             # Every row first: a damaged completed row must stop the write here, not after the file changed.
             state.journal_check()
+            # A pending row is resolved from the hash of this snapshot, and the resolution is written at once:
+            # the file must still be this snapshot first, or a stale hash could mark a row aborted that a later
+            # check then refuses to build on.
+            if not _is_unchanged(snapshot):
+                raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed after it was read; the pin was not changed")
             resolved = resolve_pending(state, snapshot.sha256)
             now = clock()
             if rollback:

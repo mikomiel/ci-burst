@@ -748,9 +748,8 @@ stage that launches renders them from the file as it reads it then.
 
 A build that has no verdict by `build_deadline_seconds` ends `failed` in a pass that
 reaches the deadline check. The deadline is not a hard bound: a pass that raises
-first, in reconcile or on a refused console read
-([#203](https://github.com/mikomiel/ci-burst/issues/203)), leaves the build in
-flight, and an `imaging` build whose image a later read finds `available` can still
+first, in reconcile or on a console read refused before the deadline, leaves the
+build in flight, and an `imaging` build whose image a later read finds `available` can still
 become a candidate. A failed
 build sets a cooldown of `failure_cooldown_seconds`. After
 `max_consecutive_failures` failed builds in a row the state is `blocked`. A
@@ -1189,7 +1188,7 @@ passing plan does not rule these out.
 | `WARM_FAILED` | the builder printed a failure marker: the script failed, for example in the archive fetch, a warm command or the gate. Read the cause in the framed tail of the event or the console |
 | `IMAGE_MARKER_DIGEST_MISMATCH` | the builder reports another archive digest than the staged one |
 | `MARKER_TIMEOUT` | no ready marker by the build deadline, or the marker was first read at or after it while the builder was still running |
-| `CONSOLE_BLIND` | the console returned no text by the deadline, or the launch fell at or after it. A console read that the provider refuses is not settled this way: the pass raises and the build does not advance ([#203](https://github.com/mikomiel/ci-burst/issues/203)) |
+| `CONSOLE_BLIND` | the console returned no text by the deadline, the provider refused the console read in a pass at or after the deadline (`notes` holds `console_read:<reason>`), or the launch fell at or after it. A console read refused before the deadline makes the pass raise, and the next pass reads again |
 | `IMAGE_BUILDER_GONE` | a pass did not see the builder as active, or no builder was recorded, while the build had no recorded image. It is not proof that the builder ended. A later applying pass asks the provider to terminate a tagged builder that it lists and that is not the active build's, and does not check the result: verify the final state yourself. Find the instance by the failed row's `builder_id` or its `ci-burst:build-id` tag, not by the deployment tags alone, which also match a newer builder ([Leaked builders and the backstop](#leaked-builders-and-the-backstop)). An image may still exist; the deletion rule handles it as the image of a failed build |
 | `IMAGE_NOT_AVAILABLE` | the image failed, or was not `available` by the deadline |
 | `TEMPLATE_DRIFT` | the candidate version differs from the pin in a field other than `ImageId`, or does not carry the build's image; `drift_fields` names them |

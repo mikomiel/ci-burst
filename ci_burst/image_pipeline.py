@@ -1539,7 +1539,15 @@ class _Pass:
                 alive = True  # a builder that was just recorded may not be listed yet
             if build.builder_id in self.ended:
                 alive = False  # reconcile ended it at the deadline, whatever the provider still lists
-            console = self.aws.console_output([build.builder_id], deadline=self.deadline).get(build.builder_id)
+            try:
+                console = self.aws.console_output([build.builder_id], deadline=self.deadline).get(build.builder_id)
+            except ProviderRefusal as refusal:
+                # An unreadable console is a blind one. Before the build deadline the pass refuses and the next pass
+                # reads again. At or after it, the build ends as ``CONSOLE_BLIND`` below, as an empty console does.
+                if self.clock() < build.deadline_at:
+                    raise
+                self.notes.append(f"console_read:{refusal.reason}")
+                console = None
             # The reads above can take time. Every check below, and the latency, use the time after the last of them.
             now = self.clock()
             marker = image_console.read_marker(console, build.archive_sha256)

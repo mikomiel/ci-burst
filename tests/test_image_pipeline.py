@@ -1939,6 +1939,25 @@ class FailureTests(PipelineCase):
         self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [ghost]}])
         self.assertEqual(self.only_build().builder_id, ghost)
 
+    def test_a_refused_console_read_before_the_deadline_refuses_the_pass_and_keeps_the_build(self):
+        build = self.expired_build(before=120)
+        self.world.fail("get_console_output", ProviderError("UnauthorizedOperation"))
+        self.refused(self.apply, "AWS_UNCERTAIN")
+        later = self.only_build()
+        self.assertEqual((later.state, later.builder_id), ("building", build.builder_id))
+        self.assertEqual(self.world.arguments("create_image"), [])
+
+    def test_a_refused_console_read_at_the_deadline_ends_the_build_as_console_blind(self):
+        build = self.expired_build()
+        self.world.fail("get_console_output", ProviderError("UnauthorizedOperation"))
+        result = self.apply()
+        self.assert_failed(result, "CONSOLE_BLIND")
+        self.assertIn("console_read:AWS_UNCERTAIN", result["notes"])
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+        self.assertEqual(self.world.arguments("create_image"), [])
+        self.assertEqual(self.metric("ci_burst_image_consecutive_failures"), 1.0)
+        self.assertEqual(len(self.events("image_check")), 2)
+
     def test_a_blind_console_at_the_deadline_ends_the_build_with_one_termination_and_the_blind_code(self):
         build = self.expired_build()
         result = self.apply()

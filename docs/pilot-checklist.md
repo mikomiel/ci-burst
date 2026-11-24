@@ -121,8 +121,8 @@ lifetime and cleanup bounds. Keep `[image].enabled` false until the gates that
 come before enabling are recorded: G1 to G5, G9, G10, G12 and G13, and the check
 that the tagged `GetConsoleOutput` grant applies to a builder
 ([deployment.md](deployment.md#image-build-role-and-source-identity-optional)),
-which no numbered gate covers. A refused console read leaves a build in flight
-instead of ending it ([#203](https://github.com/mikomiel/ci-burst/issues/203)). Also
+which no numbered gate covers: a refused console read fails every build
+`CONSOLE_BLIND` at its deadline. Also
 keep it false until a local resolve-only path for a diverged promotion journal
 exists ([#205](https://github.com/mikomiel/ci-burst/issues/205)). The other
 gates are recorded later, in the items that name them: G6 after enabling and

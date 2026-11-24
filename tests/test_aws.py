@@ -829,6 +829,27 @@ class SdkFailureTests(unittest.TestCase):
         self.assertEqual((raised.exception.reason, raised.exception.detail), ("AWS_SETUP_FAILED", "AttributeError"))
         self.assertNotIn("sentinel-sdk-message-marker", str(raised.exception))
 
+    def test_a_setup_failure_that_carries_a_response_reports_only_its_class(self):
+        class ClientError(Exception):
+            def __init__(self, response):
+                super().__init__(SDK_SENTINEL)
+                self.response = response
+
+        responses = (
+            {"Error": {"Code": SDK_SENTINEL, "Message": SDK_SENTINEL}},
+            {"Error": None},
+            {"Error": "not a mapping"},
+        )
+        for response in responses:
+            for name, call in self.entries(Aws(self.config)).items():
+                with self.subTest(response=response, entry=name):
+                    with mock.patch.dict(sys.modules, self.sdk(client_error=ClientError(response))):
+                        with self.assertRaises(ProviderRefusal) as raised:
+                            call()
+                    refusal = raised.exception
+                    self.assertEqual((refusal.reason, refusal.detail), ("AWS_SETUP_FAILED", "ClientError"))
+                    self.assertNotIn("sentinel-sdk-message-marker", json.dumps(refusal.as_dict()))
+
     def test_a_refusal_raised_while_building_the_session_passes_unchanged(self):
         original = ProviderRefusal("IMAGE_PROFILE_INVALID", "a synthetic refusal")
         for name, call in self.entries(Aws(self.config)).items():

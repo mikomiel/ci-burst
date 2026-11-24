@@ -1327,8 +1327,8 @@ def _setup_failures():
     No request has been sent at that point, so the failure is definite: a launch that never reached the
     provider must not hold a slot as an uncertain one. A refusal passes unchanged. A credential or profile
     failure (``CREDENTIAL_FAILURES``, by class name) becomes ``AWS_CREDENTIALS_UNAVAILABLE`` and any other
-    failure ``AWS_SETUP_FAILED``, each with the error's class (or code) and nothing of its text, which can
-    carry a profile name or a file path.
+    failure ``AWS_SETUP_FAILED``, each with the error's class name only: neither its text nor a code from a
+    response it carries, which can hold a profile name, a file path or free-form provider text.
     """
     try:
         yield
@@ -1337,7 +1337,7 @@ def _setup_failures():
     except Exception as error:  # noqa: BLE001 - reduced to a code below
         if any(kind.__name__ in CREDENTIAL_FAILURES for kind in type(error).__mro__):
             raise ProviderRefusal("AWS_CREDENTIALS_UNAVAILABLE", type(error).__name__) from None
-        raise ProviderRefusal("AWS_SETUP_FAILED", _error_code(error) or type(error).__name__) from None
+        raise ProviderRefusal("AWS_SETUP_FAILED", type(error).__name__) from None
 
 
 def _error_code(error):

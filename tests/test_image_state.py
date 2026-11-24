@@ -20,6 +20,7 @@ from ci_burst.image_state import (
     Build,
     ImageState,
     PinObservation,
+    build_file_hashes,
 )
 from ci_burst.ledger import SCHEMA_VERSION as LEDGER_SCHEMA_VERSION
 from ci_burst.ledger import Ledger, current_window
@@ -165,6 +166,107 @@ class SchemaTests(ImageStateCase):
             connection.execute("INSERT INTO control (id) VALUES (2)")
 
 
+GOOD_HASHES = {"b-file.lock": "e" * 64, "a-file.lock": "f" * 64}
+
+
+class ArchiveRecordTests(ImageStateCase):
+    """The schema 2 columns: where the archive goes, when it was deleted, and the hashes of the basis files."""
+
+    def end(self, build_id, state="failed", **fields):
+        with self.state.transaction():
+            return self.state.advance_build(build_id, state=state, **fields)
+
+    def test_the_new_columns_round_trip(self):
+        built = self.add_build(basis_file_hashes=GOOD_HASHES)
+        self.assertEqual((built.archive_bucket, built.archive_key, built.archive_deleted_at), (None, None, None))
+        self.assertEqual(build_file_hashes(built), GOOD_HASHES)
+        # Stored as one JSON object with sorted keys.
+        self.assertEqual(
+            built.basis_file_hashes, '{"a-file.lock": "' + "f" * 64 + '", "b-file.lock": "' + "e" * 64 + '"}'
+        )
+        with self.state.transaction():
+            staged = self.state.advance_build("build-1", archive_bucket="example-bucket", archive_key="prefix/build-1.tar.gz")
+        self.assertEqual((staged.archive_bucket, staged.archive_key), ("example-bucket", "prefix/build-1.tar.gz"))
+        self.assertEqual(self.state.build("build-1"), staged)
+        self.assertEqual(build_file_hashes(self.state.build("build-1")), GOOD_HASHES)
+
+    def test_the_hashes_are_written_at_the_insert_and_never_by_an_advance(self):
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        with self.assertRaises(ValueError):
+            with self.state.transaction():
+                self.state.advance_build("build-1", basis_file_hashes="{}")
+
+    def test_hashes_that_are_not_a_path_to_a_lower_case_sha256_are_refused_at_the_insert(self):
+        for bad in ({}, {"a.lock": "A" * 64}, {"a.lock": "e" * 63}, {"a.lock": 5}, {"": "e" * 64}, ["a.lock"], "{}"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.add_build("build-bad", basis_file_hashes=bad)
+        self.assertIsNone(self.state.build("build-bad"))
+
+    def test_a_row_without_the_hashes_gives_none_to_read(self):
+        built = self.add_build()
+        self.assertIsNone(built.basis_file_hashes)
+        with self.assertRaises(StateRefusal) as raised:
+            build_file_hashes(built)
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+
+    def test_malformed_stored_hashes_are_refused_by_row_and_never_echoed(self):
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        sentinel = "sentinel-value"
+        for stored in (
+            "not json " + sentinel,
+            "[]",
+            "null",
+            "{}",
+            '{"a.lock": "' + "E" * 64 + '"}',
+            '{"a.lock": "' + sentinel + '"}',
+            '{"a.lock": 5}',
+            b"\xff\xfe",
+        ):
+            with self.subTest(stored=stored):
+                connection = sqlite3.connect(self.state.path)
+                try:
+                    connection.execute("UPDATE image_builds SET basis_file_hashes = ? WHERE id = 'build-1'", (stored,))
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(StateRefusal) as raised:
+                    build_file_hashes(self.state.build("build-1"))
+                self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+                self.assertIn("build-1", raised.exception.detail)
+                self.assertNotIn(sentinel, raised.exception.detail)
+
+    def test_an_archive_is_owed_by_a_finished_build_that_names_one_and_has_no_deletion_time(self):
+        self.add_build("build-1", basis_file_hashes=GOOD_HASHES)
+        self.state.advance_build("build-1", archive_bucket="example-bucket", archive_key="prefix/build-1.tar.gz")
+        # A build in flight owes nothing yet.
+        self.assertEqual(self.state.archives_owed("example-deployment"), [])
+        ended = self.end("build-1", reason_code="CONSOLE_BLIND")
+        self.assertEqual(self.state.archives_owed("example-deployment"), [ended])
+        self.assertEqual(self.state.archives_owed("another-deployment"), [])
+        self.clock.advance(60)
+        deleted = self.state.mark_archive_deleted("build-1", self.clock())
+        self.assertEqual(deleted.archive_deleted_at, self.clock())
+        # Only the deletion time changes: ``updated_at`` is the end of the build, which ``promote`` reports.
+        self.assertEqual(deleted.updated_at, ended.updated_at)
+        self.assertEqual(self.state.archives_owed("example-deployment"), [])
+
+    def test_every_terminal_state_owes_and_a_row_with_no_key_owes_nothing(self):
+        for number, state in enumerate(("failed", "candidate", "promoted")):
+            build_id = f"build-{number}"
+            self.add_build(build_id)
+            self.state.advance_build(build_id, archive_bucket="example-bucket", archive_key=f"prefix/{build_id}.tar.gz")
+            self.end(build_id, state=state)
+            self.clock.advance(1)
+        self.add_build("build-none")
+        self.end("build-none")
+        self.assertEqual([row.id for row in self.state.archives_owed("example-deployment")], ["build-0", "build-1", "build-2"])
+
+    def test_marking_an_unknown_row_is_refused(self):
+        with self.assertRaises(StateRefusal) as raised:
+            self.state.mark_archive_deleted("missing", 1.0)
+        self.assertEqual(raised.exception.reason, "IMAGE_BUILD_UNKNOWN")
+
+
 class SingleFlightTests(ImageStateCase):
     def test_the_index_is_partial_and_keyed_on_the_deployment(self):
         connection = sqlite3.connect(self.state.path)
@@ -292,6 +394,21 @@ class LifecycleTests(ImageStateCase):
             ImageState(self.directory).connect()
         self.assertEqual(raised.exception.reason, "IMAGE_STATE_VERSION_UNSUPPORTED")
         self.assertEqual(raised.exception.detail, f"schema {SCHEMA_VERSION + 1}")
+        self.assertEqual(sha256_of(self.state.path), before)
+
+    def test_a_schema_one_file_is_refused_and_not_migrated(self):
+        self.state.close()
+        connection = sqlite3.connect(self.state.path)
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+        connection.close()
+        before = sha256_of(self.state.path)
+        with self.assertRaises(StateRefusal) as raised:
+            ImageState(self.directory).connect()
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("IMAGE_STATE_VERSION_UNSUPPORTED", "schema 1"))
+        with self.assertRaises(StateRefusal) as raised:
+            ImageState(self.directory).connect_readonly()
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_VERSION_UNSUPPORTED")
         self.assertEqual(sha256_of(self.state.path), before)
 
     def test_a_corrupt_file_is_refused_by_name(self):

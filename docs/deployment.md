@@ -732,8 +732,14 @@ Notes on the values:
   termination, and at least one security group, none of which has an inbound rule.
   The image id of that template is the cold base image: the builder starts from it,
   never from the warm image.
-- The staging bucket and its lifecycle rule are yours: when a build ends, ci-burst
-  makes one delete call for the archive key that its row records, and the
+- The staging bucket and its lifecycle rule are yours: the row of a build records
+  the bucket and the key before the upload starts. When the build ends, ci-burst
+  deletes that object, and a refused delete stays owed and is retried by every
+  later pass, so a change of `bucket` or `prefix` does not strand an object, as
+  long as the image role may still delete at the old location: its policy scopes
+  `s3:DeleteObject` to `<bucket>/<prefix>*`, and a delete that the provider refuses
+  stays owed, and is noted `archive:delete_failed` in every pass, until the grant
+  covers the old location or the lifecycle rule has removed the object. The
   lifecycle rule is a backstop only. Give each
   deployment a prefix of its own that nothing else uses: no other deployment, tool
   or person writes under it, and no prefix of another deployment is the same as

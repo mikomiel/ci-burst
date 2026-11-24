@@ -207,6 +207,25 @@ class BasisDigestTests(unittest.TestCase):
                 )
                 self.assertEqual(digest, expected)
 
+    def test_the_digest_from_the_file_hashes_is_the_digest_of_the_files(self):
+        hashes = image.file_hashes(self.FILES)
+        self.assertEqual(hashes, {path: sha256_hex(content) for path, content in self.FILES.items()})
+        digest = image.basis_digest_from_hashes(hashes, self.COMMANDS, self.GATE, self.STRIP, self.SCRIPT)
+        self.assertEqual(digest, self.VECTOR)
+        self.assertEqual(digest, self.digest())
+        # The order of the hashes does not matter: the lines are sorted.
+        reversed_hashes = dict(reversed(list(hashes.items())))
+        self.assertEqual(
+            image.basis_digest_from_hashes(reversed_hashes, self.COMMANDS, self.GATE, self.STRIP, self.SCRIPT), digest
+        )
+
+    def test_the_file_hashes_refuse_a_path_with_a_control_character(self):
+        for path in ("a\nb", "a\0b"):
+            with self.subTest(path=path), self.assertRaises(ConfigRefusal):
+                image.file_hashes({path: b"x"})
+            with self.subTest(path=path, source="hashes"), self.assertRaises(ConfigRefusal):
+                image.basis_digest_from_hashes({path: "e" * 64}, self.COMMANDS, self.GATE, self.STRIP, self.SCRIPT)
+
     def test_a_path_or_command_with_a_control_character_is_refused(self):
         for label, arguments in (
             ("a path with a line feed", {"files": {"a\nb": b"x"}}),

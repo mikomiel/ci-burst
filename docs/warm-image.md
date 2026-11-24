@@ -193,8 +193,12 @@ command. This section owns the workflow.
    version and changes `ImageId` only, reads both versions back and compares them.
    A difference in any other field fails the build (`TEMPLATE_DRIFT`). Otherwise the
    image and the new version are a candidate. Once the build is a candidate or has
-   failed, the pass makes one delete call for the archive if the row records an
-   archive key (a refused call is noted `archive:delete_failed`). The version is inert: it is not the
+   failed, the pass deletes the archive from the bucket and the key that its row
+   recorded before the upload started, and records the time of the deletion in
+   the row (`archive_deleted_at`). A refused call is noted `archive:delete_failed`
+   and the deletion stays owed: the reconcile of every later pass tries again
+   until it succeeds, whatever the configured bucket and prefix are by then, and
+   even when the gate is withdrawn in between. The version is inert: it is not the
    default version, and no worker launches from it.
 5. A person reads the evidence and promotes the candidate with
    `image promote --write`, which edits one line of the deployment TOML. Nothing

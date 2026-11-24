@@ -1516,10 +1516,14 @@ class BuildFlowTests(PipelineCase):
     def test_the_row_is_written_before_anything_is_staged(self):
         seen = []
         self.world.hooks["create_multipart_upload"] = lambda arguments: seen.append(
-            [(row.state, row.archive_key, row.builder_id) for row in self.builds()]
+            [
+                (row.id, row.state, row.archive_bucket, row.archive_key, row.archive_sha256, row.builder_id)
+                for row in self.builds()
+            ]
         )
-        self.start_build()
-        self.assertEqual(seen, [[("building", None, None)]])
+        _, build = self.start_build()
+        # The row names the bucket and the key before the upload, and not yet the hash of an archive or a builder.
+        self.assertEqual(seen, [[(build.id, "building", BUCKET, f"{PREFIX}{build.id}.tar.gz", None, None)]])
 
     def test_a_slow_staging_shortens_the_polling_and_the_pass_still_ends_in_time(self):
         started = self.clock()
@@ -2348,7 +2352,9 @@ class FailureTests(PipelineCase):
     def test_a_row_that_never_got_a_builder_fails_and_nothing_starts_in_the_same_pass(self):
         key = f"{PREFIX}crashed.tar.gz"
         self.world.objects[key] = (ARCHIVE, NOW - 300)
-        self.add_build("crashed", "building", age=300, archive_key=key, archive_sha256=ARCHIVE_SHA)
+        self.add_build(
+            "crashed", "building", age=300, archive_bucket=BUCKET, archive_key=key, archive_sha256=ARCHIVE_SHA
+        )
         result = self.apply()
         self.assertEqual((result["decision"], result["reason"]), ("failed", "IMAGE_BUILDER_GONE"))
         self.assertEqual(self.world.arguments("run_instances"), [])
@@ -2723,41 +2729,32 @@ class FailureTests(PipelineCase):
         self.assert_inputs_changed(result, first)
         self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
 
-    def test_a_resumed_stage_whose_basis_path_is_answered_missing_leaves_the_row(self):
-        # The commit is immutable and held the path when the row was written, so a 404 can come from an unavailable
-        # route as well as from a removed path: it ends no row, and the next pass reads again.
+    def test_a_resumed_stage_does_not_ask_the_forge_for_a_basis_path_so_a_missing_answer_changes_nothing(self):
+        # The row recorded the hash of every basis file when it was inserted: a forge that answers a path as missing
+        # (a 404 can come from an unavailable route too) is not asked, and the stage goes on.
         first = self.unstaged_build()
         self.source.errors["raw_file"] = ObservationRefusal("IMAGE_BASIS_PATH_MISSING")
-        mark = len(self.world.calls)
-        self.refused(self.apply, "IMAGE_BASIS_PATH_MISSING")
-        self.assertNotIn("create_multipart_upload", self.world.names(mark))
-        self.assertNotIn("delete_object", self.world.names(mark))
-        self.assert_unstaged(self.only_build())
+        self.world.console_plan = [(30.0, READY)]
+        mark = len(self.source.calls)
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
         self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertNotIn(("raw_file", "example.lock"), self.source.calls[mark:])
 
-    def test_a_basis_path_that_the_commit_lacks_ends_the_row_only_at_its_build_deadline(self):
+    def test_a_basis_path_that_the_file_gained_ends_the_row_at_once_and_asks_the_forge_for_nothing(self):
         first = self.unstaged_build()
-        # The file now names a second basis path that the commit of the row does not hold.
+        # The file now names a second basis path that the row did not record.
         paths = 'basis_paths = ["example.lock"]'
         self.assertIn(paths, render_toml())
         self.configure(render_toml().replace(paths, 'basis_paths = ["example.lock", "other.lock"]'))
-        self.refused(self.apply, "IMAGE_BASIS_PATH_MISSING")
-        self.assert_unstaged(self.only_build())
-        self.clock.advance(first.deadline_at - self.clock() + 1)
-        self.apply()
-        build = self.only_build()
-        self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "CONSOLE_BLIND"))
+        mark = len(self.source.calls)
+        self.assert_inputs_changed(self.apply(), first)
+        self.assertEqual(self.source.calls[mark:], [])
 
-    def test_a_resumed_stage_whose_forge_read_fails_raises_and_leaves_the_row_unstaged(self):
+    def test_a_resumed_stage_does_not_depend_on_a_forge_read_that_fails(self):
         first = self.unstaged_build()
         self.source.errors["raw_file"] = ObservationRefusal("FORGEJO_UNAVAILABLE")
-        mark = len(self.world.calls)
-        self.refused(self.apply, "FORGEJO_UNAVAILABLE")
-        self.assertNotIn("create_multipart_upload", self.world.names(mark))
-        self.assert_unstaged(self.only_build())
-        self.assertEqual(self.only_build().id, first.id)
-        # The refusal is neither an ended row nor a failure: the next pass reads again and stages.
-        del self.source.errors["raw_file"]
         self.world.console_plan = [(30.0, READY)]
         result = self.apply()
         self.assertEqual(result["decision"], "candidate", result)
@@ -2767,45 +2764,30 @@ class FailureTests(PipelineCase):
     # The forge client puts no deadline on a read of a basis file, so the pass deadline passes during the reads only
     # because the clock moves while they run.
 
-    def test_a_resumed_stage_whose_basis_reads_outlast_the_pass_leaves_the_build_for_the_next_pass(self):
+    def test_a_resumed_stage_is_not_held_by_basis_reads_that_would_outlast_the_pass(self):
         first = self.unstaged_build()
         self.source.on_read = lambda: self.clock.advance(400)
-        mark = len(self.world.calls)
-        result = self.apply()
-        self.assertEqual((result["decision"], result["reason"]), ("building", None))
-        self.assertIn("pass_deadline_exceeded", result["notes"])
-        self.assert_unstaged(self.only_build())
-        self.assertEqual(self.only_build().id, first.id)
-        self.assertNotIn("create_multipart_upload", self.world.names(mark))
-        self.assertEqual(len(self.archive_keys()), 1)
-        # Nothing is lost: the next pass reads the files again, stages the archive and launches.
-        self.source.on_read = None
         self.world.console_plan = [(30.0, READY)]
         result = self.apply()
         self.assertEqual(result["decision"], "candidate", result)
+        self.assertNotIn("pass_deadline_exceeded", result["notes"])
         self.assertEqual(self.only_build().id, first.id)
         self.assertEqual(len(self.archive_keys()), 2)
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
         self.assertEqual(self.events("image_build_failed"), [])
 
-    def test_a_resumed_stage_that_finds_the_inputs_changed_after_the_pass_deadline_ends_no_row(self):
-        # The digest differs, but the pass has no time left to end the row: the next pass does.
+    def test_a_resumed_stage_that_finds_the_inputs_changed_ends_the_row_although_reads_would_outlast_the_pass(self):
+        # No read is made, so the pass has the time to end the row at once.
         first = self.unstaged_build()
         self.configure(render_toml(gate=NO_GATE))
         self.source.on_read = lambda: self.clock.advance(400)
-        result = self.apply()
-        self.assertEqual((result["decision"], result["reason"]), ("building", None))
-        self.assertIn("pass_deadline_exceeded", result["notes"])
-        self.assert_unstaged(self.only_build())
-        self.assertEqual(self.only_build().id, first.id)
-        self.source.on_read = None
         self.assert_inputs_changed(self.apply(), first)
 
-    def test_a_resumed_stage_under_the_same_inputs_reads_the_commit_of_the_row_and_launches(self):
+    def test_a_resumed_stage_under_the_same_inputs_reads_no_file_and_stages_the_commit_of_the_row(self):
         self.source = CommitSource()
         first = self.unstaged_build()
         self.assertEqual(first.source_sha, SOURCE_SHA)
-        # The branch moved on and its head holds another lock file. The commit of the row still holds the first one.
+        # The branch moved on and its head holds another lock file. The row recorded the hash of the first one.
         self.source.sha = "cd" * 20
         self.source.at[self.source.sha] = {"example.lock": b"a lock file of a later commit\n"}
         self.source.reads.clear()
@@ -2815,9 +2797,9 @@ class FailureTests(PipelineCase):
         self.assertEqual(result["decision"], "candidate", result)
         build = self.only_build()
         self.assertEqual((build.id, build.source_sha), (first.id, SOURCE_SHA))
-        self.assertEqual(self.source.reads, [(SOURCE_SHA, "example.lock")])
-        # One read of the basis file at the row's commit, then the archive of that commit: the branch head is not read.
-        self.assertEqual(self.source.calls[mark:], [("raw_file", "example.lock"), ("archive", SOURCE_SHA)])
+        self.assertEqual(self.source.reads, [])
+        # Only the archive of the commit of the row is read: neither a basis file nor the branch head.
+        self.assertEqual(self.source.calls[mark:], [("archive", SOURCE_SHA)])
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
         self.assertEqual(self.events("image_build_failed"), [])
 
@@ -3219,21 +3201,16 @@ class BasisReadDeadlineTests(PipelineCase):
         self.assertEqual((self.sessions, self.world.calls), ([], []))
         self.assertFalse(self.state_dir.exists())
 
-    def test_a_resumed_stage_does_not_start_a_basis_read_past_the_pass_deadline(self):
+    def test_a_resumed_stage_starts_no_basis_read_at_all(self):
+        # The row recorded the hash of every file: the stage that is done again reads none, whatever the clock does.
         self.several_basis_paths()
         first = self.unstaged_build()
-        source_mark, world_mark = len(self.source.calls), len(self.world.calls)
-        self.source.on_read = lambda: self.clock.advance(400)
-        result = self.apply()
-        self.assertEqual(self.reads(source_mark), ["example.lock"])
-        self.assert_left_for_the_next_pass(result, first, world_mark)
-        # Nothing is lost: the next pass reads every file again, stages the archive and launches.
-        self.source.on_read = None
-        self.world.console_plan = [(30.0, READY)]
         source_mark = len(self.source.calls)
+        self.source.on_read = lambda: self.clock.advance(400)
+        self.world.console_plan = [(30.0, READY)]
         result = self.apply()
+        self.assertEqual(self.reads(source_mark), [])
         self.assertEqual(result["decision"], "candidate", result)
-        self.assertEqual(self.reads(source_mark), list(self.PATHS))
         self.assertEqual(self.only_build().id, first.id)
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
 
@@ -3403,10 +3380,14 @@ class ResumeTests(PipelineCase):
         self.assertEqual(len(self.events("image_reconciled")), 1)
 
     def test_a_crash_after_the_upload_is_staged_again_under_the_same_key_and_launched(self):
-        self.crash_after("archive_key")
+        self.crash_after("archive_sha256")
         build = self.only_build()
-        self.assertEqual((build.state, build.archive_key, build.archive_sha256, build.builder_id), ("building", None, None, None))
+        # The row named the bucket and the key before the upload, so the object is the one the row names.
         (key,) = self.world.objects
+        self.assertEqual(
+            (build.state, build.archive_bucket, build.archive_key, build.archive_sha256, build.builder_id),
+            ("building", BUCKET, key, None, None),
+        )
         self.assertEqual(self.world.arguments("run_instances"), [])
         self.world.console_plan = [(30.0, READY)]
         result = self.pipeline.run_until_done()
@@ -3451,6 +3432,319 @@ class ResumeTests(PipelineCase):
         self.assertEqual((result["decision"], result["reason"]), ("failed", "WARM_FAILED"))
         self.assertEqual(self.control().consecutive_failures, 1)
         self.assertEqual(len(self.events("image_build_failed")), 1)
+
+
+class ArchiveOwedTests(PipelineCase):
+    """An archive is deleted from where its row recorded it, and the deletion stays owed until it succeeds."""
+
+    OTHER_PREFIX = "other-prefix/"
+
+    def unstaged_with_an_archive(self):
+        """A build whose first pass ran out of time after the upload: its row names an archive and has no builder."""
+        self.world.hooks["generate_presigned_url"] = lambda arguments: self.clock.advance(400)
+        self.apply()
+        del self.world.hooks["generate_presigned_url"]
+        first = self.only_build()
+        self.assertEqual(list(self.world.objects), [first.archive_key])
+        return first
+
+    def crash_after_the_upload(self):
+        """A pass whose process dies after the object is stored and before it records the upload, then a new process."""
+        self.restart(state=CrashingState(self.state_dir, clock=self.clock, crash_on={"archive_sha256"}))
+        with self.assertRaises(Crash):
+            self.apply()
+        self.restart()
+        build = self.only_build()
+        self.assertEqual((build.state, build.archive_sha256, build.builder_id), ("building", None, None))
+        self.assertEqual(list(self.world.objects), [build.archive_key])
+        return build
+
+    def assert_settled_without_a_launch(self, result, build, reason):
+        """The pass ended the row without a failure, deleted its object and launched and uploaded nothing more."""
+        self.assertEqual((result["decision"], result["reason"]), ("refused", reason), result)
+        ended = self.only_build()
+        self.assertEqual((ended.id, ended.state, ended.reason_code), (build.id, "failed", reason))
+        self.assertIsNotNone(ended.archive_deleted_at)
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": build.archive_key}])
+        self.assertEqual(len(self.world.arguments("create_multipart_upload")), 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_the_bucket_and_the_key_are_in_the_row_before_the_upload_starts(self):
+        seen = []
+        self.world.hooks["create_multipart_upload"] = lambda arguments: seen.append(
+            (arguments, self.query(lambda state: state.active_build(DEPLOYMENT)))
+        )
+        self.apply()
+        ((arguments, row),) = seen
+        self.assertEqual((row.archive_bucket, row.archive_key), (arguments["Bucket"], arguments["Key"]))
+        self.assertEqual((row.archive_bucket, row.archive_key), (BUCKET, f"{PREFIX}{row.id}.tar.gz"))
+        self.assertIsNone(row.archive_sha256)
+        self.assertEqual(self.only_build().archive_sha256, ARCHIVE_SHA)
+
+    def test_a_crash_after_the_upload_and_a_withdrawn_gate_delete_the_object_the_row_names(self):
+        self.configure(render_toml(gate=NO_GATE))
+        build = self.crash_after_the_upload()
+        # The opt-out is gone and the digest does not hold it: the row ends for the gate, not for its inputs.
+        self.configure(render_toml(gate=""))
+        result = self.apply()
+        self.assert_settled_without_a_launch(result, build, "IMAGE_GATE_REQUIRED")
+
+    def test_a_crash_after_the_upload_and_a_changed_prefix_delete_the_object_under_the_old_prefix(self):
+        self.configure(render_toml(gate=NO_GATE))
+        build = self.crash_after_the_upload()
+        self.assertTrue(build.archive_key.startswith(PREFIX))
+        self.configure(render_toml(gate="", prefix=self.OTHER_PREFIX))
+        result = self.apply()
+        self.assert_settled_without_a_launch(result, build, "IMAGE_GATE_REQUIRED")
+        self.assertEqual(self.world.arguments("list_objects_v2")[-1]["Prefix"], self.OTHER_PREFIX)
+
+    def test_a_stage_done_again_uses_the_recorded_bucket_and_key_whatever_the_configuration_says(self):
+        first = self.unstaged_with_an_archive()
+        other_bucket = "example-other-staging"
+        self.configure(render_toml(prefix=self.OTHER_PREFIX).replace(BUCKET, other_bucket))
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        build = self.only_build()
+        self.assertEqual((build.id, build.archive_bucket, build.archive_key), (first.id, BUCKET, first.archive_key))
+        self.assertEqual(
+            [(call["Bucket"], call["Key"]) for call in self.world.arguments("create_multipart_upload")],
+            [(BUCKET, first.archive_key)] * 2,
+        )
+        self.assertEqual(
+            [(call["Params"]["Bucket"], call["Params"]["Key"]) for call in self.world.arguments("generate_presigned_url")],
+            [(BUCKET, first.archive_key)] * 2,
+        )
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.world.objects, {})
+        self.assertIsNotNone(build.archive_deleted_at)
+
+    def test_a_refused_delete_leaves_the_deletion_owed_for_a_pass_that_has_no_gate_and_nothing_in_flight(self):
+        first = self.unstaged_with_an_archive()
+        self.world.fail("delete_object", ProviderError("RequestLimitExceeded"), times=1)
+        self.clock.advance(BUILD_DEADLINE)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("failed", "CONSOLE_BLIND"), result)
+        self.assertIn("archive:delete_failed", result["notes"])
+        failed = self.only_build()
+        self.assertEqual(failed.id, first.id)
+        self.assertIsNone(failed.archive_deleted_at)
+        self.assertEqual(list(self.world.objects), [first.archive_key])
+        self.assertEqual(self.query(lambda state: state.archives_owed(DEPLOYMENT)), [failed])
+        # The file lost its gate and nothing is in flight. The pass still runs, because a deletion is owed.
+        self.configure(render_toml(gate=""))
+        source_mark, world_mark = len(self.source.calls), len(self.world.calls)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_GATE_REQUIRED"), result)
+        self.assertIsNone(result["build"])
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1)
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.world.arguments("delete_object")[-1], {"Bucket": BUCKET, "Key": first.archive_key})
+        self.assertEqual(self.only_build().archive_deleted_at, self.clock())
+        self.assertEqual(self.query(lambda state: state.archives_owed(DEPLOYMENT)), [])
+        # No launch, no upload, no read of the forge.
+        self.assertEqual(self.source.calls[source_mark:], [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertNotIn("create_multipart_upload", self.world.names(world_mark))
+        control = self.control()
+        self.assertEqual(control.consecutive_failures, 1)
+        self.assertEqual(self.events("image_check")[-1]["reason"], "IMAGE_GATE_REQUIRED")
+        # With nothing owed any more, the same file is refused before any client is built.
+        mark = len(self.world.calls)
+        self.refused(self.apply, "IMAGE_GATE_REQUIRED")
+        self.assertEqual(self.world.calls[mark:], [])
+
+    def test_a_deletion_that_stays_refused_stays_owed_and_is_counted_when_it_succeeds(self):
+        first = self.unstaged_with_an_archive()
+        self.world.fail("delete_object", ProviderError("RequestLimitExceeded"), times=2)
+        self.clock.advance(BUILD_DEADLINE)
+        self.apply()
+        self.pin_current()
+        self.clock.advance(60)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 0)
+        self.assertIn("archive:delete_failed", result["notes"])
+        self.assertEqual([row.id for row in self.query(lambda state: state.archives_owed(DEPLOYMENT))], [first.id])
+        self.clock.advance(60)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1)
+        self.assertNotIn("archive:delete_failed", result["notes"])
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.query(lambda state: state.archives_owed(DEPLOYMENT)), [])
+        # Once settled, it is not tried again.
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 0)
+        self.assertNotIn("delete_object", self.world.names(mark))
+
+    def test_an_owed_deletion_is_tried_before_the_provider_read_that_fails(self):
+        first = self.unstaged_with_an_archive()
+        self.world.fail("delete_object", ProviderError("RequestLimitExceeded"), times=1)
+        self.clock.advance(BUILD_DEADLINE)
+        self.apply()
+        self.assertIsNone(self.only_build().archive_deleted_at)
+        self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)
+        self.refused(self.apply, "AWS_UNCERTAIN")
+        self.assertEqual(self.world.objects, {})
+        self.assertIsNotNone(self.only_build().archive_deleted_at)
+        self.assertEqual(self.only_build().id, first.id)
+
+    def test_a_row_that_named_a_key_before_an_upload_that_never_happened_settles_at_the_first_try(self):
+        # The pass stopped between the record of the key and the upload. S3 answers a delete of a missing key as done.
+        def die(arguments):
+            raise Crash("before the upload")
+
+        self.world.hooks["create_multipart_upload"] = die
+        with self.assertRaises(Crash):
+            self.apply()
+        del self.world.hooks["create_multipart_upload"]
+        self.restart()
+        named = self.only_build()
+        self.assertEqual((named.archive_bucket, named.archive_key), (BUCKET, f"{PREFIX}{named.id}.tar.gz"))
+        self.assertIsNone(named.archive_sha256)
+        self.assertEqual(self.world.objects, {})
+        self.clock.advance(BUILD_DEADLINE)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("failed", "CONSOLE_BLIND"), result)
+        self.assertEqual(self.query(lambda state: state.archives_owed(DEPLOYMENT)), [])
+
+    def test_the_owed_count_is_part_of_the_reconcile_summary_and_the_event(self):
+        self.unstaged_with_an_archive()
+        self.world.fail("delete_object", ProviderError("RequestLimitExceeded"), times=1)
+        self.clock.advance(BUILD_DEADLINE)
+        self.apply()
+        self.pin_current()
+        self.clock.advance(60)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1)
+        self.assertEqual(result["reconcile"]["archives_deleted"], 0)
+        (event,) = self.events("image_reconciled")
+        self.assertEqual((event["owed_archives_deleted"], event["archives_deleted"]), (1, 0))
+
+
+class RestageReadsNoBasisFileTests(PipelineCase):
+    """A stage done again checks the inputs against the hashes that its row recorded, and reads no file of the forge."""
+
+    PATHS = ("example.lock", "second.lock")
+
+    def two_basis_paths(self):
+        single = 'basis_paths = ["example.lock"]'
+        self.assertIn(single, render_toml())
+        names = ", ".join(f'"{path}"' for path in self.PATHS)
+        self.configure(render_toml().replace(single, f"basis_paths = [{names}]"))
+        self.source.files = {path: LOCK_FILE + path.encode() for path in self.PATHS}
+
+    def unstaged_build(self):
+        """A build whose first pass ran out of time during the stage: it has no builder and no staged archive."""
+        self.source.on_chunk = lambda: self.clock.advance(400)
+        self.apply()
+        self.source.on_chunk = None
+        return self.only_build()
+
+    def reads(self, mark=0):
+        return [path for kind, path in self.source.calls[mark:] if kind == "raw_file"]
+
+    def test_the_row_records_the_hash_of_every_basis_file_it_was_inserted_under(self):
+        self.two_basis_paths()
+        build = self.unstaged_build()
+        self.assertEqual(
+            json.loads(build.basis_file_hashes),
+            {path: hashlib.sha256(self.source.files[path]).hexdigest() for path in self.PATHS},
+        )
+        self.assertEqual(list(json.loads(build.basis_file_hashes)), sorted(self.PATHS))
+
+    def test_a_stage_done_again_reads_no_basis_file_and_launches(self):
+        self.two_basis_paths()
+        first = self.unstaged_build()
+        # Any read of the forge would be refused, and the branch head moved on.
+        self.source.errors["raw_file"] = ObservationRefusal("FORGEJO_UNAVAILABLE")
+        self.source.sha = "cd" * 20
+        mark = len(self.source.calls)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(self.source.calls[mark:], [("archive", SOURCE_SHA)])
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_basis_reads_that_would_use_up_the_pass_no_longer_starve_the_stage(self):
+        self.two_basis_paths()
+        first = self.unstaged_build()
+        self.source.on_read = lambda: self.clock.advance(400)
+        mark = len(self.source.calls)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(self.reads(mark), [])
+        self.assertNotIn("pass_deadline_exceeded", result["notes"])
+        self.assertEqual(len(self.archive_keys()), 2)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    def archive_keys(self):
+        return [call["Key"] for call in self.world.arguments("create_multipart_upload")]
+
+    def assert_ended_for_its_inputs(self, first):
+        mark = len(self.source.calls)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_INPUTS_CHANGED"), result)
+        build = self.only_build()
+        self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "IMAGE_INPUTS_CHANGED"))
+        self.assertEqual(self.source.calls[mark:], [])
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.control().consecutive_failures, 0)
+
+    def test_a_basis_path_that_the_configuration_gained_is_changed_inputs_and_reads_no_file(self):
+        first = self.unstaged_build()
+        self.two_basis_paths()
+        self.assert_ended_for_its_inputs(first)
+
+    def test_a_basis_path_that_the_configuration_lost_is_changed_inputs_and_reads_no_file(self):
+        self.two_basis_paths()
+        first = self.unstaged_build()
+        self.configure(render_toml())
+        self.assert_ended_for_its_inputs(first)
+
+    def test_a_changed_gate_command_is_changed_inputs_and_reads_no_file(self):
+        first = self.unstaged_build()
+        self.configure(render_toml(gate=NO_GATE))
+        self.assert_ended_for_its_inputs(first)
+
+    def test_a_changed_script_is_changed_inputs_and_reads_no_file(self):
+        first = self.unstaged_build()
+        self.restart(script=SCRIPT + b"# edited\n")
+        self.assert_ended_for_its_inputs(first)
+
+    def test_a_row_with_no_recorded_hashes_is_damaged_state_and_is_not_read_from_the_forge(self):
+        self.add_build("damaged", "building", age=300)
+        mark = len(self.source.calls)
+        self.refused(self.apply, "IMAGE_STATE_UNREADABLE", detail_has=("damaged",))
+        self.assertEqual(self.source.calls[mark:], [])
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.only_build().state, "building")
+
+    def test_malformed_recorded_hashes_are_damaged_state_and_the_row_stays(self):
+        first = self.unstaged_build()
+        connection = sqlite3.connect(self.state_dir / "image-state.sqlite")
+        try:
+            connection.execute("UPDATE image_builds SET basis_file_hashes = ? WHERE id = ?", ("[not json", first.id))
+            connection.commit()
+        finally:
+            connection.close()
+        mark = len(self.source.calls)
+        self.refused(self.apply, "IMAGE_STATE_UNREADABLE", detail_lacks=("not json",))
+        self.assertEqual(self.source.calls[mark:], [])
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        build = self.only_build()
+        self.assertEqual((build.id, build.state), (first.id, "building"))
 
 
 class GateEvidenceTests(PipelineCase):

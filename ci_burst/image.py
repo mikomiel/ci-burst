@@ -82,10 +82,33 @@ def render_commands(commands, gate_command):
     return {"WARM_COMMANDS": "\n".join(commands), "WARM_GATE_COMMAND": gate_command}
 
 
+def file_hashes(files):
+    """The hex sha256 of each basis file's content, by path.
+
+    ``files`` maps each basis path to the bytes read at the resolved sha. A control character in a path is refused,
+    because a line feed or NUL in a path would let two file sets share one digest.
+    """
+    hashes = {}
+    for path, content in files.items():
+        _no_control(path, "basis path")
+        hashes[path] = hashlib.sha256(content).hexdigest()
+    return hashes
+
+
 def basis_digest(files, warm_commands, gate_command, strip_components, script_bytes):
     """The hex digest that says whether a build is due.
 
-    ``files`` maps each basis path to the bytes read at the resolved sha.
+    ``files`` maps each basis path to the bytes read at the resolved sha. The digest is
+    ``basis_digest_from_hashes`` over ``file_hashes(files)``: a row that stores the hashes gives the same digest
+    again without a read of the files.
+    """
+    return basis_digest_from_hashes(file_hashes(files), warm_commands, gate_command, strip_components, script_bytes)
+
+
+def basis_digest_from_hashes(hashes, warm_commands, gate_command, strip_components, script_bytes):
+    """The hex digest that says whether a build is due, from the hash of each basis file.
+
+    ``hashes`` maps each basis path to the hex sha256 of the file's content (``file_hashes``).
     ``strip_components`` is ``source.strip_components``, the value the builder
     receives as ``WARM_SRC_STRIP_COMPONENTS``: it sets how many leading path
     components the extraction drops, so a change of it changes the image. The
@@ -97,10 +120,10 @@ def basis_digest(files, warm_commands, gate_command, strip_components, script_by
     bytes, and the digest must not change with them.
     """
     entries = []
-    for path, content in files.items():
+    for path, content_hash in hashes.items():
         # A line feed or NUL in a path would let two file sets share one digest.
         _no_control(path, "basis path")
-        entries.append((path.encode("utf-8"), hashlib.sha256(content).hexdigest().encode("ascii")))
+        entries.append((path.encode("utf-8"), content_hash.encode("ascii")))
     values = render_commands(warm_commands, gate_command)
     rendered = (
         values["WARM_COMMANDS"] + "\0" + values["WARM_GATE_COMMAND"] + "\0" + str(strip_components)

@@ -9,7 +9,9 @@ its ledger. This module holds no AWS or Forgejo code.
 """
 
 import fcntl
+import json
 import os
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -18,7 +20,10 @@ from pathlib import Path
 
 from .errors import StateRefusal
 
-SCHEMA_VERSION = 1
+#: Schema 2 added ``archive_bucket``, ``archive_deleted_at`` and ``basis_file_hashes`` to ``image_builds``. A file at
+#: schema 1 is refused, not migrated: no deployment held one when schema 2 was made, so a pre-release file is removed
+#: by hand.
+SCHEMA_VERSION = 2
 STATE_FILE = "image-state.sqlite"
 #: A process that stopped inside a commit left a hot rollback journal, which only a writable connection rolls back.
 STATE_RECOVERY_NEEDED = "IMAGE_STATE_RECOVERY_NEEDED"
@@ -49,8 +54,10 @@ _SCHEMA_SQL = f"""
         client_token TEXT NOT NULL UNIQUE,
         basis_digest TEXT NOT NULL,
         source_sha TEXT NOT NULL,
+        archive_bucket TEXT,
         archive_key TEXT,
         archive_sha256 TEXT,
+        archive_deleted_at REAL,
         builder_id TEXT,
         image_id TEXT,
         template_version INTEGER,
@@ -66,7 +73,8 @@ _SCHEMA_SQL = f"""
         template_version_exists INTEGER,
         drift_result TEXT,
         verified_at REAL,
-        source_pin INTEGER
+        source_pin INTEGER,
+        basis_file_hashes TEXT
     );
     CREATE UNIQUE INDEX one_active ON image_builds (deployment)
         WHERE state IN ({_ACTIVE_SQL});
@@ -107,8 +115,10 @@ _SCHEMA_STATEMENTS = tuple(part.strip() for part in _SCHEMA_SQL.split(";") if pa
 
 #: Columns ``advance_build`` may change. The identity columns stay fixed.
 _BUILD_UPDATABLE = (
+    "archive_bucket",
     "archive_key",
     "archive_sha256",
+    "archive_deleted_at",
     "builder_id",
     "image_id",
     "template_version",
@@ -138,8 +148,13 @@ class Build:
     created_at: float
     updated_at: float
     deadline_at: float
+    #: Where the staged archive goes, written before the upload starts: a stage that is done again, and the
+    #: deletion at the end of the build, use these two and never the configuration of the day.
+    archive_bucket: str | None = None
     archive_key: str | None = None
     archive_sha256: str | None = None
+    #: When the archive was deleted. A terminal row that names a key and has no such time still owes the deletion.
+    archive_deleted_at: float | None = None
     builder_id: str | None = None
     image_id: str | None = None
     template_version: int | None = None
@@ -152,6 +167,9 @@ class Build:
     drift_result: str | None = None
     verified_at: float | None = None
     source_pin: int | None = None
+    #: The JSON object ``path -> sha256 of the file's content`` of the basis files read when the row was inserted,
+    #: keys sorted. ``build_file_hashes`` reads it.
+    basis_file_hashes: str | None = None
 
 
 @dataclass(frozen=True)
@@ -415,9 +433,28 @@ class ImageState:
             self._in_transaction = False
 
     # -- builds ---------------------------------------------------------
-    def insert_build(self, *, build_id, deployment, client_token, basis_digest, source_sha, deadline_at, **fields):
-        """Insert a build in state ``building``; refuse a second active build."""
+    def insert_build(
+        self,
+        *,
+        build_id,
+        deployment,
+        client_token,
+        basis_digest,
+        source_sha,
+        deadline_at,
+        basis_file_hashes=None,
+        **fields,
+    ):
+        """Insert a build in state ``building``; refuse a second active build.
+
+        ``basis_file_hashes`` maps each basis path to the hex sha256 of the file's content, as ``image.file_hashes``
+        gives it. It is stored once, as sorted JSON, and never changes: a stage that is done again recomputes the
+        digest from it and reads no file. A row that no build made (an orphan, a pin record) has none.
+        """
         _check_columns(fields, _BUILD_UPDATABLE)
+        if basis_file_hashes is not None:
+            _check_file_hashes(basis_file_hashes)
+            fields["basis_file_hashes"] = json.dumps(basis_file_hashes, sort_keys=True)
         now = self._clock()
         values = {
             "id": build_id,
@@ -473,6 +510,21 @@ class ImageState:
         """Every build of ``deployment``, oldest first."""
         rows = self._require().execute(
             "SELECT * FROM image_builds WHERE deployment = ? ORDER BY created_at, rowid", (deployment,)
+        )
+        return [_build(row) for row in rows]
+
+    def archives_owed(self, deployment):
+        """The builds of ``deployment`` that are over, name an archive and have not had it deleted, oldest first.
+
+        A terminal state, an ``archive_key`` and no ``archive_deleted_at``: the deletion stays owed until it
+        succeeds, however many passes it takes and whatever the configuration says by then. A row that names a key
+        without a bucket cannot be deleted from and is not listed: both are written together.
+        """
+        rows = self._require().execute(
+            f"SELECT * FROM image_builds WHERE deployment = ? AND state NOT IN ({_ACTIVE_SQL})"
+            " AND archive_key IS NOT NULL AND archive_key != '' AND archive_bucket IS NOT NULL"
+            " AND archive_deleted_at IS NULL ORDER BY created_at, rowid",
+            (deployment,),
         )
         return [_build(row) for row in rows]
 
@@ -630,6 +682,20 @@ class ImageState:
             "UPDATE image_builds SET image_state = ?, template_version_exists = ?, drift_result = ?,"
             " verified_at = ? WHERE id = ?",
             (image_state, template_version_exists, drift_result, verified_at, build_id),
+        )
+        if cursor.rowcount != 1:
+            raise StateRefusal("IMAGE_BUILD_UNKNOWN", build_id)
+        return self.build(build_id)
+
+    def mark_archive_deleted(self, build_id, deleted_at):
+        """Record that the archive of one row is deleted, and change nothing else.
+
+        ``updated_at`` stays as it was, as ``record_verification`` leaves it: for a candidate it is the moment the
+        build ended, which ``promote`` reports as the build duration, and a deletion that a later pass retries must
+        not move it.
+        """
+        cursor = self._require().execute(
+            "UPDATE image_builds SET archive_deleted_at = ? WHERE id = ?", (deleted_at, build_id)
         )
         if cursor.rowcount != 1:
             raise StateRefusal("IMAGE_BUILD_UNKNOWN", build_id)
@@ -918,3 +984,34 @@ def _check_columns(fields, allowed):
 
 def _build(row):
     return Build(**dict(row))
+
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def _check_file_hashes(hashes):
+    """Refuse (``ValueError``) anything but a non-empty ``path -> 64 lower-case hex`` mapping."""
+    ok = isinstance(hashes, dict) and bool(hashes)
+    ok = ok and all(isinstance(path, str) and path for path in hashes)
+    ok = ok and all(isinstance(value, str) and _SHA256_HEX.fullmatch(value) for value in hashes.values())
+    if not ok:
+        raise ValueError("basis_file_hashes must map each basis path to a lower-case hex sha256")
+
+
+def build_file_hashes(build):
+    """The basis-file hashes of a build row, or ``IMAGE_STATE_UNREADABLE`` when the row has none or they are damaged.
+
+    A row that was inserted for a build always has them. A hand-edited or damaged file can hold anything in the
+    column, so the text is parsed and checked for the shape that ``insert_build`` writes. The refusal names the
+    row, never the value.
+    """
+    refusal = StateRefusal("IMAGE_STATE_UNREADABLE", f"build row {build.id} holds no valid basis_file_hashes")
+    text = build.basis_file_hashes
+    if type(text) is not str:
+        raise refusal
+    try:
+        hashes = json.loads(text)
+        _check_file_hashes(hashes)
+    except ValueError:  # a JSON error is a ValueError too
+        raise refusal from None
+    return hashes

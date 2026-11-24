@@ -980,7 +980,7 @@ query string and a literal match of the recorded archive key are replaced by
 | `image_created` | `CreateImage` returned an id, or the pass found the image by its tags while creating it (an image that reconcile adopts writes `image_reconciled` instead) | `build_id`, `builder_id`, `image_id` |
 | `image_candidate_ready` | the candidate version was created and compared `clean` | `build_id`, `image_id`, `template_version`, `digest`, `duration_seconds` |
 | `image_build_failed` | a build failed and the failure was counted. A refused start or restage that ends its row `failed` (such as `IMAGE_INPUTS_CHANGED`) writes none and shows in `image_check` with `decision: refused`; a recorded orphan that is ended `failed` writes none either | `build_id`, `reason`, `image_id`, `digest`, `duration_seconds`, `drift_fields`, `framed_tail` |
-| `image_reconciled` | reconcile ended a builder, deleted an archive (a stray object or one that a finished build owed), recorded an image or adopted a leftover | `builders_terminated`, `archives_deleted`, `owed_archives_deleted`, `images_recorded`, `builder_adopted`, `image_adopted`, `build_id` |
+| `image_reconciled` | reconcile ended a builder, deleted an archive (a stray object or one that a finished build owed), recorded an image or adopted a leftover; the owed-deletion tail of a pass wrote it too when it deleted, was refused or deferred an archive, also in a pass that ended on a refusal (counts only, never a key or a bucket) | `builders_terminated`, `archives_deleted`, `owed_archives_deleted`, `owed_archive_delete_failed`, `owed_archives_deferred`, `images_recorded`, `builder_adopted`, `image_adopted`, `build_id` |
 | `image_pruned` | the deletion rule deregistered an image, deleted a snapshot or failed to | `deregistered`, `snapshots_deleted`, `failed`, `skipped` |
 | `image_blocked` | the failure that set `blocked` | `consecutive_failures`, `build_id` |
 | `image_promoted` | `promote --write` completed a promotion or a rollback | `old_pin`, `new_pin`, `build_id`, `image_id`, `rollback`, `file_digest` |
@@ -1178,6 +1178,13 @@ reads therefore cannot hide the result. The pin fields that it did not read are
 The command line then stamps no pin evidence (`pin_evidence` is
 `{"recorded": false, "reason": "IMAGE_CLEANUP_ONLY"}`), so the run makes no describe
 call either. When nothing is owed, the same file is refused before any client is built.
+
+A pass that is cancelled (`KeyboardInterrupt`, `SystemExit`, a cancelled task) starts
+no owed deletion and re-raises. A pass that ends on a refusal still runs them, and an
+owed deletion that was refused or deferred is not lost with the result: the pass
+writes an `image_reconciled` event with the counts `owed_archives_deleted`,
+`owed_archive_delete_failed` and `owed_archives_deferred`, and the result carries the
+same counts in `reconcile` when it is returned.
 
 The sweep of stray archives leaves every owed archive alone, including one that the
 bound deferred in this pass: only the owed deletion retries it, within the bound, and

@@ -3869,6 +3869,51 @@ class OwedArchiveBoundTests(PipelineCase):
         self.assertIsNotNone(owed.archive_deleted_at)
         self.assertNotIn(key, self.world.objects)
 
+    def test_a_cancellation_of_the_pass_starts_no_owed_deletion_and_propagates(self):
+        self.owe(2)
+
+        def cancel(arguments):
+            raise KeyboardInterrupt
+
+        self.world.hooks["describe_instances"] = cancel
+        with self.assertRaises(KeyboardInterrupt):
+            self.apply()
+        self.assertEqual(self.world.arguments("delete_object"), [])
+        self.assertEqual(len(self.query(lambda state: state.archives_owed(DEPLOYMENT))), 2)
+
+    def test_a_refused_owed_delete_stays_visible_as_an_event_when_the_pass_raises(self):
+        old_bucket = "example-old-staging"
+        key = f"{PREFIX}owed-old.tar.gz"
+        self.add_build("owed-old", archive_bucket=old_bucket, archive_key=key)
+        self.world.objects[key] = (b"archive", NOW)
+        self.world.hooks["delete_object"] = lambda arguments: (_ for _ in ()).throw(ProviderError("AccessDenied"))
+        self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)
+        refusal = self.refused(self.apply, "AWS_UNCERTAIN")
+        self.assertEqual(refusal.detail, "ProviderError")
+        (event,) = self.events("image_reconciled")
+        self.assertEqual(
+            (event["owed_archives_deleted"], event["owed_archive_delete_failed"], event["owed_archives_deferred"]),
+            (0, 1, 0),
+        )
+        text = json.dumps(event)
+        self.assertNotIn(old_bucket, text)
+        self.assertNotIn(key, text)
+        (row,) = self.builds()
+        self.assertIsNone(row.archive_deleted_at)
+        self.assertIsNotNone(row.archive_delete_tried_at)
+
+    def test_rows_that_the_bound_left_are_counted_in_the_event(self):
+        self.owe(OWED_ARCHIVES_PER_PASS + 2)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archives_deferred"], 2)
+        self.assertEqual(result["reconcile"]["owed_archive_delete_failed"], 0)
+        event = self.events("image_reconciled")[-1]
+        self.assertEqual(
+            (event["owed_archives_deleted"], event["owed_archive_delete_failed"], event["owed_archives_deferred"]),
+            (OWED_ARCHIVES_PER_PASS, 0, 2),
+        )
+
     def test_a_failure_of_the_tail_does_not_replace_the_refusal_of_the_pass(self):
         self.owe(1)
         self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)

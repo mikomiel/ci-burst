@@ -228,9 +228,14 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 - **THEN** the row records the attempt time (`archive_delete_tried_at`) and the next pass tries the rows never tried first, then the least recently tried, then the oldest
 - **AND** a deletion that stays refused does not keep a newer owed row from being deleted
 
-#### Scenario: A retry comes before a provider read that fails
-- **WHEN** a pass owes a deletion and a later read of the provider in the same pass is refused
-- **THEN** the deletion was tried before that read
+#### Scenario: A cancellation starts no deletion
+- **WHEN** a pass is cancelled (a `BaseException` that is no `Exception`, such as `KeyboardInterrupt`) while an archive deletion is owed
+- **THEN** no owed deletion starts and the cancellation propagates unchanged
+
+#### Scenario: A refused or deferred deletion stays visible
+- **WHEN** a pass ends on a refusal, or returns, and an owed deletion was refused or deferred
+- **THEN** the pass writes an `image_reconciled` event with the counts `owed_archives_deleted`, `owed_archive_delete_failed` and `owed_archives_deferred`, and no key or bucket name
+- **AND** a refusal that ended the pass is raised unchanged
 
 #### Scenario: The archive exceeds the cap
 - **WHEN** the streamed bytes pass `source.max_archive_bytes`

@@ -1335,9 +1335,9 @@ class EditTests(PromoteCase):
         self.assertEqual(self.config_path.read_bytes(), rich.replace(b"=   3    # the pin", b"=   5    # the pin"))
 
     def test_a_comment_on_the_pin_line_stays_in_the_file_and_never_reaches_the_output(self):
-        secret = "SENTINEL-198 https://private.example.invalid/note"
+        remark = "SENTINEL-198 see https://private.example.invalid/note"
         text = self.config_path.read_bytes()
-        commented = text.replace(b"launch_template_version = 3", f"launch_template_version = 3  # {secret}".encode())
+        commented = text.replace(b"launch_template_version = 3", f"launch_template_version = 3  # {remark}".encode())
         self.assertNotEqual(commented, text)
         self.config_path.write_bytes(commented)
         self.seed()

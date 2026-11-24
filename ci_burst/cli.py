@@ -197,7 +197,9 @@ def _image(config, arguments):
     """Dispatch one ``image`` command. A deployment without the image path answers ``disabled`` at once."""
     if not config.image.enabled:
         return {"decision": "disabled"}
-    state = ImageState(config.image.state_directory, clock=image_clock)
+    # Resolved once: the writer lock, the database and the events stay in this directory for the whole command,
+    # even if a link on its path moves meanwhile (#199).
+    state = ImageState(Path(config.image.state_directory).resolve(), clock=image_clock)
     command = arguments.image_command
     if command == "status":
         if arguments.refresh:

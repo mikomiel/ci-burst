@@ -885,7 +885,9 @@ def check_state_owner(config, snapshot, state):
     """
     planned = snapshot.config
     directory = planned.image.state_directory
-    same_directory = directory is not None and Path(directory).resolve() == Path(state.directory).resolve()
+    # ``state.directory`` was resolved once, when the command line opened it, and the lock, the database and the
+    # events live there. Only the file's value is resolved now, so a link moved since the start is a change too.
+    same_directory = directory is not None and Path(directory).resolve() == state.directory
     if planned.deployment != config.deployment or not same_directory:
         raise ImageRefusal(
             PROMOTE_STATE_CHANGED,
@@ -1067,10 +1069,10 @@ def _write(snapshot, state, clock, events, version, rollback, *, owner):
     with file_lock(snapshot.target):
         try:
             state.acquire_writer()  # before the writable open, which rolls back a hot journal
-            state.connect()
             # The first read decided only the two refusals above. Every other fact comes from bytes
             # read now, with both locks held: a promotion that finished after the first read must
-            # not make its own pending row look aborted.
+            # not make its own pending row look aborted. The file is checked before the state is
+            # opened for writing, because that open rolls back a hot journal of the state it opens.
             checked = snapshot.target
             snapshot = read_snapshot(snapshot.config)
             if snapshot.target != checked:
@@ -1081,9 +1083,11 @@ def _write(snapshot, state, clock, events, version, rollback, *, owner):
                     "the deployment path leads to another file than the one that was checked and locked; "
                     "nothing was written",
                 )
-            check_zone_pins(snapshot.raw)
-            # The bytes read under the locks decide too: the state and the events must still be the ones they name.
+            # The bytes read under the locks decide too: the state and the events must still be the ones they
+            # name. As at the first read, this comes before the zone pins.
             check_state_owner(owner, snapshot, state)
+            check_zone_pins(snapshot.raw)
+            state.connect()
             config = snapshot.config
             # Every row first: a damaged completed row must stop the write here, not after the file changed.
             state.journal_check()

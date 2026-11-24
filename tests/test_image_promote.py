@@ -1935,31 +1935,101 @@ class StateOwnerTests(PromoteCase):
             with self.subTest(write=write):
                 self.refused((), write=write, change=self.renamed_deployment)
 
-    def test_a_state_directory_changed_under_the_locks_is_refused_and_nothing_is_written(self):
-        # The first read passes; the file changes while the write holds both locks, before its second read.
+    def refused_under_the_locks(self, change, *arguments):
+        """The first read passes; ``change`` runs while the write holds both locks, before its second read."""
         real = image_promote.file_lock
 
         @contextlib.contextmanager
         def changed_once_locked(target):
             with real(target):
-                self.config_path.write_text(self.moved_state(self.config_path.read_text(encoding="utf-8")))
+                change()
                 yield
 
         before = self.untouched()
         with mock.patch.object(image_promote, "file_lock", changed_once_locked):
-            code, payload = self.write_pin()
+            code, payload = self.write_pin(*arguments)
         self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_STATE_CHANGED"), payload)
         self.assertEqual(self.untouched(), before)
         self.assertEqual(self.journal_rows(), [])
         self.assertEqual(self.backups(), [])
         self.assertFalse(self.other_state.exists())
+        for path in (self.state_dir, self.other_state, self.config_dir):
+            self.assertNotIn(str(path), json.dumps(payload))
 
-    def test_the_same_directory_through_another_spelling_is_not_a_change(self):
-        spelled = str(self.state_dir.parent / "." / self.state_dir.name)
-        self.config_path.write_text(
-            self.config_path.read_text(encoding="utf-8").replace(str(self.state_dir), spelled), encoding="utf-8"
-        )
-        code, payload = self.show()
+    def edit(self, change):
+        self.config_path.write_text(change(self.config_path.read_text(encoding="utf-8")), encoding="utf-8")
+
+    def test_a_state_directory_changed_under_the_locks_is_refused_and_nothing_is_written(self):
+        for arguments in ((), ("--rollback",)):
+            with self.subTest(arguments=arguments):
+                original = self.config_path.read_bytes()
+                self.refused_under_the_locks(lambda: self.edit(self.moved_state), *arguments)
+                self.config_path.write_bytes(original)
+
+    def test_a_deployment_renamed_under_the_locks_is_refused(self):
+        self.refused_under_the_locks(lambda: self.edit(self.renamed_deployment))
+
+    def test_under_the_locks_the_state_refusal_comes_before_a_zone_pin(self):
+        # The same order as at the first read: the owner of the state first, then the zones.
+        def pin_a_zone_and_move_the_state():
+            self.write_deployment(zones=ZONES_ONE_PINNED)
+            self.edit(self.moved_state)
+
+        self.refused_under_the_locks(pin_a_zone_and_move_the_state)
+
+    def test_a_refusal_under_the_locks_leaves_a_hot_journal_of_the_old_state_as_it_is(self):
+        # The writable open rolls a hot journal back, so the file is checked before the state is opened for writing.
+        EditTests.leave_a_hot_journal(self)
+        before = EditTests.hot_files(self)
+        real = image_promote.file_lock
+
+        @contextlib.contextmanager
+        def changed_once_locked(target):
+            with real(target):
+                self.edit(self.moved_state)
+                yield
+
+        with mock.patch.object(image_promote, "file_lock", changed_once_locked):
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_STATE_CHANGED"), payload)
+        self.assertEqual(EditTests.hot_files(self), before, "the database and its journal are byte for byte the same")
+        self.assertEqual(self.backups(), [])
+        self.assertFalse(self.other_state.exists())
+
+    def test_a_link_to_the_state_moved_after_the_start_is_a_change(self):
+        # The command opened the directory that the link named at its start; the file still names the link, which
+        # now leads elsewhere. The lock, the database and the events stay where the command opened them.
+        link = self.dir / "state-link"
+        link.symlink_to(self.state_dir, target_is_directory=True)
+        self.edit(lambda text: text.replace(str(self.state_dir), str(link)))
+        self.other_state.mkdir()
+
+        def move_the_link():
+            link.unlink()
+            link.symlink_to(self.other_state, target_is_directory=True)
+
+        before = sorted(path.name for path in self.other_state.iterdir())
+        real = image_promote.file_lock
+
+        @contextlib.contextmanager
+        def moved_once_locked(target):
+            with real(target):
+                move_the_link()
+                yield
+
+        dump = self.dump()
+        with mock.patch.object(image_promote, "file_lock", moved_once_locked):
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_STATE_CHANGED"), payload)
+        self.assertEqual(self.dump(), dump)
+        self.assertEqual(self.journal_rows(), [])
+        self.assertEqual(sorted(path.name for path in self.other_state.iterdir()), before)
+
+    def test_the_same_directory_through_a_link_made_after_the_start_is_not_a_change(self):
+        alias = self.dir / "state-alias"
+        alias.symlink_to(self.state_dir, target_is_directory=True)
+        with self.changed_before_the_snapshot(lambda text: text.replace(str(self.state_dir), str(alias))):
+            code, payload = self.show()
         self.assertEqual((code, payload["decision"]), (0, "preview"), payload)
 
 

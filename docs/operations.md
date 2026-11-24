@@ -1161,10 +1161,11 @@ The retries are bounded, so that a backlog of slow refused deletions cannot take
 time that a stage, a decision or a build needs. A pass starts at most 8 owed deletions
 (`OWED_ARCHIVES_PER_PASS`), and none once the pass deadline is less than 40 seconds away
 (`OWED_DELETE_RESERVE_SECONDS`, the 30 second read timeout of the AWS client plus a
-margin); the clock is read before each one. A row that was refused in this pass is not
-tried again in it. When owed rows remain
+margin); the clock is read before each one. A row whose delete this pass attempted,
+whatever the outcome, is not tried again in it: the pass keeps the ids of its attempts in
+memory, so a clock that moves does not decide it. When owed rows remain
 after the bound, the pass notes `archive:delete_deferred`. Each failed attempt records
-its time in the row (`archive_delete_tried_at`). The rows never tried go first, then
+its time in the row (`archive_delete_tried_at`), which only orders the rows. The rows never tried go first, then
 the least recently tried, then the oldest, so a deletion that stays refused goes
 behind the newer ones and cannot keep them from their turn.
 
@@ -1251,6 +1252,7 @@ passing plan does not rule these out.
 | `TEMPLATE_DRIFT` | the candidate version differs from the pin in a field other than `ImageId`, or does not carry the build's image; `drift_fields` names them |
 | `FORGEJO_ARCHIVE_TOO_LARGE` | the forge stream of the archive passed `max_archive_bytes` while it was staged. A passing `image plan` does not rule it out, because the plan reads only the first chunk |
 | `IMAGE_ARCHIVE_TOO_LARGE`, `IMAGE_ARCHIVE_UPLOAD_FAILED` | the upload counted more than `max_archive_bytes`, or the upload failed |
+| `IMAGE_STAGING_BUCKET_DENIED` | S3 answered `AccessDenied` to the upload of a first stage. A stage done again ends as a refusal instead (second table) |
 | `IMAGE_USERDATA_TOO_LARGE` | the user data, rendered with the real presigned URL, is 16384 bytes or more. `image plan` sizes it with a synthetic URL, so a plan can pass where the run fails |
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the archive request |
 | a forge or provider code | any other refusal that ended the build as described above, such as `FORGEJO_UNAVAILABLE` or `AWS_REFUSED` |
@@ -1280,6 +1282,7 @@ and the codes of `promote` in [Promote reason codes](#promote-reason-codes).
 | `IMAGE_BASIS_PATH_MISSING` | the forge answered `404` for a `basis_paths` file, or the path escapes the repository, at the branch head that a decision reads |
 | `IMAGE_BUILD_TEMPLATE_UNSAFE` | the build launch template or its version is missing or fails a safety check; the detail names the properties, never a value. On a stage done again the row ends `failed`, uncounted, and the pass answers `refused`. A read of the template that the provider refuses, such as a version that EC2 reports as not found, is the provider's own refusal instead: it is raised (exit `1`), and on a stage done again it leaves the row for the next pass |
 | `IMAGE_USERDATA_TOO_LARGE` | in `image plan`: the user data, rendered with a synthetic URL, is 16384 bytes or more. In an applying run it ends the build `failed` instead (first table) |
+| `IMAGE_STAGING_BUCKET_DENIED` | S3 answered `AccessDenied` to a staging call. Every one names the account of the image role as the bucket's owner, so the bucket now belongs to another account (a released name that was reassigned), or the role may not use it. Nothing was written or deleted, and no call is made without the owner. A stage done again at the bucket that its row recorded ends the row `failed` with this code, counts no failure and answers `refused`; the next pass stages under the configured bucket. The row's delete is refused at the same bucket: it counts in `owed_archive_delete_failed` and stays owed. A first stage ends the build as a failure (first table), and a refused listing of the sweep refuses the pass |
 | `IMAGE_SCRIPT_MISSING` | the container image does not hold the shipped warm script |
 | `pass_deadline_exceeded` | the 240-second budget of a pass ran out. It is raised in `image plan` and before a decision. Elsewhere it is a `notes` entry, alone (the row waits for the next pass) or after the name of a lookup that the pass then goes without (such as `image_lookup:` or `base_image:`), or the `refused` code of the `retention` or `deletion` part |
 | `IMAGE_STATE_LOCKED` | another pass, refresh or `promote --write` holds the writer lock of the state file; an applying run also meets it when it resolves a pending journal row |

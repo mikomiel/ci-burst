@@ -277,8 +277,8 @@ five profiles and must end in a profile that holds both static keys. No profile 
 the chain may name `credential_source`, `web_identity_token_file`,
 `credential_process`, `login_session` or an `sso_` key. Anything else is refused
 as `IMAGE_PROFILE_INVALID`, and a missing profile name as `IMAGE_PROFILE_MISSING`,
-before the SDK asks for a credential. The image commands build an EC2 client and
-an S3 client and no IAM client. Every pass builds a new SDK session, so a role
+before the SDK asks for a credential. The image commands build an EC2 client, an
+S3 client and an STS client (for `GetCallerIdentity` alone) and no IAM client. Every pass builds a new SDK session, so a role
 that cannot be assumed (an expired source key, a trust policy that denies it)
 fails that pass with the provider's error code, not with a stale session.
 
@@ -740,6 +740,14 @@ Notes on the values:
   ci-burst does not check this setting. Suspending versioning does not remove the
   noncurrent versions that already exist. The rule also applies to an old bucket that
   build rows still name.
+- Every S3 call that ci-burst makes against a staging bucket names the account of the image
+  role as the bucket's expected owner (`ExpectedBucketOwner`), which it reads once per pass
+  from `sts:GetCallerIdentity` and which asks for no permission. A bucket name that was
+  released and now belongs to another account is refused with `IMAGE_STAGING_BUCKET_DENIED`,
+  never written to or deleted from, and never retried without the owner. The staging bucket
+  must therefore be in the account of the image role. The build policy carries the same bound
+  as an `s3:ResourceAccount` condition on both S3 statements: replace `<account-id>` there
+  with that account.
 - The staging bucket and its lifecycle rule are yours: the row of a build records
   the bucket and the key before the upload starts. When the build ends, ci-burst
   deletes that object, and a refused delete stays owed and is retried at the end of

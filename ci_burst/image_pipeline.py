@@ -138,6 +138,7 @@ from .aws import (
     BUILDER_STATES,
     DEPLOYMENT_TAG,
     IMAGE_BUILD_TAG,
+    IMAGE_STAGING_BUCKET_DENIED,
     READ_TIMEOUT_SECONDS,
 )
 from .errors import DeadlineRefusal, ImageRefusal, ProviderRefusal, Refusal
@@ -1110,6 +1111,10 @@ class _Pass:
         self.summary = self._reconcile_summary()
         #: True once the owed deletions ran: the cleanup-only pass runs them inside its own work.
         self.owed_done = False
+        #: The ids of the rows whose archive delete this pass has attempted, whatever the outcome: the end of a build
+        #: records its own, and ``_delete_owed`` skips them. The persisted ``archive_delete_tried_at`` only orders
+        #: the rows (``ImageState.archives_owed``).
+        self.delete_attempted = set()
 
     def run(self):
         try:
@@ -1366,16 +1371,13 @@ class _Pass:
         At most ``OWED_ARCHIVES_PER_PASS`` start, and none once the pass deadline is less than
         ``OWED_DELETE_RESERVE_SECONDS`` away; the clock is read before each one. ``ImageState.archives_owed`` lists
         the rows never tried first, then the least recently tried, so a deletion that stays refused cannot keep a
-        newer row from its turn. A row that was refused in this pass is not tried again in it. Rows that the bound left
+        newer row from its turn. A row whose delete this pass attempted (``delete_attempted``) is not tried again in it. Rows that the bound left
         are noted as ``archive:delete_deferred``.
         """
         self.owed_done = True
-        # A row that was refused in this pass already, for instance at the end of its own build, is not tried again.
-        rows = [
-            row
-            for row in self.s.archives_owed(self.dep)
-            if row.archive_delete_tried_at is None or row.archive_delete_tried_at < self.started_at
-        ]
+        # A row whose delete was attempted in this pass already, for instance at the end of its own build, is not
+        # tried again. The set lives in memory, so a clock that moved does not decide it.
+        rows = [row for row in self.s.archives_owed(self.dep) if row.id not in self.delete_attempted]
         started = 0
         for index, owed in enumerate(rows):
             if started >= OWED_ARCHIVES_PER_PASS or self.clock() >= self.deadline - OWED_DELETE_RESERVE_SECONDS:
@@ -1536,8 +1538,15 @@ class _Pass:
         if self.aws.builders(self.dep, deadline=self.deadline):
             raise ImageRefusal(IMAGE_BUILD_ALREADY_ACTIVE)
 
-    def _stage(self, build):
-        """Stage the archive and launch the builder, and settle every way that can end short of a launch."""
+    def _stage(self, build, restage=False):
+        """Stage the archive and launch the builder, and settle every way that can end short of a launch.
+
+        A staging bucket that S3 refuses (``IMAGE_STAGING_BUCKET_DENIED``: the bucket is owned by another account,
+        or the role may not use it) ends a restage as a refused start: the row records the bucket of its earlier
+        stage, which a rotation may have released, and the next pass inserts a row for the configured one. For a
+        new row it is a failed build and counts, so that a configured bucket that is refused ends in the cooldown
+        and the block instead of in one row per pass.
+        """
         try:
             return self._stage_and_launch(build)
         except DeadlineRefusal:
@@ -1547,7 +1556,7 @@ class _Pass:
             self.hold = True
             return self.s.build(build.id)
         except Refusal as refusal:
-            if refusal.reason in START_REFUSALS:
+            if refusal.reason in START_REFUSALS or (restage and refusal.reason == IMAGE_STAGING_BUCKET_DENIED):
                 return self._end_refused(build, refusal.reason)
             # Nothing was launched: a launch whose outcome is unknown is handled inside ``_stage_and_launch`` and
             # does not come here.
@@ -1597,7 +1606,7 @@ class _Pass:
         reason = self._start_refusal()
         if reason is not None:
             return self._end_refused(build, reason)
-        return self._stage(build)
+        return self._stage(build, restage=True)
 
     def _check_inputs_unchanged(self, build):
         """Refuse with ``IMAGE_INPUTS_CHANGED`` unless the inputs of ``build`` still give the digest of its row.
@@ -2020,6 +2029,8 @@ class _Pass:
         """
         if not build.archive_key or not build.archive_bucket:
             return False
+        # Before the call: an attempt that ends in an error that is no refusal is an attempt too.
+        self.delete_attempted.add(build.id)
         try:
             self.aws.delete_object(build.archive_bucket, build.archive_key)
         except ProviderRefusal:

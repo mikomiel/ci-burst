@@ -58,7 +58,7 @@ from ci_burst.image_state import ImageState
 
 from support import Clock, write_config
 from test_aws import sdk_client_error
-from test_image_aws import SENTINELS, ProviderError, tag_list
+from test_image_aws import ACCOUNT, SENTINELS, ProviderError, tag_list
 
 NOW = 1_800_000_000.0
 HOUR = 3600
@@ -401,43 +401,76 @@ class WorldEc2:
 
 
 class WorldS3:
-    """The S3 client calls the adapter makes."""
+    """The S3 client calls the adapter makes. A call whose owner is not the bucket's owner is refused, as S3 does."""
 
     def __init__(self, world):
         self.w = world
         self.parts = {}
 
-    def create_multipart_upload(self, *, Bucket, Key):
-        self.w.enter("create_multipart_upload", dict(Bucket=Bucket, Key=Key))
+    def create_multipart_upload(self, *, Bucket, Key, ExpectedBucketOwner):
+        self.w.enter("create_multipart_upload", dict(Bucket=Bucket, Key=Key, ExpectedBucketOwner=ExpectedBucketOwner))
+        self.w.check_owner(Bucket, ExpectedBucketOwner)
         upload_id = self.w.new_id("upload")
         self.parts[upload_id] = []
         return {"UploadId": upload_id}
 
-    def upload_part(self, *, Bucket, Key, UploadId, PartNumber, Body):
-        self.w.enter("upload_part", dict(Bucket=Bucket, Key=Key, UploadId=UploadId, PartNumber=PartNumber, Body=Body))
+    def upload_part(self, *, Bucket, Key, UploadId, PartNumber, Body, ExpectedBucketOwner):
+        self.w.enter(
+            "upload_part",
+            dict(
+                Bucket=Bucket,
+                Key=Key,
+                UploadId=UploadId,
+                PartNumber=PartNumber,
+                Body=Body,
+                ExpectedBucketOwner=ExpectedBucketOwner,
+            ),
+        )
+        self.w.check_owner(Bucket, ExpectedBucketOwner)
         self.parts[UploadId].append(bytes(Body))
         return {"ETag": f"etag-{PartNumber}"}
 
-    def complete_multipart_upload(self, *, Bucket, Key, UploadId, MultipartUpload):
+    def complete_multipart_upload(self, *, Bucket, Key, UploadId, MultipartUpload, ExpectedBucketOwner):
         self.w.enter(
             "complete_multipart_upload",
-            dict(Bucket=Bucket, Key=Key, UploadId=UploadId, MultipartUpload=MultipartUpload),
+            dict(
+                Bucket=Bucket,
+                Key=Key,
+                UploadId=UploadId,
+                MultipartUpload=MultipartUpload,
+                ExpectedBucketOwner=ExpectedBucketOwner,
+            ),
         )
+        self.w.check_owner(Bucket, ExpectedBucketOwner)
         self.w.objects[Key] = (b"".join(self.parts.pop(UploadId)), self.w.clock())
         return {}
 
-    def abort_multipart_upload(self, *, Bucket, Key, UploadId):
-        self.w.enter("abort_multipart_upload", dict(Bucket=Bucket, Key=Key, UploadId=UploadId))
+    def abort_multipart_upload(self, *, Bucket, Key, UploadId, ExpectedBucketOwner):
+        self.w.enter(
+            "abort_multipart_upload",
+            dict(Bucket=Bucket, Key=Key, UploadId=UploadId, ExpectedBucketOwner=ExpectedBucketOwner),
+        )
+        self.w.check_owner(Bucket, ExpectedBucketOwner)
         self.parts.pop(UploadId, None)
         return {}
 
-    def delete_object(self, *, Bucket, Key):
-        self.w.enter("delete_object", dict(Bucket=Bucket, Key=Key))
+    def delete_object(self, *, Bucket, Key, ExpectedBucketOwner):
+        self.w.enter("delete_object", dict(Bucket=Bucket, Key=Key, ExpectedBucketOwner=ExpectedBucketOwner))
+        self.w.check_owner(Bucket, ExpectedBucketOwner)
         self.w.objects.pop(Key, None)
         return {}
 
-    def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
-        self.w.enter("list_objects_v2", dict(Bucket=Bucket, Prefix=Prefix, ContinuationToken=ContinuationToken))
+    def list_objects_v2(self, *, Bucket, Prefix, ExpectedBucketOwner, ContinuationToken=None):
+        self.w.enter(
+            "list_objects_v2",
+            dict(
+                Bucket=Bucket,
+                Prefix=Prefix,
+                ExpectedBucketOwner=ExpectedBucketOwner,
+                ContinuationToken=ContinuationToken,
+            ),
+        )
+        self.w.check_owner(Bucket, ExpectedBucketOwner)
         contents = []
         for key, (body, modified) in sorted(self.w.objects.items()):
             if not key.startswith(Prefix):
@@ -494,12 +527,21 @@ class World:
         self.groups = {}
         self.next_version = 5
         self.objects = {}
+        #: The account that the image identity runs in, and the owner of a bucket that is not listed.
+        self.account = ACCOUNT
+        #: A bucket that another account owns: bucket name -> account.
+        self.bucket_owners = {}
         self.credential_life = float(HOUR)
         self.url_padding = 0
         self.urls = []
         self.ec2 = WorldEc2(self)
         self.s3 = WorldS3(self)
         self.seed()
+
+    def check_owner(self, bucket, expected):
+        """S3 answers ``AccessDenied`` to a call that names an owner other than the bucket's."""
+        if expected != self.bucket_owners.get(bucket, self.account):
+            raise ProviderError("AccessDenied")
 
     # -- recording and fault injection -----------------------------------------
     def enter(self, method, kwargs):
@@ -637,6 +679,7 @@ class WorldAws(ImageAws):
             clients={"ec2": world.ec2, "s3": world.s3},
             clock=world.clock,
             expiry=world.clock() + world.credential_life,
+            account=world.account,
         )
         self.world = world
 
@@ -2603,7 +2646,7 @@ class FailureTests(PipelineCase):
         result = self.apply()
         self.assert_failed(result, "CONSOLE_BLIND")
         self.assertEqual(self.world.objects, {})
-        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": build.archive_key}])
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": build.archive_key, "ExpectedBucketOwner": ACCOUNT}])
         self.assertEqual(self.world.arguments("run_instances"), [])
 
     def test_a_build_one_second_short_of_its_deadline_is_staged_again(self):
@@ -2652,7 +2695,7 @@ class FailureTests(PipelineCase):
         build = self.only_build()
         self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "IMAGE_BUILD_TEMPLATE_UNSAFE"))
         self.assertEqual(self.world.objects, {})
-        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key, "ExpectedBucketOwner": ACCOUNT}])
         self.assertEqual(len(self.archive_keys()), 1)
         self.assertEqual(self.world.arguments("run_instances"), [])
 
@@ -2732,7 +2775,7 @@ class FailureTests(PipelineCase):
         self.configure(render_toml(gate=NO_GATE))
         result = self.apply()
         self.assert_inputs_changed(result, first)
-        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key, "ExpectedBucketOwner": ACCOUNT}])
 
     def test_a_resumed_stage_does_not_ask_the_forge_for_a_basis_path_so_a_missing_answer_changes_nothing(self):
         # The row recorded the hash of every basis file when it was inserted: a forge that answers a path as missing
@@ -2844,7 +2887,7 @@ class FailureTests(PipelineCase):
         self.configure(render_toml(gate=""))
         result = self.apply()
         self.assert_inputs_changed(result, first)
-        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key, "ExpectedBucketOwner": ACCOUNT}])
         self.assertEqual(self.control().consecutive_failures, 0)
 
     def test_the_pass_after_a_row_that_ended_for_a_lost_gate_is_refused_before_any_client(self):
@@ -2870,7 +2913,7 @@ class FailureTests(PipelineCase):
         self.assert_refused(result, "IMAGE_GATE_REQUIRED")
         build = self.only_build()
         self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "IMAGE_GATE_REQUIRED"))
-        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key, "ExpectedBucketOwner": ACCOUNT}])
         self.assertEqual(self.world.objects, {})
         self.assertEqual(len(self.archive_keys()), 1)
         self.assertEqual(self.world.launches, [])
@@ -2886,7 +2929,7 @@ class FailureTests(PipelineCase):
         self.assert_refused(result, "IMAGE_GATE_REQUIRED")
         build = self.only_build()
         self.assertEqual((build.state, build.reason_code), ("failed", "IMAGE_GATE_REQUIRED"))
-        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key, "ExpectedBucketOwner": ACCOUNT}])
         self.assertEqual(self.world.arguments("run_instances"), [])
 
     def test_a_lost_opt_out_is_reported_before_an_unsafe_template(self):
@@ -2919,7 +2962,7 @@ class FailureTests(PipelineCase):
         self.assertEqual(self.world.arguments("terminate_instances"), [])
         self.assertEqual(self.world.objects, {})
         deleted = [kwargs for name, kwargs in self.world.calls[mark:] if name == "delete_object"]
-        self.assertEqual(deleted, [{"Bucket": BUCKET, "Key": f"{PREFIX}{first.id}.tar.gz"}])
+        self.assertEqual(deleted, [{"Bucket": BUCKET, "Key": f"{PREFIX}{first.id}.tar.gz", "ExpectedBucketOwner": ACCOUNT}])
         self.assertEqual(self.control().consecutive_failures, 1)
 
     def test_a_resumed_stage_whose_upload_outlasts_the_build_deadline_launches_nothing_and_deletes_the_archive(self):
@@ -3473,7 +3516,7 @@ class ArchiveOwedTests(PipelineCase):
         control = self.control()
         self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
         self.assertEqual(self.world.objects, {})
-        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": build.archive_key}])
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": build.archive_key, "ExpectedBucketOwner": ACCOUNT}])
         self.assertEqual(len(self.world.arguments("create_multipart_upload")), 1)
         self.assertEqual(self.world.arguments("run_instances"), [])
         self.assertEqual(self.events("image_build_failed"), [])
@@ -3524,9 +3567,127 @@ class ArchiveOwedTests(PipelineCase):
             [(call["Params"]["Bucket"], call["Params"]["Key"]) for call in self.world.arguments("generate_presigned_url")],
             [(BUCKET, first.archive_key)] * 2,
         )
-        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key}])
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": first.archive_key, "ExpectedBucketOwner": ACCOUNT}])
         self.assertEqual(self.world.objects, {})
         self.assertIsNotNone(build.archive_deleted_at)
+
+    STAGING_CALLS = (
+        "create_multipart_upload",
+        "upload_part",
+        "complete_multipart_upload",
+        "abort_multipart_upload",
+        "delete_object",
+        "list_objects_v2",
+    )
+    OTHER_ACCOUNT = "999988887777"
+
+    def staging_calls(self, mark=0):
+        return [(name, call) for name, call in self.world.calls[mark:] if name in self.STAGING_CALLS]
+
+    def test_every_staging_call_of_a_pass_names_the_account_as_the_bucket_owner(self):
+        # A stray object for the sweep, an owed row for the tail, a build that stages, ends and deletes its archive.
+        self.world.objects[f"{PREFIX}stray.tar.gz"] = (b"stray", NOW - 2 * HOUR)
+        owed = f"{PREFIX}owed-00.tar.gz"
+        self.add_build("owed-00", archive_bucket=BUCKET, archive_key=owed)
+        self.world.objects[owed] = (b"archive", NOW)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        calls = self.staging_calls()
+        self.assertEqual(
+            {name for name, _ in calls},
+            {"create_multipart_upload", "upload_part", "complete_multipart_upload", "delete_object", "list_objects_v2"},
+        )
+        deleted = {call["Key"] for name, call in calls if name == "delete_object"}
+        self.assertIn(f"{PREFIX}stray.tar.gz", deleted)
+        self.assertIn(owed, deleted)
+        for name, call in calls:
+            with self.subTest(call=name, key=call.get("Key")):
+                self.assertEqual(call["ExpectedBucketOwner"], ACCOUNT)
+
+    def test_a_restage_into_a_bucket_that_another_account_now_owns_sends_nothing_and_is_refused(self):
+        first = self.unstaged_with_an_archive()
+        # The recorded bucket was released by a rotation and reassigned, and the configuration names another one.
+        self.world.bucket_owners[BUCKET] = self.OTHER_ACCOUNT
+        other_bucket = "example-other-staging"
+        self.configure(render_toml(prefix=self.OTHER_PREFIX).replace(BUCKET, other_bucket))
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_STAGING_BUCKET_DENIED"), result)
+        # One upload was opened, with the account of the identity as the owner, and the bucket refused it: no part,
+        # no completion, no launch and no URL. No call went out without the owner.
+        self.assertEqual(
+            [
+                (call["Bucket"], call["ExpectedBucketOwner"])
+                for name, call in self.staging_calls(mark)
+                if name == "create_multipart_upload"
+            ],
+            [(BUCKET, ACCOUNT)],
+        )
+        names = self.world.names(mark)
+        for name in ("upload_part", "complete_multipart_upload", "run_instances", "generate_presigned_url"):
+            self.assertNotIn(name, names)
+        for name, call in self.staging_calls(mark):
+            self.assertEqual(call["ExpectedBucketOwner"], ACCOUNT, name)
+        # The row is consistent: ended, no failure counted, and its archive still owed, because the delete is denied too.
+        ended = self.only_build()
+        self.assertEqual((ended.id, ended.state, ended.reason_code), (first.id, "failed", "IMAGE_STAGING_BUCKET_DENIED"))
+        self.assertEqual((ended.archive_bucket, ended.archive_key), (BUCKET, first.archive_key))
+        self.assertIsNone(ended.archive_deleted_at)
+        self.assertIsNotNone(ended.archive_delete_tried_at)
+        self.assertEqual(self.query(lambda state: state.archives_owed(DEPLOYMENT)), [ended])
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+        self.assertIn("archive:delete_failed", result["notes"])
+        self.assertEqual(self.events("image_build_failed"), [])
+        # The next pass decides from the configuration: a row for the configured bucket, and the old one stays owed.
+        self.clock.advance(DAY)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(result["reconcile"]["owed_archive_delete_failed"], 1)
+        rows = {row.id: row for row in self.builds()}
+        self.assertEqual(len(rows), 2)
+        (new,) = [row for row in rows.values() if row.id != first.id]
+        self.assertEqual(new.archive_bucket, other_bucket)
+        self.assertIsNone(rows[first.id].archive_deleted_at)
+
+    def test_a_new_row_whose_upload_is_denied_is_a_failed_build_that_counts(self):
+        self.world.fail("create_multipart_upload", ProviderError("AccessDenied"))
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("failed", "IMAGE_STAGING_BUCKET_DENIED"), result)
+        self.assertEqual(self.control().consecutive_failures, 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertNotIn("upload_part", self.world.names())
+
+    def test_an_owed_delete_in_a_bucket_of_another_account_counts_as_failed_and_stays_owed(self):
+        released = "example-released-staging"
+        key = f"{PREFIX}owed-00.tar.gz"
+        self.add_build("owed-00", archive_bucket=released, archive_key=key)
+        self.world.objects[key] = (b"archive", NOW)
+        self.world.bucket_owners[released] = self.OTHER_ACCOUNT
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 0)
+        self.assertEqual(result["reconcile"]["owed_archive_delete_failed"], 1)
+        self.assertIn("archive:delete_failed", result["notes"])
+        (attempt,) = [call for name, call in self.world.calls if name == "delete_object" and call["Key"] == key]
+        self.assertEqual((attempt["Bucket"], attempt["ExpectedBucketOwner"]), (released, ACCOUNT))
+        owed = [row.id for row in self.query(lambda state: state.archives_owed(DEPLOYMENT))]
+        self.assertEqual(owed, ["owed-00"])
+        self.assertEqual(self.world.objects[key][0], b"archive")
+        event = self.events("image_reconciled")[-1]
+        self.assertEqual((event["owed_archives_deleted"], event["owed_archive_delete_failed"]), (0, 1))
+        self.assertNotIn(released, json.dumps(self.events()))
+
+    def test_a_sweep_of_a_bucket_that_another_account_owns_deletes_nothing_and_refuses_the_pass(self):
+        self.world.bucket_owners[BUCKET] = self.OTHER_ACCOUNT
+        self.world.objects[f"{PREFIX}stray.tar.gz"] = (b"stray", NOW - 2 * HOUR)
+        self.refused(self.apply, "IMAGE_STAGING_BUCKET_DENIED")
+        self.assertEqual(self.world.arguments("delete_object"), [])
+        self.assertEqual([name for name, _ in self.staging_calls()], ["list_objects_v2"])
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
 
     def test_a_refused_delete_leaves_the_deletion_owed_for_a_pass_that_has_no_gate_and_nothing_in_flight(self):
         first = self.unstaged_with_an_archive()
@@ -3549,7 +3710,7 @@ class ArchiveOwedTests(PipelineCase):
         self.assertIsNone(result["build"])
         self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1)
         self.assertEqual(self.world.objects, {})
-        self.assertEqual(self.world.arguments("delete_object")[-1], {"Bucket": BUCKET, "Key": first.archive_key})
+        self.assertEqual(self.world.arguments("delete_object")[-1], {"Bucket": BUCKET, "Key": first.archive_key, "ExpectedBucketOwner": ACCOUNT})
         self.assertEqual(self.only_build().archive_deleted_at, self.clock())
         self.assertEqual(self.query(lambda state: state.archives_owed(DEPLOYMENT)), [])
         # No launch, no upload, no read of the forge.
@@ -3725,6 +3886,30 @@ class OwedArchiveBoundTests(PipelineCase):
     def owed_deletes(self, mark):
         return [call for name, call in self.world.calls[mark:] if name == "delete_object" and "/owed-" in call["Key"]]
 
+    def test_a_clock_that_moves_backward_does_not_skip_a_row_that_a_denied_delete_left_owed(self):
+        keys = self.owe(1, stuck=[0])
+        self.world.console_plan = [(30.0, READY)]
+        first = self.apply()
+        self.assertEqual(first["reconcile"]["owed_archive_delete_failed"], 1)
+        self.pin_current()
+        tried = self.only_build_named("owed-00").archive_delete_tried_at
+        self.assertIsNotNone(tried)
+        # The next pass starts before the recorded attempt: a pass skips a row by what it attempted, not by that time.
+        self.clock.advance(-(self.clock() - tried) - 3600)
+        self.assertLess(self.clock(), tried)
+        mark = len(self.world.calls)
+        second = self.apply()
+        self.assertEqual(second["reconcile"]["owed_archive_delete_failed"], 1, second)
+        self.assertEqual(len(self.owed_deletes(mark)), 1)
+        self.assertIn("archive:delete_failed", second["notes"])
+        # The bucket allows it again, the clock is still behind, and the row settles.
+        del self.world.hooks["delete_object"]
+        self.clock.advance(-3600)
+        third = self.apply()
+        self.assertEqual(third["reconcile"]["owed_archives_deleted"], 1, third)
+        self.assertNotIn(keys[0], self.world.objects)
+        self.assertIsNotNone(self.only_build_named("owed-00").archive_deleted_at)
+
     def test_a_restage_that_needs_most_of_the_pass_is_not_held_by_an_owed_delete_that_times_out(self):
         key = f"{PREFIX}owed-slow.tar.gz"
         self.add_build("owed-slow", archive_bucket=BUCKET, archive_key=key)
@@ -3864,7 +4049,7 @@ class OwedArchiveBoundTests(PipelineCase):
         self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)
         refusal = self.refused(self.apply, "AWS_UNCERTAIN")
         self.assertEqual(refusal.detail, "ProviderError")
-        self.assertEqual(self.world.arguments("delete_object")[-1], {"Bucket": old_bucket, "Key": key})
+        self.assertEqual(self.world.arguments("delete_object")[-1], {"Bucket": old_bucket, "Key": key, "ExpectedBucketOwner": ACCOUNT})
         (owed,) = [row for row in self.builds() if row.id == "owed-old"]
         self.assertIsNotNone(owed.archive_deleted_at)
         self.assertNotIn(key, self.world.objects)
@@ -3927,6 +4112,20 @@ class OwedArchiveBoundTests(PipelineCase):
         )
         first = [row for row in self.builds() if row.id == "owed-a"][0]
         self.assertIsNotNone(first.archive_delete_tried_at)
+        # The second row's delete went through, but its record did not: it stays owed.
+        second = [row for row in self.builds() if row.id == "owed-b"][0]
+        self.assertIsNone(second.archive_deleted_at)
+        self.assertEqual(
+            [row.id for row in self.query(lambda state: state.archives_owed(DEPLOYMENT))], ["owed-b", "owed-a"]
+        )
+
+    def assert_the_next_pass_tries_both_rows_again(self, result):
+        """The row that was denied is denied again, and the row whose record failed settles."""
+        self.assertEqual(result["reconcile"]["owed_archive_delete_failed"], 1, result)
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1, result)
+        rows = {row.id: row for row in self.builds()}
+        self.assertIsNone(rows["owed-a"].archive_deleted_at)
+        self.assertIsNotNone(rows["owed-b"].archive_deleted_at)
 
     def test_the_counts_of_the_earlier_attempts_survive_a_later_one_that_raises_in_the_tail(self):
         patched = self.two_owed_rows_the_first_of_which_the_bucket_denies()
@@ -3935,6 +4134,8 @@ class OwedArchiveBoundTests(PipelineCase):
             refusal = self.refused(self.apply, "AWS_UNCERTAIN")
         self.assertEqual(refusal.detail, "ProviderError")
         self.assert_one_event_counts_one_denied_delete()
+        self.world.console_plan = [(30.0, READY)]
+        self.assert_the_next_pass_tries_both_rows_again(self.apply())
 
     def test_the_counts_of_the_earlier_attempts_survive_a_later_one_that_raises_in_the_cleanup_pass(self):
         patched = self.two_owed_rows_the_first_of_which_the_bucket_denies()
@@ -3942,6 +4143,7 @@ class OwedArchiveBoundTests(PipelineCase):
         with patched, self.assertRaises(sqlite3.OperationalError):
             self.apply()
         self.assert_one_event_counts_one_denied_delete()
+        self.assert_the_next_pass_tries_both_rows_again(self.apply())
 
     def test_a_failure_to_write_the_owed_event_replaces_neither_the_refusal_nor_the_result(self):
         self.owe(1, stuck=[0])
@@ -4331,7 +4533,7 @@ class ReconcileTests(PipelineCase):
         result = self.apply()
         self.assertEqual(result["decision"], "building")
         self.assertEqual(set(self.world.objects), set(objects) - {old})
-        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": old}])
+        self.assertEqual(self.world.arguments("delete_object"), [{"Bucket": BUCKET, "Key": old, "ExpectedBucketOwner": ACCOUNT}])
         self.assertEqual(result["reconcile"]["archives_deleted"], 1)
         (event,) = self.events("image_reconciled")
         self.assertEqual(event["archives_deleted"], 1)

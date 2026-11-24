@@ -12,7 +12,7 @@ use to exercise pagination and response parsing without any SDK.
 
 ``ImageAws`` is the separate identity of the image-build path. It is built from
 one named shared-config profile, never from ``[aws].profile``, and it can reach
-only the EC2 and S3 services. The module has no IAM client. The presigned
+only the EC2, S3 and STS services (STS for ``GetCallerIdentity`` alone). The module has no IAM client. The presigned
 archive URL, user data and the full template payload are never logged, echoed in
 an error or placed in a returned summary. The module emits no log record of its
 own; it raises the level of the SDK's loggers, whose DEBUG records would print
@@ -24,6 +24,7 @@ import contextlib
 import copy
 import hashlib
 import logging
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -431,7 +432,15 @@ BUILDER_STATES = ("pending", "running", "stopping", "stopped")
 
 #: The image identity reaches only these services. There is deliberately no IAM
 #: client: the role that this path assumes is created and widened by a person.
-IMAGE_SERVICES = frozenset({"ec2", "s3"})
+#: ``sts`` is there for ``GetCallerIdentity`` alone, which asks for no permission: the account
+#: that every staging call names as the bucket's owner (``ImageAws.account_id``).
+IMAGE_SERVICES = frozenset({"ec2", "s3", "sts"})
+
+#: The reason of a staging call that S3 answered with ``AccessDenied``. Every staging call names this identity's
+#: account as the bucket's owner (``ExpectedBucketOwner``), and a bucket that another account owns now answers it,
+#: as does a role without the permission. Nothing is retried without the owner.
+IMAGE_STAGING_BUCKET_DENIED = "IMAGE_STAGING_BUCKET_DENIED"
+_S3_DENIED_CODES = frozenset({"AccessDenied", "403"})
 
 #: Multipart part size. S3 refuses a part below 5 MiB except the last one.
 ARCHIVE_PART_BYTES = 8 * 1024 * 1024
@@ -746,7 +755,9 @@ class ImageAws:
     replaces the profile check, so it is the caller's to make.
     """
 
-    def __init__(self, region, profile, *, session_factory=None, clients=None, clock=time.time, expiry=None):
+    def __init__(
+        self, region, profile, *, session_factory=None, clients=None, clock=time.time, expiry=None, account=None
+    ):
         if not isinstance(profile, str) or not profile:
             raise ProviderRefusal("IMAGE_PROFILE_MISSING", "an image session needs a named profile")
         # Before any session or client exists, injected ones included: the SDK
@@ -760,6 +771,8 @@ class ImageAws:
         self._expiry = expiry
         self._session_cache = None
         self._ec2_reads = None
+        # ``account`` lets a test supply the account without an STS client.
+        self._account_cache = account
 
     # -- plumbing ---------------------------------------------------------
     def _session(self):
@@ -781,14 +794,38 @@ class ImageAws:
                 self._clients[service] = self._session().client(service, region_name=self._region, config=config)
         return self._clients[service]
 
+    def account_id(self):
+        """The account of this identity, from ``GetCallerIdentity``, asked once per instance.
+
+        Every S3 call of this adapter names it as the bucket's owner. An answer that is no account number refuses,
+        so no S3 call goes out without an owner.
+        """
+        if self._account_cache is None:
+            response = self._invoke("sts", "get_caller_identity", read=True)
+            account = response.get("Account") if isinstance(response, Mapping) else None
+            if not isinstance(account, str) or not re.fullmatch(r"[0-9]{12}", account):
+                raise ProviderRefusal("AWS_ACCOUNT_UNKNOWN", "get_caller_identity returned no account", uncertain=True)
+            self._account_cache = account
+        return self._account_cache
+
     def _invoke(self, service, method, *, read=False, absent=None, **arguments):
-        """Call the provider. ``absent`` is an error code that means "not there"."""
+        """Call the provider. ``absent`` is an error code that means "not there".
+
+        An S3 call carries the account as the bucket's owner, and it is refused here, before any call, when the
+        account is unknown. ``AccessDenied`` from S3 leaves as ``IMAGE_STAGING_BUCKET_DENIED``.
+        """
+        if service == "s3":
+            arguments["ExpectedBucketOwner"] = self.account_id()
         client = self._client(service)
         try:
             return getattr(client, method)(**arguments)
         except Exception as error:  # noqa: BLE001 - classified below
-            if absent is not None and _error_code(error) == absent:
+            code = _error_code(error)
+            if absent is not None and code == absent:
                 return None
+            if service == "s3" and code in _S3_DENIED_CODES:
+                # Refused before the operation, so nothing was written or deleted; a read cannot say more.
+                raise ProviderRefusal(IMAGE_STAGING_BUCKET_DENIED, code, uncertain=read) from None
             raise (_translate_read(error) if read else _translate(error)) from None
 
     def _check_deadline(self, deadline, detail):
@@ -1088,19 +1125,27 @@ class ImageAws:
         except Exception as error:  # noqa: BLE001 - reported as a code only
             cleaned = self._discard_upload(bucket, key, upload_id)
             code = (_error_code(error) or type(error).__name__)[:64]
-            raise ProviderRefusal("IMAGE_ARCHIVE_UPLOAD_FAILED", _cleanup_detail(code, cleaned)) from None
+            reason = IMAGE_STAGING_BUCKET_DENIED if code in _S3_DENIED_CODES else "IMAGE_ARCHIVE_UPLOAD_FAILED"
+            raise ProviderRefusal(reason, _cleanup_detail(code, cleaned)) from None
         except BaseException:
             self._discard_upload(bucket, key, upload_id)
             raise
 
     def _stream_parts(self, bucket, key, upload_id, chunks, max_bytes, part_bytes, deadline):
-        s3 = self._client("s3")
+        s3, owner = self._client("s3"), self.account_id()
         digest, parts, buffer, total = hashlib.sha256(), [], bytearray(), 0
 
         def send(body):
             self._check_deadline(deadline, "archive upload")
             number = len(parts) + 1
-            response = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=number, Body=body)
+            response = s3.upload_part(
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+                PartNumber=number,
+                Body=body,
+                ExpectedBucketOwner=owner,
+            )
             parts.append({"ETag": response["ETag"], "PartNumber": number})
 
         for chunk in chunks:
@@ -1122,18 +1167,23 @@ class ImageAws:
         # The last part can cross the deadline while it uploads, and the per-part
         # check above ran before it: a late upload must not be completed.
         self._check_deadline(deadline, "archive upload")
-        s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts})
+        s3.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts}, ExpectedBucketOwner=owner
+        )
         return ArchiveUpload(key=key, size=total, sha256=digest.hexdigest())
 
     def _discard_upload(self, bucket, key, upload_id):
         """Abort the upload and delete the key. True only when both calls succeeded."""
-        s3 = self._client("s3")
+        s3, owner = self._client("s3"), self.account_id()
         clean = True
         # A completion whose response was lost may have created the object, so
         # the delete runs whether or not the abort found an upload.
         for call, arguments in (
-            (s3.abort_multipart_upload, {"Bucket": bucket, "Key": key, "UploadId": upload_id}),
-            (s3.delete_object, {"Bucket": bucket, "Key": key}),
+            (
+                s3.abort_multipart_upload,
+                {"Bucket": bucket, "Key": key, "UploadId": upload_id, "ExpectedBucketOwner": owner},
+            ),
+            (s3.delete_object, {"Bucket": bucket, "Key": key, "ExpectedBucketOwner": owner}),
         ):
             try:
                 call(**arguments)

@@ -212,7 +212,7 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 #### Scenario: A backlog of owed deletions is bounded
 - **WHEN** more archive deletions are owed than one pass may start, or refused deletions take the time that the pass leaves
 - **THEN** the pass starts at most 8 deletions after its own work, and none once the pass deadline is less than 40 seconds away (the read timeout of the SDK client plus a margin), reading the clock before each
-- **AND** the pass notes `archive:delete_deferred`, and a row refused in this pass is not tried again in it
+- **AND** the pass notes `archive:delete_deferred`, and a row whose deletion this pass attempted is not tried again in it, whatever the clock says
 
 #### Scenario: The owed deletions come after the work of the pass
 - **WHEN** a finished build owes an archive deletion that times out and the pass has a decision, a stage or a build to run
@@ -245,6 +245,11 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 #### Scenario: The upload fails
 - **WHEN** a part upload fails
 - **THEN** the upload is aborted and no builder is launched
+
+#### Scenario: A staging call is bound to the account that owns the bucket
+- **WHEN** a pass makes an S3 call against a staging bucket: the upload, its abort, a delete or a listing
+- **THEN** the call names the account of the image identity as the expected bucket owner, read once per pass from `GetCallerIdentity`, and no call goes out without it
+- **AND** an `AccessDenied` answer sends nothing more and gives `IMAGE_STAGING_BUCKET_DENIED`: a stage done again ends its row as a refused start with no failure counted, a first stage fails the build, and a refused delete counts as failed and stays owed
 
 #### Scenario: The build ends
 - **WHEN** a build whose row records an archive key reaches `candidate` or `failed`

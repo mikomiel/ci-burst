@@ -29,7 +29,7 @@ from ci_burst.image_state import PIN_RECORD_REASON, ImageState
 from ci_burst.image_status import VERSION_NOT_FOUND
 
 from support import write_config
-from test_image_aws import ProviderError
+from test_image_aws import ACCOUNT, ProviderError
 from test_image_pipeline import (
     BUCKET,
     DAY,
@@ -445,7 +445,9 @@ class RunApplyTests(CliCase):
         code, payload = self.invoke("image", "run", "--apply")
         self.assertEqual((code, payload["decision"], payload["reason"]), (2, "refused", "IMAGE_GATE_REQUIRED"))
         self.assertEqual(payload["reconcile"]["owed_archives_deleted"], 1)
-        self.assertEqual(self.world.arguments("delete_object")[-1], {"Bucket": BUCKET, "Key": key})
+        self.assertEqual(
+            self.world.arguments("delete_object")[-1], {"Bucket": BUCKET, "Key": key, "ExpectedBucketOwner": ACCOUNT}
+        )
         self.assertEqual(self.world.names(world_mark), ["delete_object"])
         self.assertEqual(self.source.calls[source_mark:], [])
         self.assertEqual(payload["pin_evidence"], {"recorded": False, "reason": "IMAGE_CLEANUP_ONLY"})

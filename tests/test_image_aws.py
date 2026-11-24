@@ -70,6 +70,7 @@ DEPLOYMENT = "test-deployment"
 REGION = "eu-central-1"
 PROFILE = "example-image-profile"
 BUCKET = "example-ci-burst-staging"
+ACCOUNT = "111122223333"
 PREFIX = "warm-archives/"
 NOW = 1_800_000_000.0
 
@@ -293,31 +294,61 @@ class FakeS3:
         if name in self.errors:
             raise self.errors[name]
 
-    def create_multipart_upload(self, *, Bucket, Key):
-        self._enter("create_multipart_upload", dict(Bucket=Bucket, Key=Key))
+    def create_multipart_upload(self, *, Bucket, Key, ExpectedBucketOwner):
+        self._enter("create_multipart_upload", dict(Bucket=Bucket, Key=Key, ExpectedBucketOwner=ExpectedBucketOwner))
         return {"UploadId": "upload-0001"}
 
-    def upload_part(self, *, Bucket, Key, UploadId, PartNumber, Body):
-        self._enter("upload_part", dict(Bucket=Bucket, Key=Key, UploadId=UploadId, PartNumber=PartNumber, Body=Body))
+    def upload_part(self, *, Bucket, Key, UploadId, PartNumber, Body, ExpectedBucketOwner):
+        self._enter(
+            "upload_part",
+            dict(
+                Bucket=Bucket,
+                Key=Key,
+                UploadId=UploadId,
+                PartNumber=PartNumber,
+                Body=Body,
+                ExpectedBucketOwner=ExpectedBucketOwner,
+            ),
+        )
         if self.fail_part == PartNumber:
             raise ProviderError("SlowDown")
         self.uploaded.append(bytes(Body))
         return {"ETag": f"etag-{PartNumber}"}
 
-    def complete_multipart_upload(self, *, Bucket, Key, UploadId, MultipartUpload):
-        self._enter("complete_multipart_upload", dict(Bucket=Bucket, Key=Key, UploadId=UploadId, MultipartUpload=MultipartUpload))
+    def complete_multipart_upload(self, *, Bucket, Key, UploadId, MultipartUpload, ExpectedBucketOwner):
+        self._enter(
+            "complete_multipart_upload",
+            dict(
+                Bucket=Bucket,
+                Key=Key,
+                UploadId=UploadId,
+                MultipartUpload=MultipartUpload,
+                ExpectedBucketOwner=ExpectedBucketOwner,
+            ),
+        )
         return {}
 
-    def abort_multipart_upload(self, *, Bucket, Key, UploadId):
-        self._enter("abort_multipart_upload", dict(Bucket=Bucket, Key=Key, UploadId=UploadId))
+    def abort_multipart_upload(self, *, Bucket, Key, UploadId, ExpectedBucketOwner):
+        self._enter(
+            "abort_multipart_upload",
+            dict(Bucket=Bucket, Key=Key, UploadId=UploadId, ExpectedBucketOwner=ExpectedBucketOwner),
+        )
         return {}
 
-    def delete_object(self, *, Bucket, Key):
-        self._enter("delete_object", dict(Bucket=Bucket, Key=Key))
+    def delete_object(self, *, Bucket, Key, ExpectedBucketOwner):
+        self._enter("delete_object", dict(Bucket=Bucket, Key=Key, ExpectedBucketOwner=ExpectedBucketOwner))
         return {}
 
-    def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
-        self._enter("list_objects_v2", dict(Bucket=Bucket, Prefix=Prefix, ContinuationToken=ContinuationToken))
+    def list_objects_v2(self, *, Bucket, Prefix, ExpectedBucketOwner, ContinuationToken=None):
+        self._enter(
+            "list_objects_v2",
+            dict(
+                Bucket=Bucket,
+                Prefix=Prefix,
+                ExpectedBucketOwner=ExpectedBucketOwner,
+                ContinuationToken=ContinuationToken,
+            ),
+        )
         index = int(ContinuationToken or 0)
         return self.pages[index]
 
@@ -352,18 +383,32 @@ class FailingCredentials:
         raise self.error
 
 
+class FakeSts:
+    def __init__(self, calls, account=ACCOUNT):
+        self.calls = calls
+        self.account = account
+        self.errors = {}
+
+    def get_caller_identity(self):
+        self.calls.append(("get_caller_identity", {}))
+        if "get_caller_identity" in self.errors:
+            raise self.errors["get_caller_identity"]
+        return {"Account": self.account, "Arn": "arn:aws:sts::" + str(self.account) + ":assumed-role/example/session"}
+
+
 class FakeSession:
-    def __init__(self, calls, ec2, s3, credentials=None):
+    def __init__(self, calls, ec2, s3, credentials=None, sts=None):
         self.calls = calls
         self.ec2 = ec2
         self.s3 = s3
+        self.sts = sts if sts is not None else FakeSts(calls)
         self.credentials = credentials
         self.services = []
 
     def client(self, service, region_name=None, config=None):
         self.services.append(service)
         self.calls.append(("session.client", {"service": service, "region": region_name}))
-        return {"ec2": self.ec2, "s3": self.s3}[service]
+        return {"ec2": self.ec2, "s3": self.s3, "sts": self.sts}[service]
 
     def get_credentials(self):
         return self.credentials
@@ -423,6 +468,7 @@ class Base(unittest.TestCase):
             clients={"ec2": self.ec2, "s3": self.s3},
             clock=self.clock,
             expiry=expiry if expiry is not None else NOW + 3600,
+            account=ACCOUNT,
         )
         values.update(overrides)
         return ImageAws(REGION, PROFILE, **values)
@@ -472,17 +518,16 @@ class SessionTests(Base):
             second._client("ec2")
         self.assertEqual(profiles, [PROFILE, PROFILE])
 
-    def test_clients_use_the_region_and_only_ec2_and_s3_exist(self):
+    def test_clients_use_the_region_and_only_ec2_s3_and_sts_exist(self):
         session = FakeSession(self.calls, self.ec2, self.s3)
         with mock.patch.object(aws_module, "_sdk_config", return_value=object()) as config:
             aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session)
             aws._client("ec2")
             aws._client("s3")
+            aws._client("sts")
             with self.assertRaises(ValueError):
                 aws._client("iam")
-            with self.assertRaises(ValueError):
-                aws._client("sts")
-        self.assertEqual(session.services, ["ec2", "s3"])
+        self.assertEqual(session.services, ["ec2", "s3", "sts"])
         self.assertEqual({arguments["region"] for arguments in self.requests("session.client")}, {REGION})
         # The bucket client signs with SigV4 and both clients are bounded in time.
         self.assertEqual(config.call_args_list[1].kwargs["signature_version"], "s3v4")
@@ -602,11 +647,11 @@ class SessionTests(Base):
             aws.deregister_image("ami-0123456789abcdef0")
             aws.delete_snapshot("snap-0123456789abcdef0")
             aws.terminate([instance_id])
-        self.assertEqual(set(session.services), {"ec2", "s3"})
+        self.assertEqual(set(session.services), {"ec2", "s3", "sts"})
 
     def test_the_module_creates_no_iam_client(self):
         source = Path(aws_module.__file__).read_text(encoding="utf-8")
-        self.assertNotIn('"iam"', source.replace('IMAGE_SERVICES = frozenset({"ec2", "s3"})', ""))
+        self.assertNotIn('"iam"', source.replace('IMAGE_SERVICES = frozenset({"ec2", "s3", "sts"})', ""))
         self.assertNotIn("'iam'", source)
 
 
@@ -1292,7 +1337,9 @@ class ArchiveTests(Base):
         self.assertNotIn("complete_multipart_upload", self.names())
         (abort,) = self.requests("abort_multipart_upload")
         self.assertEqual(abort["UploadId"], "upload-0001")
-        self.assertEqual(self.requests("delete_object"), [{"Bucket": BUCKET, "Key": self.KEY}])
+        self.assertEqual(
+            self.requests("delete_object"), [{"Bucket": BUCKET, "Key": self.KEY, "ExpectedBucketOwner": ACCOUNT}]
+        )
         # Nothing past the cap was uploaded.
         self.assertLessEqual(sum(len(part) for part in self.s3.uploaded), 100)
 
@@ -1586,7 +1633,132 @@ class ArchiveTests(Base):
 
     def test_delete_names_one_key(self):
         self.image_aws().delete_object(BUCKET, self.KEY)
-        self.assertEqual(self.requests("delete_object"), [{"Bucket": BUCKET, "Key": self.KEY}])
+        self.assertEqual(
+            self.requests("delete_object"), [{"Bucket": BUCKET, "Key": self.KEY, "ExpectedBucketOwner": ACCOUNT}]
+        )
+
+
+class StagingOwnerTests(Base):
+    """Every S3 call of the adapter names the account of the image identity as the bucket's owner."""
+
+    KEY = PREFIX + "build-0001.tar.gz"
+    OTHER = "999988887777"
+
+    def s3_requests(self):
+        return [
+            (name, arguments)
+            for name, arguments in self.calls
+            if name
+            in (
+                "create_multipart_upload",
+                "upload_part",
+                "complete_multipart_upload",
+                "abort_multipart_upload",
+                "delete_object",
+                "list_objects_v2",
+            )
+        ]
+
+    def assert_every_call_names_the_account(self, expected):
+        calls = self.s3_requests()
+        self.assertEqual({name for name, _ in calls}, set(expected))
+        for name, arguments in calls:
+            with self.subTest(call=name):
+                self.assertEqual(arguments["ExpectedBucketOwner"], ACCOUNT)
+
+    def test_an_upload_names_the_account_on_every_call(self):
+        self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10)
+        self.assert_every_call_names_the_account(
+            ["create_multipart_upload", "upload_part", "complete_multipart_upload"]
+        )
+
+    def test_the_cleanup_of_an_upload_names_the_account_on_the_abort_and_on_the_delete(self):
+        with self.assertRaises(ProviderRefusal):
+            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 60, b"y" * 60], max_bytes=100, part_bytes=10)
+        self.assert_every_call_names_the_account(
+            ["create_multipart_upload", "upload_part", "abort_multipart_upload", "delete_object"]
+        )
+
+    def test_a_listing_and_a_delete_name_the_account(self):
+        self.s3.pages = [{"Contents": []}]
+        aws = self.image_aws()
+        aws.list_objects(BUCKET, PREFIX)
+        aws.delete_object(BUCKET, self.KEY)
+        self.assert_every_call_names_the_account(["list_objects_v2", "delete_object"])
+
+    def test_the_account_is_asked_of_the_identity_once_and_every_call_carries_it(self):
+        session = FakeSession(self.calls, self.ec2, self.s3, sts=FakeSts(self.calls, account=ACCOUNT))
+        with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
+            aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clock=self.clock)
+            self.s3.pages = [{"Contents": []}]
+            aws.list_objects(BUCKET, PREFIX)
+            aws.delete_object(BUCKET, self.KEY)
+            aws.put_archive(BUCKET, self.KEY, [b"x" * 5], max_bytes=100, part_bytes=10)
+        self.assertEqual(self.names().count("get_caller_identity"), 1)
+        self.assertLess(self.names().index("get_caller_identity"), self.names().index("list_objects_v2"))
+        self.assert_every_call_names_the_account(
+            ["list_objects_v2", "delete_object", "create_multipart_upload", "upload_part", "complete_multipart_upload"]
+        )
+
+    def test_an_account_that_is_unknown_sends_no_s3_call_and_no_call_goes_out_without_it(self):
+        failing = FakeSts(self.calls)
+        failing.errors["get_caller_identity"] = ProviderError("AccessDenied")
+        malformed = FakeSts(self.calls, account="not-an-account")
+        absent = FakeSts(self.calls, account=None)
+        operations = {
+            "put_archive": lambda aws: aws.put_archive(BUCKET, self.KEY, [b"x"], max_bytes=100),
+            "list_objects": lambda aws: aws.list_objects(BUCKET, PREFIX),
+            "delete_object": lambda aws: aws.delete_object(BUCKET, self.KEY),
+        }
+        for label, sts in (("failing", failing), ("malformed", malformed), ("absent", absent)):
+            for name, operation in operations.items():
+                with self.subTest(sts=label, operation=name):
+                    session = FakeSession(self.calls, self.ec2, self.s3, sts=sts)
+                    with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
+                        aws = ImageAws(REGION, PROFILE, session_factory=lambda profile, s=session: s, clock=self.clock)
+                        with self.assertRaises(ProviderRefusal):
+                            operation(aws)
+        self.assertEqual(self.s3_requests(), [])
+
+    def test_a_bucket_of_another_account_refuses_an_upload_before_anything_is_sent(self):
+        self.s3.errors["create_multipart_upload"] = ProviderError("AccessDenied")
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10)
+        refusal = raised.exception
+        self.assertEqual((refusal.reason, refusal.detail, refusal.uncertain), ("IMAGE_STAGING_BUCKET_DENIED", "AccessDenied", False))
+        self.assertNotIn(LEAKY_MESSAGE, str(refusal))
+        # One refused call: no part, no completion, no cleanup, and no second try without the owner.
+        self.assertEqual([name for name, _ in self.s3_requests()], ["create_multipart_upload"])
+        self.assertEqual(self.s3.uploaded, [])
+
+    def test_a_bucket_that_changes_owner_between_parts_is_the_same_refusal_and_is_cleaned_up(self):
+        self.s3.errors["upload_part"] = ProviderError("AccessDenied")
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10)
+        self.assertEqual(raised.exception.reason, "IMAGE_STAGING_BUCKET_DENIED")
+        self.assertNotIn("complete_multipart_upload", self.names())
+        self.assert_every_call_names_the_account(
+            ["create_multipart_upload", "upload_part", "abort_multipart_upload", "delete_object"]
+        )
+
+    def test_a_delete_and_a_listing_that_the_owner_check_refuses_are_refusals_with_the_same_reason(self):
+        self.s3.errors["delete_object"] = ProviderError("AccessDenied")
+        with self.assertRaises(ProviderRefusal) as deleted:
+            self.image_aws().delete_object(BUCKET, self.KEY)
+        self.assertEqual((deleted.exception.reason, deleted.exception.uncertain), ("IMAGE_STAGING_BUCKET_DENIED", False))
+        self.s3.errors["list_objects_v2"] = ProviderError("AccessDenied")
+        with self.assertRaises(ProviderRefusal) as listed:
+            self.image_aws().list_objects(BUCKET, PREFIX)
+        self.assertEqual((listed.exception.reason, listed.exception.uncertain), ("IMAGE_STAGING_BUCKET_DENIED", True))
+        # Each was asked once, with the owner.
+        self.assertEqual([name for name, _ in self.s3_requests()], ["delete_object", "list_objects_v2"])
+        self.assert_every_call_names_the_account(["delete_object", "list_objects_v2"])
+
+    def test_another_s3_error_keeps_its_own_reason(self):
+        self.s3.errors["delete_object"] = ProviderError("SlowDown")
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.image_aws().delete_object(BUCKET, self.KEY)
+        self.assertNotEqual(raised.exception.reason, "IMAGE_STAGING_BUCKET_DENIED")
 
 
 class PresignTests(Base):

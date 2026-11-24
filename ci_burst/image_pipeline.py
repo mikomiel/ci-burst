@@ -984,9 +984,9 @@ class ImagePipeline:
             return self.plan(force=force)
         script = self._inputs(apply=True)
         opened = not self._state.available
-        self._state.connect()
         try:
-            self._state.acquire_writer()
+            self._state.acquire_writer()  # before the writable open, which rolls back a hot journal
+            self._state.connect()
             return _Pass(self, script, force).run()
         finally:
             self._state.release_writer()

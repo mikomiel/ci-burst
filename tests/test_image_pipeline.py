@@ -738,9 +738,15 @@ class BuildEndedBeforeTheLock(ImageState):
     """A state file whose active build ends, in another process, after the peek and before the writer lock is taken."""
 
     def acquire_writer(self):
-        active = self.active_build(DEPLOYMENT)
-        if active is not None:
-            self.advance_build(active.id, state="failed", reason_code="CONSOLE_BLIND")
+        if self._lock_fd is None:
+            other = ImageState(self.directory, clock=self._clock)  # the other process
+            try:
+                other.connect()
+                active = other.active_build(DEPLOYMENT)
+                if active is not None:
+                    other.advance_build(active.id, state="failed", reason_code="CONSOLE_BLIND")
+            finally:
+                other.close()
         return super().acquire_writer()
 
 

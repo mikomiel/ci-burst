@@ -1039,9 +1039,9 @@ def _write(snapshot, state, clock, events, version, rollback):
     if not state.probe_for_write():
         raise _missing_state(rollback)
     with file_lock(snapshot.target):
-        state.connect()
         try:
-            state.acquire_writer()
+            state.acquire_writer()  # before the writable open, which rolls back a hot journal
+            state.connect()
             # The first read decided only the two refusals above. Every other fact comes from bytes
             # read now, with both locks held: a promotion that finished after the first read must
             # not make its own pending row look aborted.

@@ -262,8 +262,8 @@ def _resolve_journal(config, state):
     """
     if not state.probe_for_write():
         return []
+    state.acquire_writer()  # before the writable open, which rolls back a hot journal
     state.connect()
-    state.acquire_writer()
     state.journal_check()
     return image_promote.resolve_pending(state, image_promote.read_snapshot(config).sha256)
 

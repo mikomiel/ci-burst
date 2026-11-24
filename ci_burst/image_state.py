@@ -207,6 +207,9 @@ class ImageState:
         during reconcile, not from this file. A file at any other schema
         version is refused before it is written, so a newer image release's
         file is never altered by an older one.
+
+        A writable open rolls back a hot journal that a process left when it stopped inside a commit, so a
+        command takes the writer lock (``acquire_writer``) before it calls this.
         """
         if self._connection is not None:
             return self
@@ -303,25 +306,30 @@ class ImageState:
     def probe_for_write(self):
         """Say whether there is a state file to write, as ``connect_readonly`` does, and leave the state closed.
 
-        A writing command calls this before it takes its locks. When a process stopped inside a commit, the file has
-        a hot rollback journal, which a read-only open cannot roll back (``IMAGE_STATE_RECOVERY_NEEDED``). Here the
-        writer lock is taken first, so no live writer is in the middle of that commit, and a writable open rolls the
-        journal back. ``IMAGE_STATE_LOCKED`` refuses when another process holds the lock, and the journal is then
-        left as it is. With no state file, nothing is created.
+        A writing command calls this before it takes its locks, to refuse without creating anything when there is
+        no state file. A file with a hot rollback journal (``IMAGE_STATE_RECOVERY_NEEDED`` on a read-only open) is
+        a file to write: the command's own ``connect``, under the writer lock, rolls the journal back.
         """
         try:
             present = self.connect_readonly()
         except StateRefusal as refusal:
             if refusal.reason != STATE_RECOVERY_NEEDED:
                 raise
-            try:
-                self.acquire_writer()
-                self.connect()  # the first read through a writable connection rolls the journal back
-            finally:
-                self.close()
-            present = self.connect_readonly()
+            present = True
         self.close()
         return present
+
+    def refuse_a_hot_journal(self):
+        """Refuse ``IMAGE_STATE_RECOVERY_NEEDED`` when the file has a hot journal, through a separate read-only open.
+
+        For a caller that holds the writer lock and must not roll a journal back (plain ``status``): it keeps its
+        lock, and no connection is left open.
+        """
+        probe = ImageState(self.directory, clock=self._clock)
+        try:
+            probe.connect_readonly()
+        finally:
+            probe.close()
 
     def detached_copy(self):
         """A copy of the open database in memory, as an ``ImageState`` of its own: a view to plan against.

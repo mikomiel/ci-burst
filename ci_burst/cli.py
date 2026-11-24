@@ -197,6 +197,7 @@ def _image(config, arguments):
     """Dispatch one ``image`` command. A deployment without the image path answers ``disabled`` at once."""
     if not config.image.enabled:
         return {"decision": "disabled"}
+    image_promote.check_not_mounted(config)
     state = ImageState(config.image.state_directory, clock=image_clock)
     command = arguments.image_command
     if command == "status":

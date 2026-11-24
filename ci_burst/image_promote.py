@@ -70,6 +70,9 @@ PROMOTE_PIN_LINE_AMBIGUOUS = "PROMOTE_PIN_LINE_AMBIGUOUS"
 PROMOTE_REPARSE_FAILED = "PROMOTE_REPARSE_FAILED"
 PROMOTE_FILE_CHANGED = "PROMOTE_FILE_CHANGED"
 PROMOTE_FILE_STALE = "PROMOTE_FILE_STALE"
+#: Every ``image`` command refuses a deployment file that is itself a mount point (#202).
+IMAGE_CONFIG_MOUNTED = "IMAGE_CONFIG_MOUNTED"
+_MOUNTINFO = Path("/proc/self/mountinfo")
 PROMOTE_DIRECTORY_NOT_DEDICATED = "PROMOTE_DIRECTORY_NOT_DEDICATED"
 PROMOTE_BUSY = "PROMOTE_BUSY"
 PROMOTE_WRITE_FAILED = "PROMOTE_WRITE_FAILED"
@@ -156,7 +159,7 @@ def _read_open_file(config, target, descriptor):
         chunks = []
         while chunk := os.read(descriptor, 1 << 16):
             chunks.append(chunk)
-        linked = os.fstat(descriptor).st_nlink > 0
+        linked = still_named(descriptor, target)
         data = b"".join(chunks)
         text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError) as error:
@@ -186,6 +189,63 @@ def _read_open_file(config, target, descriptor):
         gid=metadata.st_gid,
         identity=_identity(metadata),
     )
+
+
+def still_named(descriptor, path):
+    """Whether, after its bytes were read, the open file is still the one that ``path`` names.
+
+    The open file must keep a link, and a fresh ``stat`` of the path must give its device and inode. A replacement by a
+    rename during or before the read fails the second check even when another name (a hard link an operator kept, or
+    the inode of a file bind mount) still holds the old file (#202).
+    """
+    held = os.fstat(descriptor)
+    if held.st_nlink == 0:
+        return False
+    try:
+        named = os.stat(path)
+    except OSError:
+        return False
+    return (named.st_dev, named.st_ino) == (held.st_dev, held.st_ino)
+
+
+def _unescape_mount_point(field):
+    """A mount point of ``/proc/self/mountinfo``: space, tab, line feed and backslash are octal escapes there."""
+    for escape, character in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+        field = field.replace(escape, character)
+    return field
+
+
+def is_mount_point(path):
+    """Whether the file that ``path`` resolves to is itself a mount point, as a bind mount of the file makes it.
+
+    The mount table of the process decides: a bind mount of one file from the same file system is invisible to a
+    device comparison. Without the table (not Linux, or no ``/proc``) the device comparison of ``os.path.ismount``
+    decides.
+    """
+    target = os.path.realpath(path)
+    try:
+        table = _MOUNTINFO.read_text(encoding="utf-8")
+    except OSError:
+        return os.path.ismount(target)
+    for line in table.splitlines():
+        fields = line.split(" ")
+        if len(fields) > 4 and _unescape_mount_point(fields[4]) == target:
+            return True
+    return False
+
+
+def check_not_mounted(config):
+    """Refuse ``IMAGE_CONFIG_MOUNTED`` when the deployment file is itself a mount point.
+
+    A bind mount of the file keeps serving the inode it mounted, so after a rename elsewhere (``promote --write``, an
+    editor's atomic save) every read gives old bytes, and an old pin or hash can resolve a journal row the wrong way or
+    leave a pinned image unprotected. A mount of its directory always shows the current file. The detail names no path.
+    """
+    if is_mount_point(config.path):
+        raise ImageRefusal(
+            IMAGE_CONFIG_MOUNTED,
+            "the deployment file is itself a mount point; mount its dedicated directory, not the file, and run again",
+        )
 
 
 def _identity(metadata):

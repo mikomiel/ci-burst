@@ -47,6 +47,7 @@ from dataclasses import InitVar, dataclass, field
 from .aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
 from .config import loads
 from .errors import ConfigRefusal, ImageRefusal, ProviderRefusal
+from .image_promote import still_named
 from .image_state import ACTIVE_STATES
 from .image_template import TEMPLATE_DRIFT
 
@@ -116,6 +117,9 @@ class ProtectedSet:
     image_ids: frozenset
     _proof: InitVar[object] = None
     _resolved: object = field(default=None, init=False, repr=False, compare=False)
+    #: The deployment file the set was resolved from, and its identity then (``check_unchanged``).
+    _config_path: object = field(default=None, init=False, repr=False, compare=False)
+    _config_identity: object = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self, proof):
         if proof is not _PROVENANCE or not isinstance(self.image_ids, frozenset) or not self.image_ids:
@@ -132,11 +136,13 @@ def _is_resolved(protected):
 
 
 def _load_deployment(config_path):
-    """The deployment configuration, read from one open file whose link count is checked after the read.
+    """The deployment configuration and the identity of the file it came from, read from one open file.
 
     A bind mount of the file itself keeps the inode that was mounted. Once a rename elsewhere replaced the file,
-    that inode has no name left, and its pins and the journal rows that a pass resolved from it are old. The check
-    runs on the descriptor that supplied the bytes, after they were read, so a replacement during the read is seen.
+    its pins and the journal rows that a pass resolved from it are old. After the read the descriptor that supplied
+    the bytes must keep a link and still be the file the path names (``still_named``), so a replacement during the
+    read is seen, even when a hard link keeps the old file. The identity lets ``check_unchanged`` see a change after
+    the read.
     """
     unreadable = "the deployment configuration could not be loaded"
     try:
@@ -147,7 +153,8 @@ def _load_deployment(config_path):
         chunks = []
         while chunk := os.read(descriptor, 1 << 16):
             chunks.append(chunk)
-        stale = os.fstat(descriptor).st_nlink == 0
+        stale = not still_named(descriptor, config_path)
+        identity = _identity(os.fstat(descriptor))
     except OSError:
         raise _unsafe(unreadable) from None
     finally:
@@ -155,9 +162,28 @@ def _load_deployment(config_path):
     if stale:
         raise _unsafe("the deployment file is a view of a file that was replaced")
     try:
-        return loads(b"".join(chunks).decode("utf-8"), config_path)
+        return loads(b"".join(chunks).decode("utf-8"), config_path), identity
     except (UnicodeDecodeError, ConfigRefusal):
         raise _unsafe(unreadable) from None
+
+
+def _identity(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns, metadata.st_mtime_ns, metadata.st_size)
+
+
+def check_unchanged(protected):
+    """Refuse ``IMAGE_DELETION_UNSAFE`` unless the deployment file is still the one ``protected`` was resolved from.
+
+    ``protected_set`` reads the pins, then the provider; the deletions come after. A hand edit or a replacement of
+    the file in between can pin an image that the set does not protect, so the caller checks right before it acts:
+    the path must give the same device, inode, change and modification times and size (#202).
+    """
+    try:
+        current = _identity(os.stat(protected._config_path))
+    except (OSError, TypeError):
+        current = None
+    if current is None or current != protected._config_identity:
+        raise _unsafe("the deployment file changed after the protected set was read")
 
 
 def protected_set(
@@ -223,7 +249,7 @@ def protected_set(
     (see ``ProtectedSet``). A refusal of the deadline passes unchanged. The
     detail names a version number at most, never a provider message.
     """
-    config = _load_deployment(config_path)
+    config, identity = _load_deployment(config_path)
     pins = [config.aws.launch_template_version]
     pins.extend(zone.launch_template_version for zone in config.aws.zones)
     if previous_pin is not None:
@@ -254,7 +280,10 @@ def protected_set(
         image_ids.add(candidate.image_id)
     if active is not None and active.image_id is not None:
         image_ids.add(active.image_id)
-    return ProtectedSet(frozenset(image_ids), _PROVENANCE)
+    protected = ProtectedSet(frozenset(image_ids), _PROVENANCE)
+    object.__setattr__(protected, "_config_path", config_path)
+    object.__setattr__(protected, "_config_identity", identity)
+    return protected
 
 
 def plan_deletions(images, snapshots, protected, *, deployment, mode, now, config, builds):

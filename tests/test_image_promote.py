@@ -1872,6 +1872,189 @@ class StaleViewTests(PromoteCase):
             self.refusal((), "PROMOTE_FILE_STALE", write=False)
 
 
+class StateOwnerTests(PromoteCase):
+    """The state and the events that a command opened belong to the file that it plans from (#199)."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        self.other_state = self.dir / "other-state"
+
+    def moved_state(self, text):
+        return text.replace(str(self.state_dir), str(self.other_state))
+
+    def renamed_deployment(self, text):
+        renamed = re.sub(r'(?m)^deployment = "[^"]*"$', 'deployment = "renamed-deployment"', text, count=1)
+        self.assertNotEqual(renamed, text)
+        return renamed
+
+    @contextlib.contextmanager
+    def changed_before_the_snapshot(self, change):
+        """The file changes after the command line loaded it and before ``promote`` reads it."""
+        real = image_promote.read_snapshot
+        calls = []
+
+        def read_snapshot(config, **keywords):
+            if not calls:
+                self.config_path.write_text(change(self.config_path.read_text(encoding="utf-8")), encoding="utf-8")
+            calls.append(True)
+            return real(config, **keywords)
+
+        with mock.patch.object(image_promote, "read_snapshot", read_snapshot):
+            yield calls
+
+    def untouched(self):
+        """The tables, the events and the names in the deployment directory; the test itself edits the file."""
+        names = sorted(name for name in snapshot_tree(self.config_dir) if not name.endswith(".lock"))
+        return self.dump(), self.promoted_events(), names
+
+    def refused(self, arguments, *, write, change):
+        original = self.config_path.read_bytes()
+        try:
+            before = self.untouched()
+            with self.changed_before_the_snapshot(change) as calls:
+                code, payload = (self.write_pin if write else self.show)(*arguments)
+            self.assertEqual(calls, [True], "refused at the first read")
+            self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_STATE_CHANGED"), payload)
+            self.assertEqual(self.untouched(), before)
+            for path in (self.state_dir, self.other_state, self.config_dir):
+                self.assertNotIn(str(path), json.dumps(payload))
+            self.assertFalse(self.other_state.exists(), "the state the file names now is not created")
+            self.assertEqual(self.backups(), [])
+            self.assertEqual(self.journal_rows(), [])
+        finally:
+            self.config_path.write_bytes(original)
+
+    def test_a_state_directory_changed_before_the_snapshot_is_refused_by_every_form(self):
+        for arguments, write in (((), False), ((), True), (("--rollback",), True), (("--rollback",), False)):
+            with self.subTest(arguments=arguments, write=write):
+                self.refused(arguments, write=write, change=self.moved_state)
+
+    def test_a_deployment_renamed_before_the_snapshot_is_refused(self):
+        for write in (False, True):
+            with self.subTest(write=write):
+                self.refused((), write=write, change=self.renamed_deployment)
+
+    def refused_under_the_locks(self, change, *arguments):
+        """The first read passes; ``change`` runs once the write holds the lock of the file, before it takes the
+        writer lock of the state and reads the file again."""
+        real = image_promote.file_lock
+
+        @contextlib.contextmanager
+        def changed_once_locked(target):
+            with real(target):
+                change()
+                yield
+
+        before = self.untouched()
+        with mock.patch.object(image_promote, "file_lock", changed_once_locked):
+            code, payload = self.write_pin(*arguments)
+        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_STATE_CHANGED"), payload)
+        self.assertEqual(self.untouched(), before)
+        self.assertEqual(self.journal_rows(), [])
+        self.assertEqual(self.backups(), [])
+        self.assertFalse(self.other_state.exists())
+        for path in (self.state_dir, self.other_state, self.config_dir):
+            self.assertNotIn(str(path), json.dumps(payload))
+
+    def edit(self, change):
+        self.config_path.write_text(change(self.config_path.read_text(encoding="utf-8")), encoding="utf-8")
+
+    def test_a_state_directory_changed_under_the_locks_is_refused_and_nothing_is_written(self):
+        for arguments in ((), ("--rollback",)):
+            with self.subTest(arguments=arguments):
+                original = self.config_path.read_bytes()
+                self.refused_under_the_locks(lambda: self.edit(self.moved_state), *arguments)
+                self.config_path.write_bytes(original)
+
+    def test_a_deployment_renamed_under_the_locks_is_refused(self):
+        self.refused_under_the_locks(lambda: self.edit(self.renamed_deployment))
+
+    def test_under_the_locks_the_state_refusal_comes_before_a_zone_pin(self):
+        # The same order as at the first read: the owner of the state first, then the zones.
+        def pin_a_zone_and_move_the_state():
+            self.write_deployment(zones=ZONES_ONE_PINNED)
+            self.edit(self.moved_state)
+
+        self.refused_under_the_locks(pin_a_zone_and_move_the_state)
+
+    def test_a_refusal_under_the_locks_leaves_a_hot_journal_of_the_old_state_as_it_is(self):
+        # The writable open rolls a hot journal back, so the file is checked before the state is opened for writing.
+        EditTests.leave_a_hot_journal(self)
+        before = EditTests.hot_files(self)
+        real = image_promote.file_lock
+
+        @contextlib.contextmanager
+        def changed_once_locked(target):
+            with real(target):
+                self.edit(self.moved_state)
+                yield
+
+        with mock.patch.object(image_promote, "file_lock", changed_once_locked):
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_STATE_CHANGED"), payload)
+        self.assertEqual(EditTests.hot_files(self), before, "the database and its journal are byte for byte the same")
+        self.assertEqual(self.backups(), [])
+        self.assertFalse(self.other_state.exists())
+
+    def test_a_link_to_the_same_directory_named_after_the_start_is_a_change(self):
+        # The values are compared as written: a link is not followed, so another name for the same directory is
+        # refused too, and a rerun plans from the file as it is.
+        alias = self.dir / "state-alias"
+        alias.symlink_to(self.state_dir, target_is_directory=True)
+        self.refused((), write=False, change=lambda text: text.replace(str(self.state_dir), str(alias)))
+
+
+class LateFileChangeTests(PromoteCase):
+    """The write checks the path and the file again right before it resolves rows and right before the rename."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+
+    def test_a_config_link_moved_while_the_backup_is_written_is_refused(self):
+        link_directory = self.dir / "link"
+        link_directory.mkdir()
+        link = link_directory / "deployment.toml"
+        link.symlink_to(self.config_path)
+        elsewhere = self.dir / "elsewhere"
+        elsewhere.mkdir()
+        moved = elsewhere / "deployment.toml"
+        moved.write_bytes(self.config_path.read_bytes())
+        real = image_promote._create_backup
+
+        def moved_during_the_backup(*arguments, **keywords):
+            backup = real(*arguments, **keywords)
+            link.unlink()
+            link.symlink_to(moved)
+            return backup
+
+        original, dump = self.config_path.read_bytes(), self.dump()
+        with mock.patch.object(image_promote, "_create_backup", moved_during_the_backup):
+            code, payload = self.invoke("image", "promote", "--write", "--config", str(link), config=False)
+        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_FILE_CHANGED"), payload)
+        self.assertEqual(self.config_path.read_bytes(), original, "the file the link left keeps its pin")
+        self.assertEqual(moved.read_bytes(), original)
+        self.assertEqual(self.dump(), dump)
+        self.assertEqual(self.backups(), [])
+        self.assertFalse(self.temporary().exists())
+
+    def test_an_edit_after_the_locked_read_leaves_a_pending_row_pending(self):
+        self.crash_before_rename()
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        real = ImageState.journal_check
+
+        def edited_after_the_read(state):
+            result = real(state)
+            self.edit_file(b"region = ", b"# hand edit\nregion = ")
+            return result
+
+        with mock.patch.object(ImageState, "journal_check", edited_after_the_read):
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_FILE_CHANGED"), payload)
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"], "not resolved from a stale hash")
+
+
 class FreshnessTests(unittest.TestCase):
     LIMIT = 3600
 

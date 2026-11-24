@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import types
@@ -713,6 +714,105 @@ class MissingSdkTests(unittest.TestCase):
                     Aws(self.config).account_id()
         self.assertEqual(raised.exception.reason, "AWS_SDK_UNAVAILABLE")
         self.assertFalse(raised.exception.uncertain)
+
+
+SDK_SENTINEL = "sentinel-sdk-message-marker arn:aws:iam::111122223333:role/secret-name"
+
+
+class SdkFailureTests(unittest.TestCase):
+    """Building the session, a client or credentials lets only a refusal leave the adapter (#180)."""
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+        self.config = load(write_config(self.root, config={"aws": {"profile": "ci-burst-check"}}))
+
+    def sdk(self, *, session_error=None, client_error=None):
+        """A fake SDK whose session or client constructor raises; ``botocore.exceptions`` is absent."""
+        boto3_module = types.ModuleType("boto3")
+
+        class Session:
+            def __init__(self, profile_name=None):
+                if session_error is not None:
+                    raise session_error
+
+            def client(self, service, region_name=None, config=None):
+                if client_error is not None:
+                    raise client_error
+                raise AssertionError("no client may be built in this test")
+
+        boto3_module.Session = Session
+        config_module = types.ModuleType("botocore.config")
+
+        class Config:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        config_module.Config = Config
+        botocore_module = types.ModuleType("botocore")
+        botocore_module.config = config_module
+        return {"boto3": boto3_module, "botocore": botocore_module, "botocore.config": config_module}
+
+    def entries(self, aws):
+        return {
+            "client": aws._client,
+            "account_id": aws.account_id,
+            "template": lambda: aws.template("runner", 3),
+            "spot_quote": lambda: aws.spot_quote("m7g.xlarge", "eu-central-1a"),
+            "owned_instances": lambda: aws.owned_instances("test-deployment"),
+            "instances": lambda: aws.instances(["i-1"]),
+            "console_output": lambda: aws.console_output(["i-1"]),
+            "run_spot": lambda: aws.run_spot({"MinCount": 1, "MaxCount": 1}),
+            "terminate": lambda: aws.terminate(["i-1"]),
+        }
+
+    def test_an_sdk_error_while_building_the_session_or_a_client_becomes_a_definite_sanitized_refusal(self):
+        class ProfileNotFound(Exception):
+            pass
+
+        class NoCredentialsError(Exception):
+            pass
+
+        class UnknownServiceError(Exception):
+            pass
+
+        cases = {
+            "session": ({"session_error": ProfileNotFound(SDK_SENTINEL)}, "AWS_CREDENTIALS_UNAVAILABLE"),
+            "client": ({"client_error": NoCredentialsError(SDK_SENTINEL)}, "AWS_CREDENTIALS_UNAVAILABLE"),
+            "other": ({"client_error": UnknownServiceError(SDK_SENTINEL)}, "AWS_SETUP_FAILED"),
+        }
+        for where, (failure, reason) in cases.items():
+            expected = type(next(iter(failure.values()))).__name__
+            for name, call in self.entries(Aws(self.config)).items():
+                with self.subTest(where=where, entry=name):
+                    with mock.patch.dict(sys.modules, self.sdk(**failure)):
+                        with self.assertRaises(ProviderRefusal) as raised:
+                            call()
+                    refusal = raised.exception
+                    self.assertEqual((refusal.reason, refusal.detail), (reason, expected))
+                    # No request was sent, so a launch that fails here is definite and releases its slot.
+                    self.assertFalse(refusal.uncertain)
+                    self.assertIsNone(refusal.__cause__)
+                    for text in (str(refusal), repr(refusal), json.dumps(refusal.as_dict())):
+                        self.assertNotIn("sentinel-sdk-message-marker", text)
+                        self.assertNotIn("111122223333", text)
+
+    def test_a_refusal_raised_while_building_the_session_passes_unchanged(self):
+        original = ProviderRefusal("IMAGE_PROFILE_INVALID", "a synthetic refusal")
+        for name, call in self.entries(Aws(self.config)).items():
+            with self.subTest(entry=name):
+                with mock.patch.dict(sys.modules, self.sdk(session_error=original)):
+                    with self.assertRaises(ProviderRefusal) as raised:
+                        call()
+                self.assertIs(raised.exception, original)
+
+    def test_a_console_read_without_the_sdk_refuses_as_unavailable(self):
+        missing = {"boto3": None, "botocore": None, "botocore.config": None}
+        with mock.patch.dict(sys.modules, missing):
+            with self.assertRaises(ProviderRefusal) as raised:
+                Aws(self.config).console_output(["i-1"])
+        self.assertEqual(raised.exception.reason, "AWS_SDK_UNAVAILABLE")
 
 
 if __name__ == "__main__":

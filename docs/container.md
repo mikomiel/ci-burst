@@ -857,11 +857,14 @@ topology.
 - Do not mount the directory into two containers that may run `apply`. The
   writer lock is a file lock on one host, not a distributed lock, and the
   commitment budget is local.
-- A writable run upgrades a version-1, version-2 or version-3 ledger to schema
-  4 once, while holding the writer lock: it copies the file to
-  `state.sqlite3.pre-v4.<epoch>`, checks the copy's size, then migrates in one
-  transaction. If the copy fails it refuses before the first schema write, so a
-  failed upgrade leaves the file readable by the release that wrote it. A
+- A writable run upgrades a version-1, version-2, version-3 or version-4
+  ledger to schema 5 once, while holding the writer lock. The upgrade runs one
+  step per schema, and each step copies the file, checks the copy's size, then
+  migrates in one transaction: a version-1, -2 or -3 file is copied to
+  `state.sqlite3.pre-v4.<epoch>` and lands on schema 4, then every file is
+  copied to `state.sqlite3.pre-v5.<epoch>` and lands on schema 5. If a copy
+  fails the step refuses before its first schema write, so a failed upgrade
+  leaves the file readable by the release that wrote it. A
   version-1 or version-2 file first gets the schema-3 columns
   `admitted_incidental_per_hour_micros`, `admitted_buffer_micros` and
   `admitted_inputs_backfilled`, an integer that defaults to `0`. Terminal
@@ -872,10 +875,18 @@ topology.
   marked `admitted_inputs_backfilled = 1`. The mark keeps such a row's stored
   reservation as its commitment floor and is never inferred from the current
   configuration. Every upgrade also creates the `fleet_observations` table; a
-  version-3 file has no rows to backfill. `plan`, `status` and `export` accept
-  versions 1 through 4 and never create or migrate the file. Rolling the image
-  back after an upgrade requires restoring the `.pre-v4.` copy first, because
-  the previous release refuses schema 4. The version-1 upgrade also changes the
+  version-3 file has no rows to backfill. The schema-5 step adds the nullable
+  `operations.admitted_lifetime_seconds` column, which records the
+  `aws.max_lifetime_seconds` an intent was admitted under, and backfills
+  nothing: every existing row keeps `NULL`, so an unresolved intent from an
+  earlier schema is refused with `unresolved_intent_lifetime_mismatch` until an
+  operator resolves it. `plan`, `status` and `export` accept versions 1
+  through 5 and never create or migrate the file, so they keep reading an
+  earlier schema until the first writable run. Rolling the image back after an
+  upgrade requires restoring the matching copy first, because the previous
+  release refuses a schema it does not know: `.pre-v5.` returns the schema-4
+  file, and `.pre-v4.` returns the schema-1, -2 or -3 file that the schema-4
+  step started from. The version-1 upgrade also changes the
   operator-visible budget shape: the JSON `budget` block reports `spend`,
   `committed` and `remaining` instead of `consumed`, and
   `ci_burst_ledger_consumed_micros` is replaced by `ci_burst_spend_micros` plus

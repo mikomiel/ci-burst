@@ -109,13 +109,16 @@ class ControllerCase(unittest.TestCase):
         instance_id="i-seed",
         request=None,
         age=0,
+        admitted_lifetime_seconds=3600,
     ):
         """Seed one operation that was created ``age`` seconds ago.
 
         The whole timeline of the row moves back with its creation, so it has
         the lifetime and the cost of a worker created at that time. A row with
         no age is created at the clock's current time and so, in the state
-        ``starting`` or ``running``, is inside the claim grace.
+        ``starting`` or ``running``, is inside the claim grace. The row records
+        the configured lifetime it was admitted under; pass another value, or
+        ``None`` for a row from before schema 5, to seed a mismatch.
         """
         created = self.clock.now - age
         ledger = Ledger(self.config.state.database, clock=lambda: created).connect()
@@ -130,6 +133,7 @@ class ControllerCase(unittest.TestCase):
                 window_start=current_window(created, self.config.budget.window_seconds),
                 region=self.config.aws.region,
                 account="111122223333",
+                admitted_lifetime_seconds=admitted_lifetime_seconds,
             )
         if state != "intent" or instance_id:
             ledger.set_state(operation_id, state, instance_id=instance_id)
@@ -1672,7 +1676,7 @@ class FleetTests(ControllerCase):
             )
         )
 
-    def seed_intent(self, operation_id, *, expires_at, reservation):
+    def seed_intent(self, operation_id, *, expires_at, reservation, admitted_lifetime_seconds=3600):
         """Seed one unresolved intent, advancing the clock after each seed."""
         self.seed(
             state="intent",
@@ -1680,6 +1684,7 @@ class FleetTests(ControllerCase):
             operation_id=operation_id,
             expires_at=expires_at,
             reservation=reservation,
+            admitted_lifetime_seconds=admitted_lifetime_seconds,
         )
         self.clock.advance(1)
 
@@ -2058,32 +2063,64 @@ class FleetTests(ControllerCase):
         self.assertEqual(ledger.operation("second").state, "uncertain")
         self.assertEqual(ledger.operation("first").state, "intent")
 
-    def test_resume_refuses_an_intent_written_under_another_lifetime(self):
-        # An intent that an earlier configuration wrote with 1800 seconds keeps its frozen expiry tag. Once the file
+    def assert_resume_refused_for_lifetime(self, operation_id, expires_at):
+        """Apply with one seeded intent and check the refusal left it untouched."""
+        before = self.reopened().operation(operation_id)
+        controller = self.build(observation=observation_demand())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["unresolved_intent_lifetime_mismatch"])
+        self.assertEqual(result["operation"], operation_id)
+        self.assertEqual(result["expires_at"], expires_at)
+        self.assertEqual([call for call in self.aws.calls if call[0] == "run_spot"], [])
+        self.assertEqual(self.aws.mutations(), [])
+        after = self.reopened().operation(operation_id)
+        self.assertEqual(after.state, "intent", "the unresolved ownership stays")
+        self.assertEqual(after.request_json, before.request_json)
+        self.assertEqual(after.client_token, before.client_token)
+        self.assertEqual(after, before)
+
+    def test_resume_refuses_an_intent_admitted_under_another_lifetime(self):
+        # An intent that an earlier configuration admitted for 1800 seconds keeps its frozen expiry tag. Once the file
         # says 3600, apply passes the CLI check, but the intent's tag would not match the worker's own timers (#138).
         for seconds in (1800, 7200):
             with self.subTest(seconds=seconds):
                 self.setUp()
                 expiry = self.clock.now + seconds
-                self.seed_intent("legacy", expires_at=expiry, reservation=440_000)
-                controller = self.build(observation=observation_demand())
-                result = controller.apply()
-                self.assertEqual(result["decision"], "refused")
-                self.assertEqual(result["reasons"], ["unresolved_intent_lifetime_mismatch"])
-                self.assertEqual(result["operation"], "legacy")
-                self.assertEqual(result["expires_at"], expiry)
-                self.assertEqual([call for call in self.aws.calls if call[0] == "run_spot"], [])
-                self.assertEqual(self.aws.mutations(), [])
-                operation = self.reopened().operation("legacy")
-                self.assertEqual(operation.state, "intent", "the unresolved ownership stays")
-                self.assertEqual(operation.expires_at, expiry)
+                self.seed_intent("earlier", expires_at=expiry, reservation=440_000, admitted_lifetime_seconds=seconds)
+                self.assert_resume_refused_for_lifetime("earlier", expiry)
 
-    def test_resume_sends_an_intent_whose_lifetime_is_the_configured_one_up_to_its_pass(self):
-        expiry = self.clock.now + 3600 - 200  # written 200 seconds into its pass
+    def test_resume_refuses_an_intent_that_records_no_lifetime(self):
+        # A row from before schema 5 records no admitted lifetime, and its expiry less its creation time cannot stand
+        # in for one: 3400 seconds is a 3400-second intent or a 3600-second one written 200 seconds into its pass.
+        for seconds in (3400, 3600):
+            with self.subTest(seconds=seconds):
+                self.setUp()
+                expiry = self.clock.now + seconds
+                self.seed_intent("legacy", expires_at=expiry, reservation=440_000, admitted_lifetime_seconds=None)
+                self.assertIsNone(self.reopened().operation("legacy").admitted_lifetime_seconds)
+                self.assert_resume_refused_for_lifetime("legacy", expiry)
+
+    def test_resume_sends_an_intent_admitted_under_the_configured_lifetime_whenever_it_was_written(self):
+        # Written 400 seconds into its pass, so its expiry is 3200 seconds after its creation: the recorded lifetime,
+        # not the arithmetic on the timestamps, decides.
+        expiry = self.clock.now + 3600 - 400
         self.seed_intent("current", expires_at=expiry, reservation=440_000)
+        before = self.reopened().operation("current")
+        self.assertEqual(before.admitted_lifetime_seconds, 3600)
+        self.assertEqual(before.expires_at - before.created_at, 3200)
         result = self.build(observation=observation_demand()).apply()
         self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1)
         self.assertEqual(result["resumes"][0]["decision"], "resumed")
+        self.assertEqual(result["resumes"][0]["expires_at"], expiry)
+
+    def test_a_new_admission_records_the_configured_lifetime(self):
+        config = load(write_config(self.root, config={"aws": {"max_lifetime_seconds": 1800}}))
+        result = self.build(observation=observation_demand(), config=config).apply()
+        self.assertEqual(result["decision"], "launched")
+        operation = self.reopened().operation(result["launches"][0]["operation"])
+        self.assertEqual(operation.admitted_lifetime_seconds, 1800)
+        self.assertEqual(operation.expires_at - operation.created_at, 1800)
 
     def test_resume_stops_at_an_intent_whose_lifetime_elapsed(self):
         first_expiry = self.clock.now + 3600
@@ -2797,6 +2834,7 @@ class CostTrackingTests(ControllerCase):
                 region=config.aws.region,
                 account="111122223333",
                 price_micros=100_000,
+                admitted_lifetime_seconds=1800,
             )
         ledger.set_instance("a", "i-a")
         ledger.set_launch_time("a", self.clock.now)
@@ -2857,6 +2895,7 @@ class CostTrackingTests(ControllerCase):
                 region=config.aws.region,
                 account="111122223333",
                 price_micros=200_000,
+                admitted_lifetime_seconds=3600,
             )
         ledger.set_instance("a", "i-a")
         ledger.set_launch_time("a", launched)

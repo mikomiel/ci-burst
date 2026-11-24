@@ -72,9 +72,6 @@ SCOPE_CHANGED = "SCOPE_CHANGED"
 #: EC2 documents a client token as valid for 24 hours. Beyond that a retry is
 #: no longer idempotent, so the unresolved intent blocks and needs an operator.
 CLIENT_TOKEN_MAX_AGE_SECONDS = 24 * 60 * 60
-#: How much shorter than the configured lifetime an intent's own lifetime can be. An intent's expiry is fixed at its
-#: decision and its ``created_at`` when it is written, later in the same pass, and a pass ends within 300 seconds.
-INTENT_LIFETIME_SLACK_SECONDS = 300
 
 #: EC2 retains a terminated instance record for roughly an hour. Absence from a
 #: by-id read inside that window is not proof of termination; the operation
@@ -894,6 +891,7 @@ class Controller:
                     price_micros=selected.quote.price_micros,
                     admitted_incidental_per_hour_micros=self.cost.incidental_per_hour_micros,
                     admitted_buffer_micros=self.cost.buffer_micros,
+                    admitted_lifetime_seconds=self.config.aws.max_lifetime_seconds,
                 )
             # Intent is committed before the request, so a lost response is
             # recoverable and never a reason to allocate a second operation for
@@ -963,12 +961,6 @@ class Controller:
         final = self.ledger.operation(operation.id) or operation
         request = final.request()
         return request["Placement"]["AvailabilityZone"], request.get("InstanceType", "")
-
-    def _lifetime_is_configured(self, operation):
-        """Whether an intent's own lifetime is the configured one, up to the time its pass took to write it."""
-        lifetime = operation.expires_at - operation.created_at
-        configured = self.config.aws.max_lifetime_seconds
-        return configured - INTENT_LIFETIME_SLACK_SECONDS <= lifetime <= configured
 
     def _send_candidates(self, operation, plans, result, decision):
         """Attempt the ordered pools within one admission.
@@ -1098,10 +1090,11 @@ class Controller:
                 # unresolved ownership and block admission instead.
                 attempt["decision"] = "refused"
                 attempt["reasons"] = ["unresolved_intent_lifetime_elapsed"]
-            elif not self._lifetime_is_configured(operation):
-                # Written under another aws.max_lifetime_seconds: its frozen
-                # expiry tag would not match the worker's own timers (#138).
-                # Keep the unresolved ownership and block admission instead.
+            elif operation.admitted_lifetime_seconds != self.config.aws.max_lifetime_seconds:
+                # Admitted under another aws.max_lifetime_seconds, or under none
+                # on record (a row from before schema 5): its frozen expiry tag
+                # would not match the worker's own timers (#138). Fail closed:
+                # keep the unresolved ownership and block admission instead.
                 attempt["decision"] = "refused"
                 attempt["reasons"] = ["unresolved_intent_lifetime_mismatch"]
             else:

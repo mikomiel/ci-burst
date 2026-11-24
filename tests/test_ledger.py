@@ -32,6 +32,7 @@ class LedgerTestCase(unittest.TestCase):
             "window_start": current_window(self.clock_now, 86400),
             "region": "eu-central-1",
             "account": "111122223333",
+            "admitted_lifetime_seconds": 3600,
         }
         values.update(overrides)
         with self.ledger.transaction():
@@ -56,6 +57,32 @@ class SchemaTests(LedgerTestCase):
             "SELECT admitted_inputs_backfilled FROM operations WHERE id = ?", (operation.id,)
         ).fetchone()
         self.assertEqual(row[0], 0)
+
+    def test_a_new_operation_records_the_lifetime_it_was_admitted_under(self):
+        operation = self.add(admitted_lifetime_seconds=1800)
+        self.assertEqual(operation.admitted_lifetime_seconds, 1800)
+        connection = sqlite3.connect(self.path)
+        self.addCleanup(connection.close)
+        row = connection.execute(
+            "SELECT admitted_lifetime_seconds FROM operations WHERE id = ?", (operation.id,)
+        ).fetchone()
+        self.assertEqual(row[0], 1800)
+        self.assertEqual(self.add().admitted_lifetime_seconds, 3600)
+
+    def test_a_new_operation_must_state_its_lifetime(self):
+        with self.assertRaises(TypeError):
+            with self.ledger.transaction():
+                self.ledger.new_operation(
+                    operation_id="no-lifetime",
+                    client_token="ci-burst-no-lifetime",
+                    request={},
+                    request_sha256="0" * 64,
+                    expires_at=self.clock_now + 60,
+                    reservation_micros=1,
+                    window_start=current_window(self.clock_now, 86400),
+                    region="eu-central-1",
+                    account="111122223333",
+                )
 
     def test_restart_preserves_operations(self):
         operation = self.add()
@@ -88,6 +115,7 @@ class SchemaTests(LedgerTestCase):
                 window_start=current_window(self.clock_now, 86400),
                 region="eu-central-1",
                 account="111122223333",
+                admitted_lifetime_seconds=3600,
             )
         writable.close()
         reader = Ledger(path, clock=lambda: self.clock_now).connect(create=False, read_only=True)
@@ -108,6 +136,7 @@ class SchemaTests(LedgerTestCase):
                 window_start=current_window(self.clock_now, 86400),
                 region="eu-central-1",
                 account="111122223333",
+                admitted_lifetime_seconds=3600,
             )
         writable.close()
         before = sorted(item.name for item in Path(self._directory.name).iterdir())
@@ -337,6 +366,17 @@ V3_SCHEMA = """
     PRAGMA user_version = 3;
 """
 
+V4_SCHEMA = V3_SCHEMA.replace("PRAGMA user_version = 3;", "") + """
+    CREATE TABLE fleet_observations (
+        observed_at REAL PRIMARY KEY,
+        contract TEXT NOT NULL,
+        running_attempts INTEGER NOT NULL,
+        active_registrations INTEGER NOT NULL,
+        offline_registrations INTEGER NOT NULL
+    );
+    PRAGMA user_version = 4;
+"""
+
 V1_COLUMNS = (
     "id, client_token, state, created_at, updated_at, expires_at, reservation_micros,"
     " reservation_window, region, account, request_json, request_sha256, instance_id, detail"
@@ -384,7 +424,7 @@ class MigrationTests(unittest.TestCase):
         except FileNotFoundError:
             pass
         connection = sqlite3.connect(self.path)
-        schema = {1: V1_SCHEMA, 2: V2_SCHEMA, 3: V3_SCHEMA}[version]
+        schema = {1: V1_SCHEMA, 2: V2_SCHEMA, 3: V3_SCHEMA, 4: V4_SCHEMA}[version]
         connection.executescript(schema)
         rows, columns = self._rows(version)
         rows, columns = self._rows(version)
@@ -405,6 +445,24 @@ class MigrationTests(unittest.TestCase):
 
     def backups(self):
         return sorted(self.path.parent.glob("state.sqlite3.pre-v4.*"))
+
+    def v5_backups(self):
+        return sorted(self.path.parent.glob("state.sqlite3.pre-v5.*"))
+
+    def shape(self, path):
+        """Tables, columns and indexes of a ledger file, as one comparable value."""
+        connection = sqlite3.connect(path)
+        try:
+            names = connection.execute(
+                "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall()
+            columns = {
+                table: connection.execute("PRAGMA table_info(%s)" % table).fetchall()
+                for table in ("operations", "fleet_observations")
+            }
+            return names, columns, connection.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            connection.close()
 
     def user_version(self):
         connection = sqlite3.connect(self.path)
@@ -668,6 +726,134 @@ class MigrationTests(unittest.TestCase):
         # An older readable schema has no table: that is an absent observation,
         # not an unreadable ledger.
         self.assertIsNone(ledger.latest_fleet_observation())
+
+
+    def test_v4_upgrade_adds_the_lifetime_column_once_and_leaves_rows_null(self):
+        self._write(4)
+        original = self.path.read_bytes()
+        ledger = self.writable()
+        self.assertEqual(ledger.version, 5)
+        self.assertEqual(self.user_version(), 5)
+        self.assertIn("admitted_lifetime_seconds", self.columns())
+        # One copy, named for the schema it holds, with the version-4 bytes.
+        self.assertEqual(self.backups(), [])
+        (backup,) = self.v5_backups()
+        self.assertEqual(backup.read_bytes(), original)
+        # No backfill: a lifetime that was never recorded is not invented.
+        self.assertIsNone(ledger.operation("old-op").admitted_lifetime_seconds)
+        self.assertIsNone(ledger.operation("live-op").admitted_lifetime_seconds)
+        self.assertEqual(ledger.operation("live-op").admitted_buffer_micros, 7_000)
+        self.assertEqual(ledger.operation("old-op").settled_micros, 12_345)
+        ledger.close()
+        reopened = Ledger(self.path, clock=lambda: self.now).connect(create=True)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.version, 5)
+        self.assertEqual(len(self.v5_backups()), 1)
+
+    def test_every_earlier_schema_reaches_the_shape_of_a_fresh_one(self):
+        fresh_path = self.path.parent / "fresh.sqlite3"
+        fresh = Ledger(fresh_path, clock=lambda: self.now).connect()
+        self.addCleanup(fresh.close)
+        expected = self.shape(fresh_path)
+        self.assertEqual(expected[2], 5)
+        self.assertIn("admitted_lifetime_seconds", [column[1] for column in expected[1]["operations"]])
+        for version in (1, 2, 3, 4):
+            with self.subTest(version=version):
+                self._write(version)
+                original = self.path.read_bytes()
+                ledger = Ledger(self.path, clock=lambda: self.now)
+                ledger.acquire_writer()
+                ledger.connect(create=True, backfill=(40_000, 5_000, 7_000))
+                self.assertEqual(ledger.version, 5)
+                self.assertEqual(self.shape(self.path), expected)
+                self.assertIsNone(ledger.operation("live-op").admitted_lifetime_seconds)
+                self.assertIsNone(ledger.operation("old-op").admitted_lifetime_seconds)
+                # Every step copies before its own first write, so the earliest
+                # copy still holds the file as it was found.
+                (last,) = self.v5_backups()
+                if version == 4:
+                    self.assertEqual(last.read_bytes(), original)
+                    self.assertEqual(self.backups(), [])
+                else:
+                    (first,) = self.backups()
+                    self.assertEqual(first.read_bytes(), original)
+                ledger.close()
+                for leftover in self.path.parent.glob("state.sqlite3.pre-v*"):
+                    leftover.unlink()
+
+    def test_read_only_accepts_a_v4_file_without_the_lifetime_column(self):
+        self._write(4)
+        before = sorted(item.name for item in self.path.parent.iterdir())
+        ledger = Ledger(self.path, clock=lambda: self.now).connect(create=False, read_only=True)
+        self.addCleanup(ledger.close)
+        self.assertEqual(ledger.version, 4)
+        self.assertNotIn("admitted_lifetime_seconds", self.columns())
+        operation = ledger.operation("live-op")
+        self.assertIsNone(operation.admitted_lifetime_seconds)
+        self.assertEqual(operation.admitted_buffer_micros, 7_000)
+        self.assertEqual([item.id for item in ledger.operations()], ["old-op", "live-op"])
+        self.assertEqual(self.user_version(), 4)
+        self.assertEqual(before, sorted(item.name for item in self.path.parent.iterdir()))
+
+    def test_a_v4_copy_failure_leaves_the_database_unchanged(self):
+        self._write(4)
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=OSError("denied")):
+            with self.assertRaises(StateRefusal) as raised:
+                ledger.connect(create=True)
+        self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
+        self.assertEqual(self.user_version(), 4)
+        self.assertNotIn("admitted_lifetime_seconds", self.columns())
+        self.assertEqual(self.v5_backups(), [])
+        # The refusal is retryable and the retry adds the column once.
+        ledger.connect(create=True)
+        self.assertEqual(ledger.version, 5)
+        self.assertIn("admitted_lifetime_seconds", self.columns())
+
+    def test_a_v4_size_mismatch_refuses_before_any_schema_write(self):
+        self._write(4)
+
+        def truncated(source, target):
+            Path(target).write_bytes(b"")
+
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=truncated):
+            with self.assertRaises(StateRefusal) as raised:
+                ledger.connect(create=True)
+        self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
+        self.assertEqual(self.user_version(), 4)
+        self.assertNotIn("admitted_lifetime_seconds", self.columns())
+
+    def test_a_failed_v4_upgrade_rolls_back_and_can_be_retried(self):
+        self._write(4)
+        ledger = Ledger(self.path, clock=lambda: self.now)
+        ledger.acquire_writer()
+        self.addCleanup(ledger.close)
+        real_connect = sqlite3.connect
+
+        class FailingAlter(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql.startswith("PRAGMA user_version = 5"):
+                    raise sqlite3.OperationalError("injected")
+                return super().execute(sql, *args)
+
+        with mock.patch(
+            "ci_burst.ledger.sqlite3.connect",
+            side_effect=lambda *a, **k: real_connect(*a, factory=FailingAlter, **k),
+        ):
+            with self.assertRaises(StateRefusal) as raised:
+                ledger.connect(create=True)
+        self.assertEqual(raised.exception.reason, "STATE_MIGRATION_FAILED")
+        # The added column rolled back with the failed version write.
+        self.assertEqual(self.user_version(), 4)
+        self.assertNotIn("admitted_lifetime_seconds", self.columns())
+        ledger.connect(create=True)
+        self.assertEqual(ledger.version, 5)
+        self.assertIn("admitted_lifetime_seconds", self.columns())
 
 
 class FleetObservationTests(unittest.TestCase):

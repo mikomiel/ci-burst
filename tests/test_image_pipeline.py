@@ -1958,6 +1958,21 @@ class FailureTests(PipelineCase):
         self.assertEqual(self.metric("ci_burst_image_consecutive_failures"), 1.0)
         self.assertEqual(len(self.events("image_check")), 2)
 
+    def test_a_console_read_that_starts_before_the_deadline_and_is_refused_after_it_ends_the_build(self):
+        build = self.expired_build(before=10)
+        clock = self.clock
+
+        def slow_refusal(adapter, instance_ids, *, deadline=None):
+            clock.advance(20)
+            raise ProviderRefusal("AWS_UNCERTAIN", "RequestLimitExceeded", uncertain=True)
+
+        with mock.patch.object(WorldAws, "console_output", slow_refusal):
+            result = self.apply()
+        self.assert_failed(result, "CONSOLE_BLIND")
+        self.assertIn("console_read:AWS_UNCERTAIN", result["notes"])
+        self.assertEqual(self.world.arguments("create_image"), [])
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+
     def test_a_blind_console_at_the_deadline_ends_the_build_with_one_termination_and_the_blind_code(self):
         build = self.expired_build()
         result = self.apply()

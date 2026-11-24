@@ -1543,11 +1543,12 @@ class _Pass:
                 console = self.aws.console_output([build.builder_id], deadline=self.deadline).get(build.builder_id)
             except ProviderRefusal as refusal:
                 # An unreadable console is a blind one. Before the build deadline the pass refuses and the next pass
-                # reads again. At or after it, the build ends as ``CONSOLE_BLIND`` below, as an empty console does.
+                # reads again. At or after it, the build ends ``CONSOLE_BLIND`` here, as an empty console does at the
+                # deadline. The one clock reading decides both, so a clock that steps back cannot change the verdict.
                 if self.clock() < build.deadline_at:
                     raise
                 self.notes.append(f"console_read:{refusal.reason}")
-                console = None
+                return self._fail(build, image_console.CONSOLE_BLIND)
             # The reads above can take time. Every check below, and the latency, use the time after the last of them.
             now = self.clock()
             marker = image_console.read_marker(console, build.archive_sha256)

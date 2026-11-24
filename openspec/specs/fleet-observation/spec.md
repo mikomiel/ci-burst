@@ -64,7 +64,7 @@ The exporter MUST publish the snapshot timestamp and the count gauges from the l
 - **AND** the result reports the snapshot as stale or omitted
 
 ### Requirement: Upgrade preserves operations
-A writable run MUST upgrade a version-1, version-2 or version-3 ledger through schema 4 to the current schema after a size-checked copy, MUST create the fleet table without changing existing operations, and MUST refuse before the first schema write when the copy cannot be verified.
+A writable run MUST upgrade a version-1, version-2 or version-3 ledger to the current schema in one transaction after one size-checked copy, MUST create the fleet table without changing existing operations, and MUST refuse before the first schema write when the copy cannot be verified.
 
 #### Scenario: Upgrade from an earlier schema
 - **WHEN** a writable run opens a version-1, -2 or -3 ledger

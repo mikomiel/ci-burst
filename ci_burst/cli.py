@@ -110,9 +110,6 @@ def main(argv=None):
             if arguments.command == "plan":
                 result = controller.plan()
             elif arguments.command == "apply":
-                # Before the controller opens the ledger: an intent recorded or resent under another lifetime would
-                # carry an expiry that the worker's own timers do not keep.
-                config.require_worker_lifetime()
                 result = controller.apply()
             elif arguments.command == "status":
                 result = controller.status()

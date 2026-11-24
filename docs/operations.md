@@ -1858,8 +1858,9 @@ Three different times bound one admission pass:
   pass duration. `apply` admits only when it is `3600`, the value that the
   worker bootstrap arms for its shutdown and its job bound, so the expiry tag
   and the cost reservation of a new worker use the bootstrap's duration (#138).
-  Another value refuses `apply` with `WORKER_LIFETIME_MISMATCH` before the
-  ledger is opened; `reap`, `status`, `export` and `plan` keep working, so set
+  Another value makes the controller refuse `apply` with
+  `WORKER_LIFETIME_MISMATCH` before it takes the writer lock or opens the
+  ledger; `reap`, `status`, `export` and `plan` keep working, so set
   the value to `3600` and admission resumes. An unresolved intent whose
   recorded admitted lifetime is another value, or that records none because it
   predates ledger schema 5, is not sent again: `apply` refuses it with

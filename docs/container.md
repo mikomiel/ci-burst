@@ -858,13 +858,14 @@ topology.
   writer lock is a file lock on one host, not a distributed lock, and the
   commitment budget is local.
 - A writable run upgrades a version-1, version-2, version-3 or version-4
-  ledger to schema 5 once, while holding the writer lock. The upgrade runs one
-  step per schema, and each step copies the file, checks the copy's size, then
-  migrates in one transaction: a version-1, -2 or -3 file is copied to
-  `state.sqlite3.pre-v4.<epoch>` and lands on schema 4, then every file is
-  copied to `state.sqlite3.pre-v5.<epoch>` and lands on schema 5. If a copy
-  fails the step refuses before its first schema write, so a failed upgrade
-  leaves the file readable by the release that wrote it. A
+  ledger to schema 5 once, while holding the writer lock. Each upgrade takes
+  one copy of the file, checks the copy's size, then migrates in one
+  transaction, so no file takes two copies or two commits: a version-1, -2 or
+  -3 file is copied to `state.sqlite3.pre-v4.<epoch>` and lands on schema 5
+  directly, and a version-4 file is copied to `state.sqlite3.pre-v5.<epoch>`
+  and gains one column. If the copy fails the upgrade refuses before its first
+  schema write, and a failed transaction rolls back whole, so a failed upgrade
+  leaves the file, byte for byte, readable by the release that wrote it. A
   version-1 or version-2 file first gets the schema-3 columns
   `admitted_incidental_per_hour_micros`, `admitted_buffer_micros` and
   `admitted_inputs_backfilled`, an integer that defaults to `0`. Terminal
@@ -874,9 +875,9 @@ topology.
   admission actually used are not recoverable from an earlier file, and are
   marked `admitted_inputs_backfilled = 1`. The mark keeps such a row's stored
   reservation as its commitment floor and is never inferred from the current
-  configuration. Every upgrade also creates the `fleet_observations` table; a
-  version-3 file has no rows to backfill. The schema-5 step adds the nullable
-  `operations.admitted_lifetime_seconds` column, which records the
+  configuration. An upgrade from version 1, 2 or 3 also creates the
+  `fleet_observations` table; a version-3 file has no rows to backfill. Every
+  upgrade adds the nullable `operations.admitted_lifetime_seconds` column, which records the
   `aws.max_lifetime_seconds` an intent was admitted under, and backfills
   nothing: every existing row keeps `NULL`, so an unresolved intent from an
   earlier schema is refused with `unresolved_intent_lifetime_mismatch` until an
@@ -885,7 +886,7 @@ topology.
   earlier schema until the first writable run. The previous release refuses a
   schema it does not know, so rolling the image back after an upgrade needs
   the matching copy: `.pre-v5.` returns the schema-4 file, and `.pre-v4.`
-  returns the schema-1, -2 or -3 file that the schema-4 step started from. A
+  returns the schema-1, -2 or -3 file as it was found. A
   copy holds nothing written after it: restore it only while admission is
   stopped and no `apply` has run since the upgrade, so `state.operations` still
   lists exactly the rows the copy holds. Once an `apply` has admitted or

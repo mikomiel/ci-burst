@@ -42,6 +42,9 @@ _FLEET_TABLE_SQL = """
     )
 """
 
+#: One definition used by every upgrade that reaches schema 5.
+_LIFETIME_COLUMN_SQL = "ALTER TABLE operations ADD COLUMN admitted_lifetime_seconds INTEGER"
+
 
 @dataclass(frozen=True)
 class Operation:
@@ -153,26 +156,22 @@ class Ledger:
             if version == 0:
                 self._create_schema(connection)
                 version = SCHEMA_VERSION
-            else:
-                # Each step lands on the next schema and takes its own verified
-                # copy, so an earlier file reaches the current schema through
-                # the steps that wrote it.
-                if version in (1, 2):
-                    if backfill is None:
-                        raise StateRefusal(
-                            "STATE_MIGRATION_PARAMETERS_REQUIRED",
-                            "schema %d needs the configured price, incidental rate and buffer" % version,
-                        )
-                    self._migrate(connection, version, backfill)
-                    version = 4
-                elif version == 3:
-                    self._migrate_v4(connection)
-                    version = 4
-                if version == 4:
-                    self._migrate_v5(connection)
-                    version = SCHEMA_VERSION
-                if version != SCHEMA_VERSION:
-                    raise StateRefusal("STATE_VERSION_UNSUPPORTED", f"schema {version}")
+            elif version in (1, 2):
+                if backfill is None:
+                    raise StateRefusal(
+                        "STATE_MIGRATION_PARAMETERS_REQUIRED",
+                        "schema %d needs the configured price, incidental rate and buffer" % version,
+                    )
+                self._migrate(connection, version, backfill)
+                version = SCHEMA_VERSION
+            elif version == 3:
+                self._migrate_v4(connection)
+                version = SCHEMA_VERSION
+            elif version == 4:
+                self._migrate_v5(connection)
+                version = SCHEMA_VERSION
+            elif version != SCHEMA_VERSION:
+                raise StateRefusal("STATE_VERSION_UNSUPPORTED", f"schema {version}")
             self._version = version
         except sqlite3.DatabaseError as error:
             if connection is not None:
@@ -249,7 +248,7 @@ class Ledger:
         )
 
     def _migrate(self, connection, version, backfill):
-        """Upgrade a schema-1 or schema-2 file to schema 4, after a verified copy.
+        """Upgrade a schema-1 or schema-2 file to schema 5, after one verified copy.
 
         A version-1 file passes through the version-2 shape in the same
         transaction: its terminal operations are settled from their recorded
@@ -260,7 +259,9 @@ class Ledger:
         nonterminal row also records ``admitted_inputs_backfilled = 1``, which
         makes its reservation floor a persisted decision rather than an
         inference from an estimate that includes the current configuration. The
-        same transaction creates the fleet-observation table. The caller holds
+        same transaction creates the fleet-observation table and adds the
+        nullable ``admitted_lifetime_seconds`` column, which every existing row
+        keeps as ``NULL``. The caller holds
         the deployment writer lock; this method takes no lock of its own. A
         failed copy refuses before the first schema write, and an interrupted
         upgrade rolls the whole transaction back, so the file stays readable by
@@ -304,7 +305,8 @@ class Ledger:
                 (incidental_per_hour, buffer_micros, *NONTERMINAL),
             )
             connection.execute(_FLEET_TABLE_SQL)
-            connection.execute("PRAGMA user_version = 4")
+            connection.execute(_LIFETIME_COLUMN_SQL)
+            connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
             connection.execute("COMMIT")
         except sqlite3.DatabaseError as error:
             _rollback(connection)
@@ -314,17 +316,20 @@ class Ledger:
             raise
 
     def _migrate_v4(self, connection):
-        """Add the fleet-observation table to a schema-3 file.
+        """Upgrade a schema-3 file to schema 5, after one verified copy.
 
-        The upgrade creates one table and writes no row, so it needs no
-        backfill parameters. It still copies the file first: the previous
-        release refuses schema 4, so the copy is the rollback path.
+        One transaction creates the fleet-observation table and adds the
+        nullable ``admitted_lifetime_seconds`` column; it writes no row, so it
+        needs no backfill parameters, and every existing row keeps ``NULL``.
+        The previous release refuses the new schema, so the copy is the
+        rollback path.
         """
         self._backup("pre-v4")
         try:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(_FLEET_TABLE_SQL)
-            connection.execute("PRAGMA user_version = 4")
+            connection.execute(_LIFETIME_COLUMN_SQL)
+            connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
             connection.execute("COMMIT")
         except sqlite3.DatabaseError as error:
             _rollback(connection)
@@ -334,18 +339,19 @@ class Ledger:
             raise
 
     def _migrate_v5(self, connection):
-        """Add the admitted-lifetime column to a schema-4 file.
+        """Add the admitted-lifetime column to a schema-4 file, after a verified copy.
 
         Every existing row keeps ``NULL``: the lifetime an earlier intent was
         admitted under is not recoverable from the file, and a resume refuses a
-        row that records none. It still copies the file first, because the
-        previous release refuses schema 5, so the copy is the rollback path.
+        row that records none. The previous release refuses schema 5, so the
+        copy is the rollback path. An older file reaches schema 5 in one
+        transaction of its own migration, never through this one.
         """
         self._backup("pre-v5")
         try:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute("ALTER TABLE operations ADD COLUMN admitted_lifetime_seconds INTEGER")
-            connection.execute("PRAGMA user_version = 5")
+            connection.execute(_LIFETIME_COLUMN_SQL)
+            connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
             connection.execute("COMMIT")
         except sqlite3.DatabaseError as error:
             _rollback(connection)

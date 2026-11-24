@@ -212,6 +212,9 @@ class Controller:
         """Take one bounded admission and launch decision."""
         result = self._base("apply")
         self.config.require_live_contract()
+        # Before the writer lock and the ledger: an intent recorded or resent under another lifetime would carry an
+        # expiry that the worker's own timers do not keep (#138).
+        self.config.require_worker_lifetime()
         deadline = self.clock() + self.config.controller.pass_deadline_seconds
         # The writer lock precedes the connect: an earlier-schema file is copied
         # and upgraded by that connect, and that mutation may not race a second

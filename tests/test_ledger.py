@@ -768,15 +768,16 @@ class MigrationTests(unittest.TestCase):
                 self.assertEqual(self.shape(self.path), expected)
                 self.assertIsNone(ledger.operation("live-op").admitted_lifetime_seconds)
                 self.assertIsNone(ledger.operation("old-op").admitted_lifetime_seconds)
-                # Every step copies before its own first write, so the earliest
-                # copy still holds the file as it was found.
-                (last,) = self.v5_backups()
+                # One copy and one transaction per connect: an older file takes
+                # the pre-v4 copy of its original bytes, a schema-4 file takes
+                # the pre-v5 copy, and none takes both.
                 if version == 4:
-                    self.assertEqual(last.read_bytes(), original)
+                    (copy,) = self.v5_backups()
                     self.assertEqual(self.backups(), [])
                 else:
-                    (first,) = self.backups()
-                    self.assertEqual(first.read_bytes(), original)
+                    (copy,) = self.backups()
+                    self.assertEqual(self.v5_backups(), [])
+                self.assertEqual(copy.read_bytes(), original)
                 ledger.close()
                 for leftover in self.path.parent.glob("state.sqlite3.pre-v*"):
                     leftover.unlink()
@@ -854,6 +855,90 @@ class MigrationTests(unittest.TestCase):
         ledger.connect(create=True)
         self.assertEqual(ledger.version, 5)
         self.assertIn("admitted_lifetime_seconds", self.columns())
+
+
+    def test_a_failed_copy_leaves_every_earlier_file_byte_identical(self):
+        def truncated(source, target):
+            Path(target).write_bytes(b"")
+
+        for version in (1, 2, 3, 4):
+            for name, failure in (
+                ("copy error", {"side_effect": OSError("denied")}),
+                ("size mismatch", {"side_effect": truncated}),
+            ):
+                with self.subTest(version=version, failure=name):
+                    self._write(version)
+                    original = self.path.read_bytes()
+                    ledger = Ledger(self.path, clock=lambda: self.now)
+                    ledger.acquire_writer()
+                    with mock.patch("ci_burst.ledger.shutil.copy2", **failure):
+                        with self.assertRaises(StateRefusal) as raised:
+                            ledger.connect(create=True, backfill=(40_000, 5_000, 7_000))
+                    ledger.close()
+                    self.assertEqual(raised.exception.reason, "STATE_BACKUP_FAILED")
+                    self.assertEqual(self.path.read_bytes(), original)
+                    self.assertEqual(self.user_version(), version)
+                    self.assertNotIn("admitted_lifetime_seconds", self.columns())
+                    for leftover in self.path.parent.glob("state.sqlite3.pre-v*"):
+                        leftover.unlink()
+
+    def test_an_upgrade_takes_exactly_one_copy_so_a_second_one_cannot_fail(self):
+        real_copy = shutil.copy2
+        for version in (1, 2, 3, 4):
+            with self.subTest(version=version):
+                self._write(version)
+                calls = []
+
+                def first_only(source, target, **kwargs):
+                    calls.append(target)
+                    if len(calls) > 1:
+                        raise OSError("a second copy was attempted")
+                    return real_copy(source, target, **kwargs)
+
+                ledger = Ledger(self.path, clock=lambda: self.now)
+                ledger.acquire_writer()
+                with mock.patch("ci_burst.ledger.shutil.copy2", side_effect=first_only):
+                    ledger.connect(create=True, backfill=(40_000, 5_000, 7_000))
+                self.assertEqual(ledger.version, 5)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(self.user_version(), 5)
+                ledger.close()
+                for leftover in self.path.parent.glob("state.sqlite3.pre-v*"):
+                    leftover.unlink()
+
+    def test_a_failure_inside_the_upgrade_transaction_restores_every_earlier_version(self):
+        real_connect = sqlite3.connect
+
+        class FailingVersionWrite(sqlite3.Connection):
+            def execute(self, sql, *args):
+                # The last statement of every upgrade, after its other writes.
+                if sql == "PRAGMA user_version = %d" % SCHEMA_VERSION:
+                    raise sqlite3.OperationalError("injected")
+                return super().execute(sql, *args)
+
+        for version in (1, 2, 3, 4):
+            with self.subTest(version=version):
+                self._write(version)
+                before = self.shape(self.path)
+                ledger = Ledger(self.path, clock=lambda: self.now)
+                ledger.acquire_writer()
+                with mock.patch(
+                    "ci_burst.ledger.sqlite3.connect",
+                    side_effect=lambda *a, **k: real_connect(*a, factory=FailingVersionWrite, **k),
+                ):
+                    with self.assertRaises(StateRefusal) as raised:
+                        ledger.connect(create=True, backfill=(40_000, 5_000, 7_000))
+                ledger.close()
+                self.assertEqual(raised.exception.reason, "STATE_MIGRATION_FAILED")
+                # Every schema change of the transaction rolled back together.
+                self.assertEqual(self.user_version(), version)
+                self.assertEqual(self.shape(self.path), before)
+                self.assertNotIn("admitted_lifetime_seconds", self.columns())
+                connection = sqlite3.connect(self.path)
+                self.addCleanup(connection.close)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 2)
+                for leftover in self.path.parent.glob("state.sqlite3.pre-v*"):
+                    leftover.unlink()
 
 
 class FleetObservationTests(unittest.TestCase):

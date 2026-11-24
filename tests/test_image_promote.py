@@ -1834,6 +1834,65 @@ class StaleViewTests(PromoteCase):
         self.assertEqual(renamed, [True])
         self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
 
+    @contextlib.contextmanager
+    def replaced_during_the_read(self):
+        """The first read of the deployment file renames a copy over it, while a hard link keeps the old file named.
+
+        The old file keeps a link, so a check of the link count alone sees nothing (#202). The yield gives the
+        target; the old file is also named ``kept.toml`` outside the deployment directory.
+        """
+        target = Path(self.config.path).resolve()
+        os.link(target, self.dir / "kept.toml")
+        replacement = target.parent / "replacement.tmp"
+        inode = os.stat(target).st_ino
+        real = os.read
+        renamed = []
+
+        def read(descriptor, size):
+            if not renamed and os.fstat(descriptor).st_ino == inode:
+                renamed.append(True)
+                replacement.write_bytes(target.read_bytes())
+                os.replace(replacement, target)
+            return real(descriptor, size)
+
+        with mock.patch("os.read", read):
+            yield target
+        self.assertEqual(renamed, [True])
+
+    def test_a_replacement_during_the_read_that_a_hard_link_survives_is_refused_as_stale(self):
+        with self.replaced_during_the_read() as target:
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.read_snapshot(self.config)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
+        self.assertEqual((self.dir / "kept.toml").read_bytes(), target.read_bytes())
+
+    def test_a_promote_preview_and_write_are_refused_when_a_hard_link_survives_the_replacement(self):
+        for write in (False, True):
+            with self.subTest(write=write), self.replaced_during_the_read():
+                self.refusal((), "PROMOTE_FILE_STALE", write=write)
+            (self.dir / "kept.toml").unlink()
+        self.assertEqual(self.backups(), [])
+
+    def test_still_named_is_true_for_the_file_the_path_names_and_false_for_any_other(self):
+        target = Path(self.config.path).resolve()
+        descriptor = os.open(target, os.O_RDONLY)
+        try:
+            self.assertTrue(image_promote.still_named(descriptor, target))
+            kept = self.dir / "kept.toml"
+            os.link(target, kept)
+            self.assertTrue(image_promote.still_named(descriptor, target))
+            replacement = target.parent / "replacement.tmp"
+            replacement.write_bytes(target.read_bytes())
+            os.replace(replacement, target)
+            self.assertEqual(os.fstat(descriptor).st_nlink, 1)
+            self.assertFalse(image_promote.still_named(descriptor, target))
+            kept.unlink()
+            self.assertFalse(image_promote.still_named(descriptor, target))
+            target.unlink()
+            self.assertFalse(image_promote.still_named(descriptor, target))
+        finally:
+            os.close(descriptor)
+
     def test_the_same_file_still_linked_is_read(self):
         # The control: nothing but the rename separates this read from the one above.
         target = Path(self.config.path).resolve()
@@ -2682,6 +2741,101 @@ class EventTests(PromoteCase):
 
 
 # -- the module stays local ------------------------------------------------------------------
+
+
+class MountPointTests(unittest.TestCase):
+    """``is_mount_point`` reads the mount table of the process: a bind mount of one file hides from a device check."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.dir = Path(directory.name).resolve()
+        self.table = self.dir / "mountinfo"
+        patch = mock.patch.object(image_promote, "_MOUNTINFO", self.table)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def listing(self, *mount_points):
+        lines = [f"{number} 1 8:1 /source {point} rw,relatime shared:1 - ext4 /dev/example rw" for number, point in enumerate(mount_points, start=30)]
+        self.table.write_text("\n".join(["29 1 0:5 / / rw - rootfs rootfs rw", *lines]) + "\n", encoding="utf-8")
+
+    def made(self, name="deployment.toml"):
+        path = self.dir / name
+        path.write_text("x", encoding="utf-8")
+        return path
+
+    def test_each_escape_of_the_mount_table_is_undone(self):
+        for escaped, plain in (
+            ("\\040", " "),
+            ("\\011", "\t"),
+            ("\\012", "\n"),
+            ("\\134", "\\"),
+        ):
+            with self.subTest(escaped=escaped):
+                self.assertEqual(image_promote._unescape_mount_point(f"/a{escaped}b"), f"/a{plain}b")
+        self.assertEqual(image_promote._unescape_mount_point("/a\\040b\\011c\\012d\\134e"), "/a b\tc\nd\\e")
+        self.assertEqual(image_promote._unescape_mount_point("/plain/path"), "/plain/path")
+
+    def test_a_backslash_that_spells_an_escape_stays_a_backslash(self):
+        # A name that holds a backslash and the digits 040 is written as \134 and 040: it is not a space.
+        self.assertEqual(image_promote._unescape_mount_point("/a\\134040b"), "/a\\040b")
+
+    def test_a_listed_path_is_a_mount_point(self):
+        path = self.made()
+        self.listing(str(path))
+        self.assertTrue(image_promote.is_mount_point(path))
+
+    def test_a_path_that_is_not_listed_is_not_a_mount_point(self):
+        path = self.made()
+        self.listing(str(self.dir / "another.toml"), str(self.dir))
+        self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_a_mount_of_the_directory_is_not_a_mount_of_the_file(self):
+        path = self.made()
+        self.listing(str(self.dir))
+        self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_a_listed_path_with_a_space_is_a_mount_point(self):
+        path = self.made("deployment file.toml")
+        self.listing(str(path).replace(" ", "\\040"))
+        self.assertTrue(image_promote.is_mount_point(path))
+
+    def test_a_symbolic_link_to_a_listed_file_is_a_mount_point(self):
+        path = self.made()
+        link = self.dir / "link.toml"
+        link.symlink_to(path)
+        self.listing(str(path))
+        self.assertTrue(image_promote.is_mount_point(link))
+
+    def test_a_mount_table_with_a_name_that_is_not_utf8_is_read(self):
+        path = self.made()
+        other = b"/mnt/caf\xe9"
+        first = b"31 1 8:1 /a " + other + b" rw - ext4 /dev/example rw\n"
+        second = b"32 1 8:1 /b " + os.fsencode(path) + b" rw - ext4 /dev/example rw\n"
+        self.table.write_bytes(first + second)
+        self.assertTrue(image_promote.is_mount_point(path))
+        self.table.write_bytes(first)
+        self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_a_short_or_empty_line_of_the_table_is_ignored(self):
+        path = self.made()
+        self.table.write_text("\n29 1 0:5\n", encoding="utf-8")
+        self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_an_unreadable_table_falls_back_to_the_device_comparison(self):
+        path = self.made()
+        self.assertFalse(self.table.exists())
+        for answer in (True, False):
+            with self.subTest(answer=answer), mock.patch("os.path.ismount", return_value=answer) as ismount:
+                self.assertEqual(image_promote.is_mount_point(path), answer)
+            ismount.assert_called_once_with(str(path))
+
+    def test_a_readable_table_decides_without_the_device_comparison(self):
+        path = self.made()
+        self.listing()
+        with mock.patch("os.path.ismount", return_value=True) as ismount:
+            self.assertFalse(image_promote.is_mount_point(path))
+        ismount.assert_not_called()
 
 
 class PureLocalTests(unittest.TestCase):

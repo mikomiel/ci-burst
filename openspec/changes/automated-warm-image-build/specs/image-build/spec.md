@@ -410,7 +410,7 @@ A pass that stages a build again MUST first recompute the digest over the basis 
 - **AND** the ended row counts toward `max_builds_per_day` and `min_build_interval_seconds`
 
 ### Requirement: A run can supervise a build to completion
-Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run --apply --until-done` MUST repeat bounded passes with a fixed sleep between them until the build reaches `candidate` or `failed`, or the build deadline passes. Without `--until-done`, `run --apply` MUST run one pass. Rerunning the same command MUST resume an interrupted supervisor from the state file. `--until-done` MUST be refused without `--apply`.
+Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run --apply --until-done` MUST repeat bounded passes with a fixed sleep between them until the build reaches `candidate` or `failed`, or the build deadline passes. Without `--until-done`, `run --apply` MUST run one pass. Rerunning the same command MUST resume an interrupted supervisor from the state file. `--until-done` MUST be refused without `--apply`. It MUST end with `IMAGE_CONFIG_CHANGED` when the settings change.
 
 #### Scenario: The marker arrives after the first pass
 - **WHEN** the first pass ends at its deadline before the marker and the marker appears later
@@ -437,6 +437,15 @@ Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run
 #### Scenario: Until-done without apply
 - **WHEN** an operator passes `--until-done` without `--apply`
 - **THEN** the command refuses with exit 2 and does nothing
+
+#### Scenario: Until-done meets a changed file
+- **WHEN** the deployment file no longer loads, or gives other settings (a withdrawn gate, a new pin) than the run loaded, after a pass and before the next
+- **THEN** the run ends with `IMAGE_CONFIG_CHANGED` before that pass and launches nothing more
+- **AND** the state file keeps the build, and a fresh run resumes it with the file as it is
+
+#### Scenario: Until-done meets a rewrite that changes no setting
+- **WHEN** the file is rewritten between passes and gives the same settings
+- **THEN** the loop goes on as it would without the rewrite
 
 ### Requirement: Provider reads are bounded by the pass deadline
 Every provider read of a pass, except the read that confirms a deregistration, MUST be bounded by the pass deadline. A read that would start at or after the deadline MUST NOT be made. Where the pass advances or stages a build, it MUST then note `pass_deadline_exceeded` and leave the row as its last write left it. A refused read of the base image or of the build's image, the deadline included, MUST NOT delay `CreateImage`: the pass notes `base_image:<reason>` or `image_lookup:<reason>`.
@@ -881,7 +890,7 @@ The next `promote --write`, `promote --rollback --write` or `image run --apply` 
 - **AND** the row, the state file and the TOML are unchanged
 
 ### Requirement: Promotion keeps a backup and refuses a changed file
-Before the rename, `promote --write` MUST write a timestamped backup and MUST refuse with `PROMOTE_FILE_CHANGED` when the file differs from the bytes it read. Every command that reads the file to promote, roll back or resolve a journal row MUST refuse with `PROMOTE_FILE_STALE` when no name links the open file any more.
+Before the rename, `promote --write` MUST write a timestamped backup and MUST refuse with `PROMOTE_FILE_CHANGED` when the file differs from the bytes it read. Every command that reads the file to promote, roll back or resolve a journal row MUST refuse with `PROMOTE_FILE_STALE` when the open file has no link left or is no longer the file its path names.
 
 #### Scenario: A backup exists
 - **WHEN** a write succeeds
@@ -894,6 +903,10 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 #### Scenario: A stale view of the file
 - **WHEN** a container mounted the file itself, a write elsewhere replaced the file by a rename before or during the read, and the open file has no link left (`st_nlink == 0`) once its bytes are read
 - **THEN** a command in that container that resolves the journal, promotes or rolls back refuses with `PROMOTE_FILE_STALE` and writes nothing
+
+#### Scenario: A replacement during the read that a hard link survives
+- **WHEN** a rename replaces the file during the read while another hard link keeps the old file named, so that its link count stays above zero
+- **THEN** the command refuses with `PROMOTE_FILE_STALE`, because the path no longer names the open file, and writes nothing
 
 #### Scenario: The file names another state than the command opened
 - **WHEN** `[image].state_directory` (compared as written, without following a link) or `deployment` changes between the start of `promote` (with or without `--write`, `--rollback` included) and a read of the file it plans or writes from, the read under the locks of `--write` included
@@ -979,8 +992,12 @@ Every path that deregisters an image or deletes a snapshot (retention and every 
 - **THEN** no deletion path removes the image of either pin of either row until a newer row completes
 
 #### Scenario: A stale view of the file at a deletion
-- **WHEN** the deployment file that a pass reads is a view of a file that a rename replaced before or during the read, and the open file has no link left (`st_nlink == 0`) once its bytes are read
+- **WHEN** the deployment file that a pass reads is a view of a file that a rename replaced before or during the read, and the open file has no link left (`st_nlink == 0`) or is not the file the path names once its bytes are read, a hard link that keeps the old file included
 - **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE` and no path deletes anything
+
+#### Scenario: The file changes after the protected set was resolved
+- **WHEN** the deployment file is edited or replaced after the set was resolved and before a plan is acted on
+- **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE`, because the device, inode, change and modification times or size differ, and nothing is deregistered or deleted
 
 #### Scenario: A pin of an unsettled row is malformed
 - **WHEN** a pin of a journal row newer than the newest completed one is not a positive version number
@@ -1056,7 +1073,7 @@ An event value MUST NOT hold `://`. The console tail of a failed-build event MUS
 - **THEN** the write is an error and is neither continued nor retried
 
 ### Requirement: Image configuration is strict
-The `[image]` tables MUST refuse unknown keys and out-of-range values with `CONFIG_INVALID` before any call. A phase 2 key MUST be accepted only when the code that uses it is present. Examples and tests MUST use synthetic names only.
+The `[image]` tables MUST refuse unknown keys and out-of-range values with `CONFIG_INVALID` before any call. A phase 2 key MUST be accepted only when the code that uses it is present. Examples and tests MUST use synthetic names only. Every `image` command MUST refuse a deployment file that is itself a mount point with `IMAGE_CONFIG_MOUNTED`, before it opens the state.
 
 #### Scenario: An unknown key
 - **WHEN** `[image]` contains an unknown key
@@ -1069,6 +1086,11 @@ The `[image]` tables MUST refuse unknown keys and out-of-range values with `CONF
 #### Scenario: A basis path escapes the archive
 - **WHEN** a basis path contains `..` or starts with `/`
 - **THEN** loading refuses with `CONFIG_INVALID`
+
+#### Scenario: The deployment file is itself a mount point
+- **WHEN** the image path is enabled and the file that `--config` names is a bind mount of that file
+- **THEN** every `image` command refuses with `IMAGE_CONFIG_MOUNTED` and exit 2 before it opens the state, and the detail names no path
+- **AND** no state file is created, and a disabled image path still answers `disabled`
 
 ### Requirement: The timer is enabled only after manual qualification
 The shipped `ci-burst-image` timer unit MUST be a one-shot container that mounts the configuration read-only, mounts the image state directory writable and the image role's profile directory read-only, and mounts no scaling credential and no scaling state. Documentation MUST state that the timer is enabled only after one manual build succeeded and about three clean promotions, and that the operator qualifies the unit with a refresh-script check.

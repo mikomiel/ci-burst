@@ -508,6 +508,29 @@ class ProtectedSetRefusalTests(DeletionCase):
         self.assertIn("replaced", refusal.detail)
         self.assertEqual(self.ec2.calls, [])
 
+    def test_a_replacement_during_the_read_that_a_hard_link_survives_is_unsafe_and_reads_no_version(self):
+        # The old file keeps a link, so its link count stays above zero: only the path, which names the new file
+        # now, tells the two apart (#202).
+        target = Path(self.deployment_file)
+        os.link(target, self.directory / "kept.toml")
+        replacement = target.parent / "replacement.tmp"
+        replacement.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+        real = os.read
+        renamed = []
+
+        def read(descriptor, size):
+            if not renamed:
+                renamed.append(True)
+                os.replace(replacement, target)
+            return real(descriptor, size)
+
+        with mock.patch("os.read", read):
+            refusal = self.refused()
+        self.assertEqual(renamed, [True])
+        self.assertEqual(os.stat(self.directory / "kept.toml").st_nlink, 1)
+        self.assertIn("replaced", refusal.detail)
+        self.assertEqual(self.ec2.calls, [])
+
     def test_an_unreadable_version_is_unsafe_and_leaks_nothing(self):
         self.ec2.errors["describe_launch_template_versions"] = ProviderError("RequestLimitExceeded")
         refusal = self.refused()
@@ -596,6 +619,85 @@ class ProtectedSetRefusalTests(DeletionCase):
         self.ec2.versions_store[(WORKER, PIN)]["LaunchTemplateData"] = {"ImageId": "resolve:ssm:/example/alias"}
         refusal = self.refused()
         self.assertNotIn("alias", refusal.detail)
+
+
+class ConfigChangedTests(DeletionCase):
+    """``check_unchanged``: the pins the set protects must still be the file's when the plan is acted on (#202)."""
+
+    def refused(self, protected):
+        with self.assertRaises(ImageRefusal) as raised:
+            image_deletion.check_unchanged(protected)
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertNotIn(str(self.directory), raised.exception.detail)
+        return raised.exception
+
+    def test_a_file_that_is_as_it_was_read_passes(self):
+        protected = self.resolve()
+        image_deletion.check_unchanged(protected)
+        image_deletion.check_unchanged(protected)
+
+    def test_an_edit_after_the_read_is_unsafe(self):
+        protected = self.resolve()
+        text = self.deployment_file.read_text(encoding="utf-8")
+        self.deployment_file.write_text(text + "\n# a hand edit\n", encoding="utf-8")
+        self.refused(protected)
+
+    def test_an_edit_that_keeps_the_size_is_unsafe(self):
+        protected = self.resolve()
+        size = self.deployment_file.stat().st_size
+        data = self.deployment_file.read_bytes()
+        self.deployment_file.write_bytes(data.replace(b"example-deployment", b"example-deploymenu", 1))
+        os.utime(self.deployment_file, ns=(0, 1))
+        self.assertEqual(self.deployment_file.stat().st_size, size)
+        self.refused(protected)
+
+    def test_a_replacement_with_the_same_bytes_is_unsafe(self):
+        protected = self.resolve()
+        replacement = self.deployment_file.parent / "replacement.tmp"
+        replacement.write_bytes(self.deployment_file.read_bytes())
+        os.replace(replacement, self.deployment_file)
+        self.refused(protected)
+
+    def test_an_in_place_edit_during_the_read_is_unsafe(self):
+        # The same inode keeps its name, so the read cannot tell: the identity is taken before the bytes are read,
+        # and the check after the read sees the file that the edit left, not the bytes that were used.
+        real = os.read
+        edited = []
+        text = self.deployment_file.read_text(encoding="utf-8")
+
+        def read(descriptor, size):
+            data = real(descriptor, size)
+            if not data and not edited:  # the end of the file: every byte that will be used is in
+                edited.append(True)
+                self.deployment_file.write_text(text + "\n# a hand edit\n", encoding="utf-8")
+            return data
+
+        with mock.patch("os.read", read):
+            protected = self.resolve()
+        self.assertEqual(edited, [True])
+        self.refused(protected)
+
+    def test_a_file_that_is_gone_is_unsafe(self):
+        protected = self.resolve()
+        self.deployment_file.unlink()
+        self.refused(protected)
+
+    def test_a_set_that_no_file_was_read_for_is_unsafe(self):
+        self.refused(forged_set({ami(1)}))
+
+    def test_an_edit_between_the_plan_and_the_deletions_leaves_every_image_registered(self):
+        # The pipeline resolves the set, lists the account, plans, and checks the file again before it acts.
+        self.reset()
+        self.made(1, "failed")
+        protected = self.resolve()
+        plan = self.plan("all", protected=protected)
+        self.assertEqual([(item["action"], item["image_id"]) for item in plan], [("deregister", ami(1))])
+        self.deployment_file.write_text(
+            self.deployment_file.read_text(encoding="utf-8") + "\n# a hand edit\n", encoding="utf-8"
+        )
+        self.refused(protected)
+        self.assertEqual(self.mutations(), [])
+        self.assertIn(ami(1), self.stored_images())
 
 
 class FailClosedTests(DeletionCase):

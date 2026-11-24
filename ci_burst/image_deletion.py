@@ -150,11 +150,13 @@ def _load_deployment(config_path):
     except OSError:
         raise _unsafe(unreadable) from None
     try:
+        # Taken before the bytes: an edit in place during the read leaves the name and the inode, and only the
+        # change time, the modification time or the size give it away when ``check_unchanged`` looks again.
+        identity = _identity(os.fstat(descriptor))
         chunks = []
         while chunk := os.read(descriptor, 1 << 16):
             chunks.append(chunk)
         stale = not still_named(descriptor, config_path)
-        identity = _identity(os.fstat(descriptor))
     except OSError:
         raise _unsafe(unreadable) from None
     finally:

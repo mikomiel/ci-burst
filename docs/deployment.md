@@ -430,10 +430,10 @@ single file keeps serving the old one to a build container that is still running
 ([container.md](container.md#run-the-image-commands)). The stale-file check
 protects journal resolution (`PROMOTE_FILE_STALE`) and every image and snapshot
 deletion (`IMAGE_DELETION_UNSAFE`, which skips the deletions and does not end the
-pass), as long as no hard link keeps the old file named: do not keep hard links to
-the TOML. It does not stop a running `--until-done` container, which keeps the
-settings and the pin it loaded at its start, so finish or stop it before a
-promotion. Give the file its own
+pass), also when a hard link keeps the old file named. `image` refuses a file that is itself a
+mount point (`IMAGE_CONFIG_MOUNTED`). A running `--until-done` container ends with
+`IMAGE_CONFIG_CHANGED` before its next pass when the file changed, but a pass in
+flight keeps the pin it loaded, so finish or stop it before a promotion. Give the file its own
 directory, owned by the container user so the container can create files in it:
 
 ```sh

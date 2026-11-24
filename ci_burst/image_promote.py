@@ -225,7 +225,8 @@ def is_mount_point(path):
     """
     target = os.path.realpath(path)
     try:
-        table = _MOUNTINFO.read_text(encoding="utf-8")
+        # The kernel writes a path as its bytes: ``surrogateescape`` is how Python spells a name that is not UTF-8.
+        table = _MOUNTINFO.read_text(encoding="utf-8", errors="surrogateescape")
     except OSError:
         return os.path.ismount(target)
     for line in table.splitlines():

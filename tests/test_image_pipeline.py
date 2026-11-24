@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from ci_burst import image, image_pipeline
+from ci_burst import image, image_deletion, image_pipeline
 from ci_burst.aws import (
     BASIS_DIGEST_TAG,
     BUILD_ID_TAG,
@@ -3899,6 +3899,95 @@ class ReconcileTests(PipelineCase):
         self.assertEqual(self.world.next_version, 6)
 
 
+class SettingsChangedTests(PipelineCase):
+    """``run_until_done`` runs every pass on the settings it loaded: a file that says another thing ends it (#202)."""
+
+    def setUp(self):
+        super().setUp()
+        self.world.console_plan = [(100.0, WAITING), (300.0, READY)]
+
+    def edit_after_the_first_pass(self, edit):
+        """``edit`` runs once, as the first pass returns and before the loop decides on a second."""
+        self.passes = []
+        real = self.pipeline.run_pass
+
+        def run_pass(**keywords):
+            result = real(**keywords)
+            self.passes.append(result["decision"])
+            if len(self.passes) == 1:
+                edit()
+            return result
+
+        self.pipeline.run_pass = run_pass
+
+    def replace_in_file(self, old, new):
+        text = self.config_path.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), 1, old)
+        self.config_path.write_text(text.replace(old, new), encoding="utf-8")
+
+    def assert_ended_after_one_pass(self, refusal):
+        self.assertEqual(refusal.reason, "IMAGE_CONFIG_CHANGED")
+        self.assertEqual(self.passes, ["building"])
+        self.assertEqual(len(self.sessions), 1)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.only_build().state, "building")
+        self.assertNotIn(str(self.dir), refusal.detail)
+
+    def test_an_unchanged_file_compares_equal_and_a_changed_gate_or_pin_does_not(self):
+        original = load(self.config_path)
+        self.assertEqual(load(self.config_path), original)
+        self.assertEqual(load(self.config_path), self.config)
+        self.replace_in_file(GATE, NO_GATE)
+        self.assertNotEqual(load(self.config_path), original)
+        self.replace_in_file(NO_GATE, GATE)
+        self.assertEqual(load(self.config_path), original)
+        self.replace_in_file(f"launch_template_version = {PIN}", f"launch_template_version = {PIN + 1}")
+        self.assertNotEqual(load(self.config_path), original)
+
+    def test_a_withdrawn_gate_ends_the_loop_before_the_next_pass(self):
+        self.edit_after_the_first_pass(lambda: self.replace_in_file(GATE, NO_GATE))
+        refusal = self.refused(self.pipeline.run_until_done, "IMAGE_CONFIG_CHANGED")
+        self.assert_ended_after_one_pass(refusal)
+
+    def test_a_new_pin_ends_the_loop_before_the_next_pass(self):
+        self.edit_after_the_first_pass(
+            lambda: self.replace_in_file(f"launch_template_version = {PIN}", f"launch_template_version = {PIN + 1}")
+        )
+        refusal = self.refused(self.pipeline.run_until_done, "IMAGE_CONFIG_CHANGED")
+        self.assert_ended_after_one_pass(refusal)
+
+    def test_a_file_that_no_longer_loads_ends_the_loop_before_the_next_pass(self):
+        self.edit_after_the_first_pass(lambda: self.config_path.write_text("this = = is not toml", encoding="utf-8"))
+        refusal = self.refused(self.pipeline.run_until_done, "IMAGE_CONFIG_CHANGED")
+        self.assert_ended_after_one_pass(refusal)
+        self.assertIn("CONFIG_INVALID", refusal.detail)
+
+    def test_a_file_that_is_gone_ends_the_loop_before_the_next_pass(self):
+        self.edit_after_the_first_pass(self.config_path.unlink)
+        refusal = self.refused(self.pipeline.run_until_done, "IMAGE_CONFIG_CHANGED")
+        self.assert_ended_after_one_pass(refusal)
+        self.assertIn("CONFIG_MISSING", refusal.detail)
+
+    def test_a_file_that_gives_the_same_settings_keeps_the_loop_going(self):
+        # A rewrite and a comment change no setting: the build runs to its candidate as it does without an edit.
+        self.edit_after_the_first_pass(
+            lambda: self.config_path.write_text(
+                "# a comment\n" + self.config_path.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+        )
+        result = self.pipeline.run_until_done()
+        self.assertEqual(result["decision"], "candidate")
+        self.assertEqual(len(self.sessions), 2)
+
+    def test_the_first_pass_is_refused_when_the_file_changed_before_it(self):
+        # The loop checks before every pass, the first included: a file edited after the command loaded it.
+        self.replace_in_file(GATE, NO_GATE)
+        self.refused(self.pipeline.run_until_done, "IMAGE_CONFIG_CHANGED")
+        self.assertEqual(self.sessions, [])
+        self.assertEqual(self.world.calls, [])
+        self.assertFalse(self.state_dir.exists())
+
+
 class RetentionTests(PipelineCase):
     """The deletion rule is called with the protected set a pass can resolve."""
 
@@ -3919,6 +4008,44 @@ class RetentionTests(PipelineCase):
         self.assertEqual(self.events("image_pruned"), [])
         control = self.control()
         self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+
+    def test_an_edit_of_the_file_after_the_plan_deletes_nothing_and_fails_no_build(self):
+        # The listings of the account take time: a file that changed since the set was read ends the rule, and
+        # nothing is deregistered from a plan that the old pins made (#202).
+        self.pin_current()
+        self.stale_failed_build("failed-one", 0xD1)
+        real = image_deletion.plan_deletions
+
+        def plan_then_edit(*arguments, **keywords):
+            plan = real(*arguments, **keywords)
+            self.config_path.write_text(
+                self.config_path.read_text(encoding="utf-8") + "\n# a hand edit\n", encoding="utf-8"
+            )
+            return plan
+
+        with mock.patch.object(image_deletion, "plan_deletions", plan_then_edit):
+            result = self.apply()
+        self.assertEqual(result["retention"], {"refused": "IMAGE_DELETION_UNSAFE"})
+        self.assertIn(ami(0xD1), self.world.images)
+        self.assertEqual(self.world.arguments("deregister_image"), [])
+        self.assertEqual(self.events("image_pruned"), [])
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+
+    def test_an_edit_of_the_file_after_the_plan_is_refused_in_a_dry_plan_too(self):
+        self.stale_failed_build("failed-one", 0xD1)
+        real = image_deletion.plan_deletions
+
+        def plan_then_edit(*arguments, **keywords):
+            plan = real(*arguments, **keywords)
+            self.config_path.write_text(
+                self.config_path.read_text(encoding="utf-8") + "\n# a hand edit\n", encoding="utf-8"
+            )
+            return plan
+
+        with mock.patch.object(image_deletion, "plan_deletions", plan_then_edit):
+            result = self.plan()
+        self.assertEqual(result["deletion"], {"refused": "IMAGE_DELETION_UNSAFE"})
 
     def test_reconcile_deletes_nothing_when_the_protected_set_cannot_be_resolved_and_the_pass_goes_on(self):
         self.stale_failed_build("failed-one", 0xD1)

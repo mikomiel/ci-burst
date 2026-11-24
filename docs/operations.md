@@ -640,7 +640,11 @@ or advances the active one (`building`, then `imaging`, then `candidate` or
 `failed`), then runs retention. `--until-done` repeats passes, 30 seconds apart, until the build is `candidate` or
 `failed` or a pass has nothing in flight (a refusal, an unchanged digest). It needs
 `--apply` and refuses without it (`IMAGE_UNTIL_DONE_NEEDS_APPLY`, before the
-configuration is read). A pass that raises ends the loop. The exit status does not
+configuration is read). A pass that raises ends the loop. Before every pass the loop
+loads the deployment file again and ends with `IMAGE_CONFIG_CHANGED` when it no longer
+loads or gives other settings than the run loaded (a withdrawn gate, a new pin, another
+state directory); it launches nothing more, and a fresh run reads the file as it is now.
+A rewrite that changes no setting does not end the loop. The exit status does not
 tell whether a build is still in flight: a pass can commit a result and then raise,
 so read `image status` before the next run. `--force` counts for the first pass only.
 
@@ -826,8 +830,9 @@ that your jobs pass on it. Read the evidence, run a canary
    no new candidate appears and retention does not prune the chosen image. Finish
    or stop a running `image run --apply --until-done` container first, and start a
    fresh one afterwards ([container.md](container.md#run-the-image-commands)): a running
-   build container loaded the pin when it started, and its later passes would mix
-   that pin with the new file. The same holds for a rollback and for a hand edit of
+   build container loaded the pin when it started. It ends with
+   `IMAGE_CONFIG_CHANGED` before its next pass once the file changes, but the pass
+   in progress still runs on the old pin. The same holds for a rollback and for a hand edit of
    the pin. The command takes the lock file of the TOML and the writer lock of the
    state file, verifies the candidate against the record, replaces the one
    `launch_template_version` assignment in `[aws]`, and requires the strict loader
@@ -859,10 +864,11 @@ refuses with `PROMOTION_JOURNAL_DIVERGED` and changes nothing.
 These commands read the TOML through a mount of its directory. A container that
 mounted the file itself keeps the inode it mounted, and a promotion elsewhere
 replaces the file by a rename: that container then reads the old file. Each read
-checks, after the bytes are in, that the open file still has a name, and refuses
-with `PROMOTE_FILE_STALE` when it has none, so no journal row is resolved and no
-pin is written from a stale view. A replaced file that another hard link still
-names is not detected: do not keep hard links to the deployment TOML.
+checks, after the bytes are in, that the open file still has a link and is still the
+file that the path names, and refuses with `PROMOTE_FILE_STALE` when it is not, so no
+journal row is resolved and no pin is written from a stale view. A hard link that keeps
+the old file named does not hide the replacement. Every `image` command also refuses
+a file that is itself a mount point (`IMAGE_CONFIG_MOUNTED`) before it opens the state.
 
 #### Promote reason codes
 
@@ -896,7 +902,7 @@ plan when the file is a stale view or the journal cannot be read.
 | `PROMOTE_BUSY` | another promotion holds the lock file; it is never waited for | wait, then run the command again |
 | `PROMOTE_WRITE_FAILED` | a local file step failed; the detail names the errno and no path | fix the directory (space, mode, owner) and run the command again |
 | `PROMOTION_JOURNAL_DIVERGED` | the TOML matches neither hash of a pending journal row | stop scaling `apply` and every image run, and leave the TOML and the state file as they are. There is no dedicated resolve-only command, and a pass from a restored backup can act on the wrong state or images ([#205](https://github.com/mikomiel/ci-burst/issues/205)). Do not resolve it with `image run --apply`; keep the image path disabled until #205 gives a local resolve-only path |
-| `PROMOTE_FILE_STALE` | the open TOML has no name left: the container mounted the file itself and a rename elsewhere replaced it | mount the directory of the file, not the file, and run again |
+| `PROMOTE_FILE_STALE` | the open TOML is no longer the file that its path names, or has no link left: the container mounted the file itself and a rename elsewhere replaced it, or a rename replaced it during the read | mount the directory of the file, not the file, and run again |
 | `PIN_RECORD_DIVERGED` | the pin or the backup no longer matches what the newest completed promotion recorded | set the pin by hand to the intended version, then `image status --refresh` |
 | `ROLLBACK_NO_PROMOTION` | no completed promotion is recorded, or no state file exists | set the pin by hand |
 | `ROLLBACK_PREVIOUS_NOT_RECORDED` | the previous version and its image are not recorded as read | `image status --refresh`, then roll back |
@@ -945,8 +951,9 @@ running, and reconcile the existing workers and intents
 ([Scheduler, cleanup and rollback](#scheduler-cleanup-and-rollback)). To stop the
 image path itself, set `enabled = false`: every image command then answers
 `disabled`, and the scaling path is unaffected. The edit disables fresh
-invocations only: a running `image run --apply --until-done` container keeps the
-configuration it loaded at its start, so stop that container too, and wait until no
+invocations only: a running `image run --apply --until-done` container ends with
+`IMAGE_CONFIG_CHANGED` only before its next pass, and the pass in progress keeps the
+configuration it loaded, so stop that container too, and wait until no
 `image run --apply` of any kind is running: a single pass that loaded the enabled
 file can still be staging and launch after the edit. A builder that is running then
 is no longer ended by a pass. Its own timer exists only if its user data ran, so
@@ -1227,7 +1234,9 @@ and the codes of `promote` in [Promote reason codes](#promote-reason-codes).
 | `IMAGE_STATE_VERSION_UNSUPPORTED`, `IMAGE_STATE_UNREADABLE` | the state file has a schema this version does not know, or cannot be opened as the state file; keep the file and do not edit it |
 | `IMAGE_STATE_RECOVERY_NEEDED` | a process stopped inside a commit and left a rollback journal (`image-state.sqlite-journal`) that a read-only open cannot roll back; `status`, `plan`, the previews and `run` without `--apply` refuse and leave it. A writing command rolls it back: `image run --apply`, `image promote --write` (with or without `--rollback`) or `image status --refresh` takes the writer lock before its writable open, which rolls the journal back, and then does what it always does (a run resolves a pending row and runs its pass; a promotion also writes the pin). Another holder of the lock gives `IMAGE_STATE_LOCKED` with the journal left as it is. Do not delete the journal file: it holds the pages that make the file consistent |
 | `IMAGE_PROFILE_INVALID` | the image role profile is missing or breaks the profile rules of [deployment.md](deployment.md#image-build-role-and-source-identity-optional); a provider failure, exit `1` |
-| `IMAGE_DELETION_UNSAFE` | the deletion rule could not resolve the images it must protect, or read the deployment file through a stale view, so it deleted nothing. It appears inside the `retention` part of a pass result (`deletion` in a plan) and does not fail the command; that part can carry another refusal code, such as a provider code, in the same way |
+| `IMAGE_CONFIG_MOUNTED` | the deployment file is itself a mount point (a bind mount of the file, which keeps serving the inode it mounted). Raised by every `image` command with the image path enabled, before the state is opened, exit `2`; the detail names no path. Mount the dedicated directory of the file, not the file |
+| `IMAGE_CONFIG_CHANGED` | `--until-done` loaded the deployment file again before a pass and found that it no longer loads or gives other settings than the run loaded. The loop ends before the pass and launches nothing more; the state file keeps the build. Run the command again to resume it with the file as it is now |
+| `IMAGE_DELETION_UNSAFE` | the deletion rule could not resolve the images it must protect, read the deployment file through a stale view (also a replacement that a hard link survives), or found the file changed after it resolved them, so it deleted nothing. It appears inside the `retention` part of a pass result (`deletion` in a plan) and does not fail the command; that part can carry another refusal code, such as a provider code, in the same way |
 | a forge or provider code | raised from a read before a build is staged: a `FORGEJO_*` code exits `2`, an `AWS_*` code exits `1` |
 
 Two reasons mark rows that no build made: `IMAGE_ORPHAN_RECORDED` is a tagged

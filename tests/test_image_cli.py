@@ -23,7 +23,7 @@ import sqlite3
 import unittest
 from unittest import mock
 
-from ci_burst import cli, image
+from ci_burst import cli, image, image_promote
 from ci_burst.errors import ObservationRefusal, ProviderRefusal
 from ci_burst.image_state import PIN_RECORD_REASON, ImageState
 from ci_burst.image_status import VERSION_NOT_FOUND
@@ -34,6 +34,8 @@ from test_image_pipeline import (
     DAY,
     DEPLOYMENT,
     FAILED,
+    GATE,
+    NO_GATE,
     NOW,
     PIN,
     READY,
@@ -279,6 +281,78 @@ class DisabledTests(CliCase):
         self.write_deployment(self.image_toml(image_extra="retian = 3\n"))
         code, payload = self.invoke("image", "plan")
         self.assertEqual((code, payload["error"]["reason"]), (2, "CONFIG_INVALID"))
+
+
+class MountedFileTests(CliCase):
+    """An ``image`` command refuses a deployment file that is itself a mount point, before it opens anything (#202)."""
+
+    def mounted(self):
+        return mock.patch.object(image_promote, "is_mount_point", return_value=True)
+
+    def test_every_form_is_refused_with_exit_two_and_creates_nothing(self):
+        self.forbid_clients()
+        before = snapshot_tree(self.dir)
+        for form in FORMS:
+            with self.subTest(form=" ".join(form)), self.mounted() as check:
+                code, payload = self.invoke(*form)
+                self.assertEqual((code, payload["error"]["reason"]), (2, image_promote.IMAGE_CONFIG_MOUNTED))
+                check.assert_called_once_with(self.config_path)
+        self.assertEqual(snapshot_tree(self.dir), before)
+        self.assertFalse(self.state_dir.exists())
+        self.assertEqual((self.sessions, self.source_sessions, self.world.calls), ([], 0, []))
+
+    def test_the_detail_names_no_path(self):
+        with self.mounted():
+            code, payload = self.invoke("image", "status")
+        self.assertEqual(code, 2)
+        detail = payload["error"]["detail"]
+        self.assertIn("mount", detail)
+        for text in (str(self.dir), str(self.config_path), self.config_path.name, str(self.state_dir)):
+            self.assertNotIn(text, detail)
+
+    def test_a_file_that_is_not_a_mount_point_is_served(self):
+        with mock.patch.object(image_promote, "is_mount_point", return_value=False) as check:
+            code, payload = self.invoke("image", "status")
+        self.assertEqual(code, 0, payload)
+        check.assert_called_once_with(self.config_path)
+
+    def test_a_disabled_image_table_still_answers_disabled(self):
+        self.configure("\n[image]\nenabled = false\n")
+        with self.mounted() as check:
+            code, payload = self.invoke("image", "status")
+        self.assertEqual((code, payload), (0, {"decision": "disabled"}))
+        check.assert_not_called()
+
+
+class UntilDoneThroughTheCommandTests(CliCase):
+    """The loop reloads the file the command was given, so an unchanged file must load to the settings it started with."""
+
+    def setUp(self):
+        super().setUp()
+        self.world.console_plan = [(100.0, WAITING), (300.0, READY)]
+
+    def test_an_unchanged_file_is_supervised_to_a_candidate(self):
+        code, payload = self.invoke("image", "run", "--apply", "--until-done")
+        self.assertEqual((code, payload["decision"]), (0, "candidate"), payload)
+
+    def test_a_file_edited_during_the_run_ends_it_with_exit_two_before_another_pass(self):
+        edited = []
+        real = self.sleep
+
+        def sleep(seconds):
+            if not edited:
+                edited.append(True)
+                text = self.config_path.read_text(encoding="utf-8")
+                self.config_path.write_text(text.replace(GATE, NO_GATE), encoding="utf-8")
+            real(seconds)
+
+        self.sleep = sleep
+        code, payload = self.invoke("image", "run", "--apply", "--until-done")
+        self.assertEqual(edited, [True])
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual(len(self.sessions), 1)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.only_build().state, "building")
 
 
 class GuardTests(CliCase):

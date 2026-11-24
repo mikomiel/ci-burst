@@ -594,7 +594,7 @@ def _flush_directory(directory):
         os.close(descriptor)
 
 
-def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock):
+def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock, owner):
     """Steps 4 to 8 of the design for one pin change. The caller holds both locks.
 
     An ``OSError`` of a local file step is the refusal ``PROMOTE_WRITE_FAILED``, and its detail names the errno and
@@ -617,6 +617,9 @@ def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock):
         backup = _create_backup(snapshot, clock())
         if sha256_of(target.read_bytes()) != snapshot.sha256:
             raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed after it was read; nothing was written")
+        # The last check before the journal row: the file is the same, but a link on the path to the state may have
+        # moved while the backup was written, and the row would then be recorded where no later command looks.
+        check_state_owner(owner, snapshot, state)
         with state.transaction():
             if kind == "promotion":
                 _record_previous_pin(state, snapshot)
@@ -1103,6 +1106,7 @@ def _write(snapshot, state, clock, events, version, rollback, *, owner):
                     new_pin=plan.previous_pin,
                     candidate_id=plan.target.id,
                     clock=clock,
+                    owner=owner,
                 )
                 decision, build_id, image_id = "rolled_back", None, plan.target.image_id
             else:
@@ -1116,6 +1120,7 @@ def _write(snapshot, state, clock, events, version, rollback, *, owner):
                     new_pin=build.template_version,
                     candidate_id=build.id,
                     clock=clock,
+                    owner=owner,
                 )
                 decision, build_id, image_id = "promoted", build.id, build.image_id
             # The rename is done and the row is complete: from here on nothing may undo or hide the promotion.

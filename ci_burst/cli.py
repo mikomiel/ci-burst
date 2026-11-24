@@ -197,15 +197,17 @@ def _image(config, arguments):
     """Dispatch one ``image`` command. A deployment without the image path answers ``disabled`` at once."""
     if not config.image.enabled:
         return {"decision": "disabled"}
-    # Resolved once: the writer lock, the database and the events stay in this directory for the whole command,
-    # even if a link on its path moves meanwhile (#199).
-    state = ImageState(Path(config.image.state_directory).resolve(), clock=image_clock)
+    state = ImageState(config.image.state_directory, clock=image_clock)
     command = arguments.image_command
     if command == "status":
         if arguments.refresh:
             return image_status.refresh(config, state=state, aws=make_image_aws(config), clock=image_clock)
         return image_status.status(config, state=state, clock=image_clock)
     if command == "promote":
+        # Resolved once for promote: its writer lock, its database and its events stay in this directory for the
+        # whole command, and every check of the file compares against it, so a link on its path that moves meanwhile
+        # is refused, not followed (#199).
+        state = ImageState(Path(config.image.state_directory).resolve(), clock=image_clock)
         return image_promote.promote(
             config,
             state=state,

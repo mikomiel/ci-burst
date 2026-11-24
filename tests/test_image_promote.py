@@ -1936,7 +1936,8 @@ class StateOwnerTests(PromoteCase):
                 self.refused((), write=write, change=self.renamed_deployment)
 
     def refused_under_the_locks(self, change, *arguments):
-        """The first read passes; ``change`` runs while the write holds both locks, before its second read."""
+        """The first read passes; ``change`` runs once the write holds the lock of the file, before it takes the
+        writer lock of the state and reads the file again."""
         real = image_promote.file_lock
 
         @contextlib.contextmanager
@@ -2025,7 +2026,33 @@ class StateOwnerTests(PromoteCase):
         self.assertEqual(self.journal_rows(), [])
         self.assertEqual(sorted(path.name for path in self.other_state.iterdir()), before)
 
-    def test_the_same_directory_through_a_link_made_after_the_start_is_not_a_change(self):
+    def test_a_link_to_the_state_moved_while_the_backup_is_written_is_refused(self):
+        # The file stays the same, so only the check of the state owner right before the journal row sees the move.
+        link = self.dir / "state-link"
+        link.symlink_to(self.state_dir, target_is_directory=True)
+        self.edit(lambda text: text.replace(str(self.state_dir), str(link)))
+        self.other_state.mkdir()
+        real = image_promote._create_backup
+
+        def moved_during_the_backup(*arguments, **keywords):
+            backup = real(*arguments, **keywords)
+            link.unlink()
+            link.symlink_to(self.other_state, target_is_directory=True)
+            return backup
+
+        dump, toml = self.dump(), self.config_path.read_bytes()
+        with mock.patch.object(image_promote, "_create_backup", moved_during_the_backup):
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_STATE_CHANGED"), payload)
+        self.assertEqual(self.config_path.read_bytes(), toml, "the pin did not move")
+        self.assertEqual(self.dump(), dump)
+        self.assertEqual(self.journal_rows(), [])
+        self.assertEqual(self.backups(), [])
+        self.assertFalse(self.temporary().exists())
+        self.assertEqual(list(self.other_state.iterdir()), [])
+
+    def test_the_same_directory_through_a_link_named_after_the_start_is_not_a_change(self):
+        # The link exists before the command; the file names it only after the command line loaded the file.
         alias = self.dir / "state-alias"
         alias.symlink_to(self.state_dir, target_is_directory=True)
         with self.changed_before_the_snapshot(lambda text: text.replace(str(self.state_dir), str(alias))):

@@ -21,14 +21,15 @@ Three entry points make up the Python API (the command line is task 6.1):
 A pass holds the state file's writer lock and runs, in this order:
 
 1. reconcile: terminate the active build's builder once its deadline has come;
-   delete the archives that finished builds still owe; terminate every builder
-   that is not the active build's; delete stray archives; adopt
+   terminate every builder that is not the active build's; delete stray archives; adopt
    what a crash left behind; record every tagged image that has no row as an
    unverified candidate and follow it; remove the images of failed builds
 2. observe the configured pin
 3. with no active build, decide and, when a build is due, start it; with one,
    advance it (``building`` to ``imaging`` to ``candidate`` or ``failed``)
 4. retention: the one deletion rule, then the telemetry files
+5. the owed archive deletions, last: after the work above, on the time it leaves,
+   also when the work ended on a refusal (``_Pass._owed_tail``)
 
 The pass that first sees the marker calls ``CreateImage`` before it does any
 other step that is not a read. The builder is terminated only after the image is
@@ -1142,9 +1143,10 @@ class _Pass:
             return
         try:
             self._delete_owed(self.summary)
-            self._owed_event(self.summary)
         except Exception:  # noqa: BLE001 - the tail must not replace the result or the error of the pass
             self._note("archive:delete_tail_failed")
+        finally:
+            self._owed_event(self.summary)
 
     def _publish(self, *, checked):
         """Write the check time (after a pass that finished), the counters and the metrics."""
@@ -1206,8 +1208,10 @@ class _Pass:
         the pin fields that were not read are ``None``, ``retention`` is ``None`` and ``cleanup_only`` is true.
         """
         summary = self._reconcile_summary()
-        self._delete_owed(summary)
-        self._owed_event(summary)
+        try:
+            self._delete_owed(summary)
+        finally:
+            self._owed_event(summary)
         pin = _Pin(self.p._config.aws.launch_template_version, None, None, None)
         self.refused = IMAGE_GATE_REQUIRED
         self._check_event(REFUSED, IMAGE_GATE_REQUIRED, None, pin)
@@ -1372,29 +1376,35 @@ class _Pass:
             for row in self.s.archives_owed(self.dep)
             if row.archive_delete_tried_at is None or row.archive_delete_tried_at < self.started_at
         ]
-        deleted = failed = started = 0
+        started = 0
         for index, owed in enumerate(rows):
             if started >= OWED_ARCHIVES_PER_PASS or self.clock() >= self.deadline - OWED_DELETE_RESERVE_SECONDS:
                 self._note("archive:delete_deferred")
                 summary["owed_archives_deferred"] += len(rows) - index
                 break
             started += 1
+            # Each outcome is counted as its attempt ends, so that a later attempt that raises (a state write that
+            # fails, say) leaves the counts of the earlier ones for ``_owed_event``.
             if self._delete_archive(owed):
-                deleted += 1
+                summary["owed_archives_deleted"] += 1
+                self.tele.leak("archive", 1)
             else:
-                failed += 1
-        summary["owed_archives_deleted"] += deleted
-        summary["owed_archive_delete_failed"] += failed
-        self.tele.leak("archive", deleted)
+                summary["owed_archive_delete_failed"] += 1
 
     def _owed_event(self, summary):
-        """The event of the owed deletions: counts only, never a key or a bucket. Nothing is written for none."""
+        """The event of the owed deletions: counts only, never a key or a bucket. Nothing is written for none.
+
+        It runs in a ``finally`` after the deletions, so it never raises: a failure of its own is noted, and cannot
+        replace the error that the deletions or the pass ended on.
+        """
         counts = (
             summary["owed_archives_deleted"],
             summary["owed_archive_delete_failed"],
             summary["owed_archives_deferred"],
         )
-        if any(counts):
+        if not any(counts):
+            return
+        try:
             self.tele.event(
                 "image_reconciled",
                 builders_terminated=0,
@@ -1407,6 +1417,8 @@ class _Pass:
                 image_adopted=False,
                 build_id=None,
             )
+        except Exception:  # noqa: BLE001 - see the docstring
+            self._note("archive:delete_tail_failed")
 
     def _note(self, note):
         if note not in self.notes:

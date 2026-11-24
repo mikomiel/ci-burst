@@ -1121,7 +1121,6 @@ To find such a builder, filter on both `ci-burst:image-build = true` and `ci-bur
 
 When passes do run, every applying pass reconciles before it does anything else.
 It terminates the active build's builder once its deadline has passed. It then
-retries the archive deletions that finished builds still owe (see below), and
 terminates every tagged builder that is not the active build's. It deletes any object under the archive
 prefix that is not the active archive and is older than one hour; it checks neither
 the key name nor the writer of the object, so the prefix must belong to this
@@ -1133,7 +1132,8 @@ unverified candidate that is never pinned. Such a row has the reason
 `image status` can show it as `last_build`, but never as the `candidate`, and
 `promote` cannot select it. Removals of leaked resources add to
 `ci_burst_image_leaked_resources_total`; the termination of an overdue builder of an
-active build does not, so do not use the counter to account for those. The bucket lifecycle rule on the staging
+active build does not, so do not use the counter to account for those. The archive deletions that finished builds still owe run at the end of the pass, not
+here (see below). The bucket lifecycle rule on the staging
 prefix is a backstop only. The row of a build records the bucket and the key of its
 archive (`archive_bucket`, `archive_key`) before the upload starts, and a stage
 done again uses the recorded pair, not the configured bucket and prefix of the

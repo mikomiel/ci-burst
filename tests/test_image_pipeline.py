@@ -3902,6 +3902,54 @@ class OwedArchiveBoundTests(PipelineCase):
         self.assertIsNone(row.archive_deleted_at)
         self.assertIsNotNone(row.archive_delete_tried_at)
 
+    def two_owed_rows_the_first_of_which_the_bucket_denies(self):
+        """The first row's delete is denied. The second is deleted, and the record of that raises a SQLite error."""
+        denied = f"{PREFIX}owed-a.tar.gz"
+        for name, age in (("a", 6 * DAY), ("b", 5 * DAY)):
+            key = f"{PREFIX}owed-{name}.tar.gz"
+            self.add_build(f"owed-{name}", age=age, archive_bucket="example-old-staging", archive_key=key)
+            self.world.objects[key] = (b"archive", NOW)
+
+        def deny(arguments):
+            if arguments["Key"] == denied:
+                raise ProviderError("AccessDenied")
+
+        self.world.hooks["delete_object"] = deny
+        return mock.patch.object(
+            ImageState, "mark_archive_deleted", side_effect=sqlite3.OperationalError("disk I/O error")
+        )
+
+    def assert_one_event_counts_one_denied_delete(self):
+        (event,) = self.events("image_reconciled")
+        self.assertEqual(
+            (event["owed_archives_deleted"], event["owed_archive_delete_failed"], event["owed_archives_deferred"]),
+            (0, 1, 0),
+        )
+        first = [row for row in self.builds() if row.id == "owed-a"][0]
+        self.assertIsNotNone(first.archive_delete_tried_at)
+
+    def test_the_counts_of_the_earlier_attempts_survive_a_later_one_that_raises_in_the_tail(self):
+        patched = self.two_owed_rows_the_first_of_which_the_bucket_denies()
+        self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)
+        with patched:
+            refusal = self.refused(self.apply, "AWS_UNCERTAIN")
+        self.assertEqual(refusal.detail, "ProviderError")
+        self.assert_one_event_counts_one_denied_delete()
+
+    def test_the_counts_of_the_earlier_attempts_survive_a_later_one_that_raises_in_the_cleanup_pass(self):
+        patched = self.two_owed_rows_the_first_of_which_the_bucket_denies()
+        self.configure(render_toml(gate=""))
+        with patched, self.assertRaises(sqlite3.OperationalError):
+            self.apply()
+        self.assert_one_event_counts_one_denied_delete()
+
+    def test_a_failure_to_write_the_owed_event_replaces_neither_the_refusal_nor_the_result(self):
+        self.owe(1, stuck=[0])
+        self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)
+        with mock.patch.object(image_pipeline._Telemetry, "event", side_effect=OSError("disk full")):
+            refusal = self.refused(self.apply, "AWS_UNCERTAIN")
+        self.assertEqual(refusal.detail, "ProviderError")
+
     def test_rows_that_the_bound_left_are_counted_in_the_event(self):
         self.owe(OWED_ARCHIVES_PER_PASS + 2)
         self.world.console_plan = [(30.0, READY)]

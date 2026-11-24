@@ -683,9 +683,9 @@ class ConfigChangedTests(DeletionCase):
         os.replace(replacement, self.deployment_file)
         self.refused(protected)
 
-    def test_an_in_place_edit_during_the_read_is_unsafe(self):
-        # The same inode keeps its name, so the read cannot tell: the identity is taken before the bytes are read,
-        # and the check after the read sees the file that the edit left, not the bytes that were used.
+    def test_an_in_place_edit_during_the_read_is_unsafe_and_reads_no_version(self):
+        # The same inode keeps its name, so only the identity of the open file, taken before the first byte and
+        # again after the last, tells the bytes that were used from the file that the edit left (#202).
         real = os.read
         edited = []
         text = self.deployment_file.read_text(encoding="utf-8")
@@ -697,10 +697,12 @@ class ConfigChangedTests(DeletionCase):
                 self.deployment_file.write_text(text + "\n# a hand edit\n", encoding="utf-8")
             return data
 
-        with mock.patch("os.read", read):
-            protected = self.resolve()
+        with mock.patch("os.read", read), self.assertRaises(ImageRefusal) as raised:
+            self.resolve()
         self.assertEqual(edited, [True])
-        self.refused(protected)
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertIn("changed while it was read", raised.exception.detail)
+        self.assertEqual(self.ec2.calls, [])
 
     def two_failed_images(self):
         self.reset()

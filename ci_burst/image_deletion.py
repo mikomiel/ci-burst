@@ -159,12 +159,15 @@ def _load_deployment(config_path):
         while chunk := os.read(descriptor, 1 << 16):
             chunks.append(chunk)
         stale = not still_named(descriptor, config_path)
+        edited = _identity(os.fstat(descriptor)) != identity
     except OSError:
         raise _unsafe(unreadable) from None
     finally:
         os.close(descriptor)
     if stale:
         raise _unsafe("the deployment file is a view of a file that was replaced")
+    if edited:
+        raise _unsafe("the deployment file changed while it was read")
     try:
         return loads(b"".join(chunks).decode("utf-8"), config_path), identity
     except (UnicodeDecodeError, ConfigRefusal):

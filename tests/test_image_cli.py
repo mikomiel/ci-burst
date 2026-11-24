@@ -316,6 +316,21 @@ class MountedFileTests(CliCase):
         self.assertEqual(code, 0, payload)
         check.assert_called_once_with(self.config_path)
 
+    def test_an_unreadable_mount_table_on_linux_refuses_before_the_state_opens(self):
+        # The status cannot be established, so it is not a pass: no path in the detail, no state file.
+        self.forbid_clients()
+        before = snapshot_tree(self.dir)
+        with (
+            mock.patch.object(image_promote, "_MOUNTINFO", self.dir / "no-such-table"),
+            mock.patch("sys.platform", "linux"),
+        ):
+            code, payload = self.invoke("image", "status")
+        self.assertEqual((code, payload["error"]["reason"]), (2, image_promote.IMAGE_CONFIG_MOUNTED))
+        for text in (str(self.dir), self.config_path.name, str(self.state_dir)):
+            self.assertNotIn(text, payload["error"]["detail"])
+        self.assertEqual(snapshot_tree(self.dir), before)
+        self.assertFalse(self.state_dir.exists())
+
     def test_a_disabled_image_table_still_answers_disabled(self):
         self.configure("\n[image]\nenabled = false\n")
         with self.mounted() as check:

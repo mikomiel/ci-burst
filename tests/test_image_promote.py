@@ -1903,6 +1903,53 @@ class StaleViewTests(PromoteCase):
             yield target
         self.assertEqual(switched, [True])
 
+    @contextlib.contextmanager
+    def edited_in_place_during_the_read(self):
+        """The first read of the deployment file ends, and the file is then rewritten in place (same inode, same name).
+
+        Every byte that the command uses was read before the edit, so a check of the name and the inode sees
+        nothing; the hash of those bytes is of a file that no longer exists (#202).
+        """
+        target = Path(self.config.path).resolve()
+        text = target.read_text(encoding="utf-8")
+        inode = os.stat(target).st_ino
+        real = os.read
+        edited = []
+
+        def read(descriptor, size):
+            data = real(descriptor, size)
+            if not data and not edited and os.fstat(descriptor).st_ino == inode:
+                edited.append(True)
+                target.write_text(text + "\n# a hand edit\n", encoding="utf-8")
+            return data
+
+        with mock.patch("os.read", read):
+            yield target
+        self.assertEqual(edited, [True])
+        self.assertEqual(os.stat(target).st_ino, inode)
+
+    def test_an_in_place_edit_during_the_read_is_refused_as_a_changed_file(self):
+        with self.edited_in_place_during_the_read():
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.read_snapshot(self.config)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_CHANGED")
+
+    def test_a_pending_row_is_not_resolved_from_a_file_edited_in_place_during_the_read(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        with self.edited_in_place_during_the_read():
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+
+    def test_a_promote_preview_and_write_are_refused_when_the_file_is_edited_in_place_during_the_read(self):
+        for write in (False, True):
+            with self.subTest(write=write), self.edited_in_place_during_the_read():
+                code, payload = (self.write_pin if write else self.show)()
+            self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(self.journal_rows(), [])
+
     def test_a_link_that_is_switched_during_the_read_is_refused_as_stale(self):
         with self.link_switched_during_the_read():
             with self.assertRaises(ImageRefusal) as raised:
@@ -2817,19 +2864,21 @@ class MountPointTests(unittest.TestCase):
 
     def test_each_escape_of_the_mount_table_is_undone(self):
         for escaped, plain in (
-            ("\\040", " "),
-            ("\\011", "\t"),
-            ("\\012", "\n"),
-            ("\\134", "\\"),
+            (b"\\040", b" "),
+            (b"\\011", b"\t"),
+            (b"\\012", b"\n"),
+            (b"\\134", b"\\"),
         ):
             with self.subTest(escaped=escaped):
-                self.assertEqual(image_promote._unescape_mount_point(f"/a{escaped}b"), f"/a{plain}b")
-        self.assertEqual(image_promote._unescape_mount_point("/a\\040b\\011c\\012d\\134e"), "/a b\tc\nd\\e")
-        self.assertEqual(image_promote._unescape_mount_point("/plain/path"), "/plain/path")
+                self.assertEqual(image_promote._unescape_mount_point(b"/a" + escaped + b"b"), b"/a" + plain + b"b")
+        self.assertEqual(
+            image_promote._unescape_mount_point(b"/a\\040b\\011c\\012d\\134e"), b"/a b\tc\nd\\e"
+        )
+        self.assertEqual(image_promote._unescape_mount_point(b"/plain/path"), b"/plain/path")
 
     def test_a_backslash_that_spells_an_escape_stays_a_backslash(self):
         # A name that holds a backslash and the digits 040 is written as \134 and 040: it is not a space.
-        self.assertEqual(image_promote._unescape_mount_point("/a\\134040b"), "/a\\040b")
+        self.assertEqual(image_promote._unescape_mount_point(b"/a\\134040b"), b"/a\\040b")
 
     def test_a_listed_path_is_a_mount_point(self):
         path = self.made()
@@ -2886,11 +2935,54 @@ class MountPointTests(unittest.TestCase):
         self.table.write_text("\n29 1 0:5\n", encoding="utf-8")
         self.assertFalse(image_promote.is_mount_point(path))
 
-    def test_an_unreadable_table_falls_back_to_the_device_comparison(self):
+    def listed_bytes(self, field):
+        self.table.write_bytes(
+            b"29 1 0:5 / / rw - rootfs rootfs rw\n32 1 8:1 /b " + field + b" rw - ext4 /dev/example rw\n"
+        )
+
+    def test_a_name_with_escaped_bytes_matches_as_bytes(self):
+        # Tab and backslash are escaped in the table; the text \040 in a name is a backslash and three digits.
+        for name, field in (
+            ("a\tb\\c.toml", b"a\\011b\\134c.toml"),
+            ("a\\040b.toml", b"a\\134040b.toml"),
+        ):
+            with self.subTest(name=ascii(name)):
+                path = self.made(name)
+                self.listed_bytes(os.fsencode(self.dir) + b"/" + field)
+                self.assertTrue(image_promote.is_mount_point(path))
+                self.listed_bytes(os.fsencode(self.dir) + b"/a b.toml")
+                self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_a_name_that_is_not_utf8_matches_as_bytes(self):
+        name = os.fsdecode(b"caf\xe9.toml")
+        path = self.made(name)
+        self.listed_bytes(os.fsencode(self.dir) + b"/caf\xe9.toml")
+        self.assertTrue(image_promote.is_mount_point(path))
+        # The same bytes in another spelling (the UTF-8 letter) are another name.
+        self.listed_bytes(os.fsencode(self.dir) + b"/caf\xc3\xa9.toml")
+        self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_an_unreadable_table_on_linux_refuses_and_names_no_path(self):
+        path = self.made()
+        self.assertFalse(self.table.exists())
+        with mock.patch("sys.platform", "linux"), mock.patch("os.path.ismount", return_value=False) as ismount:
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.is_mount_point(path)
+        self.assertEqual(raised.exception.reason, "IMAGE_CONFIG_MOUNTED")
+        self.assertIn("mount table", raised.exception.detail)
+        for text in (str(self.dir), path.name, str(self.table)):
+            self.assertNotIn(text, raised.exception.detail)
+        ismount.assert_not_called()
+
+    def test_an_unreadable_table_off_linux_falls_back_to_the_device_comparison(self):
         path = self.made()
         self.assertFalse(self.table.exists())
         for answer in (True, False):
-            with self.subTest(answer=answer), mock.patch("os.path.ismount", return_value=answer) as ismount:
+            with (
+                self.subTest(answer=answer),
+                mock.patch("sys.platform", "darwin"),
+                mock.patch("os.path.ismount", return_value=answer) as ismount,
+            ):
                 self.assertEqual(image_promote.is_mount_point(path), answer)
             ismount.assert_called_once_with(str(path))
 

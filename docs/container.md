@@ -309,7 +309,9 @@ neither the profile directory nor the token.
 The line mounts the dedicated directory of the TOML, never the file itself and never
 all of `/etc/ci-burst`. `promote --write` replaces the TOML atomically, and a bind
 mount of the single file keeps serving the replaced inode, with the old pins. Every
-`image` command refuses a file that is itself a mount point (`IMAGE_CONFIG_MOUNTED`).
+`image` command refuses a file that is itself a mount point (`IMAGE_CONFIG_MOUNTED`), and
+on Linux also when the mount table of the process (`/proc/self/mountinfo`) cannot be read:
+the container must keep it readable, and `image` never treats an unreadable table as a pass.
 With the directory mounted, retention reads the replacement
 file that a promotion wrote on its next pass: retention reloads the
 TOML on every pass, to find the pins it must keep. The rest of a run keeps the

@@ -912,6 +912,10 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **WHEN** a rename replaces the file during the read while another hard link keeps the old file named, so that its link count stays above zero
 - **THEN** the command refuses with `PROMOTE_FILE_STALE`, because the path no longer names the open file, and writes nothing
 
+#### Scenario: The file is edited in place during the read
+- **WHEN** the file is rewritten in place (same inode and name) while a command reads it, so that its change time, modification time or size differ after the read
+- **THEN** the command refuses with `PROMOTE_FILE_CHANGED`, and no pending row is resolved from the hash of the bytes that were read, and a deletion load refuses with `IMAGE_DELETION_UNSAFE`
+
 #### Scenario: A link that names the file switches during the read
 - **WHEN** `--config` is a symbolic link and it is switched to another file during the read, so that the file it resolved to is still named
 - **THEN** the command refuses with `PROMOTE_FILE_STALE` because the path as given no longer names the open file, and no pending row is resolved
@@ -1086,7 +1090,7 @@ An event value MUST NOT hold `://`. The console tail of a failed-build event MUS
 - **THEN** the write is an error and is neither continued nor retried
 
 ### Requirement: Image configuration is strict
-The `[image]` tables MUST refuse unknown keys and out-of-range values with `CONFIG_INVALID` before any call. A phase 2 key MUST be accepted only when the code that uses it is present. Examples and tests MUST use synthetic names only. Every `image` command MUST refuse a deployment file that is itself a mount point with `IMAGE_CONFIG_MOUNTED`, before it opens the state.
+The `[image]` tables MUST refuse unknown keys and out-of-range values with `CONFIG_INVALID` before any call. A phase 2 key MUST be accepted only when the code that uses it is present. Examples and tests MUST use synthetic names only. Every `image` command MUST refuse a deployment file that is itself a mount point with `IMAGE_CONFIG_MOUNTED`, before it opens the state, and on Linux MUST refuse it when the mount table cannot be read.
 
 #### Scenario: An unknown key
 - **WHEN** `[image]` contains an unknown key
@@ -1104,6 +1108,11 @@ The `[image]` tables MUST refuse unknown keys and out-of-range values with `CONF
 - **WHEN** the image path is enabled and the file that `--config` names is a bind mount of that file
 - **THEN** every `image` command refuses with `IMAGE_CONFIG_MOUNTED` and exit 2 before it opens the state, and the detail names no path
 - **AND** no state file is created, and a disabled image path still answers `disabled`
+
+#### Scenario: The mount table cannot be read
+- **WHEN** the image path is enabled on Linux and the mount table of the process cannot be read
+- **THEN** every `image` command refuses with `IMAGE_CONFIG_MOUNTED` before it opens the state, and the detail names no path
+- **AND** only where no such table exists (not Linux) the device comparison of the platform decides
 
 ### Requirement: The timer is enabled only after manual qualification
 The shipped `ci-burst-image` timer unit MUST be a one-shot container that mounts the configuration read-only, mounts the image state directory writable and the image role's profile directory read-only, and mounts no scaling credential and no scaling state. Documentation MUST state that the timer is enabled only after one manual build succeeded and about three clean promotions, and that the operator qualifies the unit with a refresh-script check.

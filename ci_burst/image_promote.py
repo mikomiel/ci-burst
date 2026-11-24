@@ -46,6 +46,7 @@ import hashlib
 import os
 import re
 import stat
+import sys
 import tomllib
 from contextlib import contextmanager, suppress
 import dataclasses
@@ -163,6 +164,8 @@ def _read_open_file(config, target, descriptor):
         # The resolved target and the path that was given: a link that was switched to another file during the read
         # leaves the target named, and only the given path then shows that the bytes are from the file it left.
         linked = still_named(descriptor, target) and still_named(descriptor, config.path)
+        # An edit in place keeps the inode and the name: only the times and the size of the open file show it.
+        edited = _identity(os.fstat(descriptor)) != _identity(metadata)
         data = b"".join(chunks)
         text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError) as error:
@@ -176,6 +179,10 @@ def _read_open_file(config, target, descriptor):
             PROMOTE_FILE_STALE,
             "this view of the deployment file was replaced; mount its directory, not the file, and run again",
         )
+    if edited:
+        # The identity was taken before the first byte and again after the last: a difference means that the bytes
+        # may be a mix of two contents, and a hash of them would resolve a pending row from a file that never was.
+        raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed while it was read; run the command again")
     try:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
@@ -212,8 +219,8 @@ def still_named(descriptor, path):
 
 
 def _unescape_mount_point(field):
-    """A mount point of ``/proc/self/mountinfo``: space, tab, line feed and backslash are octal escapes there."""
-    for escape, character in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+    """A mount point of ``/proc/self/mountinfo`` as bytes: space, tab, line feed and backslash are octal escapes there."""
+    for escape, character in ((b"\\040", b" "), (b"\\011", b"\t"), (b"\\012", b"\n"), (b"\\134", b"\\")):
         field = field.replace(escape, character)
     return field
 
@@ -222,20 +229,27 @@ def is_mount_point(path):
     """Whether the file that ``path`` resolves to is itself a mount point, as a bind mount of the file makes it.
 
     The mount table of the process decides: a bind mount of one file from the same file system is invisible to a
-    device comparison. Without the table (not Linux, or no ``/proc``) the device comparison of ``os.path.ismount``
-    decides.
+    device comparison. The kernel writes a path as bytes, so the comparison is on bytes (``os.fsencode`` of the
+    resolved path against the unescaped field), and a line ends at a line feed only, which the kernel escapes; U+2028,
+    a carriage return and the like stay in a name. On Linux a table that cannot be read gives no answer: the mount
+    status cannot be established, so it is refused as ``IMAGE_CONFIG_MOUNTED``, not passed. Only where there is no
+    such table (not Linux) the device comparison of ``os.path.ismount`` decides.
     """
     target = os.path.realpath(path)
     try:
-        # The kernel writes a path as its bytes: ``surrogateescape`` is how Python spells a name that is not UTF-8.
-        # The bytes are decoded as they are (no newline translation), and a line ends at a line feed only: the kernel
-        # escapes that one, and leaves U+2028, a carriage return and the like in a name.
-        table = _MOUNTINFO.read_bytes().decode("utf-8", errors="surrogateescape")
+        table = _MOUNTINFO.read_bytes()
     except OSError:
+        if sys.platform.startswith("linux"):
+            raise ImageRefusal(
+                IMAGE_CONFIG_MOUNTED,
+                "the mount table could not be read, so it cannot be shown that the deployment file is not itself a "
+                "mount point; make the mount table of the process readable, or mount the dedicated directory of the file, and run again",
+            ) from None
         return os.path.ismount(target)
-    for line in table.split("\n"):
-        fields = line.split(" ")
-        if len(fields) > 4 and _unescape_mount_point(fields[4]) == target:
+    wanted = os.fsencode(target)
+    for line in table.split(b"\n"):
+        fields = line.split(b" ")
+        if len(fields) > 4 and _unescape_mount_point(fields[4]) == wanted:
             return True
     return False
 

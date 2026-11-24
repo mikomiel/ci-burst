@@ -23,8 +23,8 @@ STATE_FILE = "image-state.sqlite"
 #: A process that stopped inside a commit left a hot rollback journal, which only a writable connection rolls back.
 STATE_RECOVERY_NEEDED = "IMAGE_STATE_RECOVERY_NEEDED"
 _RECOVERY_DETAIL = (
-    "a write that stopped left a rollback journal; `image run --apply` or `image promote --write` "
-    "rolls it back under the writer lock"
+    "a write that stopped left a rollback journal; `image status --refresh` (no pin or account change), "
+    "`image run --apply` or `image promote --write` rolls it back under the writer lock"
 )
 
 BUILD_STATES = ("building", "imaging", "candidate", "failed", "promoted")

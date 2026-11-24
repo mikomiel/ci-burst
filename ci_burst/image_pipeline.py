@@ -983,15 +983,14 @@ class ImagePipeline:
         if not apply:
             return self.plan(force=force)
         script = self._inputs(apply=True)
-        opened = not self._state.available
         try:
             self._state.acquire_writer()  # before the writable open, which rolls back a hot journal
             self._state.connect()
             return _Pass(self, script, force).run()
         finally:
-            self._state.release_writer()
-            if opened:
-                self._state.close()
+            # The lock and the writable connection end together: a connection kept without the lock could roll
+            # back a journal that another writer left between passes. The next pass opens again under the lock.
+            self._state.close()
 
     def run_until_done(self, *, force=False):
         """Repeat passes, with a fixed sleep between them, until the build is over.

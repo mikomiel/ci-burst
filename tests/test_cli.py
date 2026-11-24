@@ -40,6 +40,23 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["error"]["reason"], "FORGEJO_CONTRACT_UNQUALIFIED")
         self.assertFalse((self.root / "state.sqlite3").exists())
 
+    def test_apply_refuses_another_worker_lifetime_before_the_ledger_and_reap_still_runs(self):
+        config = write_config(self.root, config={"aws": {"max_lifetime_seconds": 1800}})
+        built = []
+
+        def controller(configuration):
+            built.append(configuration)
+            return Controller(configuration, aws=FakeAws())
+
+        with mock.patch("ci_burst.cli.Controller", controller):
+            code, payload = self.run_cli(["apply", "--config", str(config)])
+            self.assertEqual(code, 2)
+            self.assertEqual(payload["error"]["reason"], "WORKER_LIFETIME_MISMATCH")
+            self.assertFalse((self.root / "state.sqlite3").exists(), "no ledger was opened")
+            code, payload = self.run_cli(["reap", "--config", str(config)])
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["decision"], "planned")
+
     def test_exit_codes_follow_the_decision(self):
         cases = [
             ({"decision": "planned"}, 0),

@@ -615,7 +615,9 @@ def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock):
         _remove(temporary)  # a crashed run left it; this run holds the lock
         _create(temporary, new_data, snapshot)
         backup = _create_backup(snapshot, clock())
-        if sha256_of(target.read_bytes()) != snapshot.sha256:
+        # The same check as the preview's: ``--config`` must still lead to this file, with the same identity and
+        # bytes. A hash of the resolved target alone misses a link that now leads to another file.
+        if not _is_unchanged(snapshot):
             raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed after it was read; nothing was written")
         with state.transaction():
             if kind == "promotion":
@@ -1096,6 +1098,11 @@ def _write(snapshot, state, clock, events, version, rollback, *, owner):
             config = snapshot.config
             # Every row first: a damaged completed row must stop the write here, not after the file changed.
             state.journal_check()
+            # A pending row is resolved from the hash of this snapshot, and the resolution is written at once:
+            # the file must still be this snapshot first, or a stale hash could mark a row aborted that a later
+            # check then refuses to build on.
+            if not _is_unchanged(snapshot):
+                raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed after it was read; nothing was written")
             resolved = resolve_pending(state, snapshot.sha256)
             now = clock()
             if rollback:

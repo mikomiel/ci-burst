@@ -2005,6 +2005,56 @@ class StateOwnerTests(PromoteCase):
         self.refused((), write=False, change=lambda text: text.replace(str(self.state_dir), str(alias)))
 
 
+class LateFileChangeTests(PromoteCase):
+    """The write checks the path and the file again right before it resolves rows and right before the rename."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+
+    def test_a_config_link_moved_while_the_backup_is_written_is_refused(self):
+        link_directory = self.dir / "link"
+        link_directory.mkdir()
+        link = link_directory / "deployment.toml"
+        link.symlink_to(self.config_path)
+        elsewhere = self.dir / "elsewhere"
+        elsewhere.mkdir()
+        moved = elsewhere / "deployment.toml"
+        moved.write_bytes(self.config_path.read_bytes())
+        real = image_promote._create_backup
+
+        def moved_during_the_backup(*arguments, **keywords):
+            backup = real(*arguments, **keywords)
+            link.unlink()
+            link.symlink_to(moved)
+            return backup
+
+        original, dump = self.config_path.read_bytes(), self.dump()
+        with mock.patch.object(image_promote, "_create_backup", moved_during_the_backup):
+            code, payload = self.invoke("image", "promote", "--write", "--config", str(link), config=False)
+        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_FILE_CHANGED"), payload)
+        self.assertEqual(self.config_path.read_bytes(), original, "the file the link left keeps its pin")
+        self.assertEqual(moved.read_bytes(), original)
+        self.assertEqual(self.dump(), dump)
+        self.assertEqual(self.backups(), [])
+        self.assertFalse(self.temporary().exists())
+
+    def test_an_edit_after_the_locked_read_leaves_a_pending_row_pending(self):
+        self.crash_before_rename()
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        real = ImageState.journal_check
+
+        def edited_after_the_read(state):
+            result = real(state)
+            self.edit_file(b"region = ", b"# hand edit\nregion = ")
+            return result
+
+        with mock.patch.object(ImageState, "journal_check", edited_after_the_read):
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_FILE_CHANGED"), payload)
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"], "not resolved from a stale hash")
+
+
 class FreshnessTests(unittest.TestCase):
     LIMIT = 3600
 

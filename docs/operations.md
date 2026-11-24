@@ -870,21 +870,31 @@ refuses with `PROMOTION_JOURNAL_DIVERGED` and changes nothing.
 
 These commands read the TOML through a mount of its directory. A container that
 mounted the file itself keeps the inode it mounted, and a promotion elsewhere
-replaces the file by a rename: that container then reads the old file. Each read
-checks, after the bytes are in, that the open file still has a link and is still the
-file that the path names, and refuses with `PROMOTE_FILE_STALE` when it is not, so no
-journal row is resolved and no pin is written from a stale view. A hard link that keeps
-the old file named does not hide the replacement, and neither does a `--config` that is
-a symbolic link switched to another file during the read: the path as given is checked
-as well as the file it resolved to. An edit in place during the read (same inode, same
-name) is seen too: the device, inode, change and modification times and size of the open
-file are taken before the first byte and again after the last, and a difference refuses
-with `PROMOTE_FILE_CHANGED` (`IMAGE_DELETION_UNSAFE` for a deletion), so no pending row is
-resolved from the hash of bytes that the edit replaced. `promote --write` and the recovery verify the
-file once more right before they rely on a snapshot, and that read is checked the same way: the identity
-of the open file after the last byte, and the file that the path as given and the resolved target name. Every `image` command also refuses
-a file that is itself a mount point (`IMAGE_CONFIG_MOUNTED`) before it opens the state;
-it compares the bytes of the resolved path with the mount table of the process.
+replaces the file by a rename: that container then reads the old file. Every read
+that a decision rests on is one read of one open file: the pin and hash of `promote`,
+`promote --rollback` and the preview, the recovery of a pending row, the verification
+right before `promote --write` relies on a snapshot, the load that the deletion rule makes, and the reload of
+`--until-done`. After the last byte is in, the same open file is checked three ways:
+
+- **Identity.** Its device, inode, change and modification times and size equal the values from before the
+  first byte. An edit in place during the read (same inode, same name) refuses with `PROMOTE_FILE_CHANGED`
+  (`IMAGE_DELETION_UNSAFE` for a deletion), so no pending row is resolved from the hash of bytes that the edit replaced.
+- **Name.** It still has a link, and both the resolved target and the path as given still name it. A
+  mismatch refuses with `PROMOTE_FILE_STALE`, so no journal row is resolved and no pin is written from a
+  stale view. A hard link that keeps the old file named does not hide the replacement, and neither does a
+  `--config` that is a symbolic link switched to another file during the read.
+- **Mount.** It is not a mount point (`IMAGE_CONFIG_MOUNTED`), and it is still named after the mount table was
+  read, so the answer is about the file whose bytes were read. A mount point is refused on every such read, also
+  the one that supplies the hash of the recovery. Every `image` command also checks it before it opens the state.
+
+`promote --write` verifies the file this way twice: before it resolves a pending row, and again after the
+`pending` row is committed and right before the rename. A change in the second check leaves the row `pending`
+(and its backup), writes nothing and refuses with `PROMOTE_FILE_CHANGED`.
+
+A residual window remains between the last check and the use of the bytes: the product cannot lock an
+operator's editor, so an edit after the last check is not excluded. Recovery resolves a pending row from the file as it
+is found, by its hash: the old hash means that the rename did not happen (`aborted`), the new hash that it did
+(`complete`), and any other hash refuses with `PROMOTION_JOURNAL_DIVERGED`.
 
 #### Promote reason codes
 

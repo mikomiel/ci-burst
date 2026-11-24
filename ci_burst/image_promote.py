@@ -123,54 +123,74 @@ class Snapshot:
 # -- reading --------------------------------------------------------------------------
 
 
-def read_snapshot(config, *, hold=False):
-    """Read the deployment file once, through the strict loader, and keep its bytes.
+@dataclass(frozen=True)
+class AuthoritativeRead:
+    """The bytes of the deployment file as ``read_authoritative`` established them, with the facts of that open file."""
 
-    The path is followed to the file it names, so the directory that is checked,
-    locked and written is the directory the bytes live in. Every pin fact of one
-    command comes from these bytes.
+    target: Path
+    data: bytes
+    identity: tuple  # see ``_identity``; the same before the first byte and after the last
+    mode: int
+    uid: int
+    gid: int
+    held: int | None = None  # with ``hold``, the descriptor the bytes were read through, still open
 
-    With ``hold`` the descriptor stays open in ``held`` and the caller closes it: while it is open the file's inode
-    cannot be given to another file, so a later check of the path tells this file from any replacement.
+
+def read_authoritative(path, *, hold=False):
+    """The one read of the deployment file that a decision may rest on (#202).
+
+    ``path`` is followed to the file it names, and that file is opened without following a link, and without waiting
+    for a writer (a FIFO in its place is refused, never a hang). Every check is made on the one open file, after its
+    last byte was read:
+
+    - its identity (device, inode, change and modification times, size) is the same as before the first byte: an edit
+      in place gives ``PROMOTE_FILE_CHANGED``;
+    - it keeps a link, and both the resolved target and the path that was given still name it: a rename over the file
+      gives ``PROMOTE_FILE_STALE``, even when a hard link keeps the old file;
+    - it is not a mount point (``IMAGE_CONFIG_MOUNTED``, and on Linux an unreadable mount table fails closed), and it is
+      still named once the mount table was read, so that the answer is about the file whose bytes these are.
+
+    A file that cannot be opened or read is a ``ConfigRefusal``. The caller maps the reason to its own refusal; none of
+    the details names a path. A change after the last check, up to the use of the bytes, cannot be excluded: the
+    product cannot lock an operator's editor. With ``hold`` the descriptor stays open in ``held`` and the caller closes
+    it: while it is open the file's inode cannot be given to another file, so a later check tells this file from any
+    replacement.
     """
-    target = Path(config.path).resolve()
     try:
-        descriptor = os.open(target, os.O_RDONLY | os.O_CLOEXEC)
+        target = Path(path).resolve()
+        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
-        raise ConfigRefusal("CONFIG_MISSING", str(config.path)) from None
-    except OSError as error:
-        raise ConfigRefusal("CONFIG_UNREADABLE", f"{config.path}: {error}") from None
+        raise ConfigRefusal("CONFIG_MISSING", str(path)) from None
+    except (OSError, RuntimeError) as error:  # ``resolve`` raises ``RuntimeError`` for a loop of links
+        raise ConfigRefusal("CONFIG_UNREADABLE", f"{path}: {error}") from None
     try:
-        snapshot = _read_open_file(config, target, descriptor)
+        result = _read_descriptor(descriptor, target, path)
     except BaseException:
         os.close(descriptor)
         raise
     if hold:
-        return dataclasses.replace(snapshot, held=descriptor)
+        return dataclasses.replace(result, held=descriptor)
     os.close(descriptor)
-    return snapshot
+    return result
 
 
-def _read_open_file(config, target, descriptor):
-    """The snapshot of the file open at ``descriptor``: its metadata and its bytes come from that one open file."""
+def _read_descriptor(descriptor, target, path):
+    """The checks of ``read_authoritative`` on the file open at ``descriptor``."""
     try:
-        metadata = os.fstat(descriptor)
-    except OSError as error:
-        raise ConfigRefusal("CONFIG_UNREADABLE", f"{config.path}: {error}") from None
-    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
         chunks = []
         while chunk := os.read(descriptor, 1 << 16):
             chunks.append(chunk)
         # The resolved target and the path that was given: a link that was switched to another file during the read
         # leaves the target named, and only the given path then shows that the bytes are from the file it left.
-        linked = still_named(descriptor, target) and still_named(descriptor, config.path)
+        named = still_named(descriptor, target) and still_named(descriptor, path)
         # An edit in place keeps the inode and the name: only the times and the size of the open file show it.
-        edited = _identity(os.fstat(descriptor)) != _identity(metadata)
-        data = b"".join(chunks)
-        text = data.decode("utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        raise ConfigRefusal("CONFIG_UNREADABLE", f"{config.path}: {error}") from None
-    if not linked:
+        edited = _identity(os.fstat(descriptor)) != _identity(before)
+    except OSError as error:
+        raise ConfigRefusal("CONFIG_UNREADABLE", f"{path}: {error}") from None
+    if not named:
         # A bind mount of the file itself keeps the inode that was mounted. Once a write elsewhere replaced the file
         # by a rename, that inode has no name left, and every fact read from it is old: a hash that resolves a
         # pending row the wrong way, a pin that is no longer live. The check runs after the read, on the descriptor
@@ -183,22 +203,58 @@ def _read_open_file(config, target, descriptor):
         # The identity was taken before the first byte and again after the last: a difference means that the bytes
         # may be a mix of two contents, and a hash of them would resolve a pending row from a file that never was.
         raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed while it was read; run the command again")
+    check_not_mounted(target)
     try:
-        raw = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as error:
-        raise ConfigRefusal("CONFIG_INVALID", f"TOML: {error}") from None
-    return Snapshot(
+        # The mount table was read after the bytes: the answer counts only if the file is still the one it is about.
+        named = still_named(descriptor, target) and still_named(descriptor, path)
+    except OSError as error:
+        raise ConfigRefusal("CONFIG_UNREADABLE", f"{path}: {error}") from None
+    if not named:
+        raise ImageRefusal(PROMOTE_FILE_STALE, "the deployment file was replaced while its mount status was checked")
+    return AuthoritativeRead(
         target=target,
-        data=data,
-        sha256=hashlib.sha256(data).hexdigest(),
-        text=text,
-        raw=raw,
-        config=configuration.loads(text, config.path),
-        mode=stat.S_IMODE(metadata.st_mode),
-        uid=metadata.st_uid,
-        gid=metadata.st_gid,
-        identity=_identity(metadata),
+        data=b"".join(chunks),
+        identity=_identity(before),
+        mode=stat.S_IMODE(before.st_mode),
+        uid=before.st_uid,
+        gid=before.st_gid,
     )
+
+
+def read_snapshot(config, *, hold=False):
+    """Read the deployment file once, through ``read_authoritative`` and the strict loader, and keep its bytes.
+
+    The path is followed to the file it names, so the directory that is checked, locked and written is the directory
+    the bytes live in. Every pin fact of one command comes from these bytes. With ``hold`` the descriptor stays open
+    in ``held`` and the caller closes it.
+    """
+    read = read_authoritative(config.path, hold=hold)
+    try:
+        try:
+            text = read.data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ConfigRefusal("CONFIG_UNREADABLE", f"{config.path}: {error}") from None
+        try:
+            raw = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as error:
+            raise ConfigRefusal("CONFIG_INVALID", f"TOML: {error}") from None
+        return Snapshot(
+            target=read.target,
+            data=read.data,
+            sha256=hashlib.sha256(read.data).hexdigest(),
+            text=text,
+            raw=raw,
+            config=configuration.loads(text, config.path),
+            mode=read.mode,
+            uid=read.uid,
+            gid=read.gid,
+            identity=read.identity,
+            held=read.held,
+        )
+    except BaseException:
+        if read.held is not None:
+            os.close(read.held)
+        raise
 
 
 def still_named(descriptor, path):
@@ -254,14 +310,14 @@ def is_mount_point(path):
     return False
 
 
-def check_not_mounted(config):
+def check_not_mounted(path):
     """Refuse ``IMAGE_CONFIG_MOUNTED`` when the deployment file is itself a mount point.
 
     A bind mount of the file keeps serving the inode it mounted, so after a rename elsewhere (``promote --write``, an
     editor's atomic save) every read gives old bytes, and an old pin or hash can resolve a journal row the wrong way or
     leave a pinned image unprotected. A mount of its directory always shows the current file. The detail names no path.
     """
-    if is_mount_point(config.path):
+    if is_mount_point(path):
         raise ImageRefusal(
             IMAGE_CONFIG_MOUNTED,
             "the deployment file is itself a mount point; mount its dedicated directory, not the file, and run again",
@@ -280,39 +336,18 @@ def _identity(metadata):
 def _is_unchanged(snapshot):
     """Whether the deployment path still leads to the same file with the same bytes. It parses nothing.
 
-    The path is compared before anything is opened, the open neither follows a link nor waits for a writer, and the
-    identity is compared before the bytes are read: a replacement by a FIFO, a link or another file is a change, and
-    never a hang. Any error is a change.
+    The read is ``read_authoritative``: the same open file is checked for identity, name and mount, and a replacement
+    by a FIFO, a link or another file is a change, and never a hang. Any refusal or error is a change.
     """
     try:
-        target = Path(snapshot.config.path).resolve()
-        if target != snapshot.target:
+        read = read_authoritative(snapshot.config.path)
+        if read.target != snapshot.target or read.identity != snapshot.identity:
             return False
-        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or _identity(metadata) != snapshot.identity:
-                return False
-            if snapshot.held is not None and _identity(os.fstat(snapshot.held)) != _identity(metadata):
-                return False  # the held file is no longer the one the path names, or it changed
-            chunks = []
-            while chunk := os.read(descriptor, 1 << 16):
-                chunks.append(chunk)
-            # The same checks as ``_read_open_file`` makes, after the bytes are in: an edit that lands once they are
-            # buffered leaves the old hash to match, and only the file itself shows it (#202).
-            if _identity(os.fstat(descriptor)) != _identity(metadata):
-                return False
-            if not (
-                still_named(descriptor, target)
-                and still_named(descriptor, snapshot.config.path)
-                and _identity(os.fstat(descriptor)) == snapshot.identity
-            ):
-                return False
-        finally:
-            os.close(descriptor)
-    except (OSError, RuntimeError):  # ``resolve`` raises ``RuntimeError`` for a loop of links
+        if snapshot.held is not None and _identity(os.fstat(snapshot.held)) != read.identity:
+            return False  # the held file is no longer the one the path names, or it changed
+    except (Refusal, OSError):
         return False
-    return sha256_of(b"".join(chunks)) == snapshot.sha256
+    return sha256_of(read.data) == snapshot.sha256
 
 
 def sha256_of(data):
@@ -734,6 +769,16 @@ def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock):
                 f"a local file step failed ({_errno_name(error)}); the deployment file was not changed",
             ) from None
         raise
+    # The commit above took time, and an editor does not wait for it. The last check before the rename: the file must
+    # still be the one the row was written for. A change leaves the row ``pending`` (and the backup it names): the next
+    # command that resolves it decides from the file as it is found then (#202).
+    if not _is_unchanged(snapshot):
+        _discard(temporary)
+        raise ImageRefusal(
+            PROMOTE_FILE_CHANGED,
+            "the file changed after the journal row was committed; the pin was not changed and the row stays pending "
+            f"(the backup {backup.name} is kept)",
+        )
     try:
         os.replace(temporary, target)
     except OSError as error:

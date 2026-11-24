@@ -937,6 +937,33 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **THEN** the command refuses with `PROMOTE_STATE_CHANGED` and names no path
 - **AND** it changes no row, event, deployment file, state file or rollback journal of either state, and creates nothing in the state the file names now; only its own lock files may be created
 
+### Requirement: Every decision rests on one checked read of one open file
+Every read that a decision rests on MUST be one read of one open file, checked after its last byte for identity, name and mount status on that same file, and a read whose mount status cannot be shown MUST be refused. `promote --write` MUST verify the file again after the pending row is committed and right before the rename.
+
+#### Scenario: Which reads are covered
+- **WHEN** a command promotes, rolls back, previews, recovers a journal row, verifies before a write, loads the deployment file for a deletion, or reloads it for `--until-done`
+- **THEN** the read is the one checked read, and no command checks identity, name or mount on a different open file than the one whose bytes it uses
+
+#### Scenario: A window remains after the last check
+- **WHEN** the file changes after the last check and before the bytes are used
+- **THEN** the product cannot exclude it, because it cannot lock an operator's editor, and recovery resolves a pending row from the file as it is found
+
+#### Scenario: The file changes during the journal commit
+- **WHEN** the file is edited or replaced after the `pending` row is committed and before the rename
+- **THEN** `promote --write` does not rename over it, leaves the row `pending` with its backup, and refuses with `PROMOTE_FILE_CHANGED`
+
+#### Scenario: Recovery reads a file that is a mount point
+- **WHEN** the file that supplies the hash of a pending row is itself a mount point
+- **THEN** the command refuses with `IMAGE_CONFIG_MOUNTED` and resolves no row
+
+#### Scenario: The file is replaced while its mount status is checked
+- **WHEN** a rename replaces the file after its bytes were read and while the mount table is read
+- **THEN** the read refuses with `PROMOTE_FILE_STALE`, because the mount answer is not about the file that was read
+
+#### Scenario: The until-done reload meets a change during its read
+- **WHEN** the file is rewritten in place while the reload of `--until-done` reads it
+- **THEN** the run ends with `IMAGE_CONFIG_CHANGED` before the next pass
+
 ### Requirement: Promotion runs in an isolated operator container
 `promote` MUST run only as an operator-invoked one-off. The shipped documentation MUST give a container line that has no network, no AWS credential directory and no forge token. `promote --write` MUST refuse with `PROMOTE_DIRECTORY_NOT_DEDICATED` when the directory of the TOML holds anything other than the TOML, its `.bak.*` files, its lock file and its promote temporary file. A test MUST assert that `promote` constructs no AWS client.
 

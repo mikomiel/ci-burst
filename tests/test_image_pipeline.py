@@ -3968,6 +3968,26 @@ class SettingsChangedTests(PipelineCase):
         self.assert_ended_after_one_pass(refusal)
         self.assertIn("CONFIG_MISSING", refusal.detail)
 
+    def test_a_file_edited_in_place_while_the_loop_reads_it_ends_the_loop(self):
+        # The settings that the reload compared came from bytes that the edit then replaced: the loop does not run a
+        # pass on them (#202).
+        text = self.config_path.read_text(encoding="utf-8")
+        inode = os.stat(self.config_path).st_ino
+        real, edited = os.read, []
+
+        def read(descriptor, size):
+            data = real(descriptor, size)
+            if not data and not edited and os.fstat(descriptor).st_ino == inode:
+                edited.append(True)
+                self.config_path.write_text(text + "\n# a hand edit\n", encoding="utf-8")
+            return data
+
+        with mock.patch("os.read", read):
+            refusal = self.refused(self.pipeline.check_settings_unchanged, "IMAGE_CONFIG_CHANGED")
+        self.assertEqual(edited, [True])
+        self.assertIn("PROMOTE_FILE_CHANGED", refusal.detail)
+        self.assertNotIn(str(self.dir), refusal.detail)
+
     def test_a_link_retargeted_to_a_mount_point_file_ends_the_loop_with_the_mount_refusal(self):
         # ``--config`` is a link. Between the passes it names another file with the same bytes (so the settings are
         # equal), and that file is a bind mount: the loop reads through it no more (#202).

@@ -33,7 +33,7 @@ from unittest import mock
 from ci_burst import image, image_deletion, image_pipeline, image_promote
 from ci_burst.aws import BASIS_DIGEST_TAG
 from ci_burst.config import load
-from ci_burst.errors import ImageRefusal, StateRefusal
+from ci_burst.errors import ConfigRefusal, ImageRefusal, StateRefusal
 from ci_burst.image_state import ImageState
 
 from support import Clock
@@ -1805,7 +1805,7 @@ class StaleViewTests(PromoteCase):
             replacement.write_bytes(target.read_bytes())
             os.replace(replacement, target)
             with self.assertRaises(ImageRefusal) as raised:
-                image_promote._read_open_file(self.config, target, descriptor)
+                image_promote._read_descriptor(descriptor, target, self.config.path)
         finally:
             os.close(descriptor)
         self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
@@ -1828,7 +1828,7 @@ class StaleViewTests(PromoteCase):
 
         try:
             with mock.patch("os.read", read), self.assertRaises(ImageRefusal) as raised:
-                image_promote._read_open_file(self.config, target, descriptor)
+                image_promote._read_descriptor(descriptor, target, self.config.path)
         finally:
             os.close(descriptor)
         self.assertEqual(renamed, [True])
@@ -1930,33 +1930,49 @@ class StaleViewTests(PromoteCase):
 
     @contextlib.contextmanager
     def edited_in_place_during_the_verification(self):
-        """The verification read of ``promote --write`` (opened with ``O_NOFOLLOW``) ends, and the file is then rewritten.
+        """The verification read of ``promote --write`` (``_is_unchanged``) ends, and the file is then rewritten.
 
         The verifier has the old bytes buffered, so the hash matches the snapshot; only the file itself shows the
-        edit. The reads of ``read_snapshot`` are not touched (#202). The yield gives the edited bytes.
+        edit. The reads of ``read_snapshot`` are not touched, and nor is any later verification (#202). The yield gives
+        the edited bytes.
         """
         target = Path(self.config.path).resolve()
         text = target.read_text(encoding="utf-8")
         edited_bytes = (text + "\n# a hand edit\n").encode("utf-8")
-        real_open, real_read = os.open, os.read
-        verifying, edited = set(), []
+        real_check, real_read = image_promote._is_unchanged, os.read
+        verifying, edited = [], []
 
-        def opened(path, flags, *arguments, **keywords):
-            descriptor = real_open(path, flags, *arguments, **keywords)
-            if flags & os.O_NOFOLLOW and Path(path) == target:
-                verifying.add(descriptor)
-            return descriptor
+        def checking(snapshot):
+            verifying.append(True)
+            try:
+                return real_check(snapshot)
+            finally:
+                verifying.pop()
 
         def read(descriptor, size):
             data = real_read(descriptor, size)
-            if not data and descriptor in verifying and not edited:
+            if not data and verifying and not edited:
                 edited.append(True)
                 target.write_bytes(edited_bytes)
             return data
 
-        with mock.patch("os.open", opened), mock.patch("os.read", read):
+        with mock.patch.object(image_promote, "_is_unchanged", checking), mock.patch("os.read", read):
             yield edited_bytes
         self.assertEqual(edited, [True])
+
+    @contextlib.contextmanager
+    def changed_during_the_journal_commit(self, change):
+        """``change(target)`` runs right after the ``pending`` journal row is committed, before the rename."""
+        target = Path(self.config.path).resolve()
+        real = ImageState.journal_insert
+
+        def insert(state, **keywords):
+            row = real(state, **keywords)
+            change(target)
+            return row
+
+        with mock.patch.object(ImageState, "journal_insert", insert):
+            yield target
 
     def test_the_verification_read_refuses_an_edit_that_lands_after_the_bytes_are_in(self):
         snapshot = image_promote.read_snapshot(self.config)
@@ -1973,6 +1989,38 @@ class StaleViewTests(PromoteCase):
         self.assertEqual(self.backups(), [])
         self.assertEqual(self.dump(), before)
 
+    def test_an_edit_during_the_journal_commit_is_not_overwritten_and_the_row_stays_pending(self):
+        edited = (Path(self.config.path).read_text(encoding="utf-8") + "\n# a hand edit\n").encode("utf-8")
+        with self.changed_during_the_journal_commit(lambda target: target.write_bytes(edited)) as target:
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual(target.read_bytes(), edited)
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(len(self.backups()), 1)  # the row names it
+        self.assertEqual(sorted(path.name for path in target.parent.iterdir() if path.name.endswith(".promote-tmp")), [])
+
+    def test_a_replacement_during_the_journal_commit_is_not_overwritten_and_the_row_stays_pending(self):
+        def replace(target):
+            other = target.parent / "replacement.tmp"
+            other.write_bytes(target.read_bytes())
+            os.replace(other, target)
+
+        with self.changed_during_the_journal_commit(replace) as target:
+            replaced = os.stat(target).st_ino
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertNotEqual(os.stat(target).st_ino, replaced)
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+
+    def test_the_row_that_an_edit_during_the_commit_left_pending_is_resolved_from_the_file_as_found(self):
+        original = Path(self.config.path).read_bytes()
+        edited = original + b"\n# a hand edit\n"
+        with self.changed_during_the_journal_commit(lambda target: target.write_bytes(edited)) as target:
+            self.write_pin()
+        target.write_bytes(original)  # the operator undoes the edit: the file has the hash of the row's old bytes
+        payload = self.promoted()  # the next write resolves the row from the file as it is, then promotes again
+        self.assertEqual(payload["resolved"], [{"journal_id": 1, "kind": "promotion", "resolution": "aborted"}])
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["aborted", "complete"])
     def test_a_pending_row_is_not_resolved_when_an_edit_lands_during_the_verification(self):
         digest = sha(Path(self.config.path).read_bytes())
         self.add_pending(old_sha="0" * 64, new_sha=digest)
@@ -2053,7 +2101,7 @@ class StaleViewTests(PromoteCase):
         target = Path(self.config.path).resolve()
         descriptor = os.open(target, os.O_RDONLY)
         try:
-            snapshot = image_promote._read_open_file(self.config, target, descriptor)
+            snapshot = image_promote._read_descriptor(descriptor, target, self.config.path)
         finally:
             os.close(descriptor)
         self.assertEqual(snapshot.data, target.read_bytes())
@@ -2084,6 +2132,82 @@ class StaleViewTests(PromoteCase):
         with self.stale_view():
             self.refusal(("--rollback",), "PROMOTE_FILE_STALE")
             self.refusal((), "PROMOTE_FILE_STALE", write=False)
+
+
+class AuthoritativeReadTests(PromoteCase):
+    """Every read that a decision rests on is ``read_authoritative``: identity, name and mount of the one open file (#202)."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+
+    def mounted(self, answer=True):
+        return mock.patch.object(image_promote, "is_mount_point", return_value=answer)
+
+    def test_it_returns_the_bytes_the_identity_and_the_resolved_target_and_closes_the_file(self):
+        target = Path(self.config.path).resolve()
+        link = self.dir / "link.toml"
+        link.symlink_to(target)
+        read = image_promote.read_authoritative(link)
+        self.assertEqual((read.data, read.target, read.held), (target.read_bytes(), target, None))
+        self.assertEqual(read.identity[:2], (os.stat(target).st_dev, os.stat(target).st_ino))
+
+    def test_with_hold_the_descriptor_stays_open_for_the_caller(self):
+        read = image_promote.read_authoritative(self.config.path, hold=True)
+        try:
+            self.assertEqual(os.fstat(read.held).st_ino, os.stat(self.config.path).st_ino)
+        finally:
+            os.close(read.held)
+
+    def test_a_file_that_is_not_a_regular_file_is_refused_and_never_waited_for(self):
+        fifo = self.dir / "fifo.toml"
+        os.mkfifo(fifo)
+        with self.assertRaises(ConfigRefusal) as raised:
+            image_promote.read_authoritative(fifo)
+        self.assertEqual(raised.exception.reason, "CONFIG_UNREADABLE")
+
+    def test_the_mount_question_is_about_the_resolved_target_that_was_read(self):
+        target = Path(self.config.path).resolve()
+        link = self.dir / "link.toml"
+        link.symlink_to(target)
+        with self.mounted(False) as asked:
+            image_promote.read_authoritative(link)
+        asked.assert_called_once_with(target)
+
+    def test_a_file_that_is_a_mount_point_is_refused_by_every_read(self):
+        snapshot = image_promote.read_snapshot(self.config)
+        with self.mounted():
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.read_snapshot(self.config)
+            self.assertEqual(raised.exception.reason, "IMAGE_CONFIG_MOUNTED")
+            self.assertNotIn(str(self.dir), raised.exception.detail)
+            self.assertFalse(image_promote._is_unchanged(snapshot))
+        self.assertTrue(image_promote._is_unchanged(snapshot))
+
+    def test_a_replacement_while_the_mount_status_is_checked_is_refused_as_stale(self):
+        # The bytes were read and the name held; the file is then replaced as the mount table is read. The answer
+        # (not a mount point) is about a file that no longer is the deployment file.
+        target = Path(self.config.path).resolve()
+
+        def replace(path):
+            other = target.parent / "replacement.tmp"
+            other.write_bytes(target.read_bytes())
+            os.replace(other, target)
+            return False
+
+        with mock.patch.object(image_promote, "is_mount_point", replace):
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.read_snapshot(self.config)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
+
+    def test_the_snapshot_that_resolves_a_pending_row_is_refused_when_the_file_is_a_mount_point(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        answers = iter([False])  # the dispatch of the command; the read of the recovery snapshot is the next question
+        with mock.patch.object(image_promote, "is_mount_point", lambda path: next(answers, True)):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_MOUNTED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
 
 
 class StateOwnerTests(PromoteCase):

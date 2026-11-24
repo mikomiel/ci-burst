@@ -108,7 +108,7 @@ from pathlib import Path
 
 from . import image, image_console, image_deletion, image_promote
 from .aws import BASIS_DIGEST_TAG, BUILD_ID_TAG, BUILDER_STATES, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
-from .config import load
+from .config import loads
 from .errors import ConfigRefusal, DeadlineRefusal, ImageRefusal, ProviderRefusal, Refusal
 from .export import _label, _write_atomic
 from .forgejo import require_protected
@@ -1004,12 +1004,15 @@ class ImagePipeline:
         every pass.
         """
         try:
-            current = load(self._config_path)
-        except ConfigRefusal as refusal:
+            read = image_promote.read_authoritative(self._config_path)
+            current = loads(read.data.decode("utf-8"), self._config_path)
+        except ImageRefusal as refusal:
+            if refusal.reason == image_promote.IMAGE_CONFIG_MOUNTED:
+                raise  # as at the dispatch of the command: the file is itself a mount point
             raise ImageRefusal(IMAGE_CONFIG_CHANGED, f"the deployment file no longer loads ({refusal.reason})") from None
-        # The file that was just loaded is not a mount point either (a link may have been retargeted to one): the
-        # refusal is ``IMAGE_CONFIG_MOUNTED``, as at the dispatch of the command, and it comes before the comparison.
-        image_promote.check_not_mounted(current)
+        except (ConfigRefusal, UnicodeDecodeError) as refusal:
+            reason = refusal.reason if isinstance(refusal, ConfigRefusal) else "CONFIG_UNREADABLE"
+            raise ImageRefusal(IMAGE_CONFIG_CHANGED, f"the deployment file no longer loads ({reason})") from None
         if current != self._config:
             raise ImageRefusal(
                 IMAGE_CONFIG_CHANGED,

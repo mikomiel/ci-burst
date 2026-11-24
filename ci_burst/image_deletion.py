@@ -46,9 +46,8 @@ from dataclasses import InitVar, dataclass, field
 
 from .aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
 from .config import loads
-from .errors import ConfigRefusal, ImageRefusal, ProviderRefusal
+from .errors import ConfigRefusal, ImageRefusal, ProviderRefusal, Refusal
 from . import image_promote
-from .image_promote import still_named
 from .image_state import ACTIVE_STATES
 from .image_template import TEMPLATE_DRIFT
 
@@ -138,45 +137,29 @@ def _is_resolved(protected):
     return isinstance(protected, ProtectedSet) and protected._resolved is _PROVENANCE and bool(protected.image_ids)
 
 
-def _load_deployment(config_path):
-    """The deployment configuration and the identity of the file it came from, read from one open file.
+#: What ``_load_deployment`` says for each refusal of ``image_promote.read_authoritative``. No detail names a path.
+_UNSAFE_READ = {
+    image_promote.PROMOTE_FILE_STALE: "the deployment file is a view of a file that was replaced",
+    image_promote.PROMOTE_FILE_CHANGED: "the deployment file changed while it was read",
+    image_promote.IMAGE_CONFIG_MOUNTED: "the deployment file is itself a mount point, or its mount status cannot be shown",
+}
 
-    A bind mount of the file itself keeps the inode that was mounted. Once a rename elsewhere replaced the file,
-    its pins and the journal rows that a pass resolved from it are old. After the read the descriptor that supplied
-    the bytes must keep a link and still be the file the path names (``still_named``), so a replacement during the
-    read is seen, even when a hard link keeps the old file. The identity lets ``check_unchanged`` see a change after
-    the read.
+
+def _load_deployment(config_path):
+    """The deployment configuration and the identity of the file it came from, read once (``read_authoritative``).
+
+    A bind mount of the file itself keeps the inode that was mounted, so its pins and the journal rows that a pass
+    resolved from it can be old. The one read checks the identity, the name and the mount status of the open file the
+    bytes came from; a refusal of it is ``IMAGE_DELETION_UNSAFE``, and a deletion is never planned from a file that was
+    not shown to be the current one. The identity lets ``check_unchanged`` see a change after the read.
     """
     unreadable = "the deployment configuration could not be loaded"
     try:
-        descriptor = os.open(config_path, os.O_RDONLY | os.O_CLOEXEC)
-    except OSError:
-        raise _unsafe(unreadable) from None
+        read = image_promote.read_authoritative(config_path)
+    except Refusal as refusal:
+        raise _unsafe(_UNSAFE_READ.get(refusal.reason, unreadable)) from None
     try:
-        # Taken before the bytes: an edit in place during the read leaves the name and the inode, and only the
-        # change time, the modification time or the size give it away when ``check_unchanged`` looks again.
-        identity = _identity(os.fstat(descriptor))
-        chunks = []
-        while chunk := os.read(descriptor, 1 << 16):
-            chunks.append(chunk)
-        stale = not still_named(descriptor, config_path)
-        edited = _identity(os.fstat(descriptor)) != identity
-    except OSError:
-        raise _unsafe(unreadable) from None
-    finally:
-        os.close(descriptor)
-    if stale:
-        raise _unsafe("the deployment file is a view of a file that was replaced")
-    if edited:
-        raise _unsafe("the deployment file changed while it was read")
-    try:
-        mounted = image_promote.is_mount_point(config_path)
-    except ImageRefusal:  # the mount table cannot be read: the status cannot be shown, so it is not a pass
-        mounted = True
-    if mounted:
-        raise _unsafe("the deployment file is itself a mount point, or its mount status cannot be shown")
-    try:
-        return loads(b"".join(chunks).decode("utf-8"), config_path), identity
+        return loads(read.data.decode("utf-8"), config_path), read.identity
     except (UnicodeDecodeError, ConfigRefusal):
         raise _unsafe(unreadable) from None
 

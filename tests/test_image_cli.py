@@ -314,7 +314,8 @@ class MountedFileTests(CliCase):
         with mock.patch.object(image_promote, "is_mount_point", return_value=False) as check:
             code, payload = self.invoke("image", "status")
         self.assertEqual(code, 0, payload)
-        check.assert_called_once_with(self.config_path)
+        # The dispatch of the command asks, and so does the read of the file that ``status`` makes (``read_authoritative``).
+        self.assertEqual(check.call_args_list, [mock.call(self.config_path)] * 2)
 
     def test_an_unreadable_mount_table_on_linux_refuses_before_the_state_opens(self):
         # The status cannot be established, so it is not a pass: no path in the detail, no state file.

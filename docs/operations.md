@@ -1873,10 +1873,11 @@ replace the image on either host:
    `uncertain` keeps its frozen request, its expiry tag and its reservation: if
    the upgraded controller sends it, its worker carries the old expiry, and the
    reaper honours that tag even while a job runs. `status` only reads, and
-   `reap` does not change the ledger, so neither clears such a row. Keep
-   admission stopped and settle the row with the controller you are replacing
-   before you go on, as for any unresolved operation. Do not rewrite an
-   intent's request or token.
+   `reap` does not change the ledger, so neither clears such a row, and an
+   `apply` that settles it can admit a new worker in the same pass. There is no
+   settle-only command: if such a row exists, stop here, keep admission
+   stopped and the image unchanged, and escalate. Do not run `apply` to clear
+   it, and do not rewrite an intent's request or token.
 3. On both hosts, set `aws.max_lifetime_seconds = 3600` in the deployment file
    that each one mounts.
 4. Replace the image through the refresh unit of each host
@@ -1884,10 +1885,16 @@ replace the image on either host:
    cleanup host). It builds a candidate, smoke-tests it against the host's own
    file and credentials (`reap` without `--apply` on the cleanup host) and
    retags `localhost/ci-burst:latest` only after the smoke passes, so the
-   scheduled units keep the known-good image until then. Do not build straight
+   scheduled units keep the known-good image until then. On the cleanup host
+   the smoke network must match the installed reap unit
+   ([container.md](container.md#keep-the-image-current)). Do not build straight
    into `localhost/ci-burst:latest` on the cleanup host: its timer can run the
    untested image before you check it.
-5. Start `ci-burst-apply.timer` again.
+5. A refresh can end without a new image (for example while a rollback hold
+   exists). On each host, check that `/var/lib/ci-burst-image/deployed-sha`
+   names a commit that contains #138, and on the cleanup host that the next
+   scheduled `reap` run succeeded with that image.
+6. Start `ci-burst-apply.timer` again.
 
 `reap`, `status` and `export` keep their existing behaviour and do not take the
 pass deadline. `reap --apply` runs from its own unit and timer on the cleanup

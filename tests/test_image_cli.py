@@ -813,6 +813,15 @@ class StatusTests(CliCase):
         self.assertNotIn("error", payload)
         self.assertEqual(self.dump(), before)
 
+    def test_an_interruption_during_the_check_write_releases_the_writer_lock(self):
+        self.build_candidate()
+        with mock.patch.object(ImageState, "record_check_time", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.invoke("image", "status")
+        other = ImageState(self.state_dir, clock=self.clock)
+        self.addCleanup(other.close)
+        other.acquire_writer()  # refuses IMAGE_STATE_LOCKED if the status had kept the lock
+
     def test_a_failure_to_release_the_state_after_the_check_write_still_reports_the_write(self):
         self.build_candidate()
         release = ImageState.release_writer

@@ -180,17 +180,20 @@ def _record_check(state, now):
     the connection or release the lock afterwards, which cannot undo a committed
     write, is ignored here too.
     """
+    recorded = False
     try:
         state.connect()
         state.acquire_writer()
         state.record_check_time(now)
         recorded = True
     except (StateRefusal, OSError, sqlite3.Error):
-        recorded = False
-    try:
-        state.close()
-    except (OSError, sqlite3.Error):
         pass
+    finally:
+        # Always runs, an interruption included, so the lock is never left held.
+        try:
+            state.close()
+        except (OSError, sqlite3.Error):
+            pass
     return recorded
 
 

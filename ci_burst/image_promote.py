@@ -1036,9 +1036,8 @@ def _write(snapshot, state, clock, events, version, rollback):
     # Nothing is written until the checks that need only the file pass.
     check_directory(snapshot.target)
     check_zone_pins(snapshot.raw)
-    if not state.connect_readonly():
+    if not state.probe_for_write():
         raise _missing_state(rollback)
-    state.close()
     with file_lock(snapshot.target):
         state.connect()
         try:

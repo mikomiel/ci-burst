@@ -20,6 +20,12 @@ from .errors import StateRefusal
 
 SCHEMA_VERSION = 1
 STATE_FILE = "image-state.sqlite"
+#: A process that stopped inside a commit left a hot rollback journal, which only a writable connection rolls back.
+STATE_RECOVERY_NEEDED = "IMAGE_STATE_RECOVERY_NEEDED"
+_RECOVERY_DETAIL = (
+    "a write that stopped left a rollback journal; `image run --apply` or `image promote --write` "
+    "rolls it back under the writer lock"
+)
 
 BUILD_STATES = ("building", "imaging", "candidate", "failed", "promoted")
 #: The states that count as one builder in flight. The ``one_active`` index and
@@ -282,6 +288,9 @@ class ImageState:
         except sqlite3.DatabaseError as error:
             if connection is not None:
                 connection.close()
+            if getattr(error, "sqlite_errorname", None) == "SQLITE_READONLY_ROLLBACK":
+                # The journal is left as it is: only a writing command, under its lock, may roll it back.
+                raise StateRefusal(STATE_RECOVERY_NEEDED, _RECOVERY_DETAIL) from None
             raise StateRefusal("IMAGE_STATE_UNREADABLE", type(error).__name__) from None
         except BaseException:
             if connection is not None:
@@ -290,6 +299,29 @@ class ImageState:
         self._connection = connection
         self._read_only = True
         return True
+
+    def probe_for_write(self):
+        """Say whether there is a state file to write, as ``connect_readonly`` does, and leave the state closed.
+
+        A writing command calls this before it takes its locks. When a process stopped inside a commit, the file has
+        a hot rollback journal, which a read-only open cannot roll back (``IMAGE_STATE_RECOVERY_NEEDED``). Here the
+        writer lock is taken first, so no live writer is in the middle of that commit, and a writable open rolls the
+        journal back. ``IMAGE_STATE_LOCKED`` refuses when another process holds the lock, and the journal is then
+        left as it is. With no state file, nothing is created.
+        """
+        try:
+            present = self.connect_readonly()
+        except StateRefusal as refusal:
+            if refusal.reason != STATE_RECOVERY_NEEDED:
+                raise
+            try:
+                self.acquire_writer()
+                self.connect()  # the first read through a writable connection rolls the journal back
+            finally:
+                self.close()
+            present = self.connect_readonly()
+        self.close()
+        return present
 
     def detached_copy(self):
         """A copy of the open database in memory, as an ``ImageState`` of its own: a view to plan against.

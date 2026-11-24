@@ -738,9 +738,15 @@ class BuildEndedBeforeTheLock(ImageState):
     """A state file whose active build ends, in another process, after the peek and before the writer lock is taken."""
 
     def acquire_writer(self):
-        active = self.active_build(DEPLOYMENT)
-        if active is not None:
-            self.advance_build(active.id, state="failed", reason_code="CONSOLE_BLIND")
+        if self._lock_fd is None:
+            other = ImageState(self.directory, clock=self._clock)  # the other process
+            try:
+                other.connect()
+                active = other.active_build(DEPLOYMENT)
+                if active is not None:
+                    other.advance_build(active.id, state="failed", reason_code="CONSOLE_BLIND")
+            finally:
+                other.close()
         return super().acquire_writer()
 
 
@@ -4204,6 +4210,18 @@ class TelemetryTests(PipelineCase):
         self.apply()
         (event,) = self.events()
         self.assertEqual((event["event"], event["decision"], event["reason"]), ("image_check", "digest_unchanged", None))
+
+    def test_a_pass_on_a_state_the_caller_opened_ends_with_no_connection_and_no_lock(self):
+        # A writable connection kept without the lock between passes could roll back a journal that another
+        # writer left in between, so the pass closes both (#194).
+        self.pin_current()
+        self.state.acquire_writer()
+        self.state.connect()
+        self.apply()
+        self.assertFalse(self.state.available)
+        other = ImageState(self.state_dir, clock=self.clock)
+        self.addCleanup(other.close)
+        other.acquire_writer()  # refuses IMAGE_STATE_LOCKED if the pass had kept the lock
 
     def test_the_event_file_only_grows_and_holds_one_json_object_per_line(self):
         self.pin_current()

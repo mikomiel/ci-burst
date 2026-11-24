@@ -70,6 +70,7 @@ PROMOTE_PIN_LINE_AMBIGUOUS = "PROMOTE_PIN_LINE_AMBIGUOUS"
 PROMOTE_REPARSE_FAILED = "PROMOTE_REPARSE_FAILED"
 PROMOTE_FILE_CHANGED = "PROMOTE_FILE_CHANGED"
 PROMOTE_FILE_STALE = "PROMOTE_FILE_STALE"
+PROMOTE_STATE_CHANGED = "PROMOTE_STATE_CHANGED"
 PROMOTE_DIRECTORY_NOT_DEDICATED = "PROMOTE_DIRECTORY_NOT_DEDICATED"
 PROMOTE_BUSY = "PROMOTE_BUSY"
 PROMOTE_WRITE_FAILED = "PROMOTE_WRITE_FAILED"
@@ -861,13 +862,36 @@ def promote(config, *, state, clock, events, version=None, rollback=False, write
     ``notes`` is empty when the event was written.
     """
     if write:
-        return _write(read_snapshot(config), state, clock, events, version, rollback)
+        snapshot = read_snapshot(config)
+        check_state_owner(config, snapshot, state)
+        return _write(snapshot, state, clock, events, version, rollback, owner=config)
     # The preview holds the file open until it has checked it again after the copy of the state.
     snapshot = read_snapshot(config, hold=True)
     try:
+        check_state_owner(config, snapshot, state)
         return _preview(snapshot, state, clock, version, rollback)
     finally:
         os.close(snapshot.held)
+
+
+def check_state_owner(config, snapshot, state):
+    """Refuse ``PROMOTE_STATE_CHANGED`` unless ``state`` and the events belong to the file that ``snapshot`` read.
+
+    The command line picks the state directory, and binds the event writer to the deployment, from the file as it
+    loaded it at startup. Every pin fact comes from ``snapshot``, a later read. When the file changed its
+    ``[image].state_directory`` or its ``deployment`` in between, a preview would plan from another database than the
+    file names, and a write would journal the move where the next recovery command does not look (#199). The detail
+    names no path.
+    """
+    planned = snapshot.config
+    directory = planned.image.state_directory
+    same_directory = directory is not None and Path(directory).resolve() == Path(state.directory).resolve()
+    if planned.deployment != config.deployment or not same_directory:
+        raise ImageRefusal(
+            PROMOTE_STATE_CHANGED,
+            "the deployment file names another state directory or deployment than the one this command opened; "
+            "run the command again; nothing was written",
+        )
 
 
 def _missing_state(rollback):
@@ -1034,7 +1058,7 @@ def _announce(events, done, *, build_id, image_id, rollback):
     return []
 
 
-def _write(snapshot, state, clock, events, version, rollback):
+def _write(snapshot, state, clock, events, version, rollback, *, owner):
     # Nothing is written until the checks that need only the file pass.
     check_directory(snapshot.target)
     check_zone_pins(snapshot.raw)
@@ -1059,6 +1083,8 @@ def _write(snapshot, state, clock, events, version, rollback):
                     "nothing was written",
                 )
             check_zone_pins(snapshot.raw)
+            # The bytes read under the locks decide too: the state and the events must still be the ones they name.
+            check_state_owner(owner, snapshot, state)
             config = snapshot.config
             # Every row first: a damaged completed row must stop the write here, not after the file changed.
             state.journal_check()

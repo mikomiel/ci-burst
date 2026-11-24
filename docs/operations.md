@@ -874,7 +874,7 @@ depend on the record are planned against the snapshot the preview read and
 reported in `write_check`. That is not a promise that the write will succeed, and
 a preview can still be refused: when it has nothing to show
 (`PROMOTE_NO_CANDIDATE`, `PROMOTE_VERSION_NOT_CANDIDATE`, `ROLLBACK_NO_PROMOTION`),
-when the TOML changes while it reads (`PROMOTE_FILE_CHANGED`), or before the
+when the TOML changes while it reads (`PROMOTE_FILE_CHANGED`, `PROMOTE_STATE_CHANGED`), or before the
 plan when the file is a stale view or the journal cannot be read.
 
 | Code | Meaning | What to do |
@@ -891,6 +891,7 @@ plan when the file is a stale view or the journal cannot be read.
 | `PROMOTE_PIN_LINE_AMBIGUOUS` | the edit did not find exactly one plain `launch_template_version = <digits>` line inside `[aws]` | edit the file by hand |
 | `PROMOTE_REPARSE_FAILED` | the strict loader refused the new text, or it differs from the old in more than the pin | edit the file by hand; nothing was written |
 | `PROMOTE_FILE_CHANGED` | the file changed after it was read, or the path leads to another file than the one checked and locked | run the command again; nothing was written |
+| `PROMOTE_STATE_CHANGED` | the file names another `[image].state_directory` or `deployment` than the one the command opened at its start | run the command again; nothing was written |
 | `PROMOTE_DIRECTORY_NOT_DEDICATED` | the directory holds more than the TOML, its `.bak.*` backups, its lock file and its promote temporary file, or it cannot be listed | give the TOML a dedicated directory ([deployment.md](deployment.md#the-dedicated-toml-directory)) |
 | `PROMOTE_BUSY` | another promotion holds the lock file; it is never waited for | wait, then run the command again |
 | `PROMOTE_WRITE_FAILED` | a local file step failed; the detail names the errno and no path | fix the directory (space, mode, owner) and run the command again |

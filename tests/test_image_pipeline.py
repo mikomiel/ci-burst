@@ -4111,6 +4111,38 @@ class RetentionTests(PipelineCase):
         control = self.control()
         self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
 
+    def test_a_file_of_another_deployment_and_template_that_appears_after_the_pass_started_deletes_nothing(self):
+        # Another template with the same version numbers names other images: read through it, the live pin's image
+        # would be unprotected. The rule refuses, and nothing is deregistered (#202).
+        self.pin_current()
+        self.stale_failed_build("failed-one", 0xD1)
+        other = "example-other-template"
+        self.world.templates[other] = {
+            "LaunchTemplateName": other,
+            "LaunchTemplateId": "lt-0123456789abcdef9",
+            "DefaultVersionNumber": 1,
+            "LatestVersionNumber": PIN,
+        }
+        self.world.set_version(other, PIN, {"ImageId": ami(0xE1)})
+        real, switched = image_deletion.protected_set, []
+
+        def protected_set(*arguments, **keywords):
+            if not switched:
+                text = self.config_path.read_text(encoding="utf-8")
+                text = text.replace(f'launch_template_name = "{WORKER}"', f'launch_template_name = "{other}"', 1)
+                text = text.replace(f'deployment = "{DEPLOYMENT}"', 'deployment = "example-other-deployment"', 1)
+                self.config_path.write_text(text, encoding="utf-8")
+                switched.append(True)
+            return real(*arguments, **keywords)
+
+        with mock.patch.object(image_deletion, "protected_set", protected_set):
+            result = self.apply()
+        self.assertEqual(switched, [True])
+        self.assertEqual(result["retention"], {"refused": "IMAGE_DELETION_UNSAFE"})
+        self.assertIn(ami(0xD1), self.world.images)
+        self.assertIn(ami(0xA1), self.world.images)
+        self.assertEqual(self.world.arguments("deregister_image"), [])
+
     def test_an_edit_of_the_file_after_the_plan_is_refused_in_a_dry_plan_too(self):
         self.stale_failed_build("failed-one", 0xD1)
         real = image_deletion.plan_deletions

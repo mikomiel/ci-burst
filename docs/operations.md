@@ -895,6 +895,8 @@ right before `promote --write` relies on a snapshot, the load that the deletion 
 `pending` row is committed and right before the rename. A change in the second check leaves the row `pending`
 (and its backup), writes nothing and refuses with `PROMOTE_FILE_CHANGED`.
 
+A fresh read in the middle of a run (the recovery of a pending row, `status` and `status --refresh`, `promote`, the deletion rule) must be of the deployment the run started on: everything but the launch-template pins must equal the file the command loaded first, or it refuses (`IMAGE_CONFIG_CHANGED`, `PROMOTE_STATE_CHANGED` for `promote`, `IMAGE_DELETION_UNSAFE` for the deletion rule) and does nothing, so that the state file, the client and the lookups never mix two deployments.
+
 A residual window remains between the last check and the use of the bytes: the product cannot lock an
 operator's editor, so an edit after the last check is not excluded. Recovery resolves a pending row from the file as it
 is found, by its hash: the old hash means that the rename did not happen (`aborted`), the new hash that it did

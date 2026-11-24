@@ -24,8 +24,8 @@ they are absent, because the lock must be held across them.
 import sqlite3
 
 from . import image
-from .errors import ProviderRefusal, StateRefusal
-from .image_pipeline import _summary
+from .errors import ImageRefusal, ProviderRefusal, StateRefusal
+from .image_pipeline import IMAGE_CONFIG_CHANGED, _summary
 from .image_promote import (
     MISSING_IMAGE,
     ROLLBACK_NO_PROMOTION,
@@ -33,6 +33,7 @@ from .image_promote import (
     evidence,
     pending_report,
     read_snapshot,
+    same_context,
     try_rollback_plan,
 )
 from .image_state import PIN_RECORD_REASON
@@ -43,6 +44,23 @@ DAY_SECONDS = 86_400
 #: What the provider says about a launch-template version that does not exist.
 #: Any other refusal of a read leaves ``refresh`` with nothing persisted.
 VERSION_NOT_FOUND = "InvalidLaunchTemplateId.VersionNotFound"
+
+
+def _read_in_context(config):
+    """``read_snapshot`` of the file, refused with ``IMAGE_CONFIG_CHANGED`` unless it is of the context of ``config``.
+
+    The command picked the state file and the provider client from ``config``. The lookups and the records that follow
+    use the template and the deployment of this later read, so they must be of the same deployment (only the pins may
+    differ); otherwise nothing is read from the provider and nothing is recorded.
+    """
+    snapshot = read_snapshot(config)
+    if not same_context(config, snapshot.config):
+        raise ImageRefusal(
+            IMAGE_CONFIG_CHANGED,
+            "the deployment file names another deployment or template than the one this command started on; "
+            "run the command again",
+        )
+    return snapshot
 
 
 # -- plain status ---------------------------------------------------------------------
@@ -63,7 +81,7 @@ def status(config, *, state, clock):
     Only local files are read and no provider call is made.
     """
     now = clock()
-    snapshot = read_snapshot(config)
+    snapshot = _read_in_context(config)
     deployment = snapshot.config.deployment
     image_config = snapshot.config.image
     present = state.connect_readonly()
@@ -215,7 +233,7 @@ def refresh(config, *, state, aws, clock, candidates=True):
     locked for the whole refresh, and closed.
     """
     now = clock()
-    snapshot = read_snapshot(config)
+    snapshot = _read_in_context(config)
     deployment = snapshot.config.deployment
     try:
         state.acquire_writer()  # before the writable open, which rolls back a hot journal

@@ -13,6 +13,7 @@ files are left as the real process would leave them. Every value is synthetic.
 """
 
 import contextlib
+import dataclasses
 import errno
 import fcntl
 import hashlib
@@ -30,9 +31,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
-from ci_burst import image, image_deletion, image_pipeline, image_promote
+from ci_burst import cli, image, image_deletion, image_pipeline, image_promote
 from ci_burst.aws import BASIS_DIGEST_TAG
-from ci_burst.config import load
+from ci_burst.config import load, loads
 from ci_burst.errors import ConfigRefusal, ImageRefusal, StateRefusal
 from ci_burst.image_state import ImageState
 
@@ -263,6 +264,7 @@ class PromoteCase(CliCase):
         return image_deletion.protected_set(
             WorldAws(self.world),
             self.config_path,
+            run_config=self.config,
             previous_pin=None,
             pending_journal=pending,
             candidate=None,
@@ -2284,6 +2286,61 @@ class AuthoritativeReadTests(PromoteCase):
             code, payload = self.invoke("image", "run", "--apply")
         self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_MOUNTED"))
         self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+
+
+class RunContextTests(PromoteCase):
+    """A fresh read in the middle of a run must be of the deployment the run started on; only the pins may differ (#202)."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+
+    def config_with(self, old, new):
+        text = self.config_path.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), 1, old)
+        return loads(text.replace(old, new), self.config.path)
+
+    def test_the_pins_may_differ_and_nothing_else_may(self):
+        run = self.config
+        self.assertTrue(image_promote.same_context(run, run))
+        pin = self.config_with(f"launch_template_version = {PIN}", f"launch_template_version = {PIN + 1}")
+        self.assertNotEqual(pin, run)
+        self.assertTrue(image_promote.same_context(run, pin))
+        for old, new in (
+            (f'launch_template_name = "{WORKER}"', 'launch_template_name = "example-other-template"'),
+            (f'deployment = "{DEPLOYMENT}"', 'deployment = "example-other-deployment"'),
+            ('max_spot_price = "0.0400"', 'max_spot_price = "0.0500"'),
+        ):
+            with self.subTest(old=old):
+                self.assertFalse(image_promote.same_context(run, self.config_with(old, new)))
+
+    def test_a_pending_row_is_not_resolved_from_a_file_of_another_template(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        real = cli._load_image_config
+
+        def load(path):
+            config = real(path)
+            text = self.config_path.read_text(encoding="utf-8")
+            self.config_path.write_text(
+                text.replace(f'launch_template_name = "{WORKER}"', 'launch_template_name = "example-other-template"'),
+                encoding="utf-8",
+            )
+            return config
+
+        with mock.patch.object(cli, "_load_image_config", load):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+
+    def test_the_state_owner_check_refuses_a_file_of_another_template(self):
+        snapshot = image_promote.read_snapshot(self.config)
+        other = self.config_with(f'launch_template_name = "{WORKER}"', 'launch_template_name = "example-other-template"')
+        snapshot = dataclasses.replace(snapshot, config=other)
+        state = ImageState(self.config.image.state_directory, clock=lambda: 0)
+        with self.assertRaises(ImageRefusal) as raised:
+            image_promote.check_state_owner(self.config, snapshot, state)
+        self.assertEqual(raised.exception.reason, "PROMOTE_STATE_CHANGED")
 
 
 class StateOwnerTests(PromoteCase):

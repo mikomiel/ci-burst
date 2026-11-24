@@ -944,6 +944,10 @@ Every read that a decision rests on MUST be one read of one open file, checked a
 - **WHEN** a command promotes, rolls back, previews, recovers a journal row, verifies before a write, loads the deployment file for a deletion, or reloads it for `--until-done`
 - **THEN** the read is the one checked read, and no command checks identity, name or mount on a different open file than the one whose bytes it uses
 
+#### Scenario: A fresh read from another deployment is refused
+- **WHEN** a fresh read in the middle of a run (recovery, `status`, `status --refresh`, `promote` or the deletion rule) gives a file whose deployment, template, state directory or image settings differ from the file the command loaded first, apart from the launch-template pins
+- **THEN** the command refuses and does nothing: it deregisters nothing, records no verification evidence and resolves no journal row
+
 #### Scenario: A window remains after the last check
 - **WHEN** the file changes after the last check and before the bytes are used
 - **THEN** the product cannot exclude it, because it cannot lock an operator's editor, and recovery resolves a pending row from the file as it is found

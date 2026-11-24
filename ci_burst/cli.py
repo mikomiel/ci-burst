@@ -292,7 +292,7 @@ def _resolve_journal(config, state, *, same_settings=False):
     state.connect()
     state.journal_check()
     snapshot = image_promote.read_snapshot(config)
-    if same_settings and snapshot.config != config:
+    if snapshot.config != config if same_settings else not image_promote.same_context(config, snapshot.config):
         # ``--until-done``: the hash that resolves a row must be of bytes that give the settings of this run. The check
         # before this call read the file once; this is the file that the hash comes from (#202).
         raise ImageRefusal(

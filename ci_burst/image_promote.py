@@ -359,6 +359,23 @@ def _is_unchanged(snapshot):
     return sha256_of(read.data) == snapshot.sha256
 
 
+def same_context(run_config, fresh_config):
+    """Whether ``fresh_config``, read in the middle of a run, is of the deployment that the run was started on.
+
+    The command picked its state file, its provider client and its template from ``run_config``. A later read of the
+    file may name another deployment, template, region, state directory or image setting; an action or a record that
+    rests on such a read mixes two deployments. Everything is compared except the launch-template pins of ``[aws]``
+    and of the zones, which ``promote`` (or a hand edit of the pin) moves while a run is alive.
+    """
+    return _without_pins(run_config) == _without_pins(fresh_config)
+
+
+def _without_pins(config):
+    aws = config.aws
+    zones = tuple(dataclasses.replace(zone, launch_template_version=0) for zone in aws.zones)
+    return dataclasses.replace(config, aws=dataclasses.replace(aws, launch_template_version=0, zones=zones))
+
+
 def sha256_of(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -1038,7 +1055,7 @@ def check_state_owner(config, snapshot, state):
         and planned.image.state_directory == config.image.state_directory
         and Path(state.directory) == config.image.state_directory
     )
-    if planned.deployment != config.deployment or not same_directory:
+    if planned.deployment != config.deployment or not same_directory or not same_context(config, planned):
         raise ImageRefusal(
             PROMOTE_STATE_CHANGED,
             "the deployment file names another state directory or deployment than the one this command opened; "

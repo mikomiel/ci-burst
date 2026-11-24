@@ -178,6 +178,7 @@ class DeletionCase(unittest.TestCase):
             aws["availability_zones"] = zones
         self.deployment_file = write_config(self.directory, config={"deployment": DEPLOYMENT, "aws": aws})
         self.deployment_file.write_text(self.deployment_file.read_text(encoding="utf-8") + IMAGE_TOML, encoding="utf-8")
+        self.run_config = load(self.deployment_file)  # the file as the run started on it
 
     def set_version(self, number, image_id):
         self.ec2.versions_store[(WORKER, number)] = {
@@ -267,6 +268,7 @@ class DeletionCase(unittest.TestCase):
     def resolve(self, **overrides):
         values = dict(previous_pin=None, pending_journal=(), candidate=None, active=None)
         values.update(overrides)
+        values.setdefault("run_config", self.run_config)
         return protected_set(self.aws, self.deployment_file, **values)
 
     def plan(
@@ -550,7 +552,9 @@ class ProtectedSetRefusalTests(DeletionCase):
             return real(descriptor, size)
 
         with mock.patch("os.read", read), self.assertRaises(ImageRefusal) as raised:
-            protected_set(self.aws, link, previous_pin=None, pending_journal=(), candidate=None, active=None)
+            protected_set(
+                self.aws, link, run_config=load(link), previous_pin=None, pending_journal=(), candidate=None, active=None
+            )
         self.assertEqual(switched, [True])
         self.assertEqual(raised.exception.reason, UNSAFE)
         self.assertIn("replaced", raised.exception.detail)
@@ -567,7 +571,9 @@ class ProtectedSetRefusalTests(DeletionCase):
         link = self.directory / "link.toml"
         link.symlink_to(self.deployment_file)
         with self.mount_table(str(Path(self.deployment_file).resolve())), self.assertRaises(ImageRefusal) as raised:
-            protected_set(self.aws, link, previous_pin=None, pending_journal=(), candidate=None, active=None)
+            protected_set(
+                self.aws, link, run_config=load(link), previous_pin=None, pending_journal=(), candidate=None, active=None
+            )
         self.assertEqual(raised.exception.reason, UNSAFE)
         self.assertIn("mount point", raised.exception.detail)
         self.assertNotIn(str(self.directory), raised.exception.detail)
@@ -675,6 +681,48 @@ class ProtectedSetRefusalTests(DeletionCase):
         self.ec2.versions_store[(WORKER, PIN)]["LaunchTemplateData"] = {"ImageId": "resolve:ssm:/example/alias"}
         refusal = self.refused()
         self.assertNotIn("alias", refusal.detail)
+
+
+class RunContextTests(DeletionCase):
+    """The file the rule reads must be of the deployment the run started on: only the pins may differ (#202)."""
+
+    def write_other_deployment(self, **keywords):
+        """Another deployment and template with the same version numbers, whose versions name other images."""
+        text = self.deployment_file.read_text(encoding="utf-8")
+        for old, new in keywords.items():
+            self.assertEqual(text.count(old), 1, old)
+            text = text.replace(old, new)
+        self.deployment_file.write_text(text, encoding="utf-8")
+
+    def test_a_file_of_another_template_with_the_same_version_numbers_is_unsafe_and_reads_no_version(self):
+        run = self.run_config
+        for number, image_id in VERSION_IMAGES.items():
+            self.ec2.versions_store[("example-other-template", number)] = {
+                "VersionNumber": number,
+                "LaunchTemplateId": "lt-0123456789abcdef9",
+                "LaunchTemplateData": {"ImageId": ami(0xF0 + number)},
+            }
+        self.write_other_deployment(**{f'launch_template_name = "{WORKER}"': 'launch_template_name = "example-other-template"'})
+        with self.assertRaises(ImageRefusal) as raised:
+            self.resolve(run_config=run)
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertIn("another deployment or template", raised.exception.detail)
+        self.assertNotIn(str(self.directory), raised.exception.detail)
+        self.assertEqual(self.ec2.calls, [])
+
+    def test_a_file_of_another_deployment_is_unsafe(self):
+        run = self.run_config
+        self.write_other_deployment(**{f'deployment = "{DEPLOYMENT}"': 'deployment = "example-other-deployment"'})
+        with self.assertRaises(ImageRefusal) as raised:
+            self.resolve(run_config=run)
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertEqual(self.ec2.calls, [])
+
+    def test_a_file_that_only_moved_its_pin_is_resolved(self):
+        run = self.run_config
+        text = self.deployment_file.read_text(encoding="utf-8")
+        self.deployment_file.write_text(text.replace(f"launch_template_version = {PIN}", "launch_template_version = 4", 1), encoding="utf-8")
+        self.assertIn(VERSION_IMAGES[4], self.resolve(run_config=run).image_ids)
 
 
 class ConfigChangedTests(DeletionCase):

@@ -360,18 +360,21 @@ class MountedFileTests(CliCase):
         # which now leads to an ordinary file with the image path disabled, decides nothing (#202).
         self.forbid_clients()
         link, mounted, plain = self.link_to_a_mount_point()
-        real_load = cli.load
+        real_loads, retargeted = cli.loads, []
 
-        def load(path):
-            config = real_load(path)
-            self.retarget(link, plain)
+        def loads(text, path):
+            config = real_loads(text, path)
+            self.retarget(link, plain)  # the bytes are in and parsed: the path now leads to the ordinary file
+            retargeted.append(True)
             return config
 
         with (
-            mock.patch.object(cli, "load", load),
+            mock.patch.object(cli, "loads", loads),
             mock.patch.object(image_promote, "is_mount_point", lambda path: Path(path).resolve() == mounted.resolve()),
         ):
             code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual(retargeted, [True])
+        self.assertEqual(link.resolve(), plain.resolve())
         self.assert_refused_as_mounted_with_nothing_opened(code, payload)
 
     def test_a_link_that_is_retargeted_while_the_mount_table_is_asked_is_refused_as_mounted(self):
@@ -464,19 +467,33 @@ class UntilDoneThroughTheCommandTests(CliCase):
         self.assertEqual(self.dump(), before)
         self.assertEqual((self.sessions, self.world.calls), ([], []))
 
-    def test_the_same_edit_without_until_done_is_still_a_divergence(self):
-        # The check belongs to the loop: a single pass keeps its behaviour.
-        self.add_pending(old_sha="0" * 64, new_sha=self.file_sha())
+    def edit_before_the_state_opens(self, old, new):
+        """``old`` becomes ``new`` in the file after the command has loaded it and before its recovery reads it."""
         real = cli.ImageState
 
         def state(*arguments, **keywords):
             text = self.config_path.read_text(encoding="utf-8")
-            self.config_path.write_text(text.replace(GATE, NO_GATE), encoding="utf-8")
+            self.config_path.write_text(text.replace(old, new, 1), encoding="utf-8")
             return real(*arguments, **keywords)
 
-        with mock.patch.object(cli, "ImageState", state):
+        return mock.patch.object(cli, "ImageState", state)
+
+    def test_a_pin_edit_without_until_done_is_still_a_divergence(self):
+        # A pin is the one thing that may differ from the file the command loaded: a single pass keeps its behaviour,
+        # and the row that matches neither hash diverges.
+        self.add_pending(old_sha="0" * 64, new_sha=self.file_sha())
+        with self.edit_before_the_state_opens(f"launch_template_version = {PIN}", f"launch_template_version = {PIN + 1}"):
             code, payload = self.invoke("image", "run", "--apply")
         self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTION_JOURNAL_DIVERGED"))
+
+    def test_a_setting_edit_without_until_done_is_refused_as_a_changed_configuration(self):
+        # Since the run-context rule (#202), every fresh read of a run is compared with the file it loaded first,
+        # not only the loop's: an edit of anything but the pins is no divergence of a row, it is another file.
+        self.add_pending(old_sha="0" * 64, new_sha=self.file_sha())
+        with self.edit_before_the_state_opens(GATE, NO_GATE):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
 
 
 class GuardTests(CliCase):
@@ -1096,6 +1113,67 @@ class RefreshTests(CliCase):
         self.assertEqual([row["id"] for row in after["image_builds"]], [build.id, f"pin-{PIN}"])
         for name in ("pin_log", "promotion_journal", "control"):
             self.assertEqual(after[name], before[name], name)
+
+    def another_template_with_the_same_versions(self, name="example-other-template"):
+        """The account also holds ``name``, with the version numbers of the worker template and other images."""
+        self.world.templates[name] = {
+            "LaunchTemplateName": name,
+            "LaunchTemplateId": "lt-0123456789abcdef9",
+            "DefaultVersionNumber": 1,
+            "LatestVersionNumber": PIN,
+        }
+        for (template, number), version in list(self.world.versions.items()):
+            if template == WORKER:
+                self.world.set_version(name, number, {"ImageId": ami(0xE0 + number)})
+        return name
+
+    def switch_after_the_load(self, old, new):
+        """The file says ``new`` for ``old`` from the moment that the command has loaded it."""
+        real = cli._load_image_config
+        switched = []
+
+        def load(path):
+            config = real(path)
+            text = self.config_path.read_text(encoding="utf-8")
+            self.assertEqual(text.count(old), 1, old)
+            self.config_path.write_text(text.replace(old, new), encoding="utf-8")
+            switched.append(True)
+            return config
+
+        return mock.patch.object(cli, "_load_image_config", load), switched
+
+    def test_a_refresh_whose_file_names_another_template_than_the_command_started_on_records_nothing(self):
+        # The state file and the client are the command's; the version lookups would use another template (#202).
+        self.build_candidate()
+        other = self.another_template_with_the_same_versions()
+        before = self.dump()
+        mark = len(self.world.calls)
+        patch, switched = self.switch_after_the_load(f'launch_template_name = "{WORKER}"', f'launch_template_name = "{other}"')
+        with patch:
+            code, payload = self.invoke("image", "status", "--refresh")
+        self.assertEqual(switched, [True])
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertNotIn(str(self.dir), payload["error"].get("detail", ""))
+        self.assertEqual(self.dump(), before)
+        self.assertEqual(self.world.names(mark), [])
+
+    def test_a_refresh_whose_file_only_moved_the_pin_still_records(self):
+        self.build_candidate()
+        patch, switched = self.switch_after_the_load(f"launch_template_version = {PIN}", f"launch_template_version = {PIN}\n# a note")
+        with patch:
+            code, payload = self.invoke("image", "status", "--refresh")
+        self.assertEqual((code, payload["decision"]), (0, "refreshed"))
+        self.assertEqual(switched, [True])
+
+    def test_a_status_whose_file_names_another_deployment_is_refused(self):
+        self.build_candidate()
+        before = self.dump()
+        patch, switched = self.switch_after_the_load(f'deployment = "{DEPLOYMENT}"', 'deployment = "example-other-deployment"')
+        with patch:
+            code, payload = self.invoke("image", "status")
+        self.assertEqual(switched, [True])
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual(self.dump(), before)
 
     def test_refresh_names_what_it_refreshed(self):
         build = self.build_candidate()

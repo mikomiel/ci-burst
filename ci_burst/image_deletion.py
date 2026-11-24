@@ -187,6 +187,7 @@ def protected_set(
     aws,
     config_path,
     *,
+    run_config,
     previous_pin,
     pending_journal,
     candidate,
@@ -230,7 +231,8 @@ def protected_set(
       active build is protected whatever its row records.
 
     ``config_path`` is the deployment file. Every call loads it again, so a pin
-    written after the caller's own load is seen. A pending journal row protects
+    written after the caller's own load is seen. ``run_config`` is the configuration the run started on: the file
+    must be of the same context (``image_promote.same_context``), or the rule refuses. A pending journal row protects
     both of its pins until a later task resolves the row. Resolving a row from
     the hash of the file is task 6.4 and is out of scope here: this function
     never reads the file's bytes and never decides which of a row's two pins is
@@ -238,8 +240,9 @@ def protected_set(
 
     It refuses with ``IMAGE_DELETION_UNSAFE`` when the deployment file is a
     view of a file that a rename replaced (no name links its inode), when the
-    configuration cannot be loaded, when a pin is not a version number, when the read does not return
-    exactly the pinned versions, when a version cannot be read, or when a version
+    configuration cannot be loaded or is of another deployment or template than the run, when a pin is not a
+    version number, when the read does not return exactly the pinned versions, when a version cannot be read, or when
+    a version
     names no literal image (an alias that resolves later says which image is in
     use only at launch). Then no path may delete anything: ``plan_deletions``
     cannot be called without the result, and no other way to make one exists
@@ -247,6 +250,10 @@ def protected_set(
     detail names a version number at most, never a provider message.
     """
     config, identity = _load_deployment(config_path)
+    if not image_promote.same_context(run_config, config):
+        # Every provider read below names the template of ``config``: the file must be of the deployment that the run,
+        # its state and its listings belong to. Only the pins may differ.
+        raise _unsafe("the deployment file is of another deployment or template than the run")
     pins = [config.aws.launch_template_version]
     pins.extend(zone.launch_template_version for zone in config.aws.zones)
     if previous_pin is not None:

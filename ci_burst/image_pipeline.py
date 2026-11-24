@@ -940,6 +940,7 @@ class ImagePipeline:
         protected = image_deletion.protected_set(
             aws,
             self._config_path,
+            run_config=self._config,
             previous_pin=facts.previous_pin,
             promoted_pin=facts.promoted_pin,
             latest_pins=facts.latest_pins,

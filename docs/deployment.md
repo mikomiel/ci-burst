@@ -546,7 +546,10 @@ reports the overrun. A deployment that needs a longer pass must raise the
 unit's `TimeoutStartSec`; `pass_deadline_seconds` is not offered above `290`.
 The pass budget is not the worker lifetime: `aws.max_lifetime_seconds` bounds
 the instance itself, and with the shipped defaults the order is
-`240 < 300 < 3600`. `reap`, `status` and `export` are not bounded by it.
+`240 < 300 < 3600`. The loader accepts only `3600`, the lifetime that
+`deploy/runner/bootstrap.sh` arms on the instance (its shutdown and its job
+bound), so the expiry tag and the cost reservation use the same clock as the
+worker; a test compares the two. `reap`, `status` and `export` are not bounded by it.
 § Scheduler, cleanup and rollback in
 [operations.md](operations.md#scheduler-cleanup-and-rollback) owns the full
 relation to the systemd unit and the transport timeouts.

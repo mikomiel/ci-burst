@@ -1848,8 +1848,9 @@ Three different times bound one admission pass:
   deployment that needs a longer pass must raise this unit timeout;
   `pass_deadline_seconds` is not offered above `290`.
 - `aws.max_lifetime_seconds` is the worker instance's own lifetime, not the
-  pass duration. It may be shorter than a pass on a deliberately short-lived
-  worker; it must remain longer than the worker needs to run one job.
+  pass duration. The loader accepts only `3600`, the value that the worker
+  bootstrap arms for its shutdown and its job bound, so the expiry tag and the
+  cost reservation never disagree with the instance (#138).
 
 `reap`, `status` and `export` keep their existing behaviour and do not take the
 pass deadline. `reap --apply` runs from its own unit and timer on the cleanup

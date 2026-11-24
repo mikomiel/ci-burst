@@ -63,6 +63,15 @@ _V2_SCHEMA = """
 """
 
 
+def with_lifetime(config, seconds):
+    """``config`` with another worker lifetime than the loader accepts.
+
+    The loader accepts only the lifetime that the worker bootstrap arms (#138). The controller's arithmetic still takes
+    the value from the configuration, so these tests set it on the loaded object.
+    """
+    return replace(config, aws=replace(config.aws, max_lifetime_seconds=seconds))
+
+
 class ControllerCase(unittest.TestCase):
     #: An age beyond the default claim grace of 300 seconds. A seeded worker of
     #: this age covers no waiting job, so a test that is not about coverage gives
@@ -226,7 +235,7 @@ class PlanTests(ControllerCase):
         self.assertEqual(result["budget"]["remaining"].startswith("-"), True)
 
     def test_admission_recomputes_time_after_a_slow_quote_read(self):
-        config = load(write_config(self.root, config={"aws": {"max_lifetime_seconds": 60}}))
+        config = with_lifetime(load(write_config(self.root)), 60)
         aws = FakeAws(spot_quote=quote(clock=self.clock))
         aws.on_quote = lambda: self.clock.advance(70)
         controller = self.build(observation=observation_demand(), aws=aws, config=config)
@@ -1784,15 +1793,7 @@ class FleetTests(ControllerCase):
         )
 
     def test_a_later_worker_is_not_committed_after_the_shared_expiry_elapses(self):
-        config = load(
-            write_config(
-                self.root,
-                config={
-                    "controller": {"max_instances": 2},
-                    "aws": {"max_lifetime_seconds": 60},
-                },
-            )
-        )
+        config = with_lifetime(load(write_config(self.root, config={"controller": {"max_instances": 2}})), 60)
         controller = self.build(observation=observation_demand(2), config=config)
         self.aws.on_run = lambda request: self.clock.advance(70)
         result = controller.apply()
@@ -2746,7 +2747,7 @@ class CostTrackingTests(ControllerCase):
             self.root,
             config={
                 "budget": {"allowance": "0.1503"},
-                "aws": {"max_spot_price": "0.2000", "max_lifetime_seconds": 1800},
+                "aws": {"max_spot_price": "0.2000"},
                 "controller": {"max_instances": 2},
             },
         )
@@ -2755,7 +2756,7 @@ class CostTrackingTests(ControllerCase):
                 'non_compute_allowance = "0.50"', 'non_compute_allowance = "0.000001"'
             )
         )
-        config = load(path)
+        config = with_lifetime(load(path), 1800)
         ledger = Ledger(config.state.database, clock=self.clock).connect()
         with ledger.transaction():
             ledger.new_operation(
@@ -2894,7 +2895,7 @@ class CostTrackingTests(ControllerCase):
             self.root,
             config={
                 "budget": {"allowance": "0.2030"},
-                "aws": {"max_spot_price": "0.2000", "max_lifetime_seconds": 60},
+                "aws": {"max_spot_price": "0.2000"},
                 "controller": {"max_instances": 2},
             },
         )
@@ -2906,7 +2907,7 @@ class CostTrackingTests(ControllerCase):
         controller = self.build(
             observation=observation_demand(2),
             aws=FakeAws(spot_quote=quote(price_micros=200_000, clock=self.clock)),
-            config=load(lowered_path),
+            config=with_lifetime(load(lowered_path), 60),
         )
         self.aws.instances_result = []
         # The admitted worker keeps its own 3_600-second expiry window, so the
@@ -2988,15 +2989,18 @@ class CostTrackingTests(ControllerCase):
         self.assertEqual(self.reopened().operation(operation_id).settled_micros, first)
 
     def test_the_billing_minimum_is_committed_once_for_a_two_worker_batch(self):
-        config = load(
-            write_config(
-                self.root,
-                config={
-                    "controller": {"max_instances": 2},
-                    "aws": {"max_spot_price": "0.060000", "max_lifetime_seconds": 60},
-                    "budget": {"allowance": "0.002002", "non_compute_allowance": "0.000001"},
-                },
-            )
+        config = with_lifetime(
+            load(
+                write_config(
+                    self.root,
+                    config={
+                        "controller": {"max_instances": 2},
+                        "aws": {"max_spot_price": "0.060000"},
+                        "budget": {"allowance": "0.002002", "non_compute_allowance": "0.000001"},
+                    },
+                )
+            ),
+            60,
         )
         controller = self.build(
             observation=observation_demand(2),
@@ -3100,10 +3104,7 @@ class CostTrackingTests(ControllerCase):
                 self.root,
                 config={
                     "controller": {"max_instances": 2},
-                    "aws": {
-                        "max_spot_price": max_spot_price,
-                        "max_lifetime_seconds": max_lifetime_seconds,
-                    },
+                    "aws": {"max_spot_price": max_spot_price},
                     "budget": {"allowance": "0.55"},
                 },
             )
@@ -3114,7 +3115,7 @@ class CostTrackingTests(ControllerCase):
                     if "non_compute_allowance" not in line
                 )
             )
-            return load(rendered)
+            return with_lifetime(load(rendered), max_lifetime_seconds)
 
         migrating = self.build(
             observation=observation_empty(),

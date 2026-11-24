@@ -65,6 +65,10 @@ MAX_INSTANCE_TYPE_LENGTH = 64
 #: every configured type in every configured zone, so the bound keeps those
 #: synchronous provider reads predictable.
 _MAX_INSTANCE_TYPES = 4
+#: The worker's own lifetime. ``deploy/runner/bootstrap.sh`` arms its shutdown and bounds its job with this
+#: literal, and ``aws.max_lifetime_seconds`` (the expiry tag and the cost reservation) must equal it: one
+#: clock, not two (#138). A test compares the two.
+WORKER_LIFETIME_SECONDS = 3600
 
 #: How many basis paths one image build may hash. Each path is one raw read
 #: from the forge before any build starts, so the bound keeps that predictable.
@@ -289,6 +293,16 @@ def _integer(table, key, where, *, minimum, maximum, required=True):
         _fail(f"{where}.{key}", "must be an integer")
     if not minimum <= value <= maximum:
         _fail(f"{where}.{key}", f"must be between {minimum} and {maximum}")
+    return value
+
+
+def _worker_lifetime(aws_table):
+    value = _integer(aws_table, "max_lifetime_seconds", "aws", minimum=60, maximum=86_400)
+    if value != WORKER_LIFETIME_SECONDS:
+        _fail(
+            "aws.max_lifetime_seconds",
+            f"must be {WORKER_LIFETIME_SECONDS}, the lifetime that the worker bootstrap arms on the instance",
+        )
     return value
 
 
@@ -814,7 +828,7 @@ def loads(text, path):
         ),
         launch_template_version=launch_template_version,
         max_spot_price=_money(aws_table, "max_spot_price", "aws"),
-        max_lifetime_seconds=_integer(aws_table, "max_lifetime_seconds", "aws", minimum=60, maximum=86_400),
+        max_lifetime_seconds=_worker_lifetime(aws_table),
         price_max_age_seconds=_integer(
             aws_table, "price_max_age_seconds", "aws", minimum=60, maximum=86_400, required=False
         )

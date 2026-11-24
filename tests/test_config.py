@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ci_burst.config import ImageConfig, load, loads
+from ci_burst.config import WORKER_LIFETIME_SECONDS, ImageConfig, load, loads
 from ci_burst.errors import ConfigRefusal
 
 from support import write_config
@@ -298,6 +298,26 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigRefusal) as raised:
             load(path)
         self.assertIn("aws.max_lifetime_seconds", raised.exception.detail)
+
+    def test_refuses_a_lifetime_other_than_the_one_the_bootstrap_arms(self):
+        # One clock (#138): the expiry tag and the cost reservation come from this value, the shutdown and the job
+        # bound on the worker from the bootstrap's literal.
+        for seconds in (60, 1800, WORKER_LIFETIME_SECONDS - 1, WORKER_LIFETIME_SECONDS + 1, 7200, 86_400):
+            with self.subTest(seconds=seconds):
+                path = write_config(self.root, config={"aws": {"max_lifetime_seconds": seconds}})
+                with self.assertRaises(ConfigRefusal) as raised:
+                    load(path)
+                self.assertIn("aws.max_lifetime_seconds", raised.exception.detail)
+                self.assertIn(str(WORKER_LIFETIME_SECONDS), raised.exception.detail)
+        config = load(write_config(self.root, config={"aws": {"max_lifetime_seconds": WORKER_LIFETIME_SECONDS}}))
+        self.assertEqual(config.aws.max_lifetime_seconds, WORKER_LIFETIME_SECONDS)
+
+    def test_the_lifetime_matches_every_clock_in_the_worker_bootstrap(self):
+        bootstrap = (Path(__file__).resolve().parents[1] / "deploy" / "runner" / "bootstrap.sh").read_text()
+        shutdown = re.findall(r"systemd-run --on-active=(\d+) --unit=runner-lifetime ", bootstrap)
+        job = re.findall(r"timeout --signal=TERM --kill-after=\d+ (\d+) ", bootstrap)
+        self.assertEqual(shutdown, [str(WORKER_LIFETIME_SECONDS)])
+        self.assertEqual(job, [str(WORKER_LIFETIME_SECONDS)])
 
     def test_missing_file(self):
         with self.assertRaises(ConfigRefusal) as raised:

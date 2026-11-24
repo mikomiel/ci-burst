@@ -1997,67 +1997,12 @@ class StateOwnerTests(PromoteCase):
         self.assertEqual(self.backups(), [])
         self.assertFalse(self.other_state.exists())
 
-    def test_a_link_to_the_state_moved_after_the_start_is_a_change(self):
-        # The command opened the directory that the link named at its start; the file still names the link, which
-        # now leads elsewhere. The lock, the database and the events stay where the command opened them.
-        link = self.dir / "state-link"
-        link.symlink_to(self.state_dir, target_is_directory=True)
-        self.edit(lambda text: text.replace(str(self.state_dir), str(link)))
-        self.other_state.mkdir()
-
-        def move_the_link():
-            link.unlink()
-            link.symlink_to(self.other_state, target_is_directory=True)
-
-        before = sorted(path.name for path in self.other_state.iterdir())
-        real = image_promote.file_lock
-
-        @contextlib.contextmanager
-        def moved_once_locked(target):
-            with real(target):
-                move_the_link()
-                yield
-
-        dump = self.dump()
-        with mock.patch.object(image_promote, "file_lock", moved_once_locked):
-            code, payload = self.write_pin()
-        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_STATE_CHANGED"), payload)
-        self.assertEqual(self.dump(), dump)
-        self.assertEqual(self.journal_rows(), [])
-        self.assertEqual(sorted(path.name for path in self.other_state.iterdir()), before)
-
-    def test_a_link_to_the_state_moved_while_the_backup_is_written_is_refused(self):
-        # The file stays the same, so only the check of the state owner right before the journal row sees the move.
-        link = self.dir / "state-link"
-        link.symlink_to(self.state_dir, target_is_directory=True)
-        self.edit(lambda text: text.replace(str(self.state_dir), str(link)))
-        self.other_state.mkdir()
-        real = image_promote._create_backup
-
-        def moved_during_the_backup(*arguments, **keywords):
-            backup = real(*arguments, **keywords)
-            link.unlink()
-            link.symlink_to(self.other_state, target_is_directory=True)
-            return backup
-
-        dump, toml = self.dump(), self.config_path.read_bytes()
-        with mock.patch.object(image_promote, "_create_backup", moved_during_the_backup):
-            code, payload = self.write_pin()
-        self.assertEqual((code, payload.get("error", {}).get("reason")), (2, "PROMOTE_STATE_CHANGED"), payload)
-        self.assertEqual(self.config_path.read_bytes(), toml, "the pin did not move")
-        self.assertEqual(self.dump(), dump)
-        self.assertEqual(self.journal_rows(), [])
-        self.assertEqual(self.backups(), [])
-        self.assertFalse(self.temporary().exists())
-        self.assertEqual(list(self.other_state.iterdir()), [])
-
-    def test_the_same_directory_through_a_link_named_after_the_start_is_not_a_change(self):
-        # The link exists before the command; the file names it only after the command line loaded the file.
+    def test_a_link_to_the_same_directory_named_after_the_start_is_a_change(self):
+        # The values are compared as written: a link is not followed, so another name for the same directory is
+        # refused too, and a rerun plans from the file as it is.
         alias = self.dir / "state-alias"
         alias.symlink_to(self.state_dir, target_is_directory=True)
-        with self.changed_before_the_snapshot(lambda text: text.replace(str(self.state_dir), str(alias))):
-            code, payload = self.show()
-        self.assertEqual((code, payload["decision"]), (0, "preview"), payload)
+        self.refused((), write=False, change=lambda text: text.replace(str(self.state_dir), str(alias)))
 
 
 class FreshnessTests(unittest.TestCase):

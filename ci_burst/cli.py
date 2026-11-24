@@ -204,10 +204,6 @@ def _image(config, arguments):
             return image_status.refresh(config, state=state, aws=make_image_aws(config), clock=image_clock)
         return image_status.status(config, state=state, clock=image_clock)
     if command == "promote":
-        # Resolved once for promote: its writer lock, its database and its events stay in this directory for the
-        # whole command, and every check of the file compares against it, so a link on its path that moves meanwhile
-        # is refused, not followed (#199).
-        state = ImageState(Path(config.image.state_directory).resolve(), clock=image_clock)
         return image_promote.promote(
             config,
             state=state,

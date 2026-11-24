@@ -896,7 +896,7 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **THEN** a command in that container that resolves the journal, promotes or rolls back refuses with `PROMOTE_FILE_STALE` and writes nothing
 
 #### Scenario: The file names another state than the command opened
-- **WHEN** `[image].state_directory` (compared as the directory it resolves to, against the one the command resolved at its start) or `deployment` changes between the start of `promote` (with or without `--write`, `--rollback` included) and a read of the file it plans or writes from, the read under the locks of `--write` included
+- **WHEN** `[image].state_directory` (compared as written, without following a link) or `deployment` changes between the start of `promote` (with or without `--write`, `--rollback` included) and a read of the file it plans or writes from, the read under the locks of `--write` included
 - **THEN** the command refuses with `PROMOTE_STATE_CHANGED` and names no path
 - **AND** it changes no row, event, deployment file, state file or rollback journal of either state, and creates nothing in the state the file names now; only its own lock files may be created
 

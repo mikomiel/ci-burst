@@ -594,7 +594,7 @@ def _flush_directory(directory):
         os.close(descriptor)
 
 
-def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock, owner):
+def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock):
     """Steps 4 to 8 of the design for one pin change. The caller holds both locks.
 
     An ``OSError`` of a local file step is the refusal ``PROMOTE_WRITE_FAILED``, and its detail names the errno and
@@ -617,9 +617,6 @@ def _write_pin(state, snapshot, *, kind, new_pin, candidate_id, clock, owner):
         backup = _create_backup(snapshot, clock())
         if sha256_of(target.read_bytes()) != snapshot.sha256:
             raise ImageRefusal(PROMOTE_FILE_CHANGED, "the file changed after it was read; nothing was written")
-        # The last check before the journal row: the file is the same, but a link on the path to the state may have
-        # moved while the backup was written, and the row would then be recorded where no later command looks.
-        check_state_owner(owner, snapshot, state)
         with state.transaction():
             if kind == "promotion":
                 _record_previous_pin(state, snapshot)
@@ -887,10 +884,15 @@ def check_state_owner(config, snapshot, state):
     names no path.
     """
     planned = snapshot.config
-    directory = planned.image.state_directory
-    # ``state.directory`` was resolved once, when the command line opened it, and the lock, the database and the
-    # events live there. Only the file's value is resolved now, so a link moved since the start is a change too.
-    same_directory = directory is not None and Path(directory).resolve() == state.directory
+    # The values are compared as the file writes them (the loader collapses ``.`` and doubled separators), not
+    # resolved: every fact about the owner then comes from the file's bytes, which the last check before the rename
+    # compares by hash. A link on the path is not followed; changing what it names, like changing the value, is a
+    # cutover for a time when no image command runs.
+    same_directory = (
+        planned.image.state_directory is not None
+        and planned.image.state_directory == config.image.state_directory
+        and Path(state.directory) == config.image.state_directory
+    )
     if planned.deployment != config.deployment or not same_directory:
         raise ImageRefusal(
             PROMOTE_STATE_CHANGED,
@@ -1106,7 +1108,6 @@ def _write(snapshot, state, clock, events, version, rollback, *, owner):
                     new_pin=plan.previous_pin,
                     candidate_id=plan.target.id,
                     clock=clock,
-                    owner=owner,
                 )
                 decision, build_id, image_id = "rolled_back", None, plan.target.image_id
             else:
@@ -1120,7 +1121,6 @@ def _write(snapshot, state, clock, events, version, rollback, *, owner):
                     new_pin=build.template_version,
                     candidate_id=build.id,
                     clock=clock,
-                    owner=owner,
                 )
                 decision, build_id, image_id = "promoted", build.id, build.image_id
             # The rename is done and the row is complete: from here on nothing may undo or hide the promotion.

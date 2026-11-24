@@ -1078,8 +1078,8 @@ conditions). Reverting the source is a reviewed change, not a history rewrite.
 | `FORGEJO_UNEXPECTED_SHAPE` | the endpoint returned something other than an array or `null` |
 | `AWS_SDK_UNAVAILABLE` | the `boto3` runtime dependency is not installed in the command's environment |
 | `AWS_REFUSED` | the identity lacks a permission, or a condition (tag, template, subnet) does not match |
-| `AWS_CREDENTIALS_UNAVAILABLE` | the SDK could not resolve the profile or its credentials (for example an unknown profile, missing credentials or a malformed shared config); no request was sent, and the detail is the error class only |
-| `AWS_SETUP_FAILED` | the SDK could not build the session or a client for another reason; no request was sent, and the detail is the error's code or class only |
+| `AWS_CREDENTIALS_UNAVAILABLE` | the SDK could not resolve the profile or its credentials (for example an unknown profile, missing credentials or a malformed shared config); the requested AWS operation was not sent, and the detail is the error class only |
+| `AWS_SETUP_FAILED` | the SDK could not be imported, configured or build the session or a client for another reason; the requested AWS operation was not sent, and the detail is the error's code or class only |
 | `AWS_UNCERTAIN` | the provider outcome is unknown; the recorded client token resumes the same operation |
 | `AWS_INVENTORY_INCOMPLETE` | the inventory response is not a complete, parseable result; no operation is settled and no replacement is admitted |
 | `UNRECORDED_OWNED_INSTANCE`, `OWNERSHIP_TAGS_MISSING`, `OPERATION_TAG_INVALID` | an owned instance needs reconciliation before another launch |

@@ -798,6 +798,37 @@ class SdkFailureTests(unittest.TestCase):
                         self.assertNotIn("sentinel-sdk-message-marker", text)
                         self.assertNotIn("111122223333", text)
 
+    def test_a_failure_while_the_sdk_config_or_the_sdk_import_is_built_becomes_a_definite_refusal(self):
+        class BrokenConfig(Exception):
+            pass
+
+        modules = self.sdk()
+
+        def config(**kwargs):
+            raise BrokenConfig(SDK_SENTINEL)
+
+        modules["botocore.config"].Config = config
+        for name, call in self.entries(Aws(self.config)).items():
+            with self.subTest(source="config", entry=name):
+                with mock.patch.dict(sys.modules, modules):
+                    with self.assertRaises(ProviderRefusal) as raised:
+                        call()
+                self.assertEqual((raised.exception.reason, raised.exception.detail), ("AWS_SETUP_FAILED", "BrokenConfig"))
+                self.assertFalse(raised.exception.uncertain)
+                self.assertNotIn("sentinel-sdk-message-marker", str(raised.exception))
+        real_import = __import__
+
+        def broken_import(name, *arguments, **keywords):
+            if name == "boto3":
+                raise AttributeError(SDK_SENTINEL)
+            return real_import(name, *arguments, **keywords)
+
+        with mock.patch.dict(sys.modules, self.sdk()), mock.patch("builtins.__import__", broken_import):
+            with self.assertRaises(ProviderRefusal) as raised:
+                Aws(self.config)._session()
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("AWS_SETUP_FAILED", "AttributeError"))
+        self.assertNotIn("sentinel-sdk-message-marker", str(raised.exception))
+
     def test_a_refusal_raised_while_building_the_session_passes_unchanged(self):
         original = ProviderRefusal("IMAGE_PROFILE_INVALID", "a synthetic refusal")
         for name, call in self.entries(Aws(self.config)).items():

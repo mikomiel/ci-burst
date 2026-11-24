@@ -206,11 +206,11 @@ class Aws:
         """One resolved credential identity for identity and EC2 calls."""
         if self._session_cache is not None:
             return self._session_cache
-        try:
-            import boto3
-        except ImportError:
-            raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
         with _setup_failures():
+            try:
+                import boto3
+            except ImportError:
+                raise ProviderRefusal("AWS_SDK_UNAVAILABLE", "install the boto3 runtime dependency") from None
             self._session_cache = boto3.Session(profile_name=self._config.aws.profile)
         return self._session_cache
 
@@ -224,10 +224,10 @@ class Aws:
     def _client(self):
         if self._client_cache is not None:
             return self._client_cache
-        # Resolve the guarded configuration first: a checkout without the SDK
-        # must refuse here, before the session is touched.
-        config = self._client_config()
         with _setup_failures():
+            # Resolve the guarded configuration first: a checkout without the SDK
+            # must refuse here, before the session is touched.
+            config = self._client_config()
             self._client_cache = self._session().client(
                 "ec2",
                 region_name=self._config.aws.region,
@@ -250,8 +250,8 @@ class Aws:
         """Return the AWS account the configured credential route reaches."""
         if self._account_cache is not None:
             return self._account_cache
-        config = self._client_config()
         with _setup_failures():
+            config = self._client_config()
             sts = self._session().client("sts", region_name=self._config.aws.region, config=config)
         try:
             response = sts.get_caller_identity()

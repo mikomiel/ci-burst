@@ -1334,6 +1334,26 @@ class EditTests(PromoteCase):
         self.promoted()
         self.assertEqual(self.config_path.read_bytes(), rich.replace(b"=   3    # the pin", b"=   5    # the pin"))
 
+    def test_a_comment_on_the_pin_line_stays_in_the_file_and_never_reaches_the_output(self):
+        remark = "SENTINEL-198 see https://private.example.invalid/note"
+        text = self.config_path.read_bytes()
+        commented = text.replace(b"launch_template_version = 3", f"launch_template_version = 3  # {remark}".encode())
+        self.assertNotEqual(commented, text)
+        self.config_path.write_bytes(commented)
+        self.seed()
+        code, preview = self.show()
+        self.assertEqual(code, 0, preview)
+        line = self.pin_line_number()
+        self.assertEqual(
+            preview["pin_change"],
+            {"line": line, "from": "launch_template_version = 3", "to": "launch_template_version = 5"},
+        )
+        self.assertNotIn("SENTINEL-198", json.dumps(preview))
+        written = self.promoted()
+        self.assertEqual(written["change"], preview["pin_change"])
+        self.assertNotIn("SENTINEL-198", json.dumps(written))
+        self.assertEqual(self.config_path.read_bytes(), commented.replace(b"= 3  # ", b"= 5  # "))
+
     def test_carriage_returns_survive(self):
         crlf = self.config_path.read_bytes().replace(b"\n", b"\r\n")
         self.config_path.write_bytes(crlf)
@@ -1575,7 +1595,7 @@ class PlanEditTests(unittest.TestCase):
         self.assertEqual(text, DEPLOYMENT_TEXT.replace("= 3  # pinned", "= 7  # pinned"))
         self.assertEqual(
             change,
-            {"line": 7, "from": "launch_template_version = 3  # pinned", "to": "launch_template_version = 7  # pinned"},
+            {"line": 7, "from": "launch_template_version = 3", "to": "launch_template_version = 7"},
         )
 
     def test_the_other_tables_with_a_key_of_that_name_are_not_touched(self):
@@ -1586,7 +1606,7 @@ class PlanEditTests(unittest.TestCase):
     def test_the_new_value_may_have_more_digits(self):
         text, change = image_promote.plan_edit(DEPLOYMENT_TEXT, 10_000)
         self.assertIn("launch_template_version = 10000  # pinned", text)
-        self.assertEqual(change["to"], "launch_template_version = 10000  # pinned")
+        self.assertEqual(change["to"], "launch_template_version = 10000")
 
     def test_carriage_returns_indentation_spacing_and_a_missing_final_newline_are_kept(self):
         original = "[ aws ] # the table\r\n  launch_template_version=3\r\nregion = 'x'"

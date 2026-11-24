@@ -186,9 +186,9 @@ command. This section owns the workflow.
    a pass that reaches its checks: a build with no ready marker by
    `build_deadline_seconds` then ends `failed`, and an image still pending at the
    deadline fails the build, though the first read after the deadline can still
-   find it `available` and go on. A pass that raises earlier, for example on a
-   refused console read ([#203](https://github.com/mikomiel/ci-burst/issues/203)),
-   leaves the build in flight.
+   find it `available` and go on. A pass that raises earlier, for example in
+   reconcile or on a console read refused before the deadline, leaves the build in
+   flight; a console read refused at or after the deadline ends it `CONSOLE_BLIND`.
 4. It creates a new version of the worker launch template that copies the pinned
    version and changes `ImageId` only, reads both versions back and compares them.
    A difference in any other field fails the build (`TEMPLATE_DRIFT`). Otherwise the

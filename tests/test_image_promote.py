@@ -14,6 +14,7 @@ files are left as the real process would leave them. Every value is synthetic.
 
 import contextlib
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -1202,6 +1203,98 @@ class EditTests(PromoteCase):
         )
         self.assertEqual(self.row("build-b")["state"], "promoted")
         self.assertEqual([item["status"] for item in self.journal_rows()], ["complete"])
+
+    # -- a hot rollback journal (#194) ----------------------------------------------------
+    def leave_a_hot_journal(self):
+        """Leave the state file as a process that died inside the commit of ``journal_complete`` leaves it.
+
+        A copy of the file runs that commit's update with a one-page cache, so SQLite writes changed pages into
+        the file before the commit, and the file and its rollback journal are copied back mid-transaction. Only a
+        writable connection rolls such a journal back. Returns the bytes of both files.
+        """
+        database = self.state_dir / "image-state.sqlite"
+        journal = Path(str(database) + "-journal")
+        with tempfile.TemporaryDirectory() as scratch:
+            work = Path(scratch) / database.name
+            shutil.copyfile(database, work)
+            connection = sqlite3.connect(work, isolation_level=None)
+            try:
+                connection.execute("PRAGMA cache_size=1")
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("UPDATE promotion_journal SET status = 'complete' WHERE status = 'pending'")
+                connection.execute("CREATE TABLE spill (x BLOB)")
+                for _ in range(64):
+                    connection.execute("INSERT INTO spill VALUES (zeroblob(4000))")
+                shutil.copyfile(work, database)
+                shutil.copyfile(str(work) + "-journal", journal)
+            finally:
+                connection.execute("ROLLBACK")
+                connection.close()
+        self.assertGreater(journal.stat().st_size, 0)
+        return database.read_bytes(), journal.read_bytes()
+
+    def hot_files(self):
+        database = self.state_dir / "image-state.sqlite"
+        journal = Path(str(database) + "-journal")
+        return database.read_bytes(), (journal.read_bytes() if journal.exists() else None)
+
+    def test_a_hot_journal_makes_status_and_the_previews_refuse_and_name_the_recovery_and_touches_nothing(self):
+        self.seed()
+        self.crash_after_rename()
+        files = self.leave_a_hot_journal()
+        before = snapshot_tree(self.dir)
+        for arguments in (("status",), ("promote",), ("promote", "--rollback"), ("run",), ("plan",)):
+            with self.subTest(command=arguments):
+                if arguments[0] in ("run", "plan"):
+                    self.allow_clients()
+                code, payload = self.invoke("image", *arguments)
+                self.forbid_clients()
+                self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_STATE_RECOVERY_NEEDED"), payload)
+                self.assertIn("image run --apply", payload["error"]["detail"])
+                self.assertEqual(self.hot_files(), files)
+        self.assertEqual(snapshot_tree(self.dir), before)
+
+    def test_promote_write_rolls_a_hot_journal_back_under_its_locks_and_resolves_the_row(self):
+        self.seed()
+        self.crash_after_rename()
+        after = self.config_path.read_bytes()
+        self.leave_a_hot_journal()
+        code, payload = self.write_pin()
+        # The journal rolled back to the pending row; the file holds the new pin, so the row completes and
+        # nothing is left to promote.
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_NO_CANDIDATE"), payload)
+        self.assertFalse(Path(str(self.state_dir / "image-state.sqlite") + "-journal").exists())
+        self.assertEqual([item["status"] for item in self.journal_rows()], ["complete"])
+        self.assertEqual(self.row("build-b")["state"], "promoted")
+        self.assertEqual(self.config_path.read_bytes(), after)
+        tables = {row["name"] for row in self.table("sqlite_master")}
+        self.assertNotIn("spill", tables)
+
+    def test_run_apply_rolls_a_hot_journal_back_and_resolves_the_row(self):
+        self.seed()
+        self.crash_after_rename()
+        self.leave_a_hot_journal()
+        pinned = self.digest()
+        self.world.images[ami(0xB1)]["Tags"] = tag_list({**owned("build-b"), BASIS_DIGEST_TAG: pinned})
+        self.allow_clients()
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(
+            payload["journal_resolved"], [{"journal_id": 1, "kind": "promotion", "resolution": "complete"}]
+        )
+        self.assertEqual(self.row("build-b")["state"], "promoted")
+
+    def test_a_hot_journal_stays_while_another_process_holds_the_writer_lock(self):
+        self.seed()
+        self.crash_after_rename()
+        files = self.leave_a_hot_journal()
+        lock = os.open(str(self.state_dir / "image-state.sqlite") + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        code, payload = self.write_pin()
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_STATE_LOCKED"), payload)
+        self.assertEqual(self.hot_files(), files)
 
     def test_a_pending_row_is_judged_from_the_file_as_it_is_under_the_lock(self):
         self.seed()

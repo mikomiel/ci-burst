@@ -1038,13 +1038,12 @@ def _write(snapshot, state, clock, events, version, rollback):
     # Nothing is written until the checks that need only the file pass.
     check_directory(snapshot.target)
     check_zone_pins(snapshot.raw)
-    if not state.connect_readonly():
+    if not state.probe_for_write():
         raise _missing_state(rollback)
-    state.close()
     with file_lock(snapshot.target):
-        state.connect()
         try:
-            state.acquire_writer()
+            state.acquire_writer()  # before the writable open, which rolls back a hot journal
+            state.connect()
             # The first read decided only the two refusals above. Every other fact comes from bytes
             # read now, with both locks held: a promotion that finished after the first read must
             # not make its own pending row look aborted.

@@ -182,8 +182,9 @@ def _record_check(state, now):
     """
     recorded = False
     try:
+        state.acquire_writer()  # before the writable open, which rolls back a hot journal
+        state.refuse_a_hot_journal()  # a read-only status never rolls a journal back
         state.connect()
-        state.acquire_writer()
         state.record_check_time(now)
         recorded = True
     except (StateRefusal, OSError, sqlite3.Error):
@@ -216,9 +217,9 @@ def refresh(config, *, state, aws, clock, candidates=True):
     now = clock()
     snapshot = read_snapshot(config)
     deployment = snapshot.config.deployment
-    state.connect()
     try:
-        state.acquire_writer()
+        state.acquire_writer()  # before the writable open, which rolls back a hot journal
+        state.connect()
         reads = _Reads(aws, snapshot.config.aws.launch_template_name)
         planned = [
             _evidence_for(reads, state, deployment, version, row, now)

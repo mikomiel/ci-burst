@@ -888,10 +888,13 @@ topology.
   follows `origin/main` replaces the image by itself within minutes of a merge,
   so on such a host either drain before the change that brings schema 5 is
   merged, with admission stopped from the final check until the new image is
-  promoted, or stop `ci-burst-refresh.timer` and wait until
-  `ci-burst-refresh.service` is inactive before the merge, because stopping the
-  timer does not stop a refresh that is already running; verify the drain, then
-  start the timer again. Keep cleanup running either way. If one is found after the upgrade, keep
+  promoted, or hold refresh before the merge as the rollback does:
+  `systemctl disable --now ci-burst-refresh.timer`, so a reboot does not arm
+  it again, then `systemctl stop ci-burst-refresh.service`, which also cancels
+  a start that is queued, and confirm the service is inactive. Verify the
+  drain, keep admission stopped from that check until the new image is
+  promoted, and only then `systemctl enable --now ci-burst-refresh.timer`.
+  Keep cleanup running either way. If one is found after the upgrade, keep
   admission stopped, keep cleanup running, do not delete or edit the row, and
   escalate: an empty owned inventory does not prove that its request was never
   sent. `plan`, `status` and `export` accept versions 1

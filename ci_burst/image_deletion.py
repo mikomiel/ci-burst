@@ -47,6 +47,7 @@ from dataclasses import InitVar, dataclass, field
 from .aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
 from .config import loads
 from .errors import ConfigRefusal, ImageRefusal, ProviderRefusal
+from . import image_promote
 from .image_promote import still_named
 from .image_state import ACTIVE_STATES
 from .image_template import TEMPLATE_DRIFT
@@ -168,6 +169,12 @@ def _load_deployment(config_path):
         raise _unsafe("the deployment file is a view of a file that was replaced")
     if edited:
         raise _unsafe("the deployment file changed while it was read")
+    try:
+        mounted = image_promote.is_mount_point(config_path)
+    except ImageRefusal:  # the mount table cannot be read: the status cannot be shown, so it is not a pass
+        mounted = True
+    if mounted:
+        raise _unsafe("the deployment file is itself a mount point, or its mount status cannot be shown")
     try:
         return loads(b"".join(chunks).decode("utf-8"), config_path), identity
     except (UnicodeDecodeError, ConfigRefusal):

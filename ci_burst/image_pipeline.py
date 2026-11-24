@@ -106,7 +106,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import image, image_console, image_deletion
+from . import image, image_console, image_deletion, image_promote
 from .aws import BASIS_DIGEST_TAG, BUILD_ID_TAG, BUILDER_STATES, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
 from .config import load
 from .errors import ConfigRefusal, DeadlineRefusal, ImageRefusal, ProviderRefusal, Refusal
@@ -1007,6 +1007,9 @@ class ImagePipeline:
             current = load(self._config_path)
         except ConfigRefusal as refusal:
             raise ImageRefusal(IMAGE_CONFIG_CHANGED, f"the deployment file no longer loads ({refusal.reason})") from None
+        # The file that was just loaded is not a mount point either (a link may have been retargeted to one): the
+        # refusal is ``IMAGE_CONFIG_MOUNTED``, as at the dispatch of the command, and it comes before the comparison.
+        image_promote.check_not_mounted(current)
         if current != self._config:
             raise ImageRefusal(
                 IMAGE_CONFIG_CHANGED,

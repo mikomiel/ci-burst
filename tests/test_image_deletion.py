@@ -24,7 +24,7 @@ from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ci_burst import image_deletion
+from ci_burst import image_deletion, image_promote
 from ci_burst.aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG, Image, ImageAws, Snapshot
 from ci_burst.config import ImageConfig, load
 from ci_burst.errors import DeadlineRefusal, ImageRefusal, ProviderRefusal
@@ -554,6 +554,37 @@ class ProtectedSetRefusalTests(DeletionCase):
         self.assertEqual(switched, [True])
         self.assertEqual(raised.exception.reason, UNSAFE)
         self.assertIn("replaced", raised.exception.detail)
+        self.assertEqual(self.ec2.calls, [])
+
+    def mount_table(self, *mount_points):
+        table = self.directory / "mountinfo"
+        lines = [f"{number} 1 8:1 /a {point} rw - ext4 /dev/example rw" for number, point in enumerate(mount_points, 30)]
+        table.write_text("\n".join(["29 1 0:5 / / rw - rootfs rootfs rw", *lines]) + "\n", encoding="utf-8")
+        return mock.patch.object(image_promote, "_MOUNTINFO", table)
+
+    def test_a_deployment_file_that_is_a_mount_point_is_unsafe_and_reads_no_version(self):
+        # A link that was retargeted to a file that is a bind mount is read through the mount no more (#202).
+        link = self.directory / "link.toml"
+        link.symlink_to(self.deployment_file)
+        with self.mount_table(str(Path(self.deployment_file).resolve())), self.assertRaises(ImageRefusal) as raised:
+            protected_set(self.aws, link, previous_pin=None, pending_journal=(), candidate=None, active=None)
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertIn("mount point", raised.exception.detail)
+        self.assertNotIn(str(self.directory), raised.exception.detail)
+        self.assertEqual(self.ec2.calls, [])
+
+    def test_a_file_that_is_not_listed_as_a_mount_point_is_loaded(self):
+        with self.mount_table(str(self.directory / "another.toml")):
+            self.assertTrue(self.resolve())
+
+    def test_an_unreadable_mount_table_on_linux_is_unsafe(self):
+        with (
+            mock.patch.object(image_promote, "_MOUNTINFO", self.directory / "no-such-table"),
+            mock.patch("sys.platform", "linux"),
+            self.assertRaises(ImageRefusal) as raised,
+        ):
+            self.resolve()
+        self.assertEqual(raised.exception.reason, UNSAFE)
         self.assertEqual(self.ec2.calls, [])
 
     def test_an_unreadable_version_is_unsafe_and_leaks_nothing(self):

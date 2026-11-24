@@ -311,7 +311,9 @@ all of `/etc/ci-burst`. `promote --write` replaces the TOML atomically, and a bi
 mount of the single file keeps serving the replaced inode, with the old pins. Every
 `image` command refuses a file that is itself a mount point (`IMAGE_CONFIG_MOUNTED`), and
 on Linux also when the mount table of the process (`/proc/self/mountinfo`) cannot be read:
-the container must keep it readable, and `image` never treats an unreadable table as a pass.
+the container must keep it readable, and `image` never treats an unreadable table as a pass. The
+check runs again when `--until-done` reloads the file and when the deletion rule loads it, so a
+`--config` link that is retargeted to a mounted file ends the run.
 With the directory mounted, retention reads the replacement
 file that a promotion wrote on its next pass: retention reloads the
 TOML on every pass, to find the pins it must keep. The rest of a run keeps the

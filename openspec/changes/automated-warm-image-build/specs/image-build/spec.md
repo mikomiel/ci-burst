@@ -447,6 +447,14 @@ Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run
 - **WHEN** a promotion row is pending and the deployment file is edited after the command loaded it and before the row is resolved
 - **THEN** the run ends with `IMAGE_CONFIG_CHANGED`, not `PROMOTION_JOURNAL_DIVERGED`, and the row stays pending
 
+#### Scenario: Until-done meets a file that became a mount point
+- **WHEN** `--config` is a link that is retargeted between passes to a file that is itself a mount point
+- **THEN** the run ends with `IMAGE_CONFIG_MOUNTED` before the next pass, and the deletion rule that loads the same file refuses with `IMAGE_DELETION_UNSAFE`
+
+#### Scenario: The recovery snapshot gives other settings
+- **WHEN** a promotion row is pending, the settings check passes, and the file then changes before recovery reads it
+- **THEN** `--until-done` ends with `IMAGE_CONFIG_CHANGED` because the bytes that would resolve the row give other settings, and the row stays pending
+
 #### Scenario: Until-done meets a rewrite that changes no setting
 - **WHEN** the file is rewritten between passes and gives the same settings
 - **THEN** the loop goes on as it would without the rewrite
@@ -915,6 +923,10 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 #### Scenario: The file is edited in place during the read
 - **WHEN** the file is rewritten in place (same inode and name) while a command reads it, so that its change time, modification time or size differ after the read
 - **THEN** the command refuses with `PROMOTE_FILE_CHANGED`, and no pending row is resolved from the hash of the bytes that were read, and a deletion load refuses with `IMAGE_DELETION_UNSAFE`
+
+#### Scenario: The file is edited after the verification read buffered it
+- **WHEN** `promote --write` or the recovery verifies the file once more and the file is edited in place after those bytes were read
+- **THEN** the verification refuses (`PROMOTE_FILE_CHANGED`), the file is not overwritten, no backup is written and a pending row stays pending
 
 #### Scenario: A link that names the file switches during the read
 - **WHEN** `--config` is a symbolic link and it is switched to another file during the read, so that the file it resolved to is still named

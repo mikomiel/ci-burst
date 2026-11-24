@@ -27,7 +27,7 @@ from .controller import Controller
 from .errors import ImageRefusal, ProviderRefusal, Refusal
 from .export import Exporter
 from .forgejo import ForgejoSource
-from .image_pipeline import ImagePipeline, write_event
+from .image_pipeline import IMAGE_CONFIG_CHANGED, ImagePipeline, write_event
 from .image_state import ImageState
 
 FAILED_DECISIONS = ("launch_failed", "cleanup_failed", "cleanup_degraded", "uncertain")
@@ -242,7 +242,7 @@ def _apply(config, arguments, pipeline, sessions, state):
             # Before the writable open and the resolution, which read the file again: an edit since this command
             # loaded it must give ``IMAGE_CONFIG_CHANGED``, not a divergence of a row that the edit caused (#202).
             pipeline.check_settings_unchanged()
-        resolved = _resolve_journal(config, state)
+        resolved = _resolve_journal(config, state, same_settings=arguments.until_done)
         if arguments.until_done:
             result = pipeline.run_until_done(force=arguments.force)
         else:
@@ -254,7 +254,7 @@ def _apply(config, arguments, pipeline, sessions, state):
         state.close()
 
 
-def _resolve_journal(config, state):
+def _resolve_journal(config, state, *, same_settings=False):
     """Resolve the pending journal row of a promotion that crashed, from the hash of the deployment file.
 
     The state is left open with the writer lock held, so the pass that follows runs
@@ -270,7 +270,16 @@ def _resolve_journal(config, state):
     state.acquire_writer()  # before the writable open, which rolls back a hot journal
     state.connect()
     state.journal_check()
-    return image_promote.resolve_pending(state, image_promote.read_snapshot(config).sha256)
+    snapshot = image_promote.read_snapshot(config)
+    if same_settings and snapshot.config != config:
+        # ``--until-done``: the hash that resolves a row must be of bytes that give the settings of this run. The check
+        # before this call read the file once; this is the file that the hash comes from (#202).
+        raise ImageRefusal(
+            IMAGE_CONFIG_CHANGED,
+            "the deployment file changed since this run loaded it; run again to resume the build with the file as it "
+            "is now",
+        )
+    return image_promote.resolve_pending(state, snapshot.sha256)
 
 
 def _stamp_pins(config, state, sessions):

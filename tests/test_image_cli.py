@@ -388,6 +388,26 @@ class UntilDoneThroughTheCommandTests(CliCase):
         self.assertEqual(self.dump(), before)
         self.assertEqual((self.sessions, self.world.calls), ([], []))
 
+    def test_the_snapshot_that_resolves_a_row_must_give_the_settings_of_the_run(self):
+        # The settings check passes (the file is as loaded), then the file changes before the recovery reads it: the
+        # row must not be resolved from the hash of the new bytes (#202).
+        edited = self.config_path.read_text(encoding="utf-8").replace(GATE, NO_GATE)
+        digest = hashlib.sha256(edited.encode("utf-8")).hexdigest()
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        real = image_promote.read_snapshot
+
+        def read_snapshot(*arguments, **keywords):
+            self.config_path.write_text(edited, encoding="utf-8")
+            return real(*arguments, **keywords)
+
+        before = self.dump()
+        with mock.patch.object(image_promote, "read_snapshot", read_snapshot):
+            code, payload = self.invoke("image", "run", "--apply", "--until-done")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(self.dump(), before)
+        self.assertEqual((self.sessions, self.world.calls), ([], []))
+
     def test_the_same_edit_without_until_done_is_still_a_divergence(self):
         # The check belongs to the loop: a single pass keeps its behaviour.
         self.add_pending(old_sha="0" * 64, new_sha=self.file_sha())

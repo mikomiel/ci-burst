@@ -298,6 +298,16 @@ def _is_unchanged(snapshot):
             chunks = []
             while chunk := os.read(descriptor, 1 << 16):
                 chunks.append(chunk)
+            # The same checks as ``_read_open_file`` makes, after the bytes are in: an edit that lands once they are
+            # buffered leaves the old hash to match, and only the file itself shows it (#202).
+            if _identity(os.fstat(descriptor)) != _identity(metadata):
+                return False
+            if not (
+                still_named(descriptor, target)
+                and still_named(descriptor, snapshot.config.path)
+                and _identity(os.fstat(descriptor)) == snapshot.identity
+            ):
+                return False
         finally:
             os.close(descriptor)
     except (OSError, RuntimeError):  # ``resolve`` raises ``RuntimeError`` for a loop of links

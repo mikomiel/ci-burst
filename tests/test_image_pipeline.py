@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from ci_burst import image, image_deletion, image_pipeline
+from ci_burst import image, image_deletion, image_pipeline, image_promote
 from ci_burst.aws import (
     BASIS_DIGEST_TAG,
     BUILD_ID_TAG,
@@ -3967,6 +3967,34 @@ class SettingsChangedTests(PipelineCase):
         refusal = self.refused(self.pipeline.run_until_done, "IMAGE_CONFIG_CHANGED")
         self.assert_ended_after_one_pass(refusal)
         self.assertIn("CONFIG_MISSING", refusal.detail)
+
+    def test_a_link_retargeted_to_a_mount_point_file_ends_the_loop_with_the_mount_refusal(self):
+        # ``--config`` is a link. Between the passes it names another file with the same bytes (so the settings are
+        # equal), and that file is a bind mount: the loop reads through it no more (#202).
+        text = self.config_path.read_text(encoding="utf-8")
+        mounted = self.dir / "mounted.toml"
+        mounted.write_text(text, encoding="utf-8")
+        link = self.dir / "link.toml"
+        link.symlink_to(self.config_path)
+        self.config_path = link
+        self.restart()
+        table = self.dir / "mountinfo"
+        table.write_text(
+            f"29 1 0:5 / / rw - rootfs rootfs rw\n30 1 8:1 /a {mounted.resolve()} rw - ext4 /dev/example rw\n",
+            encoding="utf-8",
+        )
+
+        def retarget():
+            moved = self.dir / "link.tmp"
+            moved.symlink_to(mounted)
+            os.replace(moved, link)
+
+        self.edit_after_the_first_pass(retarget)
+        with mock.patch.object(image_promote, "_MOUNTINFO", table):
+            refusal = self.refused(self.pipeline.run_until_done, "IMAGE_CONFIG_MOUNTED")
+        self.assertEqual(self.passes, ["building"])
+        self.assertEqual(len(self.sessions), 1)
+        self.assertNotIn(str(self.dir), refusal.detail)
 
     def test_a_file_that_gives_the_same_settings_keeps_the_loop_going(self):
         # A rewrite and a comment change no setting: the build runs to its candidate as it does without an edit.

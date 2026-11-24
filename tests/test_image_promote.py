@@ -1928,6 +1928,63 @@ class StaleViewTests(PromoteCase):
         self.assertEqual(edited, [True])
         self.assertEqual(os.stat(target).st_ino, inode)
 
+    @contextlib.contextmanager
+    def edited_in_place_during_the_verification(self):
+        """The verification read of ``promote --write`` (opened with ``O_NOFOLLOW``) ends, and the file is then rewritten.
+
+        The verifier has the old bytes buffered, so the hash matches the snapshot; only the file itself shows the
+        edit. The reads of ``read_snapshot`` are not touched (#202). The yield gives the edited bytes.
+        """
+        target = Path(self.config.path).resolve()
+        text = target.read_text(encoding="utf-8")
+        edited_bytes = (text + "\n# a hand edit\n").encode("utf-8")
+        real_open, real_read = os.open, os.read
+        verifying, edited = set(), []
+
+        def opened(path, flags, *arguments, **keywords):
+            descriptor = real_open(path, flags, *arguments, **keywords)
+            if flags & os.O_NOFOLLOW and Path(path) == target:
+                verifying.add(descriptor)
+            return descriptor
+
+        def read(descriptor, size):
+            data = real_read(descriptor, size)
+            if not data and descriptor in verifying and not edited:
+                edited.append(True)
+                target.write_bytes(edited_bytes)
+            return data
+
+        with mock.patch("os.open", opened), mock.patch("os.read", read):
+            yield edited_bytes
+        self.assertEqual(edited, [True])
+
+    def test_the_verification_read_refuses_an_edit_that_lands_after_the_bytes_are_in(self):
+        snapshot = image_promote.read_snapshot(self.config)
+        self.assertTrue(image_promote._is_unchanged(snapshot))
+        with self.edited_in_place_during_the_verification():
+            self.assertFalse(image_promote._is_unchanged(snapshot))
+
+    def test_promote_write_does_not_overwrite_an_edit_that_lands_during_the_verification(self):
+        before = self.dump()
+        with self.edited_in_place_during_the_verification() as edited:
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual(self.config_path.read_bytes(), edited)
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(self.dump(), before)
+
+    def test_a_pending_row_is_not_resolved_when_an_edit_lands_during_the_verification(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        before = self.dump()
+        with self.edited_in_place_during_the_verification() as edited:
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(self.config_path.read_bytes(), edited)
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(self.dump(), before)
+
     def test_an_in_place_edit_during_the_read_is_refused_as_a_changed_file(self):
         with self.edited_in_place_during_the_read():
             with self.assertRaises(ImageRefusal) as raised:

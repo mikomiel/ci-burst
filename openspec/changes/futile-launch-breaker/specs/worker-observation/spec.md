@@ -28,6 +28,12 @@ change to the brake's reader.
 - **THEN** the record is not rewritten
 - **AND** its modification time ages, so the brake sees it as `stale` after 600 seconds
 
+#### Scenario: A run that cannot write its textfile leaves the record alone
+- **WHEN** a run cannot replace the metrics textfile, so the command exits 1
+- **THEN** the record is not rewritten, because the command writes the record after the event file and the textfile
+- **AND** its modification time ages, so the brake sees it as `stale` after 600 seconds
+- **AND** the next successful run repeats the events of the failed run under the same identities
+
 #### Scenario: The record is deleted
 - **WHEN** the record is deleted
 - **THEN** the controller reports the evidence state `missing` and admits as it would without the brake
@@ -38,3 +44,8 @@ change to the brake's reader.
 - **WHEN** the command writes a record for a worker that ended after printing the exit marker and no registration evidence
 - **THEN** the controller's reader classifies that worker as futile
 - **AND** it classifies a worker that registered as registered
+
+#### Scenario: The brake accepts every marker the command writes
+- **WHEN** the command writes a record with a one-job process outcome or a Spot interruption notice, including a notice whose registration id is null
+- **THEN** the controller's reader accepts the file
+- **AND** it classifies the worker as registered

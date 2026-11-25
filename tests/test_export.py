@@ -17,6 +17,7 @@ from ci_burst.export import (
     MAX_CONSOLE_READS,
     MAX_EVENTS_BYTES,
     POST_REGISTRATION_STEPS,
+    STATE_VERSION,
     STEP_NAMES,
     Exporter,
     default_record_path,
@@ -26,7 +27,7 @@ from ci_burst.export import (
 )
 from ci_burst.launch_evidence import FUTILE, REGISTERED, classify, read_launch_evidence
 
-from support import FakeAws, instance, operation_hex, write_config
+from support import FakeAws, futile_record, instance, operation_hex, registered_record, write_config, write_observed
 
 NOW = 1_800_000_000.0
 
@@ -1809,6 +1810,128 @@ class LaunchEvidenceContractTests(ExportCase):
         self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 3})
         self.assertTrue(evidence.holds)
 
+    def test_the_reader_accepts_every_marker_the_exporter_writes(self):
+        # A reader that is stricter than the writer would switch the gate off
+        # without any test that refuses a record noticing it.
+        runner = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
+        notice = "cloud-init: bootstrap spot-interruption action={} host=ip-10-0-0-1 runner={}\n"
+        consoles = {
+            "i-0123456789abcdec0": notice.format("terminate", runner),
+            "i-0123456789abcdec1": notice.format("stop", "unknown"),
+            "i-0123456789abcdec2": ONE_JOB_COMPLETED,
+            "i-0123456789abcdec3": ONE_JOB_FAILED,
+            "i-0123456789abcdec4": ONE_JOB_TIMEOUT,
+        }
+        owned = [self.owned(key, index) for index, key in enumerate(consoles, start=1)]
+        self.run_export(self.build(owned, consoles), now=time.time())
+        records = self.records()
+        self.assertEqual(
+            [records[key]["spot_interruption"] for key in list(consoles)[:2]],
+            [["terminate", "ip-10-0-0-1", runner], ["stop", "ip-10-0-0-1", None]],
+        )
+        self.assertEqual(
+            [records[key]["job_process"] for key in list(consoles)[2:]],
+            [["completed", 0], ["failed", 42], ["timeout", 124]],
+        )
+        evidence = read_launch_evidence(self.state_file, time.time())
+        # The workers share one read time, so all five are considered.
+        self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 5, "futile": 0})
+
+    def test_the_reader_accepts_exactly_what_the_loader_keeps(self):
+        # The exporter's own loader drops a record that it did not write. The
+        # reader must refuse the same keys and the same marker values, so both
+        # sides are asked about one file.
+        runner = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
+        valid = "i-0123456789abcdef0"
+        cases = (
+            (valid, "job_process", None, True),
+            (valid, "job_process", ["completed", 0], True),
+            (valid, "job_process", ["failed", 42], True),
+            (valid, "job_process", ["timeout", 137], True),
+            (valid, "job_process", [], False),
+            (valid, "job_process", ["completed", 1], False),
+            (valid, "job_process", [["completed"], 0], False),
+            (valid, "spot_interruption", None, True),
+            (valid, "spot_interruption", ["terminate", "ip-10-0-0-1", runner], True),
+            (valid, "spot_interruption", ["terminate", "ip-10-0-0-1", None], True),
+            (valid, "spot_interruption", ["terminate", "ip-10-0-0-1", "unknown"], False),
+            (valid, "spot_interruption", ["terminate", "ip-10-0-0-1", ""], False),
+            (valid, "spot_interruption", [], False),
+            ("i-01234567", "job_process", None, True),
+            ("i-0123456789abcdef01", "job_process", None, False),
+            ("not-an-instance", "job_process", None, False),
+        )
+        for key, field, value, accepted in cases:
+            with self.subTest(key=key, field=field, value=value):
+                write_observed(
+                    self.state_file,
+                    mtime=NOW,
+                    payload={
+                        "version": STATE_VERSION,
+                        "console_reads": 1,
+                        "totals": {"launches": 1, "registered": 0, "unregistered": 1},
+                        "instances": {key: futile_record(NOW - 60, **{field: value})},
+                    },
+                )
+                _, note = load_state(self.state_file)
+                self.assertEqual(note is None, accepted)
+                self.assertEqual(read_launch_evidence(self.state_file, NOW).state == "fresh", accepted)
+
+    def test_a_value_that_the_loader_drops_never_makes_the_reader_hold_alone(self):
+        # ``state``, ``operation`` and ``steps`` are read leniently. A value of
+        # the right type that ``export`` drops is no evidence to the reader, as
+        # it is to the loader, and a value of the wrong type drops the file. So
+        # the reader holds only where the record that ``export`` rewrites holds.
+        older = {
+            f"i-0123456789abcde{index:02x}": futile_record(NOW - 600 + 100 * index, index=index)
+            for index in range(3)
+        }
+        bases = (
+            lambda: futile_record(NOW - 50, index=9),
+            lambda: registered_record(NOW - 50, index=9),
+            lambda: registered_record(
+                NOW - 50, index=9, job_process=None, registered=False, steps=["mount-options", "register"]
+            ),
+        )
+        overrides = (
+            ("steps", ["bogus"]),
+            ("steps", ["Register"]),
+            ("steps", ["register", "bogus"]),
+            ("steps", ["mount-options", 5]),
+            ("steps", "register"),
+            ("state", "Terminated"),
+            ("state", "running"),
+            ("state", ""),
+            ("state", ["terminated"]),
+            ("operation", "x"),
+            ("operation", operation_hex(9).upper()),
+            ("operation", None),
+            ("operation", 5),
+        )
+        for position, make in enumerate(bases):
+            for field, value in overrides:
+                with self.subTest(base=position, field=field, value=value):
+                    record = make()
+                    record[field] = value
+                    write_observed(
+                        self.state_file,
+                        mtime=NOW,
+                        payload={
+                            "version": STATE_VERSION,
+                            "console_reads": 4,
+                            "totals": {"launches": 4, "registered": 0, "unregistered": 0},
+                            "instances": {**older, "i-0123456789abcdef9": record},
+                        },
+                    )
+                    raw = read_launch_evidence(self.state_file, NOW)
+                    kept, _ = load_state(self.state_file)
+                    write_observed(self.state_file, mtime=NOW, payload=kept)
+                    rewritten = read_launch_evidence(self.state_file, NOW)
+                    if raw.state == "fresh":
+                        self.assertEqual(raw.as_dict(), rewritten.as_dict())
+                    else:
+                        self.assertEqual(raw.as_dict(), {"state": "malformed", "considered": 0, "futile": 0})
+
 
 class RecordCadenceTests(ExportCase):
     """The reader takes the record's modification time as a heartbeat."""
@@ -1838,6 +1961,53 @@ class RecordCadenceTests(ExportCase):
         self.assertEqual(raised.exception.reason, "console_read_cap_exceeded")
         self.assertEqual(self.state_file.read_bytes(), before)
         self.assertEqual(os.stat(self.state_file).st_mtime, old)
+
+    def fail_the_textfile(self, consoles):
+        """Write a record, age it, and return a run that cannot write its textfile.
+
+        A directory where the textfile belongs cannot be replaced by a file. The
+        second worker is new evidence, so a record that the run wrote would
+        differ from the one on disk.
+        """
+        self.run_export(self.build(self.owned(), consoles))
+        old = time.time() - 3600
+        os.utime(self.state_file, (old, old))
+        self.metrics.unlink()
+        self.metrics.mkdir()
+        consoles["i-0123456789abcdef1"] = CLEAN_BOOT
+        owned = self.owned() + [
+            instance("i-0123456789abcdef1", state="terminated", operation=operation_hex(2))
+        ]
+        return old, self.build(owned, consoles)
+
+    def test_a_run_that_cannot_write_its_textfile_leaves_the_record_alone(self):
+        # The record's modification time is the launch evidence heartbeat, and
+        # a run that fails must not refresh it.
+        old, exporter = self.fail_the_textfile({"i-0123456789abcdef0": CLEAN_BOOT})
+        before = self.state_file.read_bytes()
+        with self.assertRaises(OSError):
+            self.run_export(exporter, now=NOW + 60)
+        self.assertEqual(self.state_file.read_bytes(), before)
+        self.assertEqual(os.stat(self.state_file).st_mtime, old)
+        # The failed replacement leaves no temporary file behind.
+        self.assertEqual(os.listdir(self.metrics.parent), [self.metrics.name])
+        self.assertEqual(sorted(os.listdir(self.state_file.parent)), ["observed.json", "worker-events.ndjson"])
+
+    def test_the_events_of_a_run_that_failed_repeat_under_the_same_identities(self):
+        # The record is the last file a run writes, so a run that fails earlier
+        # has already published its events. Delivery stays at least once: the
+        # next run repeats them, and the identity lets a consumer drop the repeat.
+        old, exporter = self.fail_the_textfile({"i-0123456789abcdef0": CLEAN_BOOT})
+        with self.assertRaises(OSError):
+            self.run_export(exporter, now=NOW + 60)
+        published = [event["id"] for event in self.events_read()]
+        self.assertTrue(any(key.startswith("i-0123456789abcdef1:") for key in published))
+        self.metrics.rmdir()
+        self.run_export(exporter, now=NOW + 120)
+        repeated = [event["id"] for event in self.events_read()]
+        self.assertEqual(set(repeated), set(published))
+        self.assertGreater(len(repeated), len(published))
+        self.assertGreater(os.stat(self.state_file).st_mtime, old)
 
     def test_a_deleted_record_is_rebuilt_with_the_rebuilding_run_time(self):
         consoles = {"i-0123456789abcdef0": CLEAN_BOOT}

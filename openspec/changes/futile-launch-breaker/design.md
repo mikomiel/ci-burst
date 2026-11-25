@@ -26,7 +26,7 @@ Nothing in `_decide` looks at how earlier workers ended.
 
 | Term | Meaning |
 |---|---|
-| Record | `observed.json` in the `export` directory beside the ledger, at `<dirname(state.database)>/export/observed.json`. `export` rewrites it on every successful run. |
+| Record | `observed.json` in the `export` directory beside the ledger, at `<dirname(state.database)>/export/observed.json`. `export` writes it last, on every successful run. |
 | Ended | The record's provider state is `terminated` or `stopped`. These are the two states after which `export` reads the console no more, so the record is finished and its `seen` time no longer changes. |
 | Registration evidence | The record shows the registration step, a step that the shipped first-boot script prints only after registration, a one-job process outcome or a Spot interruption notice. |
 | Registered | Ended, has an operation identifier, shows registration evidence. |
@@ -56,8 +56,8 @@ Everything that authorizes a launch still comes from the queue, the ledger, the
 provider and the price read.
 
 The delta modifies the existing requirement instead of adding a second rule
-beside it, so the two cannot disagree. It also binds `export`: it must rewrite
-the record on every successful run, because the gate reads the file's
+beside it, so the two cannot disagree. It also binds `export`: it must write
+the record last, on every successful run, because the gate reads the file's
 modification time as a heartbeat, and a change to the record's version or to a
 field the gate reads must change the reader in the same change.
 
@@ -113,9 +113,12 @@ proves that the worker registered, even when the registration line is gone. A
 worker is futile only when the exit marker is present and none of those later
 markers is.
 
-The cost is a narrower gate. A worker that ended without an exit marker, such as
-an empty console, a hard kill or a power-off, is no evidence and never futile. A
-custom first-boot script that prints no exit marker never trips the gate.
+The cost is a narrower gate. A worker that ended without an exit marker and
+without registration evidence, such as an empty console, a hard kill before
+registration or a power-off, is no evidence and never futile. A worker that ended
+without an exit marker but shows registration evidence is registered and can
+clear a hold. A custom first-boot script that prints no exit marker never trips
+the gate.
 
 | The record shows | Class | Why |
 |---|---|---|
@@ -133,7 +136,7 @@ custom first-boot script that prints no exit marker never trips the gate.
 | What orders and ages a record? | `seen`. | It stops changing when the record finishes, because `export` never reads a finished record again. Every loaded record has one, because `export` drops a record without a usable `seen`. `first_seen` can be null, and the ledger's creation time needs a join that a record without an operation cannot make. |
 | Is a window edge inside? | Yes. An age of at most 3600 seconds is inside. | One rule for both edges. |
 | What does a tie do? | The considered set takes every worker equal to the third. | The verdict never depends on opaque instance identifiers, and a tie that hides a registered worker opens the gate. |
-| How is freshness judged? | By the file's modification time, at most 600 seconds old. | Version 2 of the record has no generation time. `export` rewrites the file on every successful run, so the time is a heartbeat, and a refused or stopped run lets it age. The reader takes the time from the open descriptor, so a replacement by `export` cannot pair one file's time with another file's content. |
+| How is freshness judged? | By the file's modification time, at most 600 seconds old. | Version 2 of the record has no generation time. `export` writes the file last, after the event file and the textfile, on every successful run, so the time is a heartbeat, and a refused, failed or stopped run lets it age. The reader takes the time from the open descriptor, so a replacement by `export` cannot pair one file's time with another file's content. |
 | What is a time after the controller clock? | The file is `stale`. A record with such a `seen` makes the file `malformed`. | An age that cannot be established is not evidence. |
 
 A rebuilt record is stamped with the time of the run that rebuilds it. `export`
@@ -176,7 +179,7 @@ neither is a clean resume.
 
 The gate adds no credential, no IAM permission, no mount and no network path.
 `apply` and `export` already mount the same state directory, and the reader opens
-one file in it read-only.
+one regular file in it read-only, without blocking and without following a link.
 
 The console is untrusted, because a worker is untrusted after it accepts job code.
 A worker can print any marker that the closed vocabulary accepts, and it can flood
@@ -196,11 +199,15 @@ spend or access.
 |---|---|
 | No file | `missing`. Admission continues as before. |
 | The file cannot be opened or read | `unreadable`. |
+| The path is not a regular file, such as a FIFO or a directory, or is a link | `unreadable`. The reader opens the path without blocking and checks the type of the open descriptor before it reads, so a FIFO with no writer cannot stall a pass that holds the ledger writer lock. `export` replaces the record by a rename of a regular file, so a link is not its output. |
 | The file is older than 600 seconds, or dated in the future | `stale`. |
 | The file is not UTF-8 JSON, has another version, or holds a record with a bad field | `malformed`. The whole file is dropped, because a skipped record could leave older futile records among the newest three. |
+| An `instances` key that `export` rejects, or a `job_process` or `spot_interruption` value that `export` cannot write | `malformed`. The reader asks the rule that `export` applies when it loads its own record, so a record under a key that is not an instance identifier, or an empty list read as registration evidence, cannot steer the gate. |
 | A record's provider state is null, or text outside the known six | That record has not ended. The file stays usable. `export` writes `unknown` for a state it cannot label, turns it into null when it next loads the record, and keeps that null until the record is pruned. |
 | The file's owner-only mode denies a reader that runs as another user | `unreadable`. `export` creates the file through a temporary file, which is owner-only. |
 | `export` refused its last run, or its unit stopped | The file ages and reads as `stale` after 600 seconds. |
+| `export` cannot write its textfile | The record is written after the textfile, so it is not refreshed and reads as `stale` after 600 seconds. Events published before the failure repeat on the next run under the same identities, and the consoles are read again, because no record of the failed run was saved. The repeats count against the event file bound, so a long outage can push older lines out of the file. |
+| `export` writes its textfile and cannot write the record | The textfile carries the new run time, so an alert on a stopped exporter stays quiet, while the record is not refreshed and reads as `stale` after 600 seconds. The command exits 1, so the failed unit is the signal, and the hold fails open. |
 | `export` writes to another path with `--state-file` | The default path reads as `missing` or `stale`. The reader never searches. |
 | A failure the reader did not foresee | `unreadable`. The reader never raises, because a pass must not fail for an optional brake. |
 | Two passes read while `export` replaces the file | Each pass sees one whole file. `export` replaces it atomically. |
@@ -232,6 +239,14 @@ decision. `plan` reports the same hold as `apply`, because both call `_decide`.
   clock that the exporter's own retention uses.
 - A cool-down that `apply` persists. Declined: it adds durable state for what the
   window already derives from existing evidence.
+- Write the record before the textfile, as `export` first did. Declined: a run
+  that fails at its textfile would still refresh the heartbeat and keep a hold
+  fresh while the unit fails. The order taken costs a repeat: while the textfile
+  cannot be written, each run reads the same consoles again and repeats its
+  events under the same identities, which at-least-once delivery allows. The
+  repeats count against the event file bound, so a long outage can push older
+  lines out of the file, and a failure of the last write alone leaves a textfile
+  that is newer than the record.
 
 ## Rollback
 

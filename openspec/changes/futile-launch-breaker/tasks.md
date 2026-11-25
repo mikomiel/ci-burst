@@ -18,19 +18,25 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   the considered count and the futile count. It imports the record version, the
   final provider states, the operation pattern and the constant from 1.2 from
   `ci_burst/export.py`.
-- [x] 1.4 Open the file once, take the modification time from the open
-  descriptor, and read the file whole. Test the states in the order `missing`,
-  `unreadable`, `stale`, `malformed`. The function never raises, never writes,
-  repairs, locks or deletes, and maps any failure it did not foresee to
-  `unreadable`.
+- [x] 1.4 Open the file once, without blocking and without following a link,
+  take the type and the modification time from the open descriptor, and read the
+  file whole only when it is a regular file. A FIFO with no writer would block a
+  plain open while `apply` holds the ledger writer lock. Test the states in the
+  order `missing`, `unreadable`, `stale`, `malformed`. The function never raises,
+  never writes, repairs, locks or deletes, and maps a path that is not a regular
+  file, a link and any failure it did not foresee to `unreadable`.
 - [x] 1.5 Define the fixed values as named constants: 3 workers, a window of 3600
   seconds and a staleness bound of 600 seconds. Offer no configuration key and no
   off switch for them.
 - [x] 1.6 Validate the file shape and the fields the gate reads in every record.
   `seen` is a finite number. `state`, `operation`, `exit_code`, `job_process` and
   `spot_interruption` may be null, and `exit_code` is otherwise an integer from 0
-  to 255. `steps` is a list of text, and `registered` is true or false. A record
-  that fails, or whose `seen` is after the clock, makes the whole file
+  to 255. `steps` is a list of text, and `registered` is true or false. Each key
+  of `instances` passes the pattern that `export` applies to an instance
+  identifier. `job_process` and `spot_interruption` are null or exactly the value
+  that `export` stores: the reader and `export` share one rule for each, so the
+  reader accepts no empty list and no other shape that `export` cannot write. A
+  record that fails, or whose `seen` is after the clock, makes the whole file
   `malformed`. A record whose provider state is null, or text outside the known
   six, is valid and has not ended.
 - [x] 1.7 Classify each record as registered, futile or no evidence, order by
@@ -51,7 +57,7 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   `_decide`, so it reports the same hold.
 - [x] 2.5 Correct the `ci_burst/export.py` module docstring, which says the
   record never influences admission, so that it names the one read-only brake and
-  the duty to rewrite the record on every successful run.
+  the duty to write the record last, on every successful run.
 
 ## 3. Tests
 
@@ -59,9 +65,13 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   exactly 600 seconds (fresh) and over it (stale); a file dated in the future; a
   file that is not UTF-8 JSON; a wrong version; `instances` that is not an object;
   one invalid record that makes the whole file `malformed`; a `seen` in the
-  future; and a provider state that is null or text outside the known six. The
-  staleness cases set the file's modification time explicitly with `os.utime`,
-  because the fake clock is not wall time.
+  future; and a provider state that is null or text outside the known six. A path
+  that is a FIFO with no writer, a directory or a link is `unreadable`, and the
+  FIFO read runs under a time bound so that a regression fails the test and does
+  not hang the run. A key that `export` rejects and each marker value that
+  `export` cannot write make the file `malformed`, including values that are not
+  hashable. The staleness cases set the file's modification time explicitly with
+  `os.utime`, because the fake clock is not wall time.
 - [x] 3.2 Classification tests cover futile; registered by the registration step;
   registered by a later marker with the registration line lost; no exit marker;
   an instance that has not ended, including a registered one that still runs; no
@@ -76,12 +86,19 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   label, run twice so the record carries first the text `unknown` and then null)
   and classifies the file it wrote. It fails when the record version, a field name
   or the write cadence drifts, and it keeps the file `fresh` and the unlabelled
-  record unclassified. Add a test that the constant from 1.2 is a subset of
-  `STEP_NAMES` and excludes the registration step.
+  record unclassified. Further contract tests run the exporter over every marker
+  shape it writes (a one-job outcome, a Spot notice with a registration id and
+  one without) and require a `fresh` file, and ask the exporter's loader and the
+  reader about the same keys and marker values, so that the reader is no stricter
+  and no looser than the writer, and show that a value which the loader drops
+  from `state`, `operation` or `steps` never makes the reader hold where the
+  record that `export` rewrites would not. Add a test that the constant from 1.2
+  is a subset of `STEP_NAMES` and excludes the registration step.
 - [x] 3.4 Exporter tests show that a successful run with nothing new still
   rewrites the record and advances its modification time, that a refused run
-  leaves it unrewritten, and that a deleted record is rebuilt with the rebuilding
-  run's time.
+  leaves it unrewritten, that a run that cannot write its textfile leaves it
+  unrewritten and repeats its events on the next run under the same identities, and
+  that a deleted record is rebuilt with the rebuilding run's time.
 - [x] 3.5 Controller tests add one class beside `ClaimGraceTests` in
   `tests/test_controller.py`. They cover the hold with its single reason and its
   `launch_evidence`; no template read and no price read on a hold, checked
@@ -101,12 +118,17 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   the rule, the three constants, the evidence states, the fail-open behaviour, the
   length of a hold, the steady state under a persistent fault, the residual cases
   from the design, the two levers and why deleting the record does not resume,
-  that `status` does not report the gate, and that `export` creates the record
-  owner-only, so a `plan` run as another user reads `unreadable`.
+  that `status` does not report the gate, that `export` creates the record
+  owner-only, so a `plan` run as another user reads `unreadable`, that `export`
+  writes the record last so a failed run lets it age, and that a worker with
+  registration evidence and no exit marker is counted as registered.
 - [x] 4.2 In `docs/operations.md`, add `recent_launches_futile` to the list of
   zero-bound reasons in "Fleet size and fan-out", extend the "recovery path" line
   in "Claim grace" with the gate, correct the sentence in "Worker evidence" that
-  says deleting the dedupe record never changes a decision, and note in "Launch
+  says deleting the dedupe record never changes a decision, add that `export`
+  saves the dedupe record after the textfile, that the repeats of a run that
+  failed count against the event file bound, and that a run which fails at the
+  record still advances the textfile's last-run time, and note in "Launch
   decision and capacity fallback" that a hold comes before the template read.
 - [x] 4.3 In `docs/deployment.md` and `docs/container.md`, replace the wording
   that the observation unit is "independent of admission": it is optional and
@@ -115,8 +137,8 @@ instance identifiers and 32-character hexadecimal operation identifiers.
 ## 5. Verification
 
 - [x] 5.1 Run the focused tests:
-  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_export.py'`
-  and the same with `'test_controller.py'`.
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_launch_evidence.py'`
+  and the same with `'test_export.py'` and `'test_controller.py'`.
 - [x] 5.2 Run the full suite:
   `PYTHONDONTWRITEBYTECODE=1 timeout 1500 npm run -s check:policy`.
 - [x] 5.3 Run `npm run -s check:spec`.

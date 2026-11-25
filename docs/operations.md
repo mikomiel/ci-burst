@@ -283,11 +283,15 @@ rewrite is also what makes rotation and the size bound possible.
 
 Delivery is at least once. `id` is derived from the instance and the marker, so
 a repeat after a crash between publishing an event and saving the dedupe record
-carries the same identity and a consumer can drop it. The dedupe record keeps
-what was already emitted and is pruned after seven days; deleting it loses the
-history and the cumulative counters. It can change a decision in one way only:
-`apply` and `plan` read the record as a brake after repeated futile launches
-(§ Futile launch hold).
+carries the same identity and a consumer can drop it. `export` saves the dedupe
+record last, after the textfile, so a run that cannot write the textfile reads
+the same consoles again on the next run and repeats its events, under the same
+identities. The repeats count against the event file bound, so a long textfile
+outage can push older lines out of the file. The dedupe record keeps what was
+already emitted and is pruned after seven days; deleting it loses the history and
+the cumulative counters. It can change a decision in one way only: `apply` and
+`plan` read the record as a brake after repeated futile launches (§ Futile launch
+hold).
 
 ### The metrics textfile
 
@@ -302,7 +306,9 @@ is never un-learned by a later empty console. `ci_burst_spend_micros`, `ci_burst
 read-only ledger, are gauges in micro-units, and are omitted — with a
 `ledger_omitted` note in the JSON result — when it cannot be read.
 `ci_burst_export_last_run_timestamp_seconds` is what a consumer uses to detect a
-stopped exporter.
+stopped exporter. `export` writes the textfile before the dedupe record, so a run
+that fails at the record still advances this timestamp: the command exits 1 and
+the record ages, and only the failed unit shows it.
 
 ### Bounds
 
@@ -1620,8 +1626,10 @@ longer covers it, so each pass would launch again. The hold thins that loop.
 
 `apply` and `plan` read the record that `export` writes, at
 `<ledger directory>/export/observed.json`. They never write it and make no other
-call to read it. `--state-file` moves only the export run: the controller reads
-the default path and does not look anywhere else.
+call to read it. They open it without blocking and read it only when it is a
+regular file that is not a link, so a FIFO at the path cannot stall a pass.
+`--state-file` moves only the export run: the controller reads the default path
+and does not look anywhere else.
 
 A worker is classified only when its record shows that the instance ended
 (`terminated` or `stopped`) and it carries an operation identifier of this
@@ -1629,13 +1637,16 @@ deployment. It is:
 
 - registered when the record shows the registration step, a later step
   (`job` or `claim-timeout`), a one-job process outcome or a Spot interruption
-  notice;
+  notice, whether or not the record shows the exit marker;
 - futile when the record shows the exit marker (`bootstrap exiting rc=<n>`) and
   none of that registration evidence.
 
-Any other record is no evidence and is never counted. A worker that ended
-without an exit marker (an empty console, a hard kill, a power-off) never counts,
-and neither does a worker that still runs, even when it registered.
+Any other record is no evidence and is never counted: an ended worker with no
+exit marker and no registration evidence (an empty console, a hard kill before
+registration, a power-off), a worker that has not ended, and a record with no
+operation identifier of this deployment. A registered worker that ended without
+an exit marker, for example after a hard kill, is counted and can clear a hold.
+A worker that still runs is never counted, even when it registered.
 
 The rule uses three fixed values. They are not configuration and there is no off
 switch.
@@ -1662,19 +1673,21 @@ state is `fresh`. The states, in the order they are tested:
 | State | Meaning |
 | --- | --- |
 | `missing` | no file at the path |
-| `unreadable` | the file cannot be opened or read, or the reader failed in a way it did not foresee |
+| `unreadable` | the file cannot be opened or read, is not a regular file (a FIFO, a directory) or is a link, or the reader failed in a way it did not foresee |
 | `stale` | the modification time is more than 600 seconds old, or after the controller clock |
-| `malformed` | not UTF-8 JSON, another record version, or one record with a bad field the hold reads; the whole file is dropped |
+| `malformed` | not UTF-8 JSON, another record version, or one record with a bad field the hold reads, an instance key that `export` rejects, or a registration marker (`job_process`, `spot_interruption`) of a shape that `export` does not write; the whole file is dropped |
 | `fresh` | the hold is evaluated |
 
 Only `fresh` evidence can hold. Every other state admits as if the hold did not
 exist, and every other admission check still applies to a launch the hold lets
 through. `export` stays optional: where it is absent, stopped or failing, the
 record turns `missing` or `stale` and admission behaves as before. `export`
-rewrites the record on every successful run, so its modification time is the
-heartbeat; a refused run lets it age. `export` creates the record owner-only, so
-a `plan` run as another user than the export unit reads `unreadable` and plans as
-if the hold were open.
+writes the record last, after the event file and the textfile, on every
+successful run, so its modification time is the heartbeat; a refused run, or a
+run that fails before it reaches the record (the textfile cannot be written, for
+example), lets it age. `export` creates the record owner-only, so a `plan` run as
+another user than the export unit reads `unreadable` and plans as if the hold
+were open.
 
 A hold ends on its own when a registered worker joins the newest three, when the
 oldest of the three leaves the window, or when the record stops being fresh. It

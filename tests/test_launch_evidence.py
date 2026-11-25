@@ -1,6 +1,8 @@
+import contextlib
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -190,6 +192,218 @@ class EvidenceStateTests(ReaderCase):
         self.read()
         self.assertEqual((self.path.read_bytes(), os.stat(self.path).st_mtime), before)
         self.assertEqual(sorted(os.listdir(self.path.parent)), ["observed.json"])
+
+
+class NonRegularPathTests(ReaderCase):
+    """Only a regular file can be the record, and reading the path never blocks.
+
+    A plain read-only open of a FIFO that has no writer blocks forever, and
+    ``apply`` reads the record while it holds the ledger writer lock. A reader
+    that regresses must fail these tests, not hang the run, so each read runs in
+    a thread that the test abandons after a bound.
+    """
+
+    BOUND = 5.0
+
+    def read_within_the_bound(self):
+        outcome = []
+        worker = threading.Thread(
+            target=lambda: outcome.append(self.read()), name="reader-under-test", daemon=True
+        )
+        worker.start()
+        worker.join(self.BOUND)
+        if worker.is_alive():
+            # Let the thread end: a writer wakes a reader that waits in the
+            # open, and closing the writer again ends the read that follows.
+            with contextlib.suppress(OSError):
+                os.close(os.open(self.path, os.O_RDWR))
+            worker.join(self.BOUND)
+            self.fail(f"the reader was still blocked after {self.BOUND} seconds")
+        return outcome[0]
+
+    def assert_unreadable(self, evidence):
+        self.assertEqual(evidence.as_dict(), {"state": "unreadable", "considered": 0, "futile": 0})
+        self.assertFalse(evidence.holds)
+
+    def test_a_fifo_with_no_writer_is_unreadable_and_never_blocks(self):
+        self.path.parent.mkdir(parents=True)
+        os.mkfifo(self.path)
+        self.assert_unreadable(self.read_within_the_bound())
+
+    def test_a_directory_is_unreadable_and_never_blocks(self):
+        self.path.mkdir(parents=True)
+        self.assert_unreadable(self.read_within_the_bound())
+
+    def test_a_link_to_a_valid_record_is_unreadable(self):
+        # ``export`` replaces the path by a rename of a regular file and never
+        # leaves a link there, so a link is not its output.
+        target = Path(self._directory.name) / "elsewhere.json"
+        write_observed(target, [futile(index=index) for index in range(3)], mtime=NOW)
+        self.assertTrue(read_launch_evidence(target, NOW).holds)
+        self.path.parent.mkdir(parents=True)
+        self.path.symlink_to(target)
+        self.assert_unreadable(self.read_within_the_bound())
+
+    def test_a_path_that_is_not_a_regular_file_is_unreadable_before_it_is_stale(self):
+        self.path.parent.mkdir(parents=True)
+        os.mkfifo(self.path)
+        os.utime(self.path, (NOW - 7200, NOW - 7200))
+        self.assert_unreadable(self.read_within_the_bound())
+
+
+class ExporterShapeTests(ReaderCase):
+    """The reader takes a record only in a shape that ``export`` writes.
+
+    The instance key and the two markers that carry registration evidence decide
+    a hold, so a value that ``export`` cannot have written makes the whole file
+    ``malformed``. ``malformed`` is asserted, and not ``unreadable``: a value of
+    the wrong type must be refused by the shape rule and not by the reader's
+    last-resort handler.
+    """
+
+    RUNNER = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
+    HOST = "ip-10-0-0-1"
+
+    #: Each one fails the pattern that ``export`` applies to an instance key.
+    INVALID_KEYS = (
+        "",
+        "i-",
+        "i-0123456",  # fewer than 8 hexadecimal digits
+        "i-0123456789abcdef01",  # more than 17
+        "i-0123456789ABCDEF0",
+        "i-0123456789abcdeg",
+        "i-0123456789abcdef0\n",
+        " i-0123456789abcdef0",
+        "0123456789abcdef0",
+        "instance-1",
+    )
+
+    #: Each one is a value that ``export`` cannot write for ``job_process``.
+    INVALID_JOB_PROCESS = (
+        [],
+        ["completed"],
+        ["completed", 0, 0],
+        ["completed", 1],  # the outcome and the status are one vocabulary
+        ["failed", 0],
+        ["failed", 124],
+        ["timeout", 1],
+        ["cancelled", 3],
+        [1, 0],
+        [["completed"], 0],  # not hashable
+        ["completed", True],
+        ["completed", 0.0],
+        ["completed", "0"],
+        ["failed", 256],
+        ["failed", -1],
+        {"outcome": "completed", "rc": 0},
+        "completed",
+        0,
+        False,
+        "",
+    )
+
+    #: Each one is a value that ``export`` cannot write for ``spot_interruption``.
+    INVALID_SPOT_INTERRUPTION = (
+        [],
+        ["terminate"],
+        ["terminate", HOST],
+        ["terminate", HOST, None, None],
+        ["evacuate", HOST, None],
+        ["terminate", "", None],
+        ["terminate", "not a host", None],
+        # ``export`` stores null for the console spelling and drops the others.
+        ["terminate", HOST, "unknown"],
+        ["terminate", HOST, ""],
+        ["terminate", HOST, "not-a-uuid"],
+        ["terminate", HOST, 7],
+        [["terminate"], HOST, None],  # not hashable
+        ["terminate", [HOST], None],
+        {"action": "terminate"},
+        "terminate",
+        0,
+        False,
+        "",
+    )
+
+    VALID_JOB_PROCESS = (
+        ["completed", 0],
+        ["failed", 1],
+        ["failed", 255],
+        ["timeout", 124],
+        ["timeout", 137],
+    )
+
+    VALID_SPOT_INTERRUPTION = (
+        ["terminate", HOST, RUNNER],
+        ["stop", HOST, RUNNER],
+        ["hibernate", HOST, RUNNER],
+        ["unknown", HOST, RUNNER],
+        ["terminate", HOST, None],
+        ["unknown", HOST, None],
+    )
+
+    def three_futile(self):
+        return {f"i-0123456789abcde{index:02x}": futile(index=index) for index in range(3)}
+
+    def write_instances(self, instances):
+        self.write(payload={"version": STATE_VERSION, "instances": instances})
+
+    def test_three_futile_records_under_keys_that_export_rejects_do_not_hold(self):
+        self.write_instances(
+            {key: futile(index=index) for index, key in enumerate(self.INVALID_KEYS[:3])}
+        )
+        evidence = self.read()
+        self.assertEqual(evidence.as_dict(), {"state": "malformed", "considered": 0, "futile": 0})
+        self.assertFalse(evidence.holds)
+
+    def test_one_key_that_export_rejects_makes_the_whole_file_malformed(self):
+        for key in self.INVALID_KEYS:
+            with self.subTest(key=key):
+                instances = self.three_futile()
+                instances[key] = futile(index=9)
+                self.write_instances(instances)
+                self.assertEqual(
+                    self.read().as_dict(), {"state": "malformed", "considered": 0, "futile": 0}
+                )
+
+    def test_keys_at_the_bounds_that_export_accepts_are_valid(self):
+        self.write_instances(
+            {
+                "i-01234567": futile(index=1),  # 8 hexadecimal digits
+                "i-0123456789abc": futile(index=2),
+                "i-0123456789abcdef0": futile(index=3),  # 17
+            }
+        )
+        evidence = self.read()
+        self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 3})
+        self.assertTrue(evidence.holds)
+
+    def test_a_marker_that_export_cannot_write_makes_the_whole_file_malformed(self):
+        cases = [("job_process", value) for value in self.INVALID_JOB_PROCESS]
+        cases += [("spot_interruption", value) for value in self.INVALID_SPOT_INTERRUPTION]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                instances = self.three_futile()
+                instances["i-0123456789abcdef9"] = futile(index=9, **{key: value})
+                self.write_instances(instances)
+                self.assertEqual(
+                    self.read().as_dict(), {"state": "malformed", "considered": 0, "futile": 0}
+                )
+
+    def test_every_marker_shape_that_export_writes_is_registration_evidence(self):
+        cases = [("job_process", value) for value in self.VALID_JOB_PROCESS]
+        cases += [("spot_interruption", value) for value in self.VALID_SPOT_INTERRUPTION]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                instances = self.three_futile()
+                instances["i-0123456789abcdef9"] = futile(index=9, **{key: value})
+                self.write_instances(instances)
+                # The fourth worker ties the third place, so it is considered
+                # and, with its marker, it is registered and keeps the gate open.
+                evidence = self.read()
+                self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 4, "futile": 3})
+                self.assertFalse(evidence.holds)
+                self.assertEqual(classify(futile(**{key: value})), REGISTERED)
 
 
 class ClassificationTests(ReaderCase):

@@ -8,25 +8,36 @@ registering.
 
 The record can only withhold a launch. It never authorizes one, so a missing,
 unreadable, stale or malformed record is no evidence and the gate stays open.
-The reader opens one file read-only. It never writes, repairs, locks or deletes
-it, makes no provider, queue or ledger call, and never raises.
+The reader opens one regular file read-only, without blocking and without
+following a link. It never writes, repairs, locks or deletes it, makes no
+provider, queue or ledger call, and never raises.
 
 The reader takes only closed-vocabulary facts that ``export`` has already
-validated, never console text. The fields it reads and the record version are
+validated, never console text. A field of the wrong type, an instance key that
+``export`` rejects and a registration marker that ``export`` cannot write each
+drop the whole file. A value of the right type that ``export`` drops from
+``state``, ``operation`` or ``steps`` is no evidence, which is also what
+``export`` makes of it when it loads its own record, so it never creates a hold.
+The fields it reads, the record version and the rules that decide a shape are
 imported from ``export``; a contract test in ``tests/test_export.py`` fails when
 the two drift apart.
 """
 
 import json
 import os
+import stat
 from dataclasses import dataclass
 
 from .export import (
     CONSOLE_FINAL_STATES,
+    INSTANCE_PATTERN,
     OPERATION_PATTERN,
     POST_REGISTRATION_STEPS,
     STATE_VERSION,
+    _job_process_value,
+    _match,
     _number,
+    _spot_interruption_value,
 )
 
 #: A hold needs at least this many considered workers, all futile.
@@ -37,7 +48,7 @@ FUTILE_LAUNCH_COUNT = 3
 FUTILE_LAUNCH_WINDOW_SECONDS = 3600
 
 #: The record is evidence while its modification time is at most this many
-#: seconds before the controller clock. ``export`` rewrites it on every
+#: seconds before the controller clock. ``export`` rewrites it last on every
 #: successful run, so its modification time is a heartbeat.
 EVIDENCE_MAX_AGE_SECONDS = 600
 
@@ -99,18 +110,34 @@ def read_launch_evidence(path, now):
         return LaunchEvidence(UNREADABLE)
 
 
+def _open_for_reading(path, flags):
+    """Open ``path`` without blocking and without following a link.
+
+    A plain read-only open of a FIFO that has no writer blocks forever, and
+    ``apply`` reads the record while it holds the ledger writer lock. ``export``
+    replaces the record by a rename of a regular file, so a link at the path is
+    not its output.
+    """
+    return os.open(path, flags | os.O_NONBLOCK | os.O_NOFOLLOW)
+
+
 def _read(path, now):
     try:
-        stream = open(path, "rb")
+        stream = open(path, "rb", opener=_open_for_reading)
     except FileNotFoundError:
         return LaunchEvidence(MISSING)
     except OSError:
         return LaunchEvidence(UNREADABLE)
     with stream:
         try:
-            # The time comes from the open descriptor, so an atomic replacement
-            # by ``export`` cannot pair one file's time with another's content.
-            modified = os.fstat(stream.fileno()).st_mtime
+            # The type and the time come from the open descriptor, so a
+            # replacement of the path by ``export`` cannot pair one file's time
+            # with another's content, and nothing is read from a file that is
+            # not a regular one.
+            status = os.fstat(stream.fileno())
+            if not stat.S_ISREG(status.st_mode):
+                return LaunchEvidence(UNREADABLE)
+            modified = status.st_mtime
             raw = stream.read()
         except OSError:
             return LaunchEvidence(UNREADABLE)
@@ -139,8 +166,10 @@ def _records(raw, now):
     if not isinstance(instances, dict):
         return None
     records = []
-    for record in instances.values():
-        if not _record_is_valid(record, now):
+    for instance_id, record in instances.items():
+        # ``export`` drops a record under a key that is not an instance
+        # identifier, so a record filed under one is not its output.
+        if _match(INSTANCE_PATTERN, instance_id) is None or not _record_is_valid(record, now):
             return None
         records.append(record)
     return records
@@ -159,8 +188,14 @@ def _record_is_valid(record, now):
     exit_code = record["exit_code"]
     if exit_code is not None and (type(exit_code) is not int or not 0 <= exit_code <= 255):
         return False
-    for key in ("job_process", "spot_interruption"):
-        if record[key] is not None and not isinstance(record[key], list):
+    # Registration evidence is read from these two markers, so each is null or
+    # exactly the value that ``export`` stores: its own loader keeps that value
+    # unchanged, and it drops any other.
+    for key, stored in (
+        ("job_process", _job_process_value),
+        ("spot_interruption", _spot_interruption_value),
+    ):
+        if record[key] is not None and stored(record[key]) != record[key]:
             return False
     steps = record["steps"]
     if not isinstance(steps, list) or not all(isinstance(step, str) for step in steps):

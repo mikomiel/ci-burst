@@ -27,7 +27,7 @@ The allowance still bounds spend, but every launch in the window can be wasted
   block admission, and the decision reports which state it found.
 - The worker-observation requirement that the record never influences admission
   is narrowed to allow this one read-only use. It now also binds `export` to
-  rewrite the record on every successful run.
+  write the record last, on every successful run.
 - Every decision that reaches the gate reports `launch_evidence`.
 - The operator, deployment and container guides describe the gate, its limits
   and its one blunt lever.

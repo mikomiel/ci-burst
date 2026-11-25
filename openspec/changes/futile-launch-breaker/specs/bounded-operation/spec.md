@@ -124,10 +124,20 @@ The controller MUST treat a missing, unreadable, stale or malformed record as no
 - **THEN** the next pass reports `fresh` and evaluates the gate normally
 
 ### Requirement: The evidence is read from one file without side effects
-The controller MUST read the evidence only from `observed.json` in the `export` directory beside the ledger. It MUST NOT write, repair or delete that file and MUST NOT make a provider, queue or ledger call to read it. The evidence state MUST be exactly one of `missing`, `unreadable`, `stale`, `malformed` or `fresh`, tested in that order.
+The controller MUST read the evidence only from `observed.json` in the `export` directory beside the ledger. It MUST NOT write, repair or delete that file and MUST NOT make a provider, queue or ledger call to read it. It MUST NOT block on the path and MUST read only a regular file that is not a link. The evidence state MUST be exactly one of `missing`, `unreadable`, `stale`, `malformed` or `fresh`, tested in that order.
 
 #### Scenario: The record cannot be read
 - **WHEN** the file exists and cannot be opened or read
+- **THEN** the evidence state is `unreadable`
+- **AND** the gate is open
+
+#### Scenario: The path is not a regular file
+- **WHEN** the path names a FIFO, a directory or another file that is not a regular file
+- **THEN** the evidence state is `unreadable` and the read does not block, even for a FIFO that has no writer
+- **AND** the gate is open, whatever the modification time of the path
+
+#### Scenario: The path is a link
+- **WHEN** the path is a link, whatever it points to
 - **THEN** the evidence state is `unreadable`
 - **AND** the gate is open
 
@@ -154,6 +164,16 @@ The controller MUST read the evidence only from `observed.json` in the `export` 
 - **WHEN** the file's modification time is fresh and one record has a field that the gate reads with the wrong type, or a `seen` that is not a finite number or is after the controller clock
 - **THEN** the evidence state is `malformed` for the whole file
 - **AND** no record from that file is used
+
+#### Scenario: An instance key that `export` rejects
+- **WHEN** the file's modification time is fresh and one key of `instances` is not an instance identifier of the shape that `export` accepts
+- **THEN** the evidence state is `malformed` for the whole file
+- **AND** three futile records filed under such keys do not hold admission
+
+#### Scenario: A marker value that `export` cannot write
+- **WHEN** the file's modification time is fresh and a record's `job_process` or `spot_interruption` is neither null nor the value that `export` stores, such as an empty list or a pair whose outcome and status disagree
+- **THEN** the evidence state is `malformed` for the whole file
+- **AND** the marker is not read as registration evidence
 
 #### Scenario: The export unit writes to another path
 - **WHEN** `export` runs with a state file other than the default path

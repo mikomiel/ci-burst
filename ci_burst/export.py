@@ -24,15 +24,17 @@ Delivery is at least once. The event line carries a stable ``id`` that is a
 function of the instance and the marker, so a consumer can deduplicate the
 repeat that follows a crash between publishing an event and persisting the
 dedupe record; the alternative — persisting first — would lose a failure event
-instead of repeating it.
+instead of repeating it. The record is the last file a run writes, so a run that
+cannot write the metrics textfile repeats its events in the same way.
 
 The dedupe record is derived observation, not decision state. Deleting it loses
 the emitted history and the cumulative counters. It influences admission in one
 way only: ``apply`` and ``plan`` read it as a read-only brake that can withhold a
 launch after repeated futile launches (``launch_evidence``). The brake reads the
 file's modification time as a heartbeat, so every successful run rewrites the
-record, even when nothing changed. The record never authorizes a launch and never
-influences termination.
+record, even when nothing changed, and does it last: a run that fails earlier
+leaves the modification time where it was and the record ages. The record never
+authorizes a launch and never influences termination.
 """
 
 import json
@@ -460,6 +462,45 @@ def _number(value):
     return number if math.isfinite(number) else None
 
 
+def _job_process_value(value):
+    """Return ``value`` when it is the pair a record stores, else ``None``.
+
+    The launch evidence reader applies the same rule: a stored value that this
+    function does not return unchanged is one that the command cannot have
+    written.
+    """
+    if (
+        isinstance(value, list)
+        and len(value) == 2
+        and isinstance(value[0], str)
+        and type(value[1]) is int
+        and _job_process(value[0], value[1])
+    ):
+        return value
+    return None
+
+
+def _spot_interruption_value(value):
+    """Return the list a record stores for a persisted notice, else ``None``.
+
+    The stored value is the normalised triple, never the console spelling: an
+    empty string or the literal "unknown" is not a registration id this command
+    publishes, so it must not survive a rewrite. The launch evidence reader
+    applies the same rule.
+    """
+    if (
+        isinstance(value, list)
+        and len(value) == 3
+        and isinstance(value[0], str)
+        and isinstance(value[1], str)
+        and (value[2] is None or isinstance(value[2], str))
+    ):
+        normalized = _spot_interruption(value[0], value[1], value[2] or "unknown")
+        if normalized is not None:
+            return list(normalized)
+    return None
+
+
 def _sanitize_record(record):
     """Rebuild one persisted record from an explicit schema.
 
@@ -485,33 +526,10 @@ def _sanitize_record(record):
     if exit_code is not None and (type(exit_code) is not int or not 0 <= exit_code <= 255):
         exit_code = None
         changed = True
-    job_process = record.get("job_process")
-    if not (
-        isinstance(job_process, list)
-        and len(job_process) == 2
-        and isinstance(job_process[0], str)
-        and type(job_process[1]) is int
-        and _job_process(job_process[0], job_process[1])
-    ):
-        job_process = None
+    job_process = _job_process_value(record.get("job_process"))
     if job_process != record.get("job_process"):
         changed = True
-    spot_interruption = record.get("spot_interruption")
-    normalized = None
-    if (
-        isinstance(spot_interruption, list)
-        and len(spot_interruption) == 3
-        and isinstance(spot_interruption[0], str)
-        and isinstance(spot_interruption[1], str)
-        and (spot_interruption[2] is None or isinstance(spot_interruption[2], str))
-    ):
-        normalized = _spot_interruption(
-            spot_interruption[0], spot_interruption[1], spot_interruption[2] or "unknown"
-        )
-    # The stored value is the normalised triple, never the console spelling: an
-    # empty string or the literal "unknown" is not a registration id this
-    # command publishes, so it must not survive a rewrite.
-    spot_interruption = list(normalized) if normalized is not None else None
+    spot_interruption = _spot_interruption_value(record.get("spot_interruption"))
     if spot_interruption != record.get("spot_interruption"):
         changed = True
     emitted = record.get("emitted")
@@ -703,10 +721,13 @@ class Exporter:
         summary.new_events = len(events)
 
         state["console_reads"] = min(state.get("console_reads", 0) + summary.console_reads, MAX_COUNTER)
-        _write_atomic(state_file, json.dumps(state, sort_keys=True, indent=2))
+        record_text = json.dumps(state, sort_keys=True, indent=2)
 
         summary.duration = self.clock() - started
         _write_atomic(metrics_file, render_metrics(summary, current, state["console_reads"]))
+        # The record goes last. Its modification time is the launch evidence
+        # heartbeat, so a run that fails before this line must not refresh it.
+        _write_atomic(state_file, record_text)
         result = summary.as_dict()
         result["decision"] = "reported"
         return result
@@ -1137,7 +1158,7 @@ def render_metrics(summary, now, console_reads_total):
     emit(
         "ci_burst_export_last_run_timestamp_seconds",
         "gauge",
-        "Unix time of the last completed observation run.",
+        "Unix time of the last observation run that wrote this file.",
         [({}, int(now))],
     )
     emit(

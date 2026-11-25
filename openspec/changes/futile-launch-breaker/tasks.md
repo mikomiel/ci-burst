@@ -29,7 +29,8 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   while `apply` holds the ledger writer lock. Test the states in the order
   `missing`, `unreadable`, `stale`, `malformed`. Decode the JSON with hooks that
   refuse `NaN`, `Infinity` and `-Infinity`, and a JSON object that names a member
-  twice at any level, so a file that holds one is `malformed`. `export` cannot
+  twice at any level, so a file that holds one is `malformed`. The hooks belong to
+  `ci_burst/export.py` and the reader imports them (see 1.8). `export` cannot
   write a repeated member, because it serialises dictionaries with text keys. The
   function never raises, never writes, repairs, locks or deletes, and maps a path
   that is not a regular file, a link and any failure it did not foresee to
@@ -51,6 +52,14 @@ instance identifiers and 32-character hexadecimal operation identifiers.
 - [x] 1.7 Classify each record as registered, futile or no evidence, order by
   `seen`, keep the window edge inside, and build the considered set with the tie
   rule from the spec.
+- [x] 1.8 Decode the record in `load_state` in `ci_burst/export.py` with the same
+  two hooks. A file that holds a refused constant or a repeated member takes the
+  branch of a file that does not decode: the loader drops it whole, notes
+  `state_rebuilt` and starts from an empty record, so the emitted history and the
+  cumulative counters start again, as when the record is deleted. Add no other
+  behaviour. A loader that kept the last value of a repeat would keep a record that
+  the reader calls `malformed`, skip its finished console and rewrite the file with
+  a fresh heartbeat.
 
 ## 2. Gate
 
@@ -115,8 +124,14 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   reader about the same keys and marker values, so that the reader is no stricter
   and no looser than the writer, and show that a value which the loader drops
   from `state`, `operation` or `steps` never makes the reader hold where the
-  record that `export` rewrites would not. Add a test that the constant from 1.2
-  is a subset of `STEP_NAMES` and excludes the registration step.
+  record that `export` rewrites would not. Further tests show that the loader
+  drops a record file whole (`state_rebuilt`) when a JSON object in it names a
+  member twice, at the top level, in `instances` and in a record, or when it holds
+  `NaN`, `Infinity` or `-Infinity`; that the same records without a repeat are
+  kept; and that a run over three finished workers, with one instance key repeated
+  (registered first, futile last) and two other futile records, writes a record
+  that the reader does not hold on. Add a test that the constant from 1.2 is a
+  subset of `STEP_NAMES` and excludes the registration step.
 - [x] 3.4 Exporter tests show that a successful run with nothing new still
   rewrites the record and advances its modification time, that a refused run
   leaves it unrewritten, that a run that cannot write its textfile leaves it
@@ -153,9 +168,11 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   saves the dedupe record after the textfile, that the repeats of a run that
   failed count against the event file bound, that a run which fails at the record
   exits 1 before the unit publishes the textfile, so the collector's last-run
-  time does not advance, and that a unit which fails at publication keeps the
-  record fresh, and note in "Launch decision and capacity fallback" that a hold
-  comes before the template read.
+  time does not advance, that the counters keep their guarantee in the textfiles
+  that the shipped unit publishes and not in direct mode, where a later run can
+  lower a counter and a consumer treats a fall as a reset, and that a unit which
+  fails at publication keeps the record fresh, and note in "Launch decision and
+  capacity fallback" that a hold comes before the template read.
 - [x] 4.3 In `docs/deployment.md` and `docs/container.md`, replace the wording
   that the observation unit is "independent of admission": it is optional and
   launches nothing, but where it runs, `apply` reads its record as a brake.

@@ -1721,6 +1721,15 @@ class ObservationRefusesOnlyWhenOwnedInstancesExceedTheLimitTests(ExportCase):
         self.assertEqual(read & {item.instance_id for item in live}, {item.instance_id for item in live})
 
 
+def object_text(members):
+    """Return the JSON text of an object from ``(name, value)`` pairs, where a name may occur twice.
+
+    ``json.dumps`` writes a dictionary, which holds a key once, so it cannot write
+    a repeated member. That is also why ``export`` cannot.
+    """
+    return "{" + ", ".join(f"{json.dumps(name)}: {json.dumps(value)}" for name, value in members) + "}"
+
+
 class LaunchEvidenceContractTests(ExportCase):
     """The record that ``export`` writes is the one the launch evidence reader reads.
 
@@ -1733,6 +1742,11 @@ class LaunchEvidenceContractTests(ExportCase):
     KILLED_ID = "i-0123456789abcdea2"
     EMPTY_ID = "i-0123456789abcdea3"
     UNLABELLED_ID = "i-0123456789abcdea4"
+
+    #: The three finished workers of the loader tests. The record says that none
+    #: of them registered, and the provider lists all three as terminated. The
+    #: console of the first shows registration and the other two never register.
+    WORKER_IDS = ("i-0123456789abcdea0", "i-0123456789abcdea1", "i-0123456789abcdea2")
 
     def owned(self, instance_id, index, state="terminated"):
         return instance(instance_id, state=state, operation=operation_hex(index), zone="eu-central-1a")
@@ -1931,6 +1945,153 @@ class LaunchEvidenceContractTests(ExportCase):
                         self.assertEqual(raw.as_dict(), rewritten.as_dict())
                     else:
                         self.assertEqual(raw.as_dict(), {"state": "malformed", "considered": 0, "futile": 0})
+
+    def finished_workers(self, now, *, repeated):
+        """Write the record of three finished workers and return its text and an exporter.
+
+        The record says that none of them registered, and the exporter lists the
+        same three as terminated. The console of the first shows registration, so a
+        run that reads it again finds a worker that registered. When ``repeated``
+        is true that worker is filed under its key twice, registered first and
+        futile last, and ``json`` keeps the last.
+        """
+        first, second, third = self.WORKER_IDS
+        members = [
+            (first, futile_record(now - 300, index=1)),
+            (second, futile_record(now - 240, index=2)),
+            (third, futile_record(now - 180, index=3)),
+        ]
+        if repeated:
+            members.insert(0, (first, registered_record(now - 300, index=1)))
+        totals = json.dumps({"launches": 3, "registered": 1, "unregistered": 2})
+        raw = (
+            '{"version": %d, "console_reads": 3, "totals": %s, "instances": %s}'
+            % (STATE_VERSION, totals, object_text(members))
+        ).encode("utf-8")
+        write_observed(self.state_file, raw=raw, mtime=now)
+        never_registered = "cloud-init: STEP mount-options\ncloud-init: bootstrap exiting rc=1\n"
+        owned = [self.owned(instance_id, index) for index, instance_id in enumerate(self.WORKER_IDS, start=1)]
+        consoles = {first: CLEAN_BOOT, second: never_registered, third: never_registered}
+        return raw, self.build(owned, consoles)
+
+    def test_the_same_records_without_a_repeated_key_are_kept_and_hold(self):
+        # The control of the next test: its file differs from this one by the
+        # repeat only. The loader keeps finished records and does not read them
+        # again, so the hold rests on the file.
+        now = time.time()
+        _, exporter = self.finished_workers(now, repeated=False)
+        self.assertTrue(read_launch_evidence(self.state_file, now).holds)
+        result = self.run_export(exporter, now=now)
+        self.assertNotIn("state_rebuilt", result["notes"])
+        self.assertEqual(result["console_reads"], 0)
+        evidence = read_launch_evidence(self.state_file, time.time())
+        self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 3})
+        self.assertTrue(evidence.holds)
+
+    def test_a_repeated_instance_key_cannot_turn_a_registered_worker_into_a_hold(self):
+        # ``json`` keeps the last value of a repeated member. A loader that did so
+        # would keep the futile record, skip the finished worker whose console
+        # shows registration, and rewrite the file with a fresh heartbeat, so the
+        # next pass would hold on evidence that nobody read. The loader refuses
+        # the repeat as the reader does, so it cannot load the file, and the run
+        # reads the three finished workers again.
+        now = time.time()
+        raw, exporter = self.finished_workers(now, repeated=True)
+        first = self.WORKER_IDS[0]
+        self.assertEqual(raw.count(f'"{first}":'.encode("ascii")), 2)
+        self.assertFalse(json.loads(raw)["instances"][first]["registered"], "the last value is the futile one")
+        self.assertEqual(read_launch_evidence(self.state_file, now).state, "malformed")
+
+        result = self.run_export(exporter, now=now)
+
+        # What the next pass sees: the worker registered, so nothing holds.
+        evidence = read_launch_evidence(self.state_file, time.time())
+        self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 2})
+        self.assertFalse(evidence.holds)
+        # Why: the file was not loaded, so every worker was read again.
+        self.assertIn("state_rebuilt", result["notes"])
+        self.assertEqual([set(call) for call in self.console_read_calls(exporter)], [set(self.WORKER_IDS)])
+        self.assertEqual(result["console_reads"], 3)
+        self.assertTrue(self.records()[first]["registered"])
+
+    def test_a_nonstandard_json_constant_is_not_kept_and_rewritten_clean(self):
+        # ``json`` accepts ``NaN``, ``Infinity`` and ``-Infinity``, but they are not
+        # JSON and ``export`` never writes them. Each one sits in a field that the
+        # loader drops, so a loader that accepted the word would keep the three
+        # finished futile records and rewrite a clean file with a fresh heartbeat,
+        # and the consoles, which show registration, would never be read.
+        now = time.time()
+        owned = [self.owned(instance_id, index) for index, instance_id in enumerate(self.WORKER_IDS, start=1)]
+        consoles = {instance_id: CLEAN_BOOT for instance_id in self.WORKER_IDS}
+        for word, constant in (("NaN", float("nan")), ("Infinity", float("inf")), ("-Infinity", float("-inf"))):
+            for place in ("a field of a record", "a field of the top level"):
+                with self.subTest(constant=word, place=place):
+                    instances = {
+                        instance_id: futile_record(now - 300 + 60 * index, index=index)
+                        for index, instance_id in enumerate(self.WORKER_IDS, start=1)
+                    }
+                    payload = {
+                        "version": STATE_VERSION,
+                        "console_reads": 3,
+                        "totals": {"launches": 3, "registered": 0, "unregistered": 3},
+                        "instances": instances,
+                    }
+                    if place == "a field of the top level":
+                        payload["console_reads"] = constant
+                    else:
+                        instances[self.WORKER_IDS[0]]["first_seen"] = constant
+                    write_observed(self.state_file, mtime=now, payload=payload)
+                    self.assertIn(word.encode("ascii"), self.state_file.read_bytes())
+                    self.assertEqual(read_launch_evidence(self.state_file, now).state, "malformed")
+
+                    result = self.run_export(self.build(owned, consoles), now=now)
+
+                    evidence = read_launch_evidence(self.state_file, time.time())
+                    self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 0})
+                    self.assertFalse(evidence.holds)
+                    self.assertIn("state_rebuilt", result["notes"])
+                    self.assertEqual(result["console_reads"], 3)
+
+    def test_the_loader_drops_a_record_that_names_a_member_twice_whole(self):
+        # The loader takes the branch it takes for a file that is not JSON: it
+        # returns an empty record and ``state_rebuilt``, whatever level repeats
+        # and whatever the two values are. The reader calls the same file
+        # ``malformed``, so neither side reads what the other refuses. Each file
+        # is otherwise one that the loader keeps without a note.
+        first = self.WORKER_IDS[0]
+        record = futile_record(NOW - 60, index=1)
+        totals = json.dumps({"launches": 1, "registered": 0, "unregistered": 1})
+        instance_twice = object_text([(first, registered_record(NOW - 60, index=1)), (first, record)])
+        zone_twice = object_text([*record.items(), ("zone", "eu-central-1b")])
+        control = '{"version": %d, "console_reads": 1, "totals": %s, "instances": {"%s": %s}}'
+        cases = (
+            (
+                "a member at the top level",
+                '{"version": %d, "version": %d, "console_reads": 1, "totals": %s, "instances": {}}'
+                % (STATE_VERSION, STATE_VERSION, totals),
+            ),
+            (
+                "an instance key",
+                '{"version": %d, "console_reads": 1, "totals": %s, "instances": %s}'
+                % (STATE_VERSION, totals, instance_twice),
+            ),
+            ("a member of a record", control % (STATE_VERSION, totals, first, zone_twice)),
+        )
+        clean = control % (STATE_VERSION, totals, first, json.dumps(record))
+        write_observed(self.state_file, raw=clean.encode("utf-8"), mtime=NOW)
+        _, note = load_state(self.state_file)
+        self.assertIsNone(note, "without a repeat the loader keeps the file as it is")
+        empty = {
+            "version": STATE_VERSION,
+            "console_reads": 0,
+            "totals": {"launches": 0, "registered": 0, "unregistered": 0},
+            "instances": {},
+        }
+        for name, text in cases:
+            with self.subTest(name):
+                write_observed(self.state_file, raw=text.encode("utf-8"), mtime=NOW)
+                self.assertEqual(load_state(self.state_file), (empty, "state_rebuilt"))
+                self.assertEqual(read_launch_evidence(self.state_file, NOW).state, "malformed")
 
 
 class RecordCadenceTests(ExportCase):

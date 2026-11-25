@@ -305,7 +305,11 @@ Every series carries the deployment label. `ci_burst_worker_launches_total`,
 `ci_burst_worker_registered_total` and `ci_burst_worker_unregistered_total` are
 cumulative counters kept separately from the expiring per-instance records, so
 they do not fall when an instance ages out of the provider's record window or
-when a record is pruned. `ci_burst_worker_unregistered_total` counts workers
+when a record is pruned. The shipped unit keeps that guarantee between its
+textfiles; only a lost or damaged dedupe record (deleted, or replaced by
+`export` because it cannot load it) restarts a counter. Direct mode, described
+below, does not keep it.
+`ci_burst_worker_unregistered_total` counts workers
 that ended without ever showing the registration marker; evidence observed once
 is never un-learned by a later empty console. `ci_burst_spend_micros`, `ci_burst_committed_micros`,
 `ci_burst_allowance_micros` and `ci_burst_remaining_micros` come from the
@@ -320,9 +324,17 @@ systemd runs `ExecStartPost` only after `export` exits 0. A run that fails at th
 record therefore exits 1 and publishes nothing: the collector's timestamp does
 not advance, the record ages, and the failed unit shows it. A unit that fails at
 the publication has already refreshed the record, and the collector's timestamp
-does not advance either. Where `--metrics-file` names the collector's own file,
-as in the commands above, the collector reads each textfile as soon as `export`
-replaces it, so a run that fails at the record still advances the timestamp.
+does not advance either. Where `--metrics-file` names the collector's own file
+(direct mode, as in the commands above), the collector reads each textfile as
+soon as `export` replaces it, so a run that fails at the record still advances
+the timestamp. That textfile holds counters that no record saved. The next run
+starts from the older totals and can write lower values, for example when an
+instance has left the provider's inventory in between, so a counter can fall.
+The guarantee above holds for the shipped unit, which publishes only after a
+successful run, and not for direct mode. Use direct mode for manual and
+diagnostic runs. A consumer of a directly written file must treat a fall as a
+counter reset, as Prometheus `rate` and `increase` do, and a window that holds
+the fall reads high by about the value before it.
 
 ### Bounds
 
@@ -380,8 +392,20 @@ schema — or that belongs to another deployment — is dropped (`state_rebuilt`
 dropped rather than kept forever;
 a ledger state outside the ledger's own vocabulary is counted as `invalid`
 (`ledger_state_unknown`). None of those is a failure: derived evidence that
-cannot be validated is discarded, not published. The
-command never calls Forgejo and never mutates a resource, so it keeps working
+cannot be validated is discarded, not published.
+
+The same rule covers the decoding of the record. `export` refuses a record file
+that holds `NaN`, `Infinity` or `-Infinity`, or in which a JSON object names a
+member twice, at any level. It writes neither. It drops such a file whole and
+notes `state_rebuilt`, so the emitted history and the cumulative counters start
+again, as when the record is deleted, and the run reads again the consoles that
+it selects within its read budget. The launch hold reads the same file with the
+same two refusals (§ Futile launch hold), so `export` carries no record over from
+a file that the hold would call `malformed` for either reason. A loader that kept
+the last value of a repeat could keep a futile record in place of a registered
+one, skip its finished console and rewrite the file with a fresh heartbeat.
+
+The command never calls Forgejo and never mutates a resource, so it keeps working
 when the queue or the admission path is the thing that is broken.
 
 ### Fleet snapshot
@@ -1710,7 +1734,7 @@ state is `fresh`. The states, in the order they are tested:
 | `missing` | no file at the path |
 | `unreadable` | the file cannot be opened or read, is not a regular file (a FIFO, a directory) or is a link, or the reader failed in a way it did not foresee |
 | `stale` | the modification time is more than 600 seconds old, or after the controller clock |
-| `malformed` | larger than 16 MiB, not UTF-8 JSON (a `NaN`, `Infinity` or `-Infinity` constant counts as not JSON), a JSON object that names a member twice at any level (a decoder keeps only the last value, and `export` never writes one), another record version, or one record with a bad field the hold reads, an instance key that `export` rejects, or a registration marker (`job_process`, `spot_interruption`) of a shape that `export` does not write; the whole file is dropped |
+| `malformed` | larger than 16 MiB, not UTF-8 JSON (a `NaN`, `Infinity` or `-Infinity` constant counts as not JSON), a JSON object that names a member twice at any level (a decoder keeps only the last value, and `export` never writes one; `export` refuses a constant and a repeat in the same way when it loads its own record, § Worker evidence), another record version, or one record with a bad field the hold reads, an instance key that `export` rejects, or a registration marker (`job_process`, `spot_interruption`) of a shape that `export` does not write; the whole file is dropped |
 | `fresh` | the hold is evaluated |
 
 Only `fresh` evidence can hold. Every other state admits as if the hold did not
@@ -1773,7 +1797,7 @@ report the hold (§ Claim grace). Two levers exist, and neither is a clean resum
 
 | Lever | Effect |
 | --- | --- |
-| Delete the record | The next pass reads `missing` and admits. The next export run rebuilds records for the instances the provider still lists, about the last hour of ended workers, and stamps them with its own time, so the hold can return for a full window. |
+| Delete the record | The next pass reads `missing` and admits. The next export run rebuilds records from the consoles that it reads within its per-run budget (`MAX_CONSOLE_READS`, 16, live workers first) among the instances the provider still lists, about the last hour of ended workers, and stamps them with its own time. A surplus of ended workers waits for later runs while the provider still lists them. The hold can return for a full window. |
 | Stop the export timer | The record ages past 600 seconds and the hold opens. Worker observation stops too. This is the one blunt lever. |
 
 ## Launch decision and capacity fallback

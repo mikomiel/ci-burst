@@ -26,10 +26,12 @@ validated, never console text. A field of the wrong type, an instance key that
 ``export`` rejects and a registration marker that ``export`` cannot write each
 drop the whole file. So does a JSON constant that is not standard JSON
 (``NaN``, ``Infinity``, ``-Infinity``), and so does a JSON object that names a
-member twice, at any level: ``export`` writes neither (``_refuse_repeated_member``
-says why). A value of the right type that ``export`` drops from ``state``,
-``operation`` or ``steps`` is no evidence, which is also what ``export`` makes of
-it when it loads its own record, so it never creates a hold.
+member twice, at any level: ``export`` writes neither, and the decoder hooks that
+refuse them are ``export``'s own (``_refuse_repeated_member`` says why), so
+``export`` drops the same file when it loads its record. A value of the right
+type that ``export`` drops from ``state``, ``operation`` or ``steps`` is no
+evidence, which is also what ``export`` makes of it when it loads its own record,
+so it never creates a hold.
 The fields it reads, the record version and the rules that decide a shape are
 imported from ``export``; a contract test in ``tests/test_export.py`` fails when
 the two drift apart.
@@ -49,6 +51,8 @@ from .export import (
     _job_process_value,
     _match,
     _number,
+    _refuse_constant,
+    _refuse_repeated_member,
     _spot_interruption_value,
 )
 
@@ -203,35 +207,6 @@ def _read(path, now):
     if records is None:
         return LaunchEvidence(MALFORMED)
     return _evaluate(records, now)
-
-
-def _refuse_constant(constant):
-    """Refuse ``NaN``, ``Infinity`` and ``-Infinity`` while the file is decoded.
-
-    ``json`` accepts them, but they are not JSON and ``export`` never writes one.
-    The error is a ``ValueError``, so the file is ``malformed`` and not
-    ``unreadable``.
-    """
-    raise ValueError(f"{constant} is not a JSON value")
-
-
-def _refuse_repeated_member(pairs):
-    """Refuse a JSON object that names one member twice, at any level.
-
-    ``json`` keeps the last value of a repeated member, so a record with an
-    invalid ``steps`` followed by a valid one would pass every field rule, and a
-    key of ``instances`` that repeats would keep only its last record. ``export``
-    cannot write either. It serialises its record with ``json.dumps`` from
-    dictionaries whose keys are all text, the fixed field names and the instance
-    identifiers that pass ``INSTANCE_PATTERN``, and a dictionary holds a key once.
-    (``json.dumps`` can write one name twice only for keys of different types,
-    such as ``1`` and ``"1"``, and ``export`` has none.) The error is a
-    ``ValueError``, so the file is ``malformed`` and not ``unreadable``.
-    """
-    members = dict(pairs)
-    if len(members) != len(pairs):
-        raise ValueError("a JSON object names a member twice")
-    return members
 
 
 def _records(raw, now):

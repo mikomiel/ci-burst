@@ -140,9 +140,11 @@ the gate.
 | What is a time after the controller clock? | The file is `stale`. A record with such a `seen` makes the file `malformed`. | An age that cannot be established is not evidence. |
 
 A rebuilt record is stamped with the time of the run that rebuilds it. `export`
-reads again every owned instance that the provider still lists, which is about the
-last hour of ended workers. A rebuild therefore re-dates that evidence and can
-renew a hold for up to one window.
+selects the owned instances that the provider still lists, which is about the last
+hour of ended workers, and reads at most `MAX_CONSOLE_READS` (16, live workers
+first) of their consoles in one run. It defers the surplus ended workers to later
+runs while the provider still lists them. A rebuild therefore re-dates the evidence that those
+reads recover and can renew a hold for up to one window.
 
 ## What the gate does under a persistent fault
 
@@ -172,7 +174,7 @@ neither is a clean resume.
 
 | Lever | Effect |
 |---|---|
-| Delete the record | The next pass sees `missing` and admits. `export` rebuilds records for the instances that the provider still lists on its next run and stamps them with its own time, so the gate can hold again for a full window. |
+| Delete the record | The next pass sees `missing` and admits. On its next run `export` rebuilds records from the consoles that it reads within its per-run budget (`MAX_CONSOLE_READS`, 16, live workers first) among the instances that the provider still lists, and stamps them with its own time. A surplus of ended workers waits for later runs while the provider still lists them. The gate can hold again for a full window. |
 | Stop the export timer | The record ages past 600 seconds and the gate opens. Worker observation stops too. This is the one blunt lever. |
 
 ## Trust and credentials
@@ -204,13 +206,14 @@ spend or access.
 | The file is larger than 16 MiB | `malformed`, tested after the age, so a stale file is `stale` whatever its size. The reader takes the size from the open descriptor and reads no content. A file that grows past the bound after the size was taken is `malformed` too. The reader reads the descriptor itself, in chunks that the bound still allows and through no buffered stream, and stops at 16 MiB plus one byte, so it fetches no more than that from the file. A buffered read of that last byte would fetch a whole block more. `malformed` fits because the file is not a record that `export` writes within the bound, and the order of the states keeps the size test after the age test. `unreadable` would say that the file cannot be read, and it can. |
 | The file holds `NaN`, `Infinity` or `-Infinity` | `malformed`. The decoder refuses the three constants, because they are not JSON and `export` never writes them. No field rule decides it, so a constant in a field that the gate does not read drops the file too. |
 | A JSON object names a member twice, at any level | `malformed`, whatever the two values are. A decoder keeps only the last value of a repeated member, so a record with an invalid `steps` followed by a valid one would pass every field rule, and an instance key that repeats would keep only its last record, which can hide a registered worker. The decoder refuses the repeat, as it refuses the three constants, so a repeat in a field that the gate does not read drops the file too. `export` cannot write one: it serialises dictionaries whose keys are all text, and a dictionary holds a key once. |
+| `export` loads a record that holds `NaN`, `Infinity` or `-Infinity`, or that names a JSON member twice | The loader decodes with the two refusals that the reader uses. They are `export`'s own and the reader imports them, so the two cannot disagree on these two refusals. The loader takes the branch for a file that does not decode: it drops the file whole, notes `state_rebuilt` and starts from an empty record. The emitted history and the cumulative counters start again, as when the record is deleted, and the run reads again the consoles that it selects within its per-run read budget (`MAX_CONSOLE_READS`, 16, live workers first). It cannot keep the last value of a repeat: that would keep a futile record in place of a registered one, skip its finished console and rewrite the file with a fresh heartbeat, so the next pass would hold on evidence that nobody read. |
 | The file is not UTF-8 JSON, has another version, or holds a record with a bad field | `malformed`. The whole file is dropped, because a skipped record could leave older futile records among the newest three. |
 | An `instances` key that `export` rejects, or a `job_process` or `spot_interruption` value that `export` cannot write | `malformed`. The reader asks the rule that `export` applies when it loads its own record, so a record under a key that is not an instance identifier, or an empty list read as registration evidence, cannot steer the gate. |
 | A record's provider state is null, or text outside the known six | That record has not ended. The file stays usable. `export` writes `unknown` for a state it cannot label, turns it into null when it next loads the record, and keeps that null until the record is pruned. |
 | The file's owner-only mode denies a reader that runs as another user | `unreadable`. `export` creates the file through a temporary file, which is owner-only. |
 | `export` refused its last run, or its unit stopped | The file ages and reads as `stale` after 600 seconds. |
 | `export` cannot write its textfile | The record is written after the textfile, so it is not refreshed and reads as `stale` after 600 seconds. The run had published its events before the failure, and no record of the run was saved, so the next run rediscovers the owned instances and reads again the consoles that it selects within its per-run read budget (`MAX_CONSOLE_READS`, 16, live workers first). A marker that it still finds on one of them is emitted again under the same identity. A console that the run defers past the budget (`console_read_deferred`) is not read in that run, so the run emits nothing for it. An instance that left the provider's inventory, or a marker that scrolled out of the console, is not emitted again. The repeats count against the event file bound, so a long outage can push older lines out of the file. |
-| `export` writes its textfile and cannot write the record | The record is not refreshed and reads as `stale` after 600 seconds, and the hold fails open. The command exits 1, so the failed unit is the signal. The shipped unit publishes the textfile into the collector's directory only after a successful command, so it does not publish here: the collector's copy is not replaced and its last-run timestamp does not advance either. Only where `--metrics-file` names the collector's own file does the new timestamp reach the collector. |
+| `export` writes its textfile and cannot write the record | The record is not refreshed and reads as `stale` after 600 seconds, and the hold fails open. The command exits 1, so the failed unit is the signal. The shipped unit publishes the textfile into the collector's directory only after a successful command, so it does not publish here: the collector's copy is not replaced and its last-run timestamp does not advance either. Only where `--metrics-file` names the collector's own file (direct mode) does the new timestamp reach the collector, and with it the counters, which hold totals that no record saved: the next run starts from the older totals and can write lower values, for example when an instance has left the provider's inventory in between. The guarantee that the counters do not fall therefore holds for the shipped unit, which publishes only after a successful run, and not for direct mode. Direct mode is for manual and diagnostic runs, and a consumer of a directly written file must treat a fall as a counter reset: `rate` and `increase` do, and a window that holds the fall reads high by about the value before it. |
 | The shipped unit cannot publish the textfile after a successful run | `export` has already written the record, so it stays `fresh`, and a hold still rests on it, because the evidence in it was read. The collector's copy of the textfile is not replaced, so its last-run timestamp does not advance, and the failed unit is the signal. |
 | `export` writes to another path with `--state-file` | The default path reads as `missing` or `stale`. The reader never searches. |
 | A failure the reader did not foresee | `unreadable`. The reader never raises, because a pass must not fail for an optional brake. |
@@ -257,7 +260,9 @@ which `plan` does not.
   that a run defers past the budget is not read in that run. The repeats
   count against the event file bound, so a long outage can
   push older lines out of the file, and a failure of the last write alone leaves
-  a textfile that is newer than the record.
+  a textfile that is newer than the record. The shipped unit never publishes that
+  textfile. Where a collector reads it directly, its counters can fall, so the
+  contract names that use as manual and diagnostic (see "Failure behaviour").
 
 ## Rollback
 

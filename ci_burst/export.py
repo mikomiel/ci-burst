@@ -26,8 +26,20 @@ repeat that follows a crash between publishing an event and persisting the
 dedupe record; the alternative — persisting first — would lose a failure event
 instead of repeating it. The record is the last file a run writes, so a run that
 cannot write the metrics textfile leaves it as it was. The next run reads the
-current consoles of the instances that the provider still lists and emits again,
-under the same identities, the markers it still finds on the consoles it reads within ``MAX_CONSOLE_READS``.
+current consoles of the instances that the provider still lists, at most
+``MAX_CONSOLE_READS`` of them in one run, and emits again, under the same
+identities, the markers it still finds on those consoles.
+
+The same order sets the counter contract. The cumulative counters are saved in
+the record, so a run that fails at the record write has already replaced the
+metrics textfile with totals that no record saved, and the next run starts from
+the older totals. The shipped unit publishes a textfile only after the command
+exits 0, so the textfiles that a collector reads from it never carry such totals,
+and its counters fall only when the record is lost or damaged: deleted, or
+replaced by ``load_state`` because it cannot use it. A collector that reads
+``--metrics-file`` itself can read a value that a later run lowers. That use is
+for manual and diagnostic runs, and a consumer of such a file must treat a fall
+as a counter reset.
 
 The dedupe record is derived observation, not decision state. Deleting it loses
 the emitted history and the cumulative counters. It influences admission in one
@@ -338,12 +350,60 @@ def _increment(counter):
     return min(counter + 1, MAX_COUNTER)
 
 
+def _refuse_constant(constant):
+    """Refuse ``NaN``, ``Infinity`` and ``-Infinity`` while a record is decoded.
+
+    ``json`` accepts the three words, but they are not JSON and this command never
+    writes one. It is the decoder's ``parse_constant``, so it sees these words
+    only: a number that overflows, such as ``1e309``, decodes to a float infinity,
+    and the field rules drop it (``_number``, ``_counter`` and the integer
+    checks). The error is a ``ValueError``.
+    """
+    raise ValueError(f"{constant} is not a JSON value")
+
+
+def _refuse_repeated_member(pairs):
+    """Refuse a JSON object that names one member twice, at any level.
+
+    ``json`` keeps the last value of a repeated member, so a record with an invalid
+    ``steps`` followed by a valid one would pass every field rule, and a key of
+    ``instances`` that repeats would keep only its last record. This command
+    cannot write either. It serialises its record with ``json.dumps`` from
+    dictionaries whose keys are all text, the fixed field names and the instance
+    identifiers that pass ``INSTANCE_PATTERN``, and a dictionary holds a key once.
+    (``json.dumps`` can write one name twice only for keys of different types,
+    such as ``1`` and ``"1"``, and this command has none.) The error is a
+    ``ValueError``.
+
+    This is the decoder's ``object_pairs_hook`` for both readers of the record:
+    ``load_state`` and the launch evidence reader decode with it and with
+    ``_refuse_constant``, so neither keeps a value that the other refuses. The
+    reader calls the file ``malformed``. ``load_state`` takes its branch for a file
+    that does not decode, and drops the whole file.
+    """
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        raise ValueError("a JSON object names a member twice")
+    return members
+
+
 def load_state(path):
     """Return ``(state, note)``; an unusable record is replaced, not repaired.
 
     Nested types are validated here rather than at first use: a record that
     loads but cannot be iterated would fail the whole run, and a metrics run is
     the wrong place to fail closed on derived observation.
+
+    A file that does not decode is replaced whole, and the note is
+    ``state_rebuilt``. Besides text that is not JSON, the decoder refuses
+    ``NaN``, ``Infinity`` and ``-Infinity``, and a JSON object that names a member
+    twice, at any level. This command writes none of them, and the launch
+    evidence reader refuses the same files. A loader that kept the last value of a
+    repeat would keep a record that the reader would not read, skip the finished
+    workers in it and rewrite the file with a fresh heartbeat. The emitted history
+    and the cumulative counters start again, as they do when the file is deleted,
+    and the run reads again the consoles that it selects within
+    ``MAX_CONSOLE_READS``.
     """
     empty = {"version": STATE_VERSION, "console_reads": 0, "totals": _empty_totals(), "instances": {}}
     try:
@@ -353,7 +413,11 @@ def load_state(path):
     except (OSError, UnicodeDecodeError):
         return empty, "state_rebuilt"
     try:
-        payload = json.loads(raw)
+        payload = json.loads(
+            raw,
+            parse_constant=_refuse_constant,
+            object_pairs_hook=_refuse_repeated_member,
+        )
     except (ValueError, RecursionError):
         return empty, "state_rebuilt"
     if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:
@@ -726,9 +790,12 @@ class Exporter:
         record_text = json.dumps(state, sort_keys=True, indent=2)
 
         summary.duration = self.clock() - started
-        _write_atomic(metrics_file, render_metrics(summary, current, state["console_reads"]))
         # The record goes last. Its modification time is the launch evidence
-        # heartbeat, so a run that fails before this line must not refresh it.
+        # heartbeat, so a run that fails before the record write must not
+        # refresh it. Do not reorder the two writes to make the counters safer:
+        # the module docstring states what the order costs, and the shipped unit
+        # publishes the textfile only after this command exits 0.
+        _write_atomic(metrics_file, render_metrics(summary, current, state["console_reads"]))
         _write_atomic(state_file, record_text)
         result = summary.as_dict()
         result["decision"] = "reported"

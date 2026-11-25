@@ -142,8 +142,6 @@ and this file records what was installed, not that the check passed.
    `runner` account, and record the result with the deployment. This
    repository's CI does not qualify an image.
 
-Clean up old template versions and their images by the rule in [`docs/operations.md`](../../../docs/operations.md#retention-of-hand-built-worker-images).
-
 The image build is operator-owned. `provision.sh` does not register a runner,
 read a secret, create an image or publish anything; IAM and network changes
 remain operator actions.

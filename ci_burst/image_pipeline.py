@@ -973,8 +973,9 @@ class ImagePipeline:
 
         With ``apply`` the pass takes the state file's writer lock (a pass that
         is already running gives ``IMAGE_STATE_LOCKED``) and releases it at the
-        end. The lock and the connection end together, even for a state that the
-        caller opened. Without a gate command or the opt-out the pass is refused
+        end. Once the inputs are validated, the lock and the connection end together,
+        even for a state that the caller opened; a refusal before that point
+        (such as ``IMAGE_GATE_REQUIRED``) leaves a caller's state to its caller. Without a gate command or the opt-out the pass is refused
         (``IMAGE_GATE_REQUIRED``) before any client is built, unless the state holds
         a build in flight: the pass then settles that build and starts no other.
         """

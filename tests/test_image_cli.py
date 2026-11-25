@@ -803,6 +803,44 @@ class StatusTests(CliCase):
         self.assertEqual((code, payload["decision"], payload["check_recorded"]), (0, "status", False))
         self.assertEqual(self.dump(), before)
 
+    def test_a_database_error_on_the_check_write_reports_check_recorded_false_and_exits_zero(self):
+        self.build_candidate()
+        before = self.dump()
+        error = sqlite3.OperationalError("attempt to write a readonly database")
+        with mock.patch.object(ImageState, "record_check_time", side_effect=error):
+            code, payload = self.invoke("image", "status")
+        self.assertEqual((code, payload["decision"], payload["check_recorded"]), (0, "status", False))
+        self.assertNotIn("error", payload)
+        self.assertEqual(self.dump(), before)
+
+    def test_an_interruption_during_the_check_write_releases_the_writer_lock(self):
+        self.build_candidate()
+        with mock.patch.object(ImageState, "record_check_time", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.invoke("image", "status")
+        other = ImageState(self.state_dir, clock=self.clock)
+        self.addCleanup(other.close)
+        other.acquire_writer()  # refuses IMAGE_STATE_LOCKED if the status had kept the lock
+
+    def test_a_failure_to_release_the_state_after_the_check_write_still_reports_the_write(self):
+        self.build_candidate()
+        release = ImageState.release_writer
+        failures = []
+
+        def failing_release(state):
+            held = state._lock_fd is not None
+            release(state)
+            if held and not failures:
+                failures.append(True)
+                raise OSError("synthetic release failure")
+
+        self.clock.advance(60)
+        with mock.patch.object(ImageState, "release_writer", failing_release):
+            code, payload = self.invoke("image", "status")
+        self.assertEqual(failures, [True])
+        self.assertEqual((code, payload["decision"], payload["check_recorded"]), (0, "status", True))
+        self.assertEqual(self.dump()["control"][0]["last_check_at"], self.clock())
+
     def test_a_pending_row_is_reported_with_the_resolution_its_hash_implies_and_is_not_resolved(self):
         self.pin_current()
         self.add_pending(old_sha=self.file_sha(), new_sha="1" * 64)

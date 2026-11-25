@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ci_burst.config import ImageConfig, load, loads
+from ci_burst.config import WORKER_LIFETIME_SECONDS, ImageConfig, load, loads
 from ci_burst.errors import ConfigRefusal
 
 from support import write_config
@@ -298,6 +298,25 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigRefusal) as raised:
             load(path)
         self.assertIn("aws.max_lifetime_seconds", raised.exception.detail)
+
+    def test_the_loader_accepts_another_lifetime_and_only_admission_refuses_it(self):
+        # reap, status, export and plan must keep working on a file that still holds another value (#138).
+        for seconds in (60, 1800, 7200):
+            with self.subTest(seconds=seconds):
+                config = load(write_config(self.root, config={"aws": {"max_lifetime_seconds": seconds}}))
+                self.assertEqual(config.aws.max_lifetime_seconds, seconds)
+                with self.assertRaises(ConfigRefusal) as raised:
+                    config.require_worker_lifetime()
+                self.assertEqual(raised.exception.reason, "WORKER_LIFETIME_MISMATCH")
+                self.assertIn(str(WORKER_LIFETIME_SECONDS), raised.exception.detail)
+        load(write_config(self.root)).require_worker_lifetime()  # the shipped default is the bootstrap's value
+
+    def test_the_lifetime_matches_every_clock_in_the_worker_bootstrap(self):
+        bootstrap = (Path(__file__).resolve().parents[1] / "deploy" / "runner" / "bootstrap.sh").read_text()
+        shutdown = re.findall(r"systemd-run --on-active=(\d+) --unit=runner-lifetime ", bootstrap)
+        job = re.findall(r"timeout --signal=TERM --kill-after=\d+ (\d+) ", bootstrap)
+        self.assertEqual(shutdown, [str(WORKER_LIFETIME_SECONDS)])
+        self.assertEqual(job, [str(WORKER_LIFETIME_SECONDS)])
 
     def test_missing_file(self):
         with self.assertRaises(ConfigRefusal) as raised:

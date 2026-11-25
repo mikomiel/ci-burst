@@ -857,11 +857,15 @@ topology.
 - Do not mount the directory into two containers that may run `apply`. The
   writer lock is a file lock on one host, not a distributed lock, and the
   commitment budget is local.
-- A writable run upgrades a version-1, version-2 or version-3 ledger to schema
-  4 once, while holding the writer lock: it copies the file to
-  `state.sqlite3.pre-v4.<epoch>`, checks the copy's size, then migrates in one
-  transaction. If the copy fails it refuses before the first schema write, so a
-  failed upgrade leaves the file readable by the release that wrote it. A
+- A writable run upgrades a version-1, version-2, version-3 or version-4
+  ledger to schema 5 once, while holding the writer lock. Each upgrade takes
+  one copy of the file, checks the copy's size, then migrates in one
+  transaction, so no file takes two copies or two commits: a version-1, -2 or
+  -3 file is copied to `state.sqlite3.pre-v4.<epoch>` and lands on schema 5
+  directly, and a version-4 file is copied to `state.sqlite3.pre-v5.<epoch>`
+  and gains one column. If the copy fails the upgrade refuses before its first
+  schema write, and a failed transaction rolls back whole, so a failed upgrade
+  leaves the file, byte for byte, readable by the release that wrote it. A
   version-1 or version-2 file first gets the schema-3 columns
   `admitted_incidental_per_hour_micros`, `admitted_buffer_micros` and
   `admitted_inputs_backfilled`, an integer that defaults to `0`. Terminal
@@ -871,11 +875,43 @@ topology.
   admission actually used are not recoverable from an earlier file, and are
   marked `admitted_inputs_backfilled = 1`. The mark keeps such a row's stored
   reservation as its commitment floor and is never inferred from the current
-  configuration. Every upgrade also creates the `fleet_observations` table; a
-  version-3 file has no rows to backfill. `plan`, `status` and `export` accept
-  versions 1 through 4 and never create or migrate the file. Rolling the image
-  back after an upgrade requires restoring the `.pre-v4.` copy first, because
-  the previous release refuses schema 4. The version-1 upgrade also changes the
+  configuration. An upgrade from version 1, 2 or 3 also creates the
+  `fleet_observations` table; a version-3 file has no rows to backfill. Every
+  upgrade adds the nullable `operations.admitted_lifetime_seconds` column, which records the
+  `aws.max_lifetime_seconds` an intent was admitted under, and backfills
+  nothing: every existing row keeps `NULL`, so an unresolved intent from an
+  earlier schema is refused with `unresolved_intent_lifetime_mismatch` until an
+  operator resolves it. Drain before the upgrade: stop admission as in rollback
+  step 1, run `status`, and replace the image only when `state.operations` lists
+  no operation in state `intent` or `uncertain`; a refused legacy intent has no
+  supported recovery in the product. A host whose `ci-burst-refresh.timer`
+  follows `origin/main` replaces the image by itself within minutes of a merge,
+  so on such a host either drain before the change that brings schema 5 is
+  merged, with admission stopped from the final check until the new image is
+  promoted, or hold refresh before the merge as the rollback does:
+  `systemctl disable --now ci-burst-refresh.timer`, so a reboot does not arm
+  it again, then `systemctl stop ci-burst-refresh.service`, which also cancels
+  a start that is queued, and confirm the service is inactive. Verify the
+  drain, keep admission stopped from that check until the new image is
+  promoted, and only then `systemctl enable --now ci-burst-refresh.timer`.
+  Keep cleanup running either way. If one is found after the upgrade, keep
+  admission stopped, keep cleanup running, do not delete or edit the row, and
+  escalate: an empty owned inventory does not prove that its request was never
+  sent. `plan`, `status` and `export` accept versions 1
+  through 5 and never create or migrate the file, so they keep reading an
+  earlier schema until the first writable run. The previous release refuses a
+  schema it does not know, so rolling the image back after an upgrade needs
+  the matching copy: `.pre-v5.` returns the schema-4 file, and `.pre-v4.`
+  returns the schema-1, -2 or -3 file as it was found. A
+  copy holds nothing written after it. The `apply` pass that performs the
+  upgrade counts: it goes on to reconcile and can commit and send a launch in
+  the same pass. Restore a copy only while admission is stopped and the
+  evidence shows that no `apply`, the upgrading pass included, wrote an
+  operation or called the provider after the copy, so `state.operations` still
+  lists exactly the rows the copy holds. Once an `apply` has admitted or
+  settled an operation, the copy would drop that launch and its spend: keep
+  admission stopped, keep the current ledger and the upgraded image, and
+  escalate instead of rolling back. The version-1 upgrade also changes the
   operator-visible budget shape: the JSON `budget` block reports `spend`,
   `committed` and `remaining` instead of `consumed`, and
   `ci_burst_ledger_consumed_micros` is replaced by `ci_burst_spend_micros` plus

@@ -738,9 +738,15 @@ class BuildEndedBeforeTheLock(ImageState):
     """A state file whose active build ends, in another process, after the peek and before the writer lock is taken."""
 
     def acquire_writer(self):
-        active = self.active_build(DEPLOYMENT)
-        if active is not None:
-            self.advance_build(active.id, state="failed", reason_code="CONSOLE_BLIND")
+        if self._lock_fd is None:
+            other = ImageState(self.directory, clock=self._clock)  # the other process
+            try:
+                other.connect()
+                active = other.active_build(DEPLOYMENT)
+                if active is not None:
+                    other.advance_build(active.id, state="failed", reason_code="CONSOLE_BLIND")
+            finally:
+                other.close()
         return super().acquire_writer()
 
 
@@ -1938,6 +1944,40 @@ class FailureTests(PipelineCase):
         self.refused(self.apply, "AWS_UNCERTAIN")
         self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [ghost]}])
         self.assertEqual(self.only_build().builder_id, ghost)
+
+    def test_a_refused_console_read_before_the_deadline_refuses_the_pass_and_keeps_the_build(self):
+        build = self.expired_build(before=120)
+        self.world.fail("get_console_output", ProviderError("UnauthorizedOperation"))
+        self.refused(self.apply, "AWS_UNCERTAIN")
+        later = self.only_build()
+        self.assertEqual((later.state, later.builder_id), ("building", build.builder_id))
+        self.assertEqual(self.world.arguments("create_image"), [])
+
+    def test_a_refused_console_read_at_the_deadline_ends_the_build_as_console_blind(self):
+        build = self.expired_build()
+        self.world.fail("get_console_output", ProviderError("UnauthorizedOperation"))
+        result = self.apply()
+        self.assert_failed(result, "CONSOLE_BLIND")
+        self.assertIn("console_read:AWS_UNCERTAIN", result["notes"])
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+        self.assertEqual(self.world.arguments("create_image"), [])
+        self.assertEqual(self.metric("ci_burst_image_consecutive_failures"), 1.0)
+        self.assertEqual(len(self.events("image_check")), 2)
+
+    def test_a_console_read_that_starts_before_the_deadline_and_is_refused_after_it_ends_the_build(self):
+        build = self.expired_build(before=10)
+        clock = self.clock
+
+        def slow_refusal(adapter, instance_ids, *, deadline=None):
+            clock.advance(20)
+            raise ProviderRefusal("AWS_UNCERTAIN", "RequestLimitExceeded", uncertain=True)
+
+        with mock.patch.object(WorldAws, "console_output", slow_refusal):
+            result = self.apply()
+        self.assert_failed(result, "CONSOLE_BLIND")
+        self.assertIn("console_read:AWS_UNCERTAIN", result["notes"])
+        self.assertEqual(self.world.arguments("create_image"), [])
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
 
     def test_a_blind_console_at_the_deadline_ends_the_build_with_one_termination_and_the_blind_code(self):
         build = self.expired_build()
@@ -4171,6 +4211,18 @@ class TelemetryTests(PipelineCase):
         (event,) = self.events()
         self.assertEqual((event["event"], event["decision"], event["reason"]), ("image_check", "digest_unchanged", None))
 
+    def test_a_pass_on_a_state_the_caller_opened_ends_with_no_connection_and_no_lock(self):
+        # A writable connection kept without the lock between passes could roll back a journal that another
+        # writer left in between, so the pass closes both (#194).
+        self.pin_current()
+        self.state.acquire_writer()
+        self.state.connect()
+        self.apply()
+        self.assertFalse(self.state.available)
+        other = ImageState(self.state_dir, clock=self.clock)
+        self.addCleanup(other.close)
+        other.acquire_writer()  # refuses IMAGE_STATE_LOCKED if the pass had kept the lock
+
     def test_the_event_file_only_grows_and_holds_one_json_object_per_line(self):
         self.pin_current()
         self.apply()
@@ -4196,6 +4248,12 @@ class TelemetryTests(PipelineCase):
         self.assertIsNone(self.metric("ci_burst_image_last_build_timestamp_seconds", outcome="failed"))
         self.assertEqual(self.metric("ci_burst_image_build_duration_seconds"), 390.0)
         self.assertEqual(self.metric("ci_burst_image_console_latency_seconds"), 300.0)
+        text = (self.state_dir / image_pipeline.METRICS_FILE).read_text(encoding="utf-8")
+        self.assertIn(
+            "# HELP ci_burst_image_console_latency_seconds"
+            " Seconds from the build start to the latest sighting of the marker on the console.\n",
+            text,
+        )
         self.assertEqual(self.metric("ci_burst_image_consecutive_failures"), 0.0)
         self.assertEqual(self.metric("ci_burst_image_blocked"), 0.0)
         self.assertEqual(self.metric("ci_burst_image_candidate_waiting_seconds"), 0.0)

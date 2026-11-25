@@ -47,7 +47,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ci_burst.aws import Aws  # noqa: E402
+from ci_burst.aws import CREDENTIAL_FAILURES, Aws  # noqa: E402
 from ci_burst.config import load  # noqa: E402
 from ci_burst.credit import burstable  # noqa: E402
 from ci_burst.errors import ConfigRefusal, ProviderRefusal, Refusal  # noqa: E402
@@ -95,19 +95,7 @@ MAX_PARAMETER_PAGES = 100
 #: failures. A failure is reported by class name only: an exception message can
 #: contain a profile name, a file path or other setup detail that must not
 #: reach the output.
-_CREDENTIAL_FAILURES = frozenset(
-    {
-        "ProfileNotFound",
-        "NoCredentialsError",
-        "PartialCredentialsError",
-        "CredentialRetrievalError",
-        "SSOTokenLoadError",
-        "SSOError",
-        "TokenRetrievalError",
-        "ConfigParseError",
-        "InvalidConfigError",
-    }
-)
+_CREDENTIAL_FAILURES = CREDENTIAL_FAILURES
 
 #: Provider error codes that mean the named object does not exist. Every other
 #: error -- including AccessDenied, throttling and an unclassified exception --

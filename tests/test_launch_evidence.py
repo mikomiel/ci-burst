@@ -13,6 +13,7 @@ from ci_burst.launch_evidence import (
     FUTILE,
     FUTILE_LAUNCH_COUNT,
     FUTILE_LAUNCH_WINDOW_SECONDS,
+    MAX_RECORD_BYTES,
     REGISTERED,
     classify,
     read_launch_evidence,
@@ -29,6 +30,36 @@ def futile(age=60, index=1, **overrides):
 
 def registered(age=60, index=1, **overrides):
     return registered_record(NOW - age, index, **overrides)
+
+
+class CountingStream:
+    """Stand in for the stream that the reader opens and note each read it makes.
+
+    ``reads`` gets one ``(requested, returned)`` pair per read. ``before_read``
+    runs just before a read, which lets a test change the file after the reader
+    has taken its size.
+    """
+
+    def __init__(self, stream, reads, before_read=None):
+        self._stream = stream
+        self._reads = reads
+        self._before_read = before_read
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._stream.close()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    def read(self, size=-1):
+        if self._before_read is not None:
+            self._before_read()
+        data = self._stream.read(size)
+        self._reads.append((size, len(data)))
+        return data
 
 
 class ReaderCase(unittest.TestCase):
@@ -171,6 +202,28 @@ class EvidenceStateTests(ReaderCase):
         self.write(raw=raw)
         self.assertEqual(self.read().state, "malformed")
 
+    def test_a_nonstandard_json_constant_makes_the_file_malformed(self):
+        # ``json`` accepts these three words, but they are not JSON and ``export``
+        # never writes them. Each one sits in a field that the gate does not read,
+        # so the decoder refuses the file and no field rule does.
+        three = {f"i-0123456789abcde{index:02x}": futile(index=index) for index in range(3)}
+        self.write(payload={"version": STATE_VERSION, "instances": three})
+        self.assertTrue(self.read().holds, "without the constant the same records hold")
+        for word, constant in (("NaN", float("nan")), ("Infinity", float("inf")), ("-Infinity", float("-inf"))):
+            for place in ("an unread field of a record", "an unread top-level field"):
+                with self.subTest(constant=word, place=place):
+                    instances = dict(three)
+                    payload = {"version": STATE_VERSION, "instances": instances}
+                    if place == "an unread top-level field":
+                        payload["console_reads"] = constant
+                    else:
+                        instances["i-0123456789abcdef9"] = futile(index=9, first_seen=constant)
+                    self.write(payload=payload)
+                    self.assertIn(word.encode("ascii"), self.path.read_bytes())
+                    evidence = self.read()
+                    self.assertEqual(evidence.as_dict(), {"state": "malformed", "considered": 0, "futile": 0})
+                    self.assertFalse(evidence.holds)
+
     def test_a_null_or_unknown_provider_state_is_valid_and_not_ended(self):
         for state in (None, "unknown", "rebooting"):
             with self.subTest(state=state):
@@ -249,6 +302,72 @@ class NonRegularPathTests(ReaderCase):
         os.mkfifo(self.path)
         os.utime(self.path, (NOW - 7200, NOW - 7200))
         self.assert_unreadable(self.read_within_the_bound())
+
+
+class BoundedReadTests(ReaderCase):
+    """The reader decides from the open file before it reads any content.
+
+    Each file here holds three futile records and trailing spaces. That is valid
+    JSON, so a reader that parsed the file would hold, and the spaces make the
+    size. ``CountingStream`` shows what the reader asked of the stream.
+    """
+
+    def write_padded(self, size, *, mtime=NOW):
+        instances = {f"i-0123456789abcde{index:02x}": futile(index=index) for index in range(3)}
+        raw = json.dumps({"version": STATE_VERSION, "instances": instances}).encode("utf-8")
+        self.write(raw=raw + b" " * (size - len(raw)), mtime=mtime)
+
+    def read_noting_reads(self, before_read=None):
+        """Return the evidence and the ``(requested, returned)`` pair of each read."""
+        reads = []
+        real_open = open
+
+        def noting_open(*args, **kwargs):
+            return CountingStream(real_open(*args, **kwargs), reads, before_read)
+
+        with mock.patch("ci_burst.launch_evidence.open", noting_open):
+            return self.read(), reads
+
+    def test_the_bound_is_sixteen_mebibytes(self):
+        self.assertEqual(MAX_RECORD_BYTES, 16 * 1024 * 1024)
+
+    def test_a_file_at_the_bound_is_read_by_a_read_that_stops_one_byte_past_it(self):
+        self.write_padded(MAX_RECORD_BYTES)
+        evidence, reads = self.read_noting_reads()
+        self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 3})
+        self.assertTrue(evidence.holds)
+        self.assertEqual(reads, [(MAX_RECORD_BYTES + 1, MAX_RECORD_BYTES)])
+
+    def test_a_fresh_file_above_the_bound_is_malformed_and_is_not_read(self):
+        self.write_padded(MAX_RECORD_BYTES + 1)
+        evidence, reads = self.read_noting_reads()
+        self.assertEqual(evidence.as_dict(), {"state": "malformed", "considered": 0, "futile": 0})
+        self.assertFalse(evidence.holds)
+        self.assertEqual(reads, [])
+
+    def test_a_stale_file_above_the_bound_is_stale_and_is_not_read(self):
+        for name, mtime in (
+            ("past the staleness bound", NOW - EVIDENCE_MAX_AGE_SECONDS - 1),
+            ("dated in the future", NOW + 1),
+        ):
+            with self.subTest(name):
+                self.write_padded(MAX_RECORD_BYTES + 1, mtime=mtime)
+                evidence, reads = self.read_noting_reads()
+                self.assertEqual(evidence.as_dict(), {"state": "stale", "considered": 0, "futile": 0})
+                self.assertFalse(evidence.holds)
+                self.assertEqual(reads, [])
+
+    def test_a_file_that_grows_after_its_size_was_taken_is_malformed_and_read_only_to_the_bound(self):
+        self.write_padded(MAX_RECORD_BYTES)
+
+        def double():
+            with open(self.path, "ab") as stream:
+                stream.write(b" " * MAX_RECORD_BYTES)
+
+        evidence, reads = self.read_noting_reads(before_read=double)
+        self.assertEqual(evidence.as_dict(), {"state": "malformed", "considered": 0, "futile": 0})
+        self.assertFalse(evidence.holds)
+        self.assertEqual(reads, [(MAX_RECORD_BYTES + 1, MAX_RECORD_BYTES + 1)])
 
 
 class ExporterShapeTests(ReaderCase):

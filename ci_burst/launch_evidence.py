@@ -12,12 +12,20 @@ The reader opens one regular file read-only, without blocking and without
 following a link. It never writes, repairs, locks or deletes it, makes no
 provider, queue or ledger call, and never raises.
 
+The reader decides from the open descriptor before it reads a byte: a file that
+is not a regular one is ``unreadable``, a file outside the freshness bound is
+``stale`` whatever its size, and a file above ``MAX_RECORD_BYTES`` is
+``malformed``. It then reads at most one byte more than that bound, so a file
+that grows after its size was taken is ``malformed`` as well.
+
 The reader takes only closed-vocabulary facts that ``export`` has already
 validated, never console text. A field of the wrong type, an instance key that
 ``export`` rejects and a registration marker that ``export`` cannot write each
-drop the whole file. A value of the right type that ``export`` drops from
-``state``, ``operation`` or ``steps`` is no evidence, which is also what
-``export`` makes of it when it loads its own record, so it never creates a hold.
+drop the whole file, and so does a JSON constant that is not standard JSON
+(``NaN``, ``Infinity``, ``-Infinity``), which ``export`` never writes. A value
+of the right type that ``export`` drops from ``state``, ``operation`` or
+``steps`` is no evidence, which is also what ``export`` makes of it when it
+loads its own record, so it never creates a hold.
 The fields it reads, the record version and the rules that decide a shape are
 imported from ``export``; a contract test in ``tests/test_export.py`` fails when
 the two drift apart.
@@ -51,6 +59,13 @@ FUTILE_LAUNCH_WINDOW_SECONDS = 3600
 #: seconds before the controller clock. ``export`` rewrites it last on every
 #: successful run, so its modification time is a heartbeat.
 EVIDENCE_MAX_AGE_SECONDS = 600
+
+#: The reader accepts a record of at most this many bytes. ``export`` bounds the
+#: record by age (``STATE_RETENTION_SECONDS``) and not by size, so this is the
+#: reader's own bound. One instance serializes to about 0.7 to 1.3 KiB, so the
+#: bound holds about 13,000 to 23,000 instances. A larger file is ``malformed``
+#: and is not read, so the gate stays open.
+MAX_RECORD_BYTES = 16 * 1024 * 1024
 
 MISSING = "missing"
 UNREADABLE = "unreadable"
@@ -101,8 +116,10 @@ def read_launch_evidence(path, now):
     """Return the launch evidence in the record at ``path`` against the clock ``now``.
 
     The states are tested in the order ``missing``, ``unreadable``, ``stale``,
-    ``malformed``. A failure that this function did not foresee is ``unreadable``,
-    because a pass must not fail for an optional brake.
+    ``malformed``. A file above ``MAX_RECORD_BYTES`` is ``malformed``, and it is
+    tested after its age, so a stale file is ``stale`` whatever its size. A
+    failure that this function did not foresee is ``unreadable``, because a pass
+    must not fail for an optional brake.
     """
     try:
         return _read(path, now)
@@ -130,24 +147,39 @@ def _read(path, now):
         return LaunchEvidence(UNREADABLE)
     with stream:
         try:
-            # The type and the time come from the open descriptor, so a
+            # The type, the time and the size come from the open descriptor, so a
             # replacement of the path by ``export`` cannot pair one file's time
             # with another's content, and nothing is read from a file that is
-            # not a regular one.
+            # not a regular one, is not fresh or is above the bound.
             status = os.fstat(stream.fileno())
             if not stat.S_ISREG(status.st_mode):
                 return LaunchEvidence(UNREADABLE)
-            modified = status.st_mtime
-            raw = stream.read()
+            age = now - status.st_mtime
+            if not 0 <= age <= EVIDENCE_MAX_AGE_SECONDS:
+                return LaunchEvidence(STALE)
+            if status.st_size > MAX_RECORD_BYTES:
+                return LaunchEvidence(MALFORMED)
+            # One byte more than the bound shows a file that grew after its size
+            # was taken, without reading it whole.
+            raw = stream.read(MAX_RECORD_BYTES + 1)
         except OSError:
             return LaunchEvidence(UNREADABLE)
-    age = now - modified
-    if not 0 <= age <= EVIDENCE_MAX_AGE_SECONDS:
-        return LaunchEvidence(STALE)
+    if len(raw) > MAX_RECORD_BYTES:
+        return LaunchEvidence(MALFORMED)
     records = _records(raw, now)
     if records is None:
         return LaunchEvidence(MALFORMED)
     return _evaluate(records, now)
+
+
+def _refuse_constant(constant):
+    """Refuse ``NaN``, ``Infinity`` and ``-Infinity`` while the file is decoded.
+
+    ``json`` accepts them, but they are not JSON and ``export`` never writes one.
+    The error is a ``ValueError``, so the file is ``malformed`` and not
+    ``unreadable``.
+    """
+    raise ValueError(f"{constant} is not a JSON value")
 
 
 def _records(raw, now):
@@ -157,7 +189,7 @@ def _records(raw, now):
     records among the newest three.
     """
     try:
-        payload = json.loads(raw.decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"), parse_constant=_refuse_constant)
     except (UnicodeDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:

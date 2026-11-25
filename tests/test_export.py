@@ -1996,7 +1996,8 @@ class RecordCadenceTests(ExportCase):
     def test_the_events_of_a_run_that_failed_repeat_under_the_same_identities(self):
         # The record is the last file a run writes, so a run that fails earlier
         # has already published its events. Delivery stays at least once: the
-        # next run repeats them, and the identity lets a consumer drop the repeat.
+        # next run re-emits the markers it still finds, and the identity lets a
+        # consumer drop the repeat.
         old, exporter = self.fail_the_textfile({"i-0123456789abcdef0": CLEAN_BOOT})
         with self.assertRaises(OSError):
             self.run_export(exporter, now=NOW + 60)

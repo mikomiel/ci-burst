@@ -25,7 +25,9 @@ function of the instance and the marker, so a consumer can deduplicate the
 repeat that follows a crash between publishing an event and persisting the
 dedupe record; the alternative — persisting first — would lose a failure event
 instead of repeating it. The record is the last file a run writes, so a run that
-cannot write the metrics textfile repeats its events in the same way.
+cannot write the metrics textfile leaves it as it was. The next run reads the
+current consoles of the instances that the provider still lists and emits again,
+under the same identities, the markers it still finds.
 
 The dedupe record is derived observation, not decision state. Deleting it loses
 the emitted history and the cumulative counters. It influences admission in one

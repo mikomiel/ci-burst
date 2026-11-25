@@ -284,10 +284,13 @@ rewrite is also what makes rotation and the size bound possible.
 Delivery is at least once. `id` is derived from the instance and the marker, so
 a repeat after a crash between publishing an event and saving the dedupe record
 carries the same identity and a consumer can drop it. `export` saves the dedupe
-record last, after the textfile, so a run that cannot write the textfile reads
-the same consoles again on the next run and repeats its events, under the same
-identities. The repeats count against the event file bound, so a long textfile
-outage can push older lines out of the file. The dedupe record keeps what was
+record last, after the textfile, so a run that cannot write the textfile leaves
+the record as it was. The next run rediscovers the owned instances and reads
+their current consoles again, so a marker that it still finds is emitted again
+under the same identity. An instance that left the provider's inventory, or a
+marker that scrolled out of the console, is not emitted again. The repeats count
+against the event file bound, so a long textfile outage can push older lines out
+of the file. The dedupe record keeps what was
 already emitted and is pruned after seven days; deleting it loses the history and
 the cumulative counters. It can change a decision in one way only: `apply` and
 `plan` read the record as a brake after repeated futile launches (§ Futile launch
@@ -306,9 +309,17 @@ is never un-learned by a later empty console. `ci_burst_spend_micros`, `ci_burst
 read-only ledger, are gauges in micro-units, and are omitted — with a
 `ledger_omitted` note in the JSON result — when it cannot be read.
 `ci_burst_export_last_run_timestamp_seconds` is what a consumer uses to detect a
-stopped exporter. `export` writes the textfile before the dedupe record, so a run
-that fails at the record still advances this timestamp: the command exits 1 and
-the record ages, and only the failed unit shows it.
+stopped exporter, and a consumer sees a new value only after the textfile reaches
+the collector. `export` replaces the textfile at `--metrics-file` and then the
+dedupe record. In the shipped unit, `--metrics-file` is in the state directory
+and `ExecStartPost` publishes the textfile into the collector's directory.
+systemd runs `ExecStartPost` only after `export` exits 0. A run that fails at the
+record therefore exits 1 and publishes nothing: the collector's timestamp does
+not advance, the record ages, and the failed unit shows it. A unit that fails at
+the publication has already refreshed the record, and the collector's timestamp
+does not advance either. Where `--metrics-file` names the collector's own file,
+as in the commands above, the collector reads each textfile as soon as `export`
+replaces it, so a run that fails at the record still advances the timestamp.
 
 ### Bounds
 
@@ -1628,6 +1639,10 @@ longer covers it, so each pass would launch again. The hold thins that loop.
 `<ledger directory>/export/observed.json`. They never write it and make no other
 call to read it. They open it without blocking and read it only when it is a
 regular file that is not a link, so a FIFO at the path cannot stall a pass.
+They take the type, the age and the size from the open file and decide before
+they read a byte: a file that is not regular is `unreadable`, a file past the
+freshness bound is `stale` whatever its size, and a file above 16 MiB is
+`malformed`. They then read at most 16 MiB plus one byte.
 `--state-file` moves only the export run: the controller reads the default path
 and does not look anywhere else.
 
@@ -1675,19 +1690,26 @@ state is `fresh`. The states, in the order they are tested:
 | `missing` | no file at the path |
 | `unreadable` | the file cannot be opened or read, is not a regular file (a FIFO, a directory) or is a link, or the reader failed in a way it did not foresee |
 | `stale` | the modification time is more than 600 seconds old, or after the controller clock |
-| `malformed` | not UTF-8 JSON, another record version, or one record with a bad field the hold reads, an instance key that `export` rejects, or a registration marker (`job_process`, `spot_interruption`) of a shape that `export` does not write; the whole file is dropped |
+| `malformed` | larger than 16 MiB, not UTF-8 JSON (a `NaN`, `Infinity` or `-Infinity` constant counts as not JSON), another record version, or one record with a bad field the hold reads, an instance key that `export` rejects, or a registration marker (`job_process`, `spot_interruption`) of a shape that `export` does not write; the whole file is dropped |
 | `fresh` | the hold is evaluated |
 
 Only `fresh` evidence can hold. Every other state admits as if the hold did not
 exist, and every other admission check still applies to a launch the hold lets
 through. `export` stays optional: where it is absent, stopped or failing, the
-record turns `missing` or `stale` and admission behaves as before. `export`
-writes the record last, after the event file and the textfile, on every
-successful run, so its modification time is the heartbeat; a refused run, or a
-run that fails before it reaches the record (the textfile cannot be written, for
-example), lets it age. `export` creates the record owner-only, so a `plan` run as
-another user than the export unit reads `unreadable` and plans as if the hold
-were open.
+record turns `missing` or `stale` and admission behaves as before. The record's
+modification time is the heartbeat of the command's own work. `export` replaces
+the record as its last write, after the event file (when the run has events to
+add or the file exists) and the textfile, so only a run that completed those
+writes refreshes it; a refused run, or a run that fails before it reaches the
+record (the textfile cannot be written, for example), lets it age. The heartbeat
+does not cover publication. The shipped unit publishes the textfile into the
+collector's directory afterwards, from `ExecStartPost`, and a failure there
+leaves the record fresh: a hold still rests on the record, because the evidence
+in it was read, while the collector's copy of the textfile is not replaced. A run
+that fails at the record write does not reach that step, so the collector's
+last-run timestamp does not advance either (§ The metrics textfile). `export`
+creates the record owner-only, so a `plan` run as another user than the export
+unit reads `unreadable` and plans as if the hold were open.
 
 A hold ends on its own when a registered worker joins the newest three, when the
 oldest of the three leaves the window, or when the record stops being fresh. It
@@ -1716,10 +1738,18 @@ Known residual cases:
   records to later runs.
 - Only the shipped first-boot script prints the markers. Workers of another
   script are no evidence, and the hold never trips for them.
+- `export` bounds the record by its seven-day retention and not by size. The
+  reader accepts at most 16 MiB, which holds about 13,000 to 23,000 instances.
+  A fleet that launches more than about 77 to 138 workers per hour for seven
+  days passes that bound, and then every decision reports `malformed` and the
+  hold stays off.
 
 There is no acknowledgement command, and `status` does not report the hold,
-because it builds no admission decision. `plan` reports the same hold as
-`apply`. Two levers exist, and neither is a clean resume:
+because it builds no admission decision. For a pass that reaches new admission,
+`plan` reports the same hold as `apply`. A pass with an unresolved launch intent
+differs: `apply` retries that intent before it reaches the gate, so a hold does
+not stop the retry, while `plan` does not resume and, with a free slot, can
+report the hold (§ Claim grace). Two levers exist, and neither is a clean resume:
 
 | Lever | Effect |
 | --- | --- |

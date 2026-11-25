@@ -184,6 +184,33 @@ The controller MUST read the evidence only from `observed.json` in the `export` 
 - **WHEN** `plan` or `apply` runs
 - **THEN** the bytes and the modification time of the record are unchanged
 
+### Requirement: The evidence read is bounded and decided from the open file
+The controller MUST take the type, the modification time and the size of the record from the open file and decide before it reads any content. It MUST read at most 16 MiB plus one byte and MUST treat a file above 16 MiB as `malformed`. It MUST refuse the JSON constants `NaN`, `Infinity` and `-Infinity` when it decodes the file, so a file that holds one is `malformed`.
+
+#### Scenario: The file holds a nonstandard JSON constant
+- **WHEN** the file's modification time is fresh and the file holds `NaN`, `Infinity` or `-Infinity`, in a field that the gate reads or in one that it does not
+- **THEN** the evidence state is `malformed` for the whole file
+- **AND** three futile records in the same file do not hold admission
+
+#### Scenario: The file is larger than the size bound
+- **WHEN** the file's modification time is fresh and the file is larger than 16 MiB
+- **THEN** the evidence state is `malformed`
+- **AND** the controller reads none of its content, and the gate is open
+
+#### Scenario: A stale file is not read whatever its size
+- **WHEN** the file is larger than 16 MiB and its modification time is more than 600 seconds before the controller clock, or after it
+- **THEN** the evidence state is `stale`
+- **AND** the controller reads none of its content, and the gate is open
+
+#### Scenario: The file is exactly at the size bound
+- **WHEN** the file's modification time is fresh and the file is exactly 16 MiB
+- **THEN** the controller reads it and the evidence state is the one its content gives
+
+#### Scenario: The file grows past the size bound while it is read
+- **WHEN** the file grows past 16 MiB after the controller took its size
+- **THEN** the controller reads at most 16 MiB plus one byte
+- **AND** the evidence state is `malformed` and the gate is open
+
 ### Requirement: A decision reports the launch evidence it read
 Every decision that reaches the gate MUST report `launch_evidence` with the evidence `state`, the `considered` count and the `futile` count, and the counts MUST be 0 unless the state is `fresh`. A decision that ends before the gate MUST NOT carry it. A result that ends before admission computes a decision, such as a deadline deferral, is not required to carry it. `status` builds no admission decision and is not required to report the gate.
 
@@ -201,7 +228,7 @@ Every decision that reaches the gate MUST report `launch_evidence` with the evid
 - **THEN** it carries no `launch_evidence`
 
 #### Scenario: Planning reports the same hold as apply
-- **WHEN** `plan` reads the same unchanged record as an `apply` and the ledger matches the provider inventory
+- **WHEN** `plan` reads the same unchanged record as an `apply`, the ledger matches the provider inventory and the `apply` has no unresolved intent to retry
 - **THEN** the plan reports the same `launch_evidence`, reason and `launch_count` that the `apply` would use
 - **AND** no launch intent, reservation or instance is created
 

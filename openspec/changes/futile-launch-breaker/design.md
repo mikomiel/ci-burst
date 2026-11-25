@@ -136,7 +136,7 @@ the gate.
 | What orders and ages a record? | `seen`. | It stops changing when the record finishes, because `export` never reads a finished record again. Every loaded record has one, because `export` drops a record without a usable `seen`. `first_seen` can be null, and the ledger's creation time needs a join that a record without an operation cannot make. |
 | Is a window edge inside? | Yes. An age of at most 3600 seconds is inside. | One rule for both edges. |
 | What does a tie do? | The considered set takes every worker equal to the third. | The verdict never depends on opaque instance identifiers, and a tie that hides a registered worker opens the gate. |
-| How is freshness judged? | By the file's modification time, at most 600 seconds old. | Version 2 of the record has no generation time. `export` writes the file last, after the event file and the textfile, on every successful run, so the time is a heartbeat, and a refused, failed or stopped run lets it age. The reader takes the time from the open descriptor, so a replacement by `export` cannot pair one file's time with another file's content. |
+| How is freshness judged? | By the file's modification time, at most 600 seconds old. | Version 2 of the record has no generation time. `export` replaces the file as its last write, after the event file (when the run has events to add or the file exists) and the textfile, on every successful run, so the time is a heartbeat of the command's own writes, and a refused, failed or stopped run lets it age. The heartbeat does not cover the publication of the textfile into the collector's directory, which the unit does afterwards (see "Failure behaviour"). The reader takes the time from the open descriptor, so a replacement by `export` cannot pair one file's time with another file's content. |
 | What is a time after the controller clock? | The file is `stale`. A record with such a `seen` makes the file `malformed`. | An age that cannot be established is not evidence. |
 
 A rebuilt record is stamped with the time of the run that rebuilds it. `export`
@@ -200,14 +200,17 @@ spend or access.
 | No file | `missing`. Admission continues as before. |
 | The file cannot be opened or read | `unreadable`. |
 | The path is not a regular file, such as a FIFO or a directory, or is a link | `unreadable`. The reader opens the path without blocking and checks the type of the open descriptor before it reads, so a FIFO with no writer cannot stall a pass that holds the ledger writer lock. `export` replaces the record by a rename of a regular file, so a link is not its output. |
-| The file is older than 600 seconds, or dated in the future | `stale`. |
+| The file is older than 600 seconds, or dated in the future | `stale`. The reader reads none of the content, whatever the size. |
+| The file is larger than 16 MiB | `malformed`, tested after the age, so a stale file is `stale` whatever its size. The reader takes the size from the open descriptor and reads no content. A file that grows past the bound after the size was taken is read to 16 MiB plus one byte and is `malformed` too. `malformed` fits because the file is not a record that `export` writes within the bound, and the order of the states keeps the size test after the age test. `unreadable` would say that the file cannot be read, and it can. |
+| The file holds `NaN`, `Infinity` or `-Infinity` | `malformed`. The decoder refuses the three constants, because they are not JSON and `export` never writes them. No field rule decides it, so a constant in a field that the gate does not read drops the file too. |
 | The file is not UTF-8 JSON, has another version, or holds a record with a bad field | `malformed`. The whole file is dropped, because a skipped record could leave older futile records among the newest three. |
 | An `instances` key that `export` rejects, or a `job_process` or `spot_interruption` value that `export` cannot write | `malformed`. The reader asks the rule that `export` applies when it loads its own record, so a record under a key that is not an instance identifier, or an empty list read as registration evidence, cannot steer the gate. |
 | A record's provider state is null, or text outside the known six | That record has not ended. The file stays usable. `export` writes `unknown` for a state it cannot label, turns it into null when it next loads the record, and keeps that null until the record is pruned. |
 | The file's owner-only mode denies a reader that runs as another user | `unreadable`. `export` creates the file through a temporary file, which is owner-only. |
 | `export` refused its last run, or its unit stopped | The file ages and reads as `stale` after 600 seconds. |
-| `export` cannot write its textfile | The record is written after the textfile, so it is not refreshed and reads as `stale` after 600 seconds. Events published before the failure repeat on the next run under the same identities, and the consoles are read again, because no record of the failed run was saved. The repeats count against the event file bound, so a long outage can push older lines out of the file. |
-| `export` writes its textfile and cannot write the record | The textfile carries the new run time, so an alert on a stopped exporter stays quiet, while the record is not refreshed and reads as `stale` after 600 seconds. The command exits 1, so the failed unit is the signal, and the hold fails open. |
+| `export` cannot write its textfile | The record is written after the textfile, so it is not refreshed and reads as `stale` after 600 seconds. The run had published its events before the failure, and no record of the run was saved, so the next run rediscovers the owned instances and reads their current consoles again. A marker that it still finds is emitted again under the same identity. An instance that left the provider's inventory, or a marker that scrolled out of the console, is not emitted again. The repeats count against the event file bound, so a long outage can push older lines out of the file. |
+| `export` writes its textfile and cannot write the record | The record is not refreshed and reads as `stale` after 600 seconds, and the hold fails open. The command exits 1, so the failed unit is the signal. The shipped unit publishes the textfile into the collector's directory only after a successful command, so it does not publish here: the collector's copy is not replaced and its last-run timestamp does not advance either. Only where `--metrics-file` names the collector's own file does the new timestamp reach the collector. |
+| The shipped unit cannot publish the textfile after a successful run | `export` has already written the record, so it stays `fresh`, and a hold still rests on it, because the evidence in it was read. The collector's copy of the textfile is not replaced, so its last-run timestamp does not advance, and the failed unit is the signal. |
 | `export` writes to another path with `--state-file` | The default path reads as `missing` or `stale`. The reader never searches. |
 | A failure the reader did not foresee | `unreadable`. The reader never raises, because a pass must not fail for an optional brake. |
 | Two passes read while `export` replaces the file | Each pass sees one whole file. `export` replaces it atomically. |
@@ -222,7 +225,9 @@ refusal does, so the unit records a non-zero exit while the gate holds.
 
 `status` is a non-goal. It builds no admission decision, so it has no verdict to
 report, and evaluating the gate there would add a second code path for one
-decision. `plan` reports the same hold as `apply`, because both call `_decide`.
+decision. For a pass that reaches new admission, `plan` reports the same hold as
+`apply`, because both call `_decide`; `apply` first retries an unresolved intent,
+which `plan` does not.
 
 ## Alternatives
 
@@ -240,13 +245,16 @@ decision. `plan` reports the same hold as `apply`, because both call `_decide`.
 - A cool-down that `apply` persists. Declined: it adds durable state for what the
   window already derives from existing evidence.
 - Write the record before the textfile, as `export` first did. Declined: a run
-  that fails at its textfile would still refresh the heartbeat and keep a hold
-  fresh while the unit fails. The order taken costs a repeat: while the textfile
-  cannot be written, each run reads the same consoles again and repeats its
-  events under the same identities, which at-least-once delivery allows. The
-  repeats count against the event file bound, so a long outage can push older
-  lines out of the file, and a failure of the last write alone leaves a textfile
-  that is newer than the record.
+  that fails at its own textfile write would still refresh the heartbeat and keep
+  a hold fresh while the command fails. The order guards the command's own
+  writes and not the publication that follows them: a unit that fails at
+  publication still leaves a fresh record, and the hold rests on it because its
+  evidence was read. The order taken costs a repeat: while the textfile cannot be
+  written, each run reads the current consoles again and emits again, under the
+  same identities, the markers it still finds, which at-least-once delivery
+  allows. The repeats count against the event file bound, so a long outage can
+  push older lines out of the file, and a failure of the last write alone leaves
+  a textfile that is newer than the record.
 
 ## Rollback
 
@@ -277,11 +285,15 @@ image runs, the blunt lever above is the only way to open the gate early.
   record's version or fields disables the gate silently unless that test fails.
 - Only the shipped first-boot script's markers are known. Another script prints
   none of them, and its workers are no evidence.
-- The reader sets no size bound, because `export` sets none when it loads the same
-  file. A fixed bound would be a judgment that can fail silently. One worst-case
-  record serializes to about one KiB and the retention is seven days, so a bound of
-  8 MiB would be passed at about 48 launches per hour, and a busy healthy fleet
-  would then read as `malformed` for good.
+- `export` bounds the record by its seven-day retention and not by size, so the
+  reader sets its own bound of 16 MiB and reads a larger file as `malformed`
+  without reading it. One instance serializes to about 0.7 KiB for a typical
+  record and about 1.3 KiB for one that holds every closed-vocabulary value at its
+  longest, so the bound holds about 13,000 to 23,000 instances. A fleet that
+  launches more than about 77 to 138 workers per hour for the whole retention
+  passes it, and then every decision reports `malformed` and the hold stays off.
+  That is the fail-open direction, and `launch_evidence` shows the state on every
+  decision, so the loss of the gate is visible and not silent.
 
 ## Open questions
 

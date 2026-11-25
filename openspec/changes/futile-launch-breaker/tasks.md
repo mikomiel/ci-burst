@@ -19,12 +19,17 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   final provider states, the operation pattern and the constant from 1.2 from
   `ci_burst/export.py`.
 - [x] 1.4 Open the file once, without blocking and without following a link,
-  take the type and the modification time from the open descriptor, and read the
-  file whole only when it is a regular file. A FIFO with no writer would block a
-  plain open while `apply` holds the ledger writer lock. Test the states in the
-  order `missing`, `unreadable`, `stale`, `malformed`. The function never raises,
-  never writes, repairs, locks or deletes, and maps a path that is not a regular
-  file, a link and any failure it did not foresee to `unreadable`.
+  take the type, the modification time and the size from the open descriptor, and
+  decide before it reads any content. Read the file only when it is a regular
+  file, is fresh and is at most 16 MiB, and then read at most 16 MiB plus one
+  byte. A file above 16 MiB, or one that grows past it after its size was taken,
+  is `malformed`. A FIFO with no writer would block a plain open while `apply`
+  holds the ledger writer lock. Test the states in the order `missing`,
+  `unreadable`, `stale`, `malformed`. Decode the JSON with a hook that refuses
+  `NaN`, `Infinity` and `-Infinity`, so a file that holds one is `malformed`. The
+  function never raises, never writes, repairs, locks or deletes, and maps a path
+  that is not a regular file, a link and any failure it did not foresee to
+  `unreadable`.
 - [x] 1.5 Define the fixed values as named constants: 3 workers, a window of 3600
   seconds and a staleness bound of 600 seconds. Offer no configuration key and no
   off switch for them.
@@ -71,7 +76,13 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   not hang the run. A key that `export` rejects and each marker value that
   `export` cannot write make the file `malformed`, including values that are not
   hashable. The staleness cases set the file's modification time explicitly with
-  `os.utime`, because the fake clock is not wall time.
+  `os.utime`, because the fake clock is not wall time. A file above 16 MiB is
+  `malformed` when it is fresh and `stale` when it is not, and neither is read,
+  which a stand-in for the opened stream shows. A file at exactly 16 MiB is read
+  by one read of at most 16 MiB plus one byte. A file that grows past the bound
+  after its size was taken is `malformed` and is read only to the bound. A `NaN`,
+  `Infinity` or `-Infinity` constant in a field that the gate does not read makes
+  the file `malformed`.
 - [x] 3.2 Classification tests cover futile; registered by the registration step;
   registered by a later marker with the registration line lost; no exit marker;
   an instance that has not ended, including a registered one that still runs; no
@@ -97,8 +108,9 @@ instance identifiers and 32-character hexadecimal operation identifiers.
 - [x] 3.4 Exporter tests show that a successful run with nothing new still
   rewrites the record and advances its modification time, that a refused run
   leaves it unrewritten, that a run that cannot write its textfile leaves it
-  unrewritten and repeats its events on the next run under the same identities, and
-  that a deleted record is rebuilt with the rebuilding run's time.
+  unrewritten and that the next run emits again, under the same identities, the
+  markers it still finds, and that a deleted record is rebuilt with the rebuilding
+  run's time.
 - [x] 3.5 Controller tests add one class beside `ClaimGraceTests` in
   `tests/test_controller.py`. They cover the hold with its single reason and its
   `launch_evidence`; no template read and no price read on a hold, checked
@@ -127,9 +139,11 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   in "Claim grace" with the gate, correct the sentence in "Worker evidence" that
   says deleting the dedupe record never changes a decision, add that `export`
   saves the dedupe record after the textfile, that the repeats of a run that
-  failed count against the event file bound, and that a run which fails at the
-  record still advances the textfile's last-run time, and note in "Launch
-  decision and capacity fallback" that a hold comes before the template read.
+  failed count against the event file bound, that a run which fails at the record
+  exits 1 before the unit publishes the textfile, so the collector's last-run
+  time does not advance, and that a unit which fails at publication keeps the
+  record fresh, and note in "Launch decision and capacity fallback" that a hold
+  comes before the template read.
 - [x] 4.3 In `docs/deployment.md` and `docs/container.md`, replace the wording
   that the observation unit is "independent of admission": it is optional and
   launches nothing, but where it runs, `apply` reads its record as a brake.

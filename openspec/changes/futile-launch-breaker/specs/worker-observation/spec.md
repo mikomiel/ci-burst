@@ -10,7 +10,10 @@ derived observation. The record MUST NOT influence admission, launch or
 termination, except through the one read-only brake that the bounded-operation
 capability defines, which only withholds launches. The command MUST rewrite the
 record at the end of every successful run, even when nothing changed, because the
-file's modification time is that brake's freshness signal. A change to the
+file's modification time is that brake's freshness signal. That time marks the
+command's own writes, which end with the record. It does not mark the publication
+of the metrics textfile into the collector's directory, which the unit that runs
+the command does afterwards. A change to the
 record's version or to a field that the brake reads MUST ship with the matching
 change to the brake's reader.
 
@@ -32,7 +35,20 @@ change to the brake's reader.
 - **WHEN** a run cannot replace the metrics textfile, so the command exits 1
 - **THEN** the record is not rewritten, because the command writes the record after the event file and the textfile
 - **AND** its modification time ages, so the brake sees it as `stale` after 600 seconds
-- **AND** the next successful run repeats the events of the failed run under the same identities
+- **AND** the next run rediscovers the owned instances and reads their current consoles again, so a marker that it still finds is emitted again under the same identity
+- **AND** an instance that left the provider's inventory, or a marker that scrolled out of the console, is not emitted again
+
+#### Scenario: A run that cannot write the record does not reach publication
+- **WHEN** a run replaces the metrics textfile and cannot replace the record, so the command exits 1
+- **THEN** the record is not rewritten and its modification time ages, so the brake sees it as `stale` after 600 seconds
+- **AND** the shipped unit does not publish the textfile into the collector's directory, because that step follows only a successful command
+- **AND** the collector's last-run timestamp does not advance either
+
+#### Scenario: The unit cannot publish the textfile
+- **WHEN** a run completes and writes the record, and the shipped unit then cannot publish the textfile into the collector's directory
+- **THEN** the record's modification time has advanced, so the brake sees the record as `fresh`
+- **AND** a hold still rests on the record, because the evidence in it was read
+- **AND** the collector's copy of the textfile is not replaced, so its last-run timestamp does not advance
 
 #### Scenario: The record is deleted
 - **WHEN** the record is deleted

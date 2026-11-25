@@ -91,7 +91,7 @@ that sets the version.
 | `python3` and its `yaml` module (`python3-yaml`); no `pip` ([warm-image.md](../../../docs/warm-image.md#pip)) | package (Debian apt) | not pinned | 68 |
 | `aws` (`awscli`), `iptables`; the bootstrap uses both as root | package (Debian apt) | not pinned | 68 |
 | `postgres` and `initdb` in `/usr/lib/postgresql/*/bin/`, not on `PATH`; `psql` | package (Debian apt); `psql` arrives as a dependency of `postgresql-17` | major version 17 in the package name, minor version not pinned | 69; checks 204-205, 214-222 |
-| `Xvfb`, `xvfb-run` (`xvfb`) | package (Debian apt) | not pinned | 69 |
+| `Xvfb` (`xvfb`); not `xvfb-run`, which needs `xauth`, and the recipe installs no recommended package | package (Debian apt) | not pinned | 69 |
 | `ca-certificates`, `zlib1g`, fonts (`fonts-*`, `xfonts-scalable`) and shared libraries (`lib*`) for a browser; no browser is installed | package (Debian apt) | not pinned | 66, 69-75 |
 | `tar`, `flock`, `systemd-tmpfiles`, `dpkg-query` | Debian 13 base image; the recipe does not install them, and its probe fails the build when one is missing | not pinned | 204 |
 
@@ -108,11 +108,18 @@ rely on them. [`docs/warm-image.md`](../../../docs/warm-image.md) owns the layer
 
 ### Qualify a heavy job
 
-To qualify a heavy job, run it once on a burst worker. A burst worker is a worker
-that ci-burst launched from this image. If the job needs a tool that is not
-listed, add the tool to [`provision.sh`](provision.sh) and add its row to the
-table in the same change. The tool reaches workers only through a new image and a
-new launch-template version ([Build](#build)).
+A passing run alone does not qualify a job: a job that does not find a tool can
+skip the checks that need it and still pass
+([operations.md](../../../docs/operations.md#worker-image-and-launch-template)). To qualify a heavy job:
+
+1. Make the job fail when a tool it needs is absent, instead of skipping.
+2. Run it on a burst worker, a worker that ci-burst launched from this image.
+3. Check from its log that the intended checks ran, not only that it passed.
+
+If the job needs a tool that is not listed, add the tool to
+[`provision.sh`](provision.sh) and its row to the table in the same change, and
+qualify the job again on the new image. The tool reaches workers only through a
+new image and a new launch-template version ([Build](#build)).
 
 ## Deployment-specific provenance
 

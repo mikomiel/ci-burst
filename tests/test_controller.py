@@ -2064,13 +2064,15 @@ class FleetTests(ControllerCase):
         self.assertEqual(ledger.operation("second").state, "uncertain")
         self.assertEqual(ledger.operation("first").state, "intent")
 
-    def assert_resume_refused_for_lifetime(self, operation_id, expires_at):
+    def assert_resume_refused_for_lifetime(
+        self, operation_id, expires_at, reason="unresolved_intent_lifetime_mismatch"
+    ):
         """Apply with one seeded intent and check the refusal left it untouched."""
         before = self.reopened().operation(operation_id)
         controller = self.build(observation=observation_demand())
         result = controller.apply()
         self.assertEqual(result["decision"], "refused")
-        self.assertEqual(result["reasons"], ["unresolved_intent_lifetime_mismatch"])
+        self.assertEqual(result["reasons"], [reason])
         self.assertEqual(result["operation"], operation_id)
         self.assertEqual(result["expires_at"], expires_at)
         self.assertEqual([call for call in self.aws.calls if call[0] == "run_spot"], [])
@@ -2114,6 +2116,45 @@ class FleetTests(ControllerCase):
         self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1)
         self.assertEqual(result["resumes"][0]["decision"], "resumed")
         self.assertEqual(result["resumes"][0]["expires_at"], expiry)
+
+    def test_resume_refuses_an_intent_older_than_the_resume_age(self):
+        # The expiry tag counts from the batch's admission and the worker's own lifetime from its boot, so every late
+        # send shortens the tag; past 900 seconds of intent age the resume is refused instead of sent (#222).
+        # The intent is refused with its ownership kept, although the provider would accept the request. 3599 seconds
+        # is the last age before the intent's own lifetime elapses.
+        for age in (900.5, 901, 1800, 3599):
+            with self.subTest(age=age):
+                self.setUp()
+                self.seed(state="intent", instance_id=None, operation_id="late", age=age)
+                self.assert_resume_refused_for_lifetime(
+                    "late", self.clock.now - age + 3600, reason="unresolved_intent_lifetime_short"
+                )
+
+    def test_resume_sends_an_intent_up_to_the_resume_age(self):
+        # The limit is exclusive of its own value: an intent exactly 900 seconds old is still sent, a greater age is
+        # not (#222).
+        for age in (0, 60, 350, 899, 900):
+            with self.subTest(age=age):
+                self.setUp()
+                self.seed(state="intent", instance_id=None, operation_id="prompt", age=age)
+                self.assertEqual(self.clock.now - self.reopened().operation("prompt").created_at, age)
+                result = self.build(observation=observation_demand()).apply()
+                self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1)
+                self.assertEqual(result["decision"], "resumed")
+                self.assertEqual(result["resumes"][0]["decision"], "resumed")
+                self.assertEqual(self.reopened().operation("prompt").state, "starting")
+
+    def test_resume_reports_the_lifetime_mismatch_before_the_resume_age(self):
+        # A legacy row that is also older than the resume age keeps the reason that the upgrade documentation names.
+        # The row is 901 seconds old and its own lifetime has not elapsed, so the age check and the mismatch check both
+        # apply and only their order decides the reason.
+        age = 901
+        self.seed(state="intent", instance_id=None, operation_id="legacy", age=age, admitted_lifetime_seconds=None)
+        legacy = self.reopened().operation("legacy")
+        self.assertIsNone(legacy.admitted_lifetime_seconds)
+        self.assertGreater(self.clock.now - legacy.created_at, 900, "older than the resume age")
+        self.assertGreater(legacy.expires_at, self.clock.now, "its own lifetime has not elapsed")
+        self.assert_resume_refused_for_lifetime("legacy", self.clock.now - age + 3600)
 
     def test_apply_refuses_another_worker_lifetime_before_any_state_or_provider_call(self):
         config = load(write_config(self.root, config={"aws": {"max_lifetime_seconds": 1800}}))

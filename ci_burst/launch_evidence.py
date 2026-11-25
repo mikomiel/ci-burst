@@ -1,0 +1,216 @@
+"""Read-only launch evidence: a brake after repeated futile launches.
+
+A worker that cannot register ends within minutes, its slot frees, and the job
+it was launched for still waits, so the next pass launches again. This module
+reads the observation record that ``export`` writes beside the ledger and tells
+admission whether the most recent finished workers all ended without
+registering.
+
+The record can only withhold a launch. It never authorizes one, so a missing,
+unreadable, stale or malformed record is no evidence and the gate stays open.
+The reader opens one file read-only. It never writes, repairs, locks or deletes
+it, makes no provider, queue or ledger call, and never raises.
+
+The reader takes only closed-vocabulary facts that ``export`` has already
+validated, never console text. The fields it reads and the record version are
+imported from ``export``; a contract test in ``tests/test_export.py`` fails when
+the two drift apart.
+"""
+
+import json
+import os
+from dataclasses import dataclass
+
+from .export import (
+    CONSOLE_FINAL_STATES,
+    OPERATION_PATTERN,
+    POST_REGISTRATION_STEPS,
+    STATE_VERSION,
+    _number,
+)
+
+#: A hold needs at least this many considered workers, all futile.
+FUTILE_LAUNCH_COUNT = 3
+
+#: A worker is considered while the controller clock minus its ``seen`` is at
+#: most this many seconds.
+FUTILE_LAUNCH_WINDOW_SECONDS = 3600
+
+#: The record is evidence while its modification time is at most this many
+#: seconds before the controller clock. ``export`` rewrites it on every
+#: successful run, so its modification time is a heartbeat.
+EVIDENCE_MAX_AGE_SECONDS = 600
+
+MISSING = "missing"
+UNREADABLE = "unreadable"
+STALE = "stale"
+MALFORMED = "malformed"
+FRESH = "fresh"
+
+REGISTERED = "registered"
+FUTILE = "futile"
+
+#: The fields the gate reads in every record. Each one must be present: a
+#: renamed field would otherwise read as null and could turn a registered
+#: worker into a futile one.
+RECORD_FIELDS = (
+    "seen",
+    "state",
+    "operation",
+    "exit_code",
+    "job_process",
+    "spot_interruption",
+    "steps",
+    "registered",
+)
+
+
+@dataclass(frozen=True)
+class LaunchEvidence:
+    """The evidence state and, when it is fresh, the considered and futile counts."""
+
+    state: str
+    considered: int = 0
+    futile: int = 0
+
+    @property
+    def holds(self):
+        """True when the considered workers are enough and every one is futile."""
+        return (
+            self.state == FRESH
+            and self.considered >= FUTILE_LAUNCH_COUNT
+            and self.futile == self.considered
+        )
+
+    def as_dict(self):
+        return {"state": self.state, "considered": self.considered, "futile": self.futile}
+
+
+def read_launch_evidence(path, now):
+    """Return the launch evidence in the record at ``path`` against the clock ``now``.
+
+    The states are tested in the order ``missing``, ``unreadable``, ``stale``,
+    ``malformed``. A failure that this function did not foresee is ``unreadable``,
+    because a pass must not fail for an optional brake.
+    """
+    try:
+        return _read(path, now)
+    except Exception:  # noqa: BLE001 - an optional brake never fails the pass
+        return LaunchEvidence(UNREADABLE)
+
+
+def _read(path, now):
+    try:
+        stream = open(path, "rb")
+    except FileNotFoundError:
+        return LaunchEvidence(MISSING)
+    except OSError:
+        return LaunchEvidence(UNREADABLE)
+    with stream:
+        try:
+            # The time comes from the open descriptor, so an atomic replacement
+            # by ``export`` cannot pair one file's time with another's content.
+            modified = os.fstat(stream.fileno()).st_mtime
+            raw = stream.read()
+        except OSError:
+            return LaunchEvidence(UNREADABLE)
+    age = now - modified
+    if not 0 <= age <= EVIDENCE_MAX_AGE_SECONDS:
+        return LaunchEvidence(STALE)
+    records = _records(raw, now)
+    if records is None:
+        return LaunchEvidence(MALFORMED)
+    return _evaluate(records, now)
+
+
+def _records(raw, now):
+    """Return the validated records, or ``None`` when the file is malformed.
+
+    One invalid record drops the whole file: skipping it could leave older futile
+    records among the newest three.
+    """
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:
+        return None
+    instances = payload.get("instances")
+    if not isinstance(instances, dict):
+        return None
+    records = []
+    for record in instances.values():
+        if not _record_is_valid(record, now):
+            return None
+        records.append(record)
+    return records
+
+
+def _record_is_valid(record, now):
+    if not isinstance(record, dict) or any(key not in record for key in RECORD_FIELDS):
+        return False
+    # The exporter's own timestamp rule: a finite number that is not a boolean.
+    seen = _number(record["seen"])
+    if seen is None or seen > now:
+        return False
+    for key in ("state", "operation"):
+        if record[key] is not None and not isinstance(record[key], str):
+            return False
+    exit_code = record["exit_code"]
+    if exit_code is not None and (type(exit_code) is not int or not 0 <= exit_code <= 255):
+        return False
+    for key in ("job_process", "spot_interruption"):
+        if record[key] is not None and not isinstance(record[key], list):
+            return False
+    steps = record["steps"]
+    if not isinstance(steps, list) or not all(isinstance(step, str) for step in steps):
+        return False
+    return isinstance(record["registered"], bool)
+
+
+def classify(record):
+    """Return ``registered``, ``futile`` or ``None`` (no evidence) for one valid record.
+
+    Only a record that shows the instance ended and carries an operation of this
+    deployment is classified. Registration evidence is the registration step, a
+    step printed only after it, a one-job process outcome or a Spot interruption
+    notice. Futile needs the exit marker, which shows the console was read after
+    the script reached its end, and no registration evidence.
+    """
+    if record["state"] not in CONSOLE_FINAL_STATES:
+        return None
+    operation = record["operation"]
+    if not isinstance(operation, str) or OPERATION_PATTERN.fullmatch(operation) is None:
+        return None
+    steps = set(record["steps"])
+    if (
+        record["registered"]
+        or "register" in steps
+        or steps & POST_REGISTRATION_STEPS
+        or record["job_process"] is not None
+        or record["spot_interruption"] is not None
+    ):
+        return REGISTERED
+    if record["exit_code"] is not None:
+        return FUTILE
+    return None
+
+
+def _evaluate(records, now):
+    """Count the considered workers and the futile ones among them."""
+    classified = []
+    for record in records:
+        verdict = classify(record)
+        if verdict is None:
+            continue
+        seen = float(record["seen"])
+        if now - seen <= FUTILE_LAUNCH_WINDOW_SECONDS:
+            classified.append((seen, verdict))
+    classified.sort(key=lambda item: item[0], reverse=True)
+    if len(classified) > FUTILE_LAUNCH_COUNT:
+        # Every worker that ties the last place is considered, so the verdict
+        # never depends on the order of opaque instance identifiers.
+        third = classified[FUTILE_LAUNCH_COUNT - 1][0]
+        classified = [item for item in classified if item[0] >= third]
+    futile = sum(1 for _, verdict in classified if verdict == FUTILE)
+    return LaunchEvidence(FRESH, considered=len(classified), futile=futile)

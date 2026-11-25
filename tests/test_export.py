@@ -1,7 +1,9 @@
 import io
 import dataclasses
 import json
+import os
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -14,13 +16,17 @@ from ci_burst.export import (
     EVENT_SCHEMA,
     MAX_CONSOLE_READS,
     MAX_EVENTS_BYTES,
+    POST_REGISTRATION_STEPS,
+    STEP_NAMES,
     Exporter,
+    default_record_path,
     load_state,
     parse_console,
     prune_state,
 )
+from ci_burst.launch_evidence import FUTILE, REGISTERED, classify, read_launch_evidence
 
-from support import FakeAws, instance, write_config
+from support import FakeAws, instance, operation_hex, write_config
 
 NOW = 1_800_000_000.0
 
@@ -1712,6 +1718,136 @@ class ObservationRefusesOnlyWhenOwnedInstancesExceedTheLimitTests(ExportCase):
         self.assertNotIn("above_configured_limit", result["notes"])
         read = set(self.console_read_calls(exporter)[0])
         self.assertEqual(read & {item.instance_id for item in live}, {item.instance_id for item in live})
+
+
+class LaunchEvidenceContractTests(ExportCase):
+    """The record that ``export`` writes is the one the launch evidence reader reads.
+
+    These tests run the real exporter. A change to the record version, to a
+    field the reader takes or to the write cadence fails here.
+    """
+
+    FUTILE_ID = "i-0123456789abcdea0"
+    REGISTERED_ID = "i-0123456789abcdea1"
+    KILLED_ID = "i-0123456789abcdea2"
+    EMPTY_ID = "i-0123456789abcdea3"
+    UNLABELLED_ID = "i-0123456789abcdea4"
+
+    def owned(self, instance_id, index, state="terminated"):
+        return instance(instance_id, state=state, operation=operation_hex(index), zone="eu-central-1a")
+
+    def records(self):
+        return json.loads(self.state_file.read_text())["instances"]
+
+    def test_the_default_record_path_is_the_one_beside_the_ledger(self):
+        exporter = self.build([], {})
+        self.assertEqual(default_record_path(exporter.config.state.database), self.state_file)
+
+    def test_the_post_registration_steps_are_shipped_steps_after_the_register_step(self):
+        self.assertTrue(POST_REGISTRATION_STEPS)
+        self.assertLessEqual(POST_REGISTRATION_STEPS, STEP_NAMES)
+        self.assertNotIn("register", POST_REGISTRATION_STEPS)
+
+    def test_the_reader_classifies_what_the_exporter_writes(self):
+        never_registered = (
+            "cloud-init: STEP mount-options\n"
+            "cloud-init: level=error msg=\"failed to register runner\"\n"
+            "cloud-init: bootstrap exiting rc=1\n"
+        )
+        killed = "cloud-init: STEP mount-options\ncloud-init: STEP register\n"
+        owned = [
+            self.owned(self.FUTILE_ID, 1),
+            self.owned(self.REGISTERED_ID, 2),
+            self.owned(self.KILLED_ID, 3),
+            self.owned(self.EMPTY_ID, 4),
+            self.owned(self.UNLABELLED_ID, 5, state="rebooting"),
+        ]
+        consoles = {
+            self.FUTILE_ID: never_registered,
+            self.REGISTERED_ID: CLEAN_BOOT,
+            self.KILLED_ID: killed,
+            self.EMPTY_ID: "",
+            self.UNLABELLED_ID: CLEAN_BOOT,
+        }
+        # Wall time, so that the exporter's own write is the heartbeat the
+        # reader judges, with no modification time set by the test.
+        self.run_export(self.build(owned, consoles), now=time.time())
+        records = self.records()
+        self.assertEqual(records[self.UNLABELLED_ID]["state"], "unknown")
+        verdicts = {key: classify(record) for key, record in records.items()}
+        self.assertEqual(
+            verdicts,
+            {
+                self.FUTILE_ID: FUTILE,
+                self.REGISTERED_ID: REGISTERED,
+                self.KILLED_ID: REGISTERED,
+                self.EMPTY_ID: None,
+                self.UNLABELLED_ID: None,
+            },
+        )
+        evidence = read_launch_evidence(self.state_file, time.time())
+        self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 1})
+
+        # Age the file, then run again with the unlabelled instance gone from
+        # the provider. The run rewrites the record, so it is fresh again, and
+        # the unlabelled state is now null.
+        old = time.time() - 3600
+        os.utime(self.state_file, (old, old))
+        self.run_export(self.build(owned[:4], consoles), now=time.time())
+        self.assertGreater(os.stat(self.state_file).st_mtime, old)
+        records = self.records()
+        self.assertIsNone(records[self.UNLABELLED_ID]["state"])
+        self.assertIsNone(classify(records[self.UNLABELLED_ID]))
+        evidence = read_launch_evidence(self.state_file, time.time())
+        self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 1})
+
+    def test_three_workers_that_never_registered_hold(self):
+        console = "cloud-init: STEP mount-options\ncloud-init: bootstrap exiting rc=1\n"
+        owned = [self.owned(f"i-0123456789abcdeb{index}", index) for index in range(3)]
+        self.run_export(self.build(owned, {item.instance_id: console for item in owned}), now=time.time())
+        evidence = read_launch_evidence(self.state_file, time.time())
+        self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 3})
+        self.assertTrue(evidence.holds)
+
+
+class RecordCadenceTests(ExportCase):
+    """The reader takes the record's modification time as a heartbeat."""
+
+    def owned(self):
+        return [instance("i-0123456789abcdef0", state="terminated", operation=operation_hex(1))]
+
+    def test_a_run_with_nothing_new_still_rewrites_the_record(self):
+        consoles = {"i-0123456789abcdef0": CLEAN_BOOT}
+        self.run_export(self.build(self.owned(), consoles))
+        # The file system stamps wall time, which the fake clock is not.
+        old = time.time() - 3600
+        os.utime(self.state_file, (old, old))
+        result = self.run_export(self.build(self.owned(), consoles), now=NOW + 60)
+        self.assertEqual(result["events_emitted"], 0)
+        self.assertEqual(result["console_reads"], 0)
+        self.assertGreater(os.stat(self.state_file).st_mtime, old)
+
+    def test_a_refused_run_leaves_the_record_alone(self):
+        self.run_export(self.build(self.owned(), {"i-0123456789abcdef0": CLEAN_BOOT}))
+        old = NOW - 3600
+        os.utime(self.state_file, (old, old))
+        before = self.state_file.read_bytes()
+        live = [instance(f"i-0123456789abcd{index:02x}") for index in range(MAX_CONSOLE_READS + 1)]
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.run_export(self.build(live, {}, max_instances=1), now=NOW + 60)
+        self.assertEqual(raised.exception.reason, "console_read_cap_exceeded")
+        self.assertEqual(self.state_file.read_bytes(), before)
+        self.assertEqual(os.stat(self.state_file).st_mtime, old)
+
+    def test_a_deleted_record_is_rebuilt_with_the_rebuilding_run_time(self):
+        consoles = {"i-0123456789abcdef0": CLEAN_BOOT}
+        self.run_export(self.build(self.owned(), consoles))
+        self.assertEqual(json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]["seen"], NOW)
+        self.state_file.unlink()
+        self.run_export(self.build(self.owned(), consoles), now=NOW + 500)
+        record = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]
+        self.assertEqual(record["seen"], NOW + 500)
+        self.assertEqual(record["first_seen"], NOW + 500)
 
 
 class ConsoleReadTests(unittest.TestCase):

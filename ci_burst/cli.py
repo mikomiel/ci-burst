@@ -18,14 +18,13 @@ import functools
 import json
 import sys
 import time
-from pathlib import Path
 
 from . import image_promote, image_status
 from .aws import ImageAws
 from .config import load
 from .controller import Controller
 from .errors import ImageRefusal, ProviderRefusal, Refusal
-from .export import Exporter
+from .export import Exporter, default_record_path
 from .forgejo import ForgejoSource
 from .image_pipeline import ImagePipeline, write_event
 from .image_state import ImageState
@@ -141,9 +140,9 @@ def _check_arguments(arguments):
 
 def _export(config, arguments):
     """One observation run, with paths derived from the deployment state."""
-    directory = Path(config.state.database).parent / "export"
-    events_file = arguments.events_file or str(directory / "worker-events.ndjson")
-    state_file = arguments.state_file or str(directory / "observed.json")
+    record = default_record_path(config.state.database)
+    events_file = arguments.events_file or str(record.parent / "worker-events.ndjson")
+    state_file = arguments.state_file or str(record)
     return Exporter(config).run(
         events_file=events_file,
         metrics_file=arguments.metrics_file,

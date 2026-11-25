@@ -1,7 +1,10 @@
+import io
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,13 +29,16 @@ from support import (
     Clock,
     FakeAws,
     FakeObserver,
+    futile_record,
     instance,
     observation_demand,
     observation_empty,
     runners_snapshot,
     quote,
+    registered_record,
     template,
     write_config,
+    write_observed,
 )
 
 #: A version-2 ledger row seeded before the writable run upgrades it to version 4.
@@ -2677,6 +2683,279 @@ class ClaimGraceTests(ControllerCase):
             self.assertEqual(result["demand"], 3)
             self.assertEqual(result["recent_launches"], 2)
             self.assertEqual(result["launch_count"], 1)
+
+
+class FutileLaunchTests(ControllerCase):
+    """Repeated futile launches hold admission until their evidence ages out.
+
+    The record that ``export`` writes sits beside the ledger. The fake clock is
+    not wall time, so every record file gets an explicit modification time.
+    """
+
+    WINDOW = 3600
+
+    def fleet(self, max_instances=4, **sections):
+        values = {"controller": {"max_instances": max_instances}}
+        values.update(sections)
+        return load(write_config(self.root, config=values))
+
+    def record_path(self):
+        return self.config.state.database.parent / "export" / "observed.json"
+
+    def write_records(self, records, *, mtime=None):
+        return write_observed(self.record_path(), records, mtime=self.clock.now if mtime is None else mtime)
+
+    def three_futile(self, newest_age=60):
+        return [futile_record(self.clock.now - newest_age - 60 * index, index=index) for index in range(3)]
+
+    def assert_no_launch_work(self):
+        names = [call[0] for call in self.aws.calls]
+        self.assertNotIn("template", names)
+        self.assertNotIn("spot_quote", names)
+        self.assertEqual(self.aws.mutations(), [])
+        self.assertEqual(self.reopened().operations(), [])
+
+    def assert_held(self, result):
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["recent_launches_futile"])
+        self.assertEqual(result["launch_count"], 0)
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 3})
+        for key in ("candidates", "budget", "selected", "template", "price"):
+            self.assertNotIn(key, result)
+
+    # -- the hold ------------------------------------------------------------
+    def test_three_futile_workers_hold_admission(self):
+        self.write_records(self.three_futile())
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        result = controller.apply()
+        self.assert_held(result)
+        self.assert_no_launch_work()
+
+    def test_a_hold_reaches_the_command_as_a_refusal(self):
+        from ci_burst import cli
+
+        self.write_records(self.three_futile())
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        buffer = io.StringIO()
+        with mock.patch.object(cli, "Controller", lambda config: controller), redirect_stdout(buffer):
+            code = cli.main(["plan", "--config", str(self.root / "deployment.toml")])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(buffer.getvalue())["reasons"], ["recent_launches_futile"])
+
+    def test_two_futile_and_one_registered_admit(self):
+        now = self.clock.now
+        self.write_records(
+            [
+                futile_record(now - 60, index=1),
+                registered_record(now - 120, index=2),
+                futile_record(now - 180, index=3),
+            ]
+        )
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertNotIn("recent_launches_futile", result["reasons"])
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 2})
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1)
+
+    def test_records_that_are_not_evidence_do_not_count(self):
+        now = self.clock.now
+        self.write_records(
+            [
+                futile_record(now - 60, index=1),
+                futile_record(now - 120, index=2),
+                # The console was never read to the end, the instance still
+                # runs, or the record names no operation of this deployment.
+                futile_record(now - 30, index=3, exit_code=None),
+                futile_record(now - 30, index=4, state="running"),
+                futile_record(now - 30, index=5, state="shutting-down"),
+                futile_record(now - 30, index=6, operation=None),
+            ]
+        )
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 2, "futile": 2})
+
+    def test_a_worker_outside_the_window_does_not_count(self):
+        now = self.clock.now
+        self.write_records(
+            [
+                futile_record(now - 60, index=1),
+                futile_record(now - 120, index=2),
+                futile_record(now - self.WINDOW - 1, index=3),
+            ]
+        )
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 2, "futile": 2})
+
+    def test_the_newest_workers_by_end_time_decide(self):
+        now = self.clock.now
+        older_registered = registered_record(now - 900, index=9)
+        self.write_records([older_registered] + self.three_futile())
+        held = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assert_held(held)
+        newer_registered = registered_record(now - 10, index=9)
+        self.write_records(self.three_futile() + [newer_registered])
+        admitted = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assertEqual(admitted["decision"], "launched")
+        self.assertEqual(admitted["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 2})
+
+    def test_a_hold_ends_when_its_evidence_ages_out(self):
+        self.write_records(self.three_futile(newest_age=60))
+        held = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assert_held(held)
+        # The oldest of the three was read 180 seconds ago. Move it past the
+        # window and keep the file fresh, as a running export would.
+        self.clock.advance(self.WINDOW - 180 + 1)
+        os.utime(self.record_path(), (self.clock.now, self.clock.now))
+        result = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 2, "futile": 2})
+        self.assertEqual(len(result["launches"]), 1)
+
+    # -- the gate fails open ----------------------------------------------------
+    def assert_admits_as_before(self, state):
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched", result)
+        self.assertEqual(result["launch_evidence"], {"state": state, "considered": 0, "futile": 0})
+        self.assertEqual(len(result["launches"]), 1)
+
+    def test_a_missing_record_admits_and_reports_it(self):
+        self.assertFalse(self.record_path().exists())
+        self.assert_admits_as_before("missing")
+
+    def test_an_unreadable_record_admits_and_reports_it(self):
+        self.record_path().mkdir(parents=True)
+        self.assert_admits_as_before("unreadable")
+
+    def test_a_stale_record_admits_and_reports_it(self):
+        self.write_records(self.three_futile(), mtime=self.clock.now - 601)
+        self.assert_admits_as_before("stale")
+
+    def test_a_record_dated_in_the_future_admits_and_reports_it(self):
+        self.write_records(self.three_futile(), mtime=self.clock.now + 60)
+        self.assert_admits_as_before("stale")
+
+    def test_a_malformed_record_admits_and_reports_it(self):
+        records = self.three_futile() + [futile_record(self.clock.now - 30, index=7, steps="register")]
+        self.write_records(records)
+        self.assert_admits_as_before("malformed")
+
+    def test_evidence_returns_when_export_writes_again(self):
+        self.write_records(self.three_futile(), mtime=self.clock.now - 601)
+        planned = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(planned["decision"], "would_launch")
+        self.assertEqual(planned["launch_evidence"], {"state": "stale", "considered": 0, "futile": 0})
+        os.utime(self.record_path(), (self.clock.now, self.clock.now))
+        held = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assert_held(held)
+
+    # -- precedence ------------------------------------------------------------
+    def test_earlier_reasons_keep_precedence_and_carry_no_evidence(self):
+        cases = {
+            "no_runnable_demand": dict(observation=observation_empty()),
+            "slot_busy": dict(observation=observation_demand(1), max_instances=1, seed="busy"),
+            "awaiting_claim": dict(observation=observation_demand(1), seed="booting"),
+        }
+        for reason, case in cases.items():
+            with self.subTest(reason):
+                self.setUp()
+                self.write_records(self.three_futile())
+                if case.get("seed"):
+                    self.seed(operation_id=case["seed"], instance_id="i-" + case["seed"])
+                controller = self.build(
+                    observation=case["observation"], config=self.fleet(case.get("max_instances", 4))
+                )
+                if case.get("seed"):
+                    self.aws.instances_result = [
+                        instance(instance_id="i-" + case["seed"], operation=case["seed"], state="running")
+                    ]
+                result = controller.apply()
+                self.assertIn(reason, result["reasons"])
+                self.assertNotIn("recent_launches_futile", result["reasons"])
+                self.assertNotIn("launch_evidence", result)
+
+    def test_an_owned_state_discrepancy_keeps_precedence(self):
+        self.write_records(self.three_futile())
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        self.aws.instances_result = [instance(instance_id="i-stray", operation="unknown-operation", state="running")]
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertNotIn("recent_launches_futile", result["reasons"])
+        self.assertNotIn("launch_evidence", result)
+
+    def test_a_hold_precedes_the_later_reasons(self):
+        later = {
+            "template_unusable": dict(aws=lambda: FakeAws(template_facts=ProviderRefusal("TEMPLATE_NOT_FOUND"))),
+            "spot_price_unavailable": dict(aws=lambda: FakeAws(spot_quote=None)),
+            "budget_allowance_exhausted": dict(budget={"allowance": "0.01"}),
+        }
+        for reason, case in later.items():
+            with self.subTest(reason):
+                self.setUp()
+                self.write_records(self.three_futile())
+                aws = case["aws"]() if "aws" in case else None
+                config = self.fleet(**({"budget": case["budget"]} if "budget" in case else {}))
+                result = self.build(observation=observation_demand(1), aws=aws, config=config).apply()
+                self.assert_held(result)
+                self.assert_no_launch_work()
+
+    def test_an_open_gate_leaves_the_later_reasons_unchanged(self):
+        later = {
+            "template_unusable": dict(aws=lambda: FakeAws(template_facts=ProviderRefusal("TEMPLATE_NOT_FOUND"))),
+            "spot_price_unavailable": dict(aws=lambda: FakeAws(spot_quote=None)),
+            "budget_allowance_exhausted": dict(budget={"allowance": "0.01"}),
+        }
+        for reason, case in later.items():
+            with self.subTest(reason):
+                self.setUp()
+                now = self.clock.now
+                self.write_records([futile_record(now - 60, index=1), futile_record(now - 120, index=2)])
+                aws = case["aws"]() if "aws" in case else None
+                config = self.fleet(**({"budget": case["budget"]} if "budget" in case else {}))
+                result = self.build(observation=observation_demand(1), aws=aws, config=config).apply()
+                self.assertEqual(result["decision"], "refused")
+                self.assertIn(reason, result["reasons"])
+                self.assertNotIn("recent_launches_futile", result["reasons"])
+                self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 2, "futile": 2})
+
+    # -- plan and the record ------------------------------------------------------
+    def test_plan_and_apply_agree_on_the_same_record(self):
+        self.write_records(self.three_futile())
+        planned = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(self.aws.mutations(), [])
+        applied = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        for result in (planned, applied):
+            self.assertEqual(result["decision"], "refused")
+            self.assertEqual(result["reasons"], ["recent_launches_futile"])
+            self.assertEqual(result["launch_count"], 0)
+            self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 3})
+        self.assertEqual(self.reopened().operations(), [])
+
+    def test_plan_reports_an_unreadable_record_and_plans_as_if_open(self):
+        self.record_path().mkdir(parents=True)
+        result = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(result["launch_evidence"], {"state": "unreadable", "considered": 0, "futile": 0})
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_plan_and_apply_leave_the_record_alone(self):
+        path = self.write_records(self.three_futile(), mtime=self.clock.now - 30)
+        before = (path.read_bytes(), os.stat(path).st_mtime_ns)
+        self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assertEqual((path.read_bytes(), os.stat(path).st_mtime_ns), before)
+        self.assertEqual(sorted(os.listdir(path.parent)), ["observed.json"])
+
+    def test_the_gate_reads_only_the_default_record_path(self):
+        # A record elsewhere in the state directory is not looked for.
+        write_observed(self.root / "export" / "elsewhere.json", self.three_futile(), mtime=self.clock.now)
+        self.assert_admits_as_before("missing")
 
 
 class BudgetHeadroomTests(ControllerCase):

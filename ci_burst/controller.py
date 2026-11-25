@@ -41,7 +41,9 @@ from .config import ZoneCandidate
 from .cost import CostModel
 from .credit import evidence as credit_evidence
 from .errors import DeadlineRefusal, PASS_DEADLINE_EXCEEDED, ProviderRefusal, Refusal, StateRefusal
+from .export import default_record_path
 from .forgejo import ForgejoObserver
+from .launch_evidence import read_launch_evidence
 from .ledger import Ledger, current_window
 from .money import format_money
 
@@ -692,6 +694,15 @@ class Controller:
             reasons.append("awaiting_claim")
             return decision, ()
         requested = min(uncovered, free)
+        # A one-way brake: the record that ``export`` writes can only withhold a
+        # launch. Missing, unreadable, stale or malformed evidence keeps the gate
+        # open, and every check below still applies to a launch it lets through.
+        evidence = read_launch_evidence(default_record_path(self.config.state.database), self.clock())
+        decision["launch_evidence"] = evidence.as_dict()
+        if evidence.holds:
+            decision["decision"] = "refused"
+            reasons.append("recent_launches_futile")
+            return decision, ()
         templates = self._templates(decision, deadline=deadline)
         if templates is None:
             decision["decision"] = "refused"

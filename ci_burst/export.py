@@ -27,8 +27,12 @@ dedupe record; the alternative — persisting first — would lose a failure eve
 instead of repeating it.
 
 The dedupe record is derived observation, not decision state. Deleting it loses
-the emitted history and the cumulative counters; it never influences admission,
-launch or termination.
+the emitted history and the cumulative counters. It influences admission in one
+way only: ``apply`` and ``plan`` read it as a read-only brake that can withhold a
+launch after repeated futile launches (``launch_evidence``). The brake reads the
+file's modification time as a heartbeat, so every successful run rewrites the
+record, even when nothing changed. The record never authorizes a launch and never
+influences termination.
 """
 
 import json
@@ -140,6 +144,11 @@ DEPLOYMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 #: is not a marker: an image could print any `STEP ...` line, and the command
 #: publishes names, so the set has to be closed rather than pattern-matched.
 STEP_NAMES = frozenset({"mount-options", "register", "claim-timeout", "job"})
+
+#: The steps the shipped first-boot script prints only after the register step. A
+#: record that shows one of them proves that the worker registered, even when the
+#: registration line scrolled out of the console before the first read.
+POST_REGISTRATION_STEPS = frozenset({"claim-timeout", "job"})
 
 #: Ordered classification rules for console lines that are not a marker. The
 #: first matching rule wins, so a specific failure is named before a generic one.
@@ -301,6 +310,15 @@ def parse_console(text):
                     errors.append(kind)
                 break
     return ConsoleFacts(tuple(steps), exit_code, tuple(errors), job_process, spot_interruption)
+
+
+def default_record_path(database):
+    """Return the observation record's default path, beside the ledger.
+
+    ``export`` writes the record here unless ``--state-file`` names another path,
+    and the launch evidence reader reads it only here.
+    """
+    return Path(database).parent / "export" / "observed.json"
 
 
 def _empty_totals():

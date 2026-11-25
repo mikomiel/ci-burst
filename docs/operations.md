@@ -285,7 +285,9 @@ Delivery is at least once. `id` is derived from the instance and the marker, so
 a repeat after a crash between publishing an event and saving the dedupe record
 carries the same identity and a consumer can drop it. The dedupe record keeps
 what was already emitted and is pruned after seven days; deleting it loses the
-history and the cumulative counters, never a decision.
+history and the cumulative counters. It can change a decision in one way only:
+`apply` and `plan` read the record as a brake after repeated futile launches
+(§ Futile launch hold).
 
 ### The metrics textfile
 
@@ -1509,7 +1511,8 @@ launches = min(max(0, waiting jobs - recent launches), free slots, affordable wo
 
 A zero bound is not an error. No free slot waits with `slot_busy`, no demand waits
 with `no_runnable_demand`, demand that recent launches already cover waits with
-`awaiting_claim`, and no affordable worker refuses with
+`awaiting_claim`, repeated futile launches refuse with `recent_launches_futile`
+(§ Futile launch hold), and no affordable worker refuses with
 `budget_allowance_exhausted`. When the allowance allows fewer launches than both
 the uncovered demand and the free slots, the batch is capped and the decision
 carries the `budget_capped_batch` note. `plan` reports the same `demand`,
@@ -1587,7 +1590,9 @@ bootstrap; range `60..1800`; there is no off value).
   deadline deferral that holds no decision, need not carry one.
 - After the grace, a job that is still waiting can get a new worker. That is the
   recovery path for a worker that failed its bootstrap or never registered; the
-  replacement stays inside the slot limit and the allowance.
+  replacement stays inside the slot limit and the allowance. When the three most
+  recent finished workers all ended that way, the futile launch hold stops the
+  replacement until their evidence ages out (§ Futile launch hold).
 
 The grace does not change the slot limit, the allowance or the price checks, and it
 matters only when `controller.max_instances` is above `1`: one slot already stops a
@@ -1606,6 +1611,108 @@ launch for a job that `apply` holds back while an operation has no instance, and
 it counts a stored `starting` or `running` operation that reconciliation would
 turn into `terminating`, until the next `apply` reconciles the row.
 
+### Futile launch hold
+
+A persistent worker fault, such as a registration parameter the worker cannot
+read or an image that lacks a command the bootstrap needs, makes every worker end
+before it registers. The slot frees, the job still waits, and the claim grace no
+longer covers it, so each pass would launch again. The hold thins that loop.
+
+`apply` and `plan` read the record that `export` writes, at
+`<ledger directory>/export/observed.json`. They never write it and make no other
+call to read it. `--state-file` moves only the export run: the controller reads
+the default path and does not look anywhere else.
+
+A worker is classified only when its record shows that the instance ended
+(`terminated` or `stopped`) and it carries an operation identifier of this
+deployment. It is:
+
+- registered when the record shows the registration step, a later step
+  (`job` or `claim-timeout`), a one-job process outcome or a Spot interruption
+  notice;
+- futile when the record shows the exit marker (`bootstrap exiting rc=<n>`) and
+  none of that registration evidence.
+
+Any other record is no evidence and is never counted. A worker that ended
+without an exit marker (an empty console, a hard kill, a power-off) never counts,
+and neither does a worker that still runs, even when it registered.
+
+The rule uses three fixed values. They are not configuration and there is no off
+switch.
+
+| Value | Meaning |
+| --- | --- |
+| 3 | workers that must be considered, all futile, for a hold |
+| 3600 seconds | the window: a worker is inside while the controller clock minus its record's `seen` is at most this |
+| 600 seconds | the record is evidence while its modification time is at most this old |
+
+The considered workers are the three classified workers inside the window with
+the newest `seen`, plus any other that ties the third. When at least three are
+considered and every one is futile, the decision is `refused` with the single
+reason `recent_launches_futile` and a `launch_count` of `0`. No template, price
+or budget is read for that decision, and no intent, reservation or instance is
+created. The command exits 2, as it does for any refusal. `slot_busy`,
+`no_runnable_demand`, `awaiting_claim` and an owned-state discrepancy keep
+precedence.
+
+Every decision that reaches the hold reports `launch_evidence` with the evidence
+`state` and the `considered` and `futile` counts. The counts are `0` unless the
+state is `fresh`. The states, in the order they are tested:
+
+| State | Meaning |
+| --- | --- |
+| `missing` | no file at the path |
+| `unreadable` | the file cannot be opened or read, or the reader failed in a way it did not foresee |
+| `stale` | the modification time is more than 600 seconds old, or after the controller clock |
+| `malformed` | not UTF-8 JSON, another record version, or one record with a bad field the hold reads; the whole file is dropped |
+| `fresh` | the hold is evaluated |
+
+Only `fresh` evidence can hold. Every other state admits as if the hold did not
+exist, and every other admission check still applies to a launch the hold lets
+through. `export` stays optional: where it is absent, stopped or failing, the
+record turns `missing` or `stale` and admission behaves as before. `export`
+rewrites the record on every successful run, so its modification time is the
+heartbeat; a refused run lets it age. `export` creates the record owner-only, so
+a `plan` run as another user than the export unit reads `unreadable` and plans as
+if the hold were open.
+
+A hold ends on its own when a registered worker joins the newest three, when the
+oldest of the three leaves the window, or when the record stops being fresh. It
+lasts at most 3600 seconds after the newest futile worker was read. A hold
+launches nothing, so a fix to the fault produces no new evidence, and admission
+still waits for the window after the fix. Evidence lags the end of a worker by
+about one export interval, so the first burst of futile launches is not
+prevented.
+
+Under a persistent fault the hold thins the waste and does not end it. At one
+slot, about three workers launch per hour: each time the oldest record ages out,
+one launch is admitted, fails, and renews the hold. With more free slots, a whole
+batch can launch each time the hold opens. The hold is not a cap on wasted
+launches and not a spend control. The configured allowance remains the only
+spend control.
+
+Known residual cases:
+
+- A worker that registered, flooded its console so the registration line
+  scrolled out, and then ended through the exit path before any later marker
+  reads as futile. Three such workers hold admission for at most one window.
+- A registered worker that still runs does not clear a hold.
+- Records carry no deployment name. A state directory shared by two deployments,
+  or kept across a rename, mixes their records.
+- `export` reads at most 16 consoles per run, so heavy turnover defers some
+  records to later runs.
+- Only the shipped first-boot script prints the markers. Workers of another
+  script are no evidence, and the hold never trips for them.
+
+There is no acknowledgement command, and `status` does not report the hold,
+because it builds no admission decision. `plan` reports the same hold as
+`apply`. Two levers exist, and neither is a clean resume:
+
+| Lever | Effect |
+| --- | --- |
+| Delete the record | The next pass reads `missing` and admits. The next export run rebuilds records for the instances the provider still lists, about the last hour of ended workers, and stamps them with its own time, so the hold can return for a full window. |
+| Stop the export timer | The record ages past 600 seconds and the hold opens. Worker observation stops too. This is the one blunt lever. |
+
 ## Launch decision and capacity fallback
 
 `plan` reports every configured candidate in order, each with the zone, subnet,
@@ -1620,6 +1727,10 @@ dropping a configured candidate; only an answered quote that is absent from the
 requested scope marks that candidate skipped. A configured template version that
 cannot be read or is unusable refuses the plan with `template_unusable` and
 `template_error` rather than dropping that candidate.
+
+A futile launch hold (§ Futile launch hold) is decided before the first template
+read. A held decision therefore carries no candidates, no `selected` candidate
+and no budget.
 
 `apply` admits a batch of at most `controller.max_instances` workers, sized by
 the waiting demand that no recent launch covers, free slots and affordable

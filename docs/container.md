@@ -384,7 +384,10 @@ systemctl enable --now ci-burst-apply.timer
 systemctl list-timers 'ci-burst-*'
 ```
 
-The observation unit is optional and independent of admission. It runs the same
+The observation unit is optional and launches nothing. Where it runs, `apply`
+reads its record in the shared state directory as a brake that can withhold a
+launch after repeated futile launches; where it does not run, admission behaves
+as before ([operations.md](operations.md#futile-launch-hold)). It runs the same
 image with no token env-file, writes its textfile into the state directory, and
 publishes that file into the collector's directory from `ExecStartPost`:
 

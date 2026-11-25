@@ -90,12 +90,19 @@ every pool is rejected the slot MUST stay free with a stable reason.
 - **AND** the frozen request advances within the same operation and reservation
 
 ### Requirement: Durable idempotent launch intent
-Before requesting a launch, the controller MUST durably record operation identity, frozen launch parameters, an idempotency token, ownership, expiry and the required reservation. Retries MUST reuse the same token and parameters. A definite capacity rejection MAY advance to the next ordered candidate as specified for fallback, replacing the frozen request and token together. A failed durable write MUST prevent the cloud request.
+Before requesting a launch, the controller MUST durably record operation identity, frozen launch parameters, an idempotency token, ownership, expiry and the required reservation. Retries MUST reuse the same token and parameters. A retry MUST NOT send an intent older than 900 seconds. A definite capacity rejection MAY advance to the next ordered candidate as specified for fallback, replacing the frozen request and token together. A failed durable write MUST prevent the cloud request.
 
 #### Scenario: Process stops before sending the request
 - **WHEN** launch intent committed but the process stopped before calling AWS
 - **THEN** recovery resumes the same operation
 - **AND** it does not allocate a replacement operation solely because the process restarted
+
+#### Scenario: Process restarts long after the intent was committed
+- **WHEN** an intent with no confirmed instance is more than 900 seconds old and `apply` runs
+- **THEN** `apply` refuses with `unresolved_intent_lifetime_short`
+- **AND** no `RunInstances` request is sent
+- **AND** the operation keeps its state, frozen request, client token and reservation
+- **AND** no replacement launch is admitted until an operator resolves the intent
 
 #### Scenario: Durable state cannot commit
 - **WHEN** the state transaction fails or another writer owns the deployment

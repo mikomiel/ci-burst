@@ -1688,18 +1688,38 @@ token cannot describe two requests. A resumed intent is retried exactly as
 frozen and never falls through, because a rejected retry cannot prove the
 earlier request created nothing.
 
-Three bounds refuse rather than launch: an unresolved intent older than the
+Four bounds refuse rather than launch: an unresolved intent older than the
 24-hour client-token validity, an intent whose configured lifetime has already
-elapsed, and an intent whose recorded admitted lifetime differs from the
+elapsed, an intent whose recorded admitted lifetime differs from the
 configured `aws.max_lifetime_seconds`, or that records none because the row
-predates ledger schema 5 (#138). Each intent stores the lifetime it was
-admitted under, so the refusal does not infer it from `expires_at` and
-`created_at`. All three keep the unresolved
+predates ledger schema 5 (#138), and an intent written more than 900 seconds
+ago (#222). Each intent stores the lifetime it was admitted under, so the
+mismatch refusal does not infer it from `expires_at` and `created_at`. All four keep the unresolved
 ownership and block admission until an operator resolves them. When more than one launch intent is unresolved,
 `apply` retries them in creation order and stops at the first intent whose age
-exceeds the client-token window, whose lifetime elapsed or differs, or whose
+exceeds the client-token window or the 900-second bound, whose lifetime elapsed or differs, or whose
 retry is not accepted. Intents after the deciding one are not sent and retain their existing
 ledger state for the next apply.
+
+The fourth bound exists because the expiry tag and the worker's own lifetime
+start at different times. The tag is frozen when the intent is admitted, and
+the same client token must carry the same request, so a resume cannot
+recompute it. The worker arms its lifetime when it boots. A late send
+therefore leaves a tag that ends before the worker's own deadline, and
+`reap --apply` could terminate the worker while a job still runs (#222). The
+age counts from the intent's `created_at`. The bound leaves room for a resume
+in a later pass after an uncertain send (one timer interval plus a full pass
+deadline, under six minutes), and it caps what a late tag can take from the
+worker's lifetime at fifteen minutes. An intent exactly 900 seconds old is still
+sent; only a greater age is refused, with `unresolved_intent_lifetime_short`.
+An intent with no confirmed instance past that age, for example after a
+controller outage longer than fifteen minutes, therefore stops admission until
+an operator resolves it. There is no command that resolves one. `apply` refuses
+every pass on its own; keep cleanup running, do not edit or delete the row, and
+escalate: an
+empty owned inventory does not prove that its request was never sent
+([container.md § Rollback](container.md#rollback), step 4, covers an unresolved
+intent).
 
 Every attempted intent produces one `resumes` record in creation order. A
 record's `expires_at` and `reservation` always come from the durable operation,
@@ -1713,11 +1733,12 @@ whatever the outcome; `instance_id` is `null` until a launch is confirmed, and
 | `refused` | `["unresolved_intent_expired"]` | `null` | absent | from the operation | `[]` |
 | `refused` | `["unresolved_intent_lifetime_elapsed"]` | `null` | absent | from the operation | `[]` |
 | `refused` | `["unresolved_intent_lifetime_mismatch"]` | `null` | absent | from the operation | `[]` |
+| `refused` | `["unresolved_intent_lifetime_short"]` | `null` | absent | from the operation | `[]` |
 
 Every record also carries `operation`. The top level carries the deciding
 intent's `operation`, `decision`, `expires_at` and `reservation`; its
 `instance_id` appears only when that intent was confirmed, its `reasons` only for
-the three refusals above, and its `refusal` only for an uncertain retry. The top
+the four refusals above, and its `refusal` only for an uncertain retry. The top
 level carries no `attempts` field, and a resume sends one frozen request, so a
 record's `attempts` is always empty.
 
@@ -1865,7 +1886,10 @@ Three different times bound one admission pass:
   recorded admitted lifetime is another value, or that records none because it
   predates ledger schema 5, is not sent again: `apply` refuses it with
   `unresolved_intent_lifetime_mismatch` and keeps admission blocked until an
-  operator resolves it, like the other unresolved-intent refusals below.
+  operator resolves it, like the other unresolved-intent refusals below. The
+  duration is not the start time: an unresolved intent written more than 900
+  seconds before `apply` resumes it is refused the same way, with
+  `unresolved_intent_lifetime_short` (#222).
 
 `reap`, `status` and `export` keep their existing behaviour and do not take the
 pass deadline. `reap --apply` runs from its own unit and timer on the cleanup

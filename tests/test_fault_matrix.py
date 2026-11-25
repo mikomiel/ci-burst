@@ -458,6 +458,46 @@ class AccountingInvariantTests(FaultMatrixCase):
             operation.settled_micros,
         )
 
+    def test_unresolved_intent_past_the_resume_age_keeps_slot_and_commitment(self):
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        self.assertEqual(first["decision"], "uncertain")
+        operation_id = first["operation"]
+        frozen = self.reopened().operation(operation_id)
+        per_launch = controller.cost.per_launch_micros()
+
+        # More than 900 seconds after the intent was written, the frozen expiry
+        # tag would end too long before the worker's own lifetime does, so the
+        # retry is refused instead of sent (#222), although the provider would
+        # now accept it. The intent keeps its slot, commitment, token and request.
+        self.aws.run_error = None
+        self.clock.advance(901)
+        late = controller.apply()
+        self.assertEqual(late["decision"], "refused")
+        self.assertEqual(late["reasons"], ["unresolved_intent_lifetime_short"])
+        sends = [call for call in self.aws.calls if call[0] == "run_spot"]
+        self.assertEqual(len(sends), 1, "only the first send reached the provider")
+        current = self.reopened().operation(operation_id)
+        self.assertEqual(current.state, "uncertain")
+        self.assertEqual(current.client_token, frozen.client_token)
+        self.assertEqual(current.request_json, frozen.request_json)
+        self.assertEqual(current.reservation_micros, per_launch)
+        self.assertEqual(self.totals(controller)["committed"], per_launch)
+        self.assertIn("slot_busy", controller.plan()["reasons"])
+
+        # Terminal provider evidence still settles it. The forward commitment is
+        # released; only the settled spend stays counted.
+        self.aws.instances_result = [instance(instance_id="i-late", operation=operation_id, state="terminated")]
+        settled_controller = self.build(observation=observation_empty(), aws=self.aws)
+        self.assertEqual(settled_controller.apply()["decision"], "wait")
+        settled = self.reopened().operation(operation_id)
+        self.assertEqual(settled.state, "terminal")
+        self.assertIsNotNone(settled.settled_micros)
+        totals = self.totals(settled_controller)
+        self.assertEqual(totals["spend"], settled.settled_micros)
+        self.assertEqual(totals["committed"], totals["spend"])
+
     def test_absence_releases_only_after_the_retention_window(self):
         operation_id = self.seed(
             state="running", expires_at=self.clock.now + 3600, reservation=540_000, instance_id="i-seed"

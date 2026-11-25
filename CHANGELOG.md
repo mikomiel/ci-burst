@@ -9,6 +9,20 @@ The version, this file and the release tag are maintained by
 conventional commits on `main`; [CONTRIBUTING.md](CONTRIBUTING.md#releases)
 owns the release boundary. Do not edit a released section by hand.
 
+## [0.12.1](https://github.com/mikomiel/ci-burst/compare/v0.12.0...v0.12.1) (2026-11-25)
+
+
+### Fixed
+
+* **aws:** refuse SDK errors while the worker adapter builds its session and clients ([#180](https://github.com/mikomiel/ci-burst/issues/180)) ([#215](https://github.com/mikomiel/ci-burst/issues/215)) ([75afeb0](https://github.com/mikomiel/ci-burst/commit/75afeb0f4830830e973288d62ac771101f9e4fb4))
+* **config:** the worker lifetime has one clock ([#138](https://github.com/mikomiel/ci-burst/issues/138)) ([#218](https://github.com/mikomiel/ci-burst/issues/218)) ([138bfa5](https://github.com/mikomiel/ci-burst/commit/138bfa5b12d08aab9c18d0af1619c5ed284873bc))
+* **controller:** refuse a resume more than 900 s after the intent ([#230](https://github.com/mikomiel/ci-burst/issues/230)) ([8464575](https://github.com/mikomiel/ci-burst/commit/8464575278d7df4aea49f53a9898bf344b06d65e))
+* **image:** a console read refused at the deadline ends the build CONSOLE_BLIND ([#203](https://github.com/mikomiel/ci-burst/issues/203)) ([#212](https://github.com/mikomiel/ci-burst/issues/212)) ([08c887c](https://github.com/mikomiel/ci-burst/commit/08c887c72baf6955bfc64a9505d3285b555e05c2))
+* **image:** keep plain status at exit 0 when the check-time write fails ([#208](https://github.com/mikomiel/ci-burst/issues/208)) ([#210](https://github.com/mikomiel/ci-burst/issues/210)) ([5d12e5d](https://github.com/mikomiel/ci-burst/commit/5d12e5d5d358cd5b94f7953e68fb9fadbf101dc6))
+* **image:** pin_change omits the pin line's trailing comment ([#198](https://github.com/mikomiel/ci-burst/issues/198)) ([#211](https://github.com/mikomiel/ci-burst/issues/211)) ([80f06ba](https://github.com/mikomiel/ci-burst/commit/80f06ba6c865d9664ed91abb7456f938e4ac7f6c))
+* **image:** promote refuses a state that the file it plans from no longer names ([#199](https://github.com/mikomiel/ci-burst/issues/199)) ([#217](https://github.com/mikomiel/ci-burst/issues/217)) ([e8dd2f2](https://github.com/mikomiel/ci-burst/commit/e8dd2f230120a77f20ac2b9a79d7a46f5656d51c))
+* **image:** recover a hot SQLite journal under the writer lock ([#194](https://github.com/mikomiel/ci-burst/issues/194)) ([#213](https://github.com/mikomiel/ci-burst/issues/213)) ([b9627bc](https://github.com/mikomiel/ci-burst/commit/b9627bc53888886d80e81ad1a749b4a031d2df04))
+
 ## [0.12.0](https://github.com/mikomiel/ci-burst/compare/v0.11.0...v0.12.0) (2026-11-22)
 
 

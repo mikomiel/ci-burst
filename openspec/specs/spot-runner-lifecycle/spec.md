@@ -97,8 +97,8 @@ Before requesting a launch, the controller MUST durably record operation identit
 - **THEN** recovery resumes the same operation
 - **AND** it does not allocate a replacement operation solely because the process restarted
 
-#### Scenario: Process restarts long after the intent was committed
-- **WHEN** an intent with no confirmed instance is more than 900 seconds old and `apply` runs
+#### Scenario: Intent is still unresolved long after it was committed
+- **WHEN** the `resume` phase of `apply` reaches an intent that has no confirmed instance after reconciliation, is more than 900 seconds old, and passes the client-token window, elapsed-lifetime and lifetime-mismatch checks
 - **THEN** `apply` refuses with `unresolved_intent_lifetime_short`
 - **AND** no `RunInstances` request is sent
 - **AND** the operation keeps its state, frozen request, client token and reservation

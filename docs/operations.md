@@ -1707,14 +1707,28 @@ the same client token must carry the same request, so a resume cannot
 recompute it. The worker arms its lifetime when it boots. A late send
 therefore leaves a tag that ends before the worker's own deadline, and
 `reap --apply` could terminate the worker while a job still runs (#222). The
-age counts from the intent's `created_at`. The bound leaves room for a resume
+bound caps the intent's age: the time from the write of its row (`created_at`)
+to the moment that `apply` checks it. The bound leaves room for a resume
 in a later pass after an uncertain send (one timer interval plus a full pass
-deadline, under six minutes), and it caps what a late tag can take from the
-worker's lifetime at fifteen minutes. An intent exactly 900 seconds old is still
+deadline, under six minutes). An intent exactly 900 seconds old is still
 sent; only a greater age is refused, with `unresolved_intent_lifetime_short`.
-An intent with no confirmed instance past that age, for example after a
-controller outage longer than fifteen minutes, therefore stops admission until
-an operator resolves it. There is no command that resolves one. `apply` refuses
+
+The bound is not a hard cap on the lifetime that a late tag takes from the
+worker. `apply` computes the expiry once, when it admits a batch of launches,
+and every row of the batch freezes that value, but each row is written later,
+after the requests of the workers before it. The tag therefore ends before the
+worker's own deadline by the sum of three times: the intent's age at the resume
+check (at most 900 seconds), the time from the batch's expiry basis to the
+row's write, and the time from that check until the worker boots, which
+includes the send itself. Only the first of them is bounded by this check, so
+the loss can exceed 900 seconds.
+
+An intent with no confirmed instance that is older than 900 seconds stops
+admission until an operator resolves it. A controller outage longer than fifteen
+minutes can leave an intent that old, but no outage is needed: an uncertain send
+leaves the intent unresolved, and while the controller keeps running, each later
+pass that ends uncertain again leaves it unresolved, so its age keeps growing
+until it passes 900 seconds. There is no command that resolves one. `apply` refuses
 every pass on its own; keep cleanup running, do not edit or delete the row, and
 escalate: an
 empty owned inventory does not prove that its request was never sent

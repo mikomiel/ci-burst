@@ -467,10 +467,9 @@ class AccountingInvariantTests(FaultMatrixCase):
         frozen = self.reopened().operation(operation_id)
         per_launch = controller.cost.per_launch_micros()
 
-        # More than 900 seconds after the intent was written, the frozen expiry
-        # tag would end too long before the worker's own lifetime does, so the
-        # retry is refused instead of sent (#222), although the provider would
-        # now accept it. The intent keeps its slot, commitment, token and request.
+        # The frozen expiry tag shortens with every late send; once the intent is
+        # more than 900 seconds old the retry is refused instead of sent (#222),
+        # although the provider would now accept it. The intent keeps its slot, commitment, token and request.
         self.aws.run_error = None
         self.clock.advance(901)
         late = controller.apply()

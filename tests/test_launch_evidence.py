@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import json
 import os
 import tempfile
@@ -7,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from ci_burst import launch_evidence
 from ci_burst.export import POST_REGISTRATION_STEPS, STATE_VERSION
 from ci_burst.launch_evidence import (
     EVIDENCE_MAX_AGE_SECONDS,
@@ -32,34 +34,40 @@ def registered(age=60, index=1, **overrides):
     return registered_record(NOW - age, index, **overrides)
 
 
-class CountingStream:
-    """Stand in for the stream that the reader opens and note each read it makes.
+class Members(list):
+    """A JSON object as ``(name, value)`` pairs, which lets a name occur twice."""
 
-    ``reads`` gets one ``(requested, returned)`` pair per read. ``before_read``
-    runs just before a read, which lets a test change the file after the reader
-    has taken its size.
+
+def render(value):
+    """Return the JSON text of ``value``; a ``Members`` may repeat a member name.
+
+    ``json.dumps`` writes a dictionary, which holds a key once, so it cannot write
+    a repeated member. That is also why ``export`` cannot.
     """
+    if isinstance(value, Members):
+        return "{" + ", ".join(f"{json.dumps(name)}: {render(item)}" for name, item in value) + "}"
+    if isinstance(value, dict):
+        return render(Members(value.items()))
+    if isinstance(value, list):
+        return "[" + ", ".join(render(item) for item in value) + "]"
+    return json.dumps(value)
 
-    def __init__(self, stream, reads, before_read=None):
-        self._stream = stream
-        self._reads = reads
-        self._before_read = before_read
 
-    def __enter__(self):
-        return self
+def repeated_members(raw):
+    """Return the sorted names that some object in ``raw`` names twice.
 
-    def __exit__(self, *exc_info):
-        self._stream.close()
+    This is the fixtures' own check and does not use the reader: a test that
+    expects ``malformed`` first shows that its file holds the repeat it names.
+    """
+    names = []
 
-    def fileno(self):
-        return self._stream.fileno()
+    def collect(pairs):
+        found = [name for name, _ in pairs]
+        names.extend({name for name in found if found.count(name) > 1})
+        return dict(pairs)
 
-    def read(self, size=-1):
-        if self._before_read is not None:
-            self._before_read()
-        data = self._stream.read(size)
-        self._reads.append((size, len(data)))
-        return data
+    json.loads(raw, object_pairs_hook=collect)
+    return sorted(names)
 
 
 class ReaderCase(unittest.TestCase):
@@ -247,6 +255,135 @@ class EvidenceStateTests(ReaderCase):
         self.assertEqual(sorted(os.listdir(self.path.parent)), ["observed.json"])
 
 
+class RepeatedMemberTests(ReaderCase):
+    """A JSON object that names a member twice is not a file that ``export`` writes.
+
+    ``json`` keeps the last value of a repeated member, so a record with an invalid
+    ``steps`` followed by a valid one passes every field rule, and a key of
+    ``instances`` that repeats keeps only its last record. ``export`` writes the
+    record from dictionaries with text keys, which cannot repeat a member. The
+    reader refuses a repeat at any level, whatever the values, and the file is
+    ``malformed``. Every fixture is raw text, and ``write_text`` first checks that
+    the file repeats the member that the test names.
+    """
+
+    INSTANCE = "i-0123456789abcde01"
+
+    def three_futile(self):
+        return {f"i-0123456789abcde{index:02x}": futile(index=index) for index in range(3)}
+
+    def write_text(self, payload, repeated):
+        raw = render(payload).encode("utf-8")
+        self.assertEqual(repeated_members(raw), repeated)
+        self.write(raw=raw)
+        return raw
+
+    def steps_members(self, record, *steps):
+        """Return the members of ``record``, with each of ``steps`` as its own ``steps`` member."""
+        members = Members((name, value) for name, value in record.items() if name != "steps")
+        members.extend(("steps", value) for value in steps)
+        return members
+
+    def assert_malformed(self):
+        evidence = self.read()
+        self.assertEqual(evidence.as_dict(), {"state": "malformed", "considered": 0, "futile": 0})
+        self.assertFalse(evidence.holds)
+
+    def test_the_same_records_without_a_repeated_member_hold(self):
+        # The control: each file below differs from this one by the repeat only.
+        instances = self.three_futile()
+        instances[self.INSTANCE] = self.steps_members(futile(index=1), ["mount-options"])
+        self.write_text({"version": STATE_VERSION, "instances": instances}, [])
+        evidence = self.read()
+        self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 3})
+        self.assertTrue(evidence.holds)
+
+    def test_an_invalid_steps_before_a_valid_one_cannot_hold_admission(self):
+        instances = self.three_futile()
+        instances[self.INSTANCE] = self.steps_members(futile(index=1), "register", ["mount-options"])
+        raw = self.write_text({"version": STATE_VERSION, "instances": instances}, ["steps"])
+        # ``json`` keeps the last member, so the record passes the field rules and
+        # the three futile records hold unless the repeat itself is refused.
+        self.assertEqual(json.loads(raw)["instances"][self.INSTANCE]["steps"], ["mount-options"])
+        self.assert_malformed()
+
+    def test_a_repeated_steps_is_malformed_in_the_other_order_and_when_the_values_agree(self):
+        for name, steps in (
+            ("a valid steps and then an invalid one", (["mount-options"], "register")),
+            ("the same valid steps twice", (["mount-options"], ["mount-options"])),
+        ):
+            with self.subTest(name):
+                instances = self.three_futile()
+                instances[self.INSTANCE] = self.steps_members(futile(index=1), *steps)
+                self.write_text({"version": STATE_VERSION, "instances": instances}, ["steps"])
+                self.assert_malformed()
+
+    def test_an_instance_key_that_repeats_cannot_hide_a_registered_worker(self):
+        # The registered worker is the newest, so it would clear the hold. A decoder
+        # that keeps the last record of a key drops it, and four futile workers hold.
+        instance_id = "i-0123456789abcdef9"
+        older = [
+            (f"i-0123456789abcde{index:02x}", futile(age=60 * (index + 2), index=index)) for index in range(3)
+        ]
+        instances = Members([*older, (instance_id, registered(age=30, index=9)), (instance_id, futile(age=30, index=9))])
+        raw = self.write_text({"version": STATE_VERSION, "instances": instances}, [instance_id])
+        self.assertFalse(json.loads(raw)["instances"][instance_id]["registered"])
+        self.assert_malformed()
+
+    def test_a_repeated_member_at_any_level_makes_the_file_malformed(self):
+        three = self.three_futile()
+        cases = (
+            (
+                "the version at the top level, invalid and then valid",
+                Members([("version", STATE_VERSION + 1), ("version", STATE_VERSION), ("instances", three)]),
+                ["version"],
+            ),
+            (
+                "instances at the top level, not an object and then an object",
+                Members([("version", STATE_VERSION), ("instances", [1]), ("instances", three)]),
+                ["instances"],
+            ),
+            (
+                "a member at the top level that the gate does not read",
+                Members(
+                    [("version", STATE_VERSION), ("console_reads", 3), ("console_reads", 3), ("instances", three)]
+                ),
+                ["console_reads"],
+            ),
+            (
+                "a member of an object that the gate does not read",
+                {"version": STATE_VERSION, "totals": Members([("launches", 1), ("launches", 2)]), "instances": three},
+                ["launches"],
+            ),
+            (
+                "a member in an instance record that the gate does not read",
+                {
+                    "version": STATE_VERSION,
+                    "instances": {
+                        **three,
+                        self.INSTANCE: Members([*futile(index=1).items(), ("zone", "eu-central-1b")]),
+                    },
+                },
+                ["zone"],
+            ),
+            (
+                "an object inside a list in an instance record",
+                {
+                    "version": STATE_VERSION,
+                    "instances": {
+                        **three,
+                        self.INSTANCE: futile(index=1, errors=[Members([("kind", "a"), ("kind", "b")])]),
+                    },
+                },
+                ["kind"],
+            ),
+        )
+        for name, payload, repeated in cases:
+            with self.subTest(name):
+                self.write_text(payload, repeated)
+                self.assert_malformed()
+
+
 class NonRegularPathTests(ReaderCase):
     """Only a regular file can be the record, and reading the path never blocks.
 
@@ -309,7 +446,9 @@ class BoundedReadTests(ReaderCase):
 
     Each file here holds three futile records and trailing spaces. That is valid
     JSON, so a reader that parsed the file would hold, and the spaces make the
-    size. ``CountingStream`` shows what the reader asked of the stream.
+    size. ``read_noting_fetched_bytes`` counts what the reader took from the file
+    itself and not what a stream handed back: a buffered stream fetches whole
+    blocks, so the bytes it returns are fewer than the bytes it fetched.
     """
 
     def write_padded(self, size, *, mtime=NOW):
@@ -317,33 +456,63 @@ class BoundedReadTests(ReaderCase):
         raw = json.dumps({"version": STATE_VERSION, "instances": instances}).encode("utf-8")
         self.write(raw=raw + b" " * (size - len(raw)), mtime=mtime)
 
-    def read_noting_reads(self, before_read=None):
-        """Return the evidence and the ``(requested, returned)`` pair of each read."""
-        reads = []
-        real_open = open
+    def append_spaces(self, count):
+        with open(self.path, "ab") as stream:
+            stream.write(b" " * count)
 
-        def noting_open(*args, **kwargs):
-            return CountingStream(real_open(*args, **kwargs), reads, before_read)
+    def read_noting_fetched_bytes(self, after_size=None):
+        """Return the evidence and the number of bytes the reader took from the file.
 
-        with mock.patch("ci_burst.launch_evidence.open", noting_open):
-            return self.read(), reads
+        The count is the offset of the descriptor that the reader opened, read once
+        the reader has returned. The kernel advances the offset by every byte that
+        any read hands out, so it counts the bytes fetched whether a buffered stream
+        or ``os.read`` did the reading. A duplicate of the descriptor shares the
+        offset and outlives the reader's own close. ``after_size`` runs once, right
+        after the reader has taken the file's size from the descriptor.
+        """
+        duplicates = []
+        pending = [] if after_size is None else [after_size]
+        real_open, real_fstat = launch_evidence._open_for_reading, os.fstat
+
+        def open_and_duplicate(path, flags):
+            descriptor = real_open(path, flags)
+            duplicates.append(os.dup(descriptor))
+            return descriptor
+
+        def fstat_and_then_change_the_file(descriptor):
+            status = real_fstat(descriptor)
+            while pending:
+                pending.pop()()
+            return status
+
+        try:
+            with (
+                mock.patch("ci_burst.launch_evidence._open_for_reading", open_and_duplicate),
+                mock.patch("ci_burst.launch_evidence.os.fstat", fstat_and_then_change_the_file),
+            ):
+                evidence = self.read()
+            (duplicate,) = duplicates
+            return evidence, os.lseek(duplicate, 0, os.SEEK_CUR)
+        finally:
+            for duplicate in duplicates:
+                os.close(duplicate)
 
     def test_the_bound_is_sixteen_mebibytes(self):
         self.assertEqual(MAX_RECORD_BYTES, 16 * 1024 * 1024)
 
-    def test_a_file_at_the_bound_is_read_by_a_read_that_stops_one_byte_past_it(self):
+    def test_a_file_at_the_bound_is_read_in_full(self):
         self.write_padded(MAX_RECORD_BYTES)
-        evidence, reads = self.read_noting_reads()
+        evidence, fetched = self.read_noting_fetched_bytes()
         self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 3})
         self.assertTrue(evidence.holds)
-        self.assertEqual(reads, [(MAX_RECORD_BYTES + 1, MAX_RECORD_BYTES)])
+        self.assertEqual(fetched, MAX_RECORD_BYTES)
 
     def test_a_fresh_file_above_the_bound_is_malformed_and_is_not_read(self):
         self.write_padded(MAX_RECORD_BYTES + 1)
-        evidence, reads = self.read_noting_reads()
+        evidence, fetched = self.read_noting_fetched_bytes()
         self.assertEqual(evidence.as_dict(), {"state": "malformed", "considered": 0, "futile": 0})
         self.assertFalse(evidence.holds)
-        self.assertEqual(reads, [])
+        self.assertEqual(fetched, 0)
 
     def test_a_stale_file_above_the_bound_is_stale_and_is_not_read(self):
         for name, mtime in (
@@ -352,22 +521,27 @@ class BoundedReadTests(ReaderCase):
         ):
             with self.subTest(name):
                 self.write_padded(MAX_RECORD_BYTES + 1, mtime=mtime)
-                evidence, reads = self.read_noting_reads()
+                evidence, fetched = self.read_noting_fetched_bytes()
                 self.assertEqual(evidence.as_dict(), {"state": "stale", "considered": 0, "futile": 0})
                 self.assertFalse(evidence.holds)
-                self.assertEqual(reads, [])
+                self.assertEqual(fetched, 0)
 
-    def test_a_file_that_grows_after_its_size_was_taken_is_malformed_and_read_only_to_the_bound(self):
-        self.write_padded(MAX_RECORD_BYTES)
-
-        def double():
-            with open(self.path, "ab") as stream:
-                stream.write(b" " * MAX_RECORD_BYTES)
-
-        evidence, reads = self.read_noting_reads(before_read=double)
-        self.assertEqual(evidence.as_dict(), {"state": "malformed", "considered": 0, "futile": 0})
-        self.assertFalse(evidence.holds)
-        self.assertEqual(reads, [(MAX_RECORD_BYTES + 1, MAX_RECORD_BYTES + 1)])
+    def test_a_file_that_grows_after_its_size_was_taken_is_malformed_and_fetched_only_to_the_bound(self):
+        # One byte past the bound shows that the file is too large, and the reader
+        # fetches no more than that, however far the file has grown.
+        for name, size, growth in (
+            ("a file at the bound that doubles", MAX_RECORD_BYTES, MAX_RECORD_BYTES),
+            ("a file at the bound that grows by one byte", MAX_RECORD_BYTES, 1),
+            ("a small file that grows far past the bound", 4096, 2 * MAX_RECORD_BYTES),
+        ):
+            with self.subTest(name):
+                self.write_padded(size)
+                evidence, fetched = self.read_noting_fetched_bytes(
+                    after_size=functools.partial(self.append_spaces, growth)
+                )
+                self.assertEqual(evidence.as_dict(), {"state": "malformed", "considered": 0, "futile": 0})
+                self.assertFalse(evidence.holds)
+                self.assertEqual(fetched, MAX_RECORD_BYTES + 1)
 
 
 class ExporterShapeTests(ReaderCase):

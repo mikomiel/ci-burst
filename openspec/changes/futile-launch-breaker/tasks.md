@@ -21,12 +21,16 @@ instance identifiers and 32-character hexadecimal operation identifiers.
 - [x] 1.4 Open the file once, without blocking and without following a link,
   take the type, the modification time and the size from the open descriptor, and
   decide before it reads any content. Read the file only when it is a regular
-  file, is fresh and is at most 16 MiB, and then read at most 16 MiB plus one
-  byte. A file above 16 MiB, or one that grows past it after its size was taken,
-  is `malformed`. A FIFO with no writer would block a plain open while `apply`
-  holds the ledger writer lock. Test the states in the order `missing`,
-  `unreadable`, `stale`, `malformed`. Decode the JSON with a hook that refuses
-  `NaN`, `Infinity` and `-Infinity`, so a file that holds one is `malformed`. The
+  file, is fresh and is at most 16 MiB, and then read the descriptor itself, in
+  chunks that the bound still allows and through no buffered stream, until it
+  holds 16 MiB plus one byte. A file above 16 MiB, or one that grows past it
+  after its size was taken, is `malformed`, and the reader fetches no more than
+  16 MiB plus one byte from it. A FIFO with no writer would block a plain open
+  while `apply` holds the ledger writer lock. Test the states in the order
+  `missing`, `unreadable`, `stale`, `malformed`. Decode the JSON with hooks that
+  refuse `NaN`, `Infinity` and `-Infinity`, and a JSON object that names a member
+  twice at any level, so a file that holds one is `malformed`. `export` cannot
+  write a repeated member, because it serialises dictionaries with text keys. The
   function never raises, never writes, repairs, locks or deletes, and maps a path
   that is not a regular file, a link and any failure it did not foresee to
   `unreadable`.
@@ -77,12 +81,20 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   `export` cannot write make the file `malformed`, including values that are not
   hashable. The staleness cases set the file's modification time explicitly with
   `os.utime`, because the fake clock is not wall time. A file above 16 MiB is
-  `malformed` when it is fresh and `stale` when it is not, and neither is read,
-  which a stand-in for the opened stream shows. A file at exactly 16 MiB is read
-  by one read of at most 16 MiB plus one byte. A file that grows past the bound
-  after its size was taken is `malformed` and is read only to the bound. A `NaN`,
-  `Infinity` or `-Infinity` constant in a field that the gate does not read makes
-  the file `malformed`.
+  `malformed` when it is fresh and `stale` when it is not, and neither is read.
+  A file at exactly 16 MiB is read in full. A file that grows past the bound after
+  its size was taken is `malformed`, and the reader fetches exactly 16 MiB plus
+  one byte from it, for a file that was at the bound and for a small one alike.
+  The tests count the bytes fetched at the descriptor, from the offset of a
+  duplicate of the reader's descriptor, so the count holds whatever API reads
+  the file and a buffered stream that fetches a whole block more fails it. A
+  `NaN`, `Infinity` or `-Infinity` constant in a field that the gate does not read
+  makes the file `malformed`. So does a JSON object that names a member twice, at
+  the top level, in `instances`, in a record and in a nested object, whatever the
+  values: an invalid `steps` followed by a valid one in a record of three
+  otherwise futile records, the same instance key twice (registered, then
+  futile), and the same records with no repeat, which hold. Each such file is
+  checked to hold the repeat that its test names.
 - [x] 3.2 Classification tests cover futile; registered by the registration step;
   registered by a later marker with the registration line lost; no exit marker;
   an instance that has not ended, including a registered one that still runs; no

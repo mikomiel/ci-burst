@@ -286,11 +286,14 @@ a repeat after a crash between publishing an event and saving the dedupe record
 carries the same identity and a consumer can drop it. `export` saves the dedupe
 record last, after the textfile, so a run that cannot write the textfile leaves
 the record as it was. The next run rediscovers the owned instances and reads
-their current consoles again, so a marker that it still finds is emitted again
-under the same identity. An instance that left the provider's inventory, or a
-marker that scrolled out of the console, is not emitted again. The repeats count
-against the event file bound, so a long textfile outage can push older lines out
-of the file. The dedupe record keeps what was
+again the consoles that it selects within its per-run read budget
+(`MAX_CONSOLE_READS`, 16, live workers first), so a marker that it still finds on
+one of them is emitted again under the same identity. A console that the run
+defers past the budget (`console_read_deferred`) is not read in that run, so the
+run emits nothing for it. An instance that left the provider's inventory, or a
+marker that scrolled out of the console, is not emitted again.
+The repeats count against the event file bound, so a long textfile outage can
+push older lines out of the file. The dedupe record keeps what was
 already emitted and is pruned after seven days; deleting it loses the history and
 the cumulative counters. It can change a decision in one way only: `apply` and
 `plan` read the record as a brake after repeated futile launches (§ Futile launch
@@ -1656,7 +1659,10 @@ regular file that is not a link, so a FIFO at the path cannot stall a pass.
 They take the type, the age and the size from the open file and decide before
 they read a byte: a file that is not regular is `unreadable`, a file past the
 freshness bound is `stale` whatever its size, and a file above 16 MiB is
-`malformed`. They then read at most 16 MiB plus one byte.
+`malformed`. They then read the open file itself, with no buffered stream in
+between, and stop at 16 MiB plus one byte. A file that grows past 16 MiB after
+they took its size is `malformed`, and they fetch no more than 16 MiB plus one
+byte from it.
 `--state-file` moves only the export run: the controller reads the default path
 and does not look anywhere else.
 
@@ -1704,7 +1710,7 @@ state is `fresh`. The states, in the order they are tested:
 | `missing` | no file at the path |
 | `unreadable` | the file cannot be opened or read, is not a regular file (a FIFO, a directory) or is a link, or the reader failed in a way it did not foresee |
 | `stale` | the modification time is more than 600 seconds old, or after the controller clock |
-| `malformed` | larger than 16 MiB, not UTF-8 JSON (a `NaN`, `Infinity` or `-Infinity` constant counts as not JSON), another record version, or one record with a bad field the hold reads, an instance key that `export` rejects, or a registration marker (`job_process`, `spot_interruption`) of a shape that `export` does not write; the whole file is dropped |
+| `malformed` | larger than 16 MiB, not UTF-8 JSON (a `NaN`, `Infinity` or `-Infinity` constant counts as not JSON), a JSON object that names a member twice at any level (a decoder keeps only the last value, and `export` never writes one), another record version, or one record with a bad field the hold reads, an instance key that `export` rejects, or a registration marker (`job_process`, `spot_interruption`) of a shape that `export` does not write; the whole file is dropped |
 | `fresh` | the hold is evaluated |
 
 Only `fresh` evidence can hold. Every other state admits as if the hold did not

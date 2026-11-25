@@ -185,12 +185,22 @@ The controller MUST read the evidence only from `observed.json` in the `export` 
 - **THEN** the bytes and the modification time of the record are unchanged
 
 ### Requirement: The evidence read is bounded and decided from the open file
-The controller MUST take the type, the modification time and the size of the record from the open file and decide before it reads any content. It MUST read at most 16 MiB plus one byte and MUST treat a file above 16 MiB as `malformed`. It MUST refuse the JSON constants `NaN`, `Infinity` and `-Infinity` when it decodes the file, so a file that holds one is `malformed`.
+The controller MUST take the type, the modification time and the size of the record from the open file and decide before it reads any content. It MUST read the open file itself, not through a buffered stream, and fetch at most 16 MiB plus one byte from it, and MUST treat a file above 16 MiB as `malformed`. It MUST refuse the JSON constants `NaN`, `Infinity` and `-Infinity`, and a JSON object that names a member twice, when it decodes the file, so a file that holds one is `malformed`.
 
 #### Scenario: The file holds a nonstandard JSON constant
 - **WHEN** the file's modification time is fresh and the file holds `NaN`, `Infinity` or `-Infinity`, in a field that the gate reads or in one that it does not
 - **THEN** the evidence state is `malformed` for the whole file
 - **AND** three futile records in the same file do not hold admission
+
+#### Scenario: A JSON object names a member twice
+- **WHEN** the file's modification time is fresh and a JSON object in the file names one member twice, at the top level, in `instances` or in a record, whatever the two values are
+- **THEN** the evidence state is `malformed` for the whole file
+- **AND** three futile records in the same file do not hold admission, even when the last value of the repeated member is valid
+
+#### Scenario: An instance key repeats
+- **WHEN** the file's modification time is fresh and `instances` holds one key twice, a registered record under the first and a futile record under the second
+- **THEN** the evidence state is `malformed` for the whole file
+- **AND** the futile record, which a decoder that keeps the last value would use alone, does not hold admission
 
 #### Scenario: The file is larger than the size bound
 - **WHEN** the file's modification time is fresh and the file is larger than 16 MiB
@@ -208,7 +218,7 @@ The controller MUST take the type, the modification time and the size of the rec
 
 #### Scenario: The file grows past the size bound while it is read
 - **WHEN** the file grows past 16 MiB after the controller took its size
-- **THEN** the controller reads at most 16 MiB plus one byte
+- **THEN** the controller fetches at most 16 MiB plus one byte from the file, however far the file has grown
 - **AND** the evidence state is `malformed` and the gate is open
 
 ### Requirement: A decision reports the launch evidence it read

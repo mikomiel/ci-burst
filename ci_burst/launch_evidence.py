@@ -15,17 +15,21 @@ provider, queue or ledger call, and never raises.
 The reader decides from the open descriptor before it reads a byte: a file that
 is not a regular one is ``unreadable``, a file outside the freshness bound is
 ``stale`` whatever its size, and a file above ``MAX_RECORD_BYTES`` is
-``malformed``. It then reads at most one byte more than that bound, so a file
-that grows after its size was taken is ``malformed`` as well.
+``malformed``. It then reads the descriptor itself, with no buffered stream in
+between, and stops once it holds one byte more than that bound. A file that
+grows past the bound after its size was taken is ``malformed`` as well, and the reader fetches
+no more than that one byte past the bound from it: a buffered read of that last
+byte would fetch a whole block more.
 
 The reader takes only closed-vocabulary facts that ``export`` has already
 validated, never console text. A field of the wrong type, an instance key that
 ``export`` rejects and a registration marker that ``export`` cannot write each
-drop the whole file, and so does a JSON constant that is not standard JSON
-(``NaN``, ``Infinity``, ``-Infinity``), which ``export`` never writes. A value
-of the right type that ``export`` drops from ``state``, ``operation`` or
-``steps`` is no evidence, which is also what ``export`` makes of it when it
-loads its own record, so it never creates a hold.
+drop the whole file. So does a JSON constant that is not standard JSON
+(``NaN``, ``Infinity``, ``-Infinity``), and so does a JSON object that names a
+member twice, at any level: ``export`` writes neither (``_refuse_repeated_member``
+says why). A value of the right type that ``export`` drops from ``state``,
+``operation`` or ``steps`` is no evidence, which is also what ``export`` makes of
+it when it loads its own record, so it never creates a hold.
 The fields it reads, the record version and the rules that decide a shape are
 imported from ``export``; a contract test in ``tests/test_export.py`` fails when
 the two drift apart.
@@ -66,6 +70,10 @@ EVIDENCE_MAX_AGE_SECONDS = 600
 #: bound holds about 13,000 to 23,000 instances. A larger file is ``malformed``
 #: and is not read, so the gate stays open.
 MAX_RECORD_BYTES = 16 * 1024 * 1024
+
+#: The reader asks the descriptor for at most this many bytes at a time. Each
+#: request is also capped by what ``MAX_RECORD_BYTES`` still allows.
+_READ_CHUNK_BYTES = 1024 * 1024
 
 MISSING = "missing"
 UNREADABLE = "unreadable"
@@ -138,9 +146,33 @@ def _open_for_reading(path, flags):
     return os.open(path, flags | os.O_NONBLOCK | os.O_NOFOLLOW)
 
 
+def _read_to_bound(descriptor):
+    """Return what ``descriptor`` holds, fetching at most ``MAX_RECORD_BYTES + 1`` bytes.
+
+    The reads go straight to the descriptor, and each asks for no more than the
+    bound still allows, so a file that grew after its size was taken costs one byte
+    past the bound and no more. A buffered stream cannot promise that: to return
+    the last byte it fetches a whole block and keeps the rest in its buffer.
+    ``os.read`` is used, and not the stream's ``read``, because the descriptor is
+    non-blocking: a read that finds no data raises ``BlockingIOError``, which the
+    caller maps to ``unreadable``, where ``FileIO.read`` would return ``None``.
+    """
+    chunks = []
+    fetched = 0
+    while fetched <= MAX_RECORD_BYTES:
+        chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, MAX_RECORD_BYTES + 1 - fetched))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        fetched += len(chunk)
+    return b"".join(chunks)
+
+
 def _read(path, now):
     try:
-        stream = open(path, "rb", opener=_open_for_reading)
+        # The stream is unbuffered and only owns the descriptor: the content is
+        # read from the descriptor itself, by ``_read_to_bound``.
+        stream = open(path, "rb", buffering=0, opener=_open_for_reading)
     except FileNotFoundError:
         return LaunchEvidence(MISSING)
     except OSError:
@@ -151,7 +183,8 @@ def _read(path, now):
             # replacement of the path by ``export`` cannot pair one file's time
             # with another's content, and nothing is read from a file that is
             # not a regular one, is not fresh or is above the bound.
-            status = os.fstat(stream.fileno())
+            descriptor = stream.fileno()
+            status = os.fstat(descriptor)
             if not stat.S_ISREG(status.st_mode):
                 return LaunchEvidence(UNREADABLE)
             age = now - status.st_mtime
@@ -161,7 +194,7 @@ def _read(path, now):
                 return LaunchEvidence(MALFORMED)
             # One byte more than the bound shows a file that grew after its size
             # was taken, without reading it whole.
-            raw = stream.read(MAX_RECORD_BYTES + 1)
+            raw = _read_to_bound(descriptor)
         except OSError:
             return LaunchEvidence(UNREADABLE)
     if len(raw) > MAX_RECORD_BYTES:
@@ -182,6 +215,25 @@ def _refuse_constant(constant):
     raise ValueError(f"{constant} is not a JSON value")
 
 
+def _refuse_repeated_member(pairs):
+    """Refuse a JSON object that names one member twice, at any level.
+
+    ``json`` keeps the last value of a repeated member, so a record with an
+    invalid ``steps`` followed by a valid one would pass every field rule, and a
+    key of ``instances`` that repeats would keep only its last record. ``export``
+    cannot write either. It serialises its record with ``json.dumps`` from
+    dictionaries whose keys are all text, the fixed field names and the instance
+    identifiers that pass ``INSTANCE_PATTERN``, and a dictionary holds a key once.
+    (``json.dumps`` can write one name twice only for keys of different types,
+    such as ``1`` and ``"1"``, and ``export`` has none.) The error is a
+    ``ValueError``, so the file is ``malformed`` and not ``unreadable``.
+    """
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        raise ValueError("a JSON object names a member twice")
+    return members
+
+
 def _records(raw, now):
     """Return the validated records, or ``None`` when the file is malformed.
 
@@ -189,7 +241,11 @@ def _records(raw, now):
     records among the newest three.
     """
     try:
-        payload = json.loads(raw.decode("utf-8"), parse_constant=_refuse_constant)
+        payload = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=_refuse_constant,
+            object_pairs_hook=_refuse_repeated_member,
+        )
     except (UnicodeDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:

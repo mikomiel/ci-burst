@@ -35,7 +35,8 @@ change to the brake's reader.
 - **WHEN** a run cannot replace the metrics textfile, so the command exits 1
 - **THEN** the record is not rewritten, because the command writes the record after the event file and the textfile
 - **AND** its modification time ages, so the brake sees it as `stale` after 600 seconds
-- **AND** the next run rediscovers the owned instances and reads their current consoles again, so a marker that it still finds is emitted again under the same identity
+- **AND** the next run rediscovers the owned instances and reads again the consoles that it selects within its per-run read budget (`MAX_CONSOLE_READS`, 16, live workers first), so a marker that it still finds on one of them is emitted again under the same identity
+- **AND** a console that the run defers past that budget (`console_read_deferred`) is not read in that run, so the run emits nothing for it
 - **AND** an instance that left the provider's inventory, or a marker that scrolled out of the console, is not emitted again
 
 #### Scenario: A run that cannot write the record does not reach publication

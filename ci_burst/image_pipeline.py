@@ -66,8 +66,11 @@ paths included, end the row ``failed`` with ``IMAGE_INPUTS_CHANGED``, count no
 failure and launch nothing, and the next pass decides from the new inputs. It then runs the template check of
 a start again: an unsafe template ends the row ``failed`` and the pass answers
 ``refused``, like a refused start check. The launch reads the clock again right
-before the provider call: at or after the build deadline no builder is launched,
-and the build fails ``CONSOLE_BLIND``.
+before the provider call, after its last read (the listing of the builders):
+at or after the build deadline no builder is launched, and the build fails
+``CONSOLE_BLIND``. At or after the pass deadline none is launched either, and the
+row is left as a stage that the pass deadline ended: ``building`` with no builder
+and no archive hash, for the next pass to stage again.
 
 The archive of a build is deleted when the build ends, from the bucket and the
 key its row recorded, and the row records the time (``archive_deleted_at``). A
@@ -78,7 +81,9 @@ archive at once. A pass starts at most ``OWED_ARCHIVES_PER_PASS`` of them
 after its own work, on the time that work leaves, and also when the pass ended on a
 refusal: none starts once the pass deadline is less than ``OWED_DELETE_RESERVE_SECONDS``
 away. The owner check of a delete can be the first use of the account of this session, a provider
-call that takes time, so the clock is read again after the check, right before the S3 call. A backlog
+call that takes time, and the first S3 call builds the S3 client, which takes time too. So the clock is
+read again after the check, and once more by the adapter after it built the client, right before the S3
+request: a delete that would start inside the reserve does not start, and its row stays owed. A backlog
 of slow refused deletions cannot take the time that a stage, a decision
 or a build needs. If passes never leave that time, the bucket lifecycle rule stays the
 backstop. A refused
@@ -172,8 +177,9 @@ STRAY_ARCHIVE_AGE_SECONDS = 3600
 #: One pass starts at most this many owed archive deletions, after its own work and on the time that work leaves. A
 #: deletion starts only while the clock is before the pass deadline minus ``OWED_DELETE_RESERVE_SECONDS``: the read
 #: timeout of the SDK client, which one delete can use up, and a margin. The clock is read again after the owner check,
-#: which can ask the provider for the account first, so the S3 call itself never starts inside the reserve. A backlog
-#: of slow refused deletions cannot take the time that a stage, a decision or a build needs.
+#: which can ask the provider for the account first, and once more by the adapter after it built its S3 client, so the
+#: S3 request itself never starts inside the reserve. A backlog of slow refused deletions cannot take the time that a
+#: stage, a decision or a build needs.
 OWED_ARCHIVES_PER_PASS = 8
 OWED_DELETE_RESERVE_SECONDS = READ_TIMEOUT_SECONDS + 10
 
@@ -772,15 +778,18 @@ class ImagePipeline:
     ``IMAGE_USERDATA_TOO_LARGE`` in ``plan``, ``IMAGE_STATE_LOCKED`` and every
     provider read that fails) are raised. ``IMAGE_GATE_REQUIRED`` is raised by
     ``plan`` and by an applying pass whose state holds no build in flight and no
-    archive deletion that is owed: a pass that settles either is not refused for
-    it, and answers ``refused`` with that code when a launch is asked of it or no
-    build is left to settle. The answers of the trigger rules, and
-    the two refusals of a start (``START_REFUSALS``), are returned as the
-    decision ``refused`` with a ``reason``. So are ``IMAGE_BUILD_TEMPLATE_UNSAFE``
-    and ``IMAGE_INPUTS_CHANGED`` when a pass stages again a build that has a row:
-    the row ends and counts no failure. A build that ends badly is returned
-    as the decision ``failed`` with the reason code of the failure. A result
-    holds ids, 12-character digests, counts and codes only.
+    archive deletion that is owed. A pass that settles either is not refused for
+    it. One that starts with no build in flight (a cleanup pass, for an owed
+    deletion) runs the deletions and answers ``refused`` with that code. One that
+    starts with a build in flight answers the verdict of that build, and answers
+    ``refused`` with that code only for a launch it would make: a stage done
+    again. The answers of the trigger rules, and the two refusals of a start
+    (``START_REFUSALS``), are returned as the decision ``refused`` with a
+    ``reason``. So are ``IMAGE_BUILD_TEMPLATE_UNSAFE`` and
+    ``IMAGE_INPUTS_CHANGED`` when a pass stages again a build that has a row:
+    the row ends and counts no failure. A build that ends badly is returned as
+    the decision ``failed`` with the reason code of the failure. A result holds
+    ids, 12-character digests, counts and codes only.
     """
 
     def __init__(
@@ -1058,8 +1067,12 @@ class ImagePipeline:
         caller. Without a gate command or the opt-out the pass is refused
         (``IMAGE_GATE_REQUIRED``) before any client is built, unless the state
         holds a build in flight or an archive deletion that a finished build
-        owes: the pass then settles it and starts no build. With no build left
-        to settle it answers ``refused``.
+        owes. The pass then settles what the state holds and starts no build.
+        With no build in flight at its start it is a cleanup pass: it runs the
+        owed deletions and answers ``refused`` (``cleanup_only``). With a build
+        in flight at its start it answers the verdict of that build (``building``,
+        ``imaging``, ``candidate`` or ``failed``). It answers ``refused`` only for
+        a launch it would make: a stage done again.
         """
         if not self._image.enabled:
             return {"decision": DISABLED}
@@ -1392,11 +1405,12 @@ class _Pass:
 
         At most ``OWED_ARCHIVES_PER_PASS`` start, and none once the pass deadline is less than
         ``OWED_DELETE_RESERVE_SECONDS`` away. The clock is read before each one, and again after its owner check
-        (``_delete_archive``), which can be the first use of the account and so take time. ``ImageState.archives_owed``
-        lists the rows never tried first, then the least recently tried, so a deletion that stays refused cannot keep
-        a newer row from its turn. A row whose delete this pass attempted (``delete_attempted``) is not tried again
-        in it. The rows that the bound left, and the row whose owner check ended inside the reserve, stay owed and
-        are noted as ``archive:delete_deferred``.
+        (``_delete_archive``), which can be the first use of the account and so take time, and once more by the
+        adapter after it built its S3 client. ``ImageState.archives_owed`` lists the rows never tried first, then the
+        least recently tried, so a deletion that stays refused cannot keep a newer row from its turn. A row whose
+        delete this pass attempted (``delete_attempted``) is not tried again in it. The rows that the bound left, and
+        the row whose owner check or client build ended inside the reserve, stay owed and are noted as
+        ``archive:delete_deferred``.
         """
         self.owed_done = True
         # A row whose delete was attempted in this pass already, for instance at the end of its own build, is not
@@ -1410,7 +1424,8 @@ class _Pass:
                 started += 1
                 outcome = self._delete_archive(owed, not_after=cutoff)
             if outcome is None:
-                # No delete started: the bound is met, or the owner check of this row ended inside the reserve.
+                # No delete started: the bound is met, or the owner check or the client build of this row ended inside
+                # the reserve.
                 self._note("archive:delete_deferred")
                 summary["owed_archives_deferred"] += len(rows) - index
                 break
@@ -1744,18 +1759,23 @@ class _Pass:
         with an unknown outcome: the builder may exist, and the next pass adopts
         it by its build-id tag or fails the build.
 
-        The clock is read after the last read and right before the call, and no builder is launched at or after
-        the build deadline: the call is refused with ``CONSOLE_BLIND``, the code of a console that never showed
-        anything.
+        The clock is read once, after the last read and right before the call, and no builder is launched at or after
+        either deadline. At or after the build deadline the call is refused with ``CONSOLE_BLIND``, the code of a
+        console that never showed anything. At or after the pass deadline it is refused with ``DeadlineRefusal``: the
+        last read, the listing of the builders, starts inside the pass and can end after it, and the row then waits for
+        the next pass to stage it again (``_stage_and_launch``, ``_stage``).
         """
         aws, cfg = self.aws, self.cfg
         url = aws.presign_get(build.archive_bucket, upload.key, cfg.source.presign_seconds)
         user_data = image.render_user_data(self.script, image.warm_exports(cfg, url, upload.sha256))
         self._check_no_builder()
-        if self.clock() >= build.deadline_at:
+        now = self.clock()
+        if now >= build.deadline_at:
             # The upload and the reads before this call take time. ``_stage`` ends the build with this code and
             # ``_fail`` deletes the archive that the row names.
             raise ImageRefusal(image_console.CONSOLE_BLIND)
+        if now >= self.deadline:
+            raise DeadlineRefusal("RunInstances")
         try:
             return aws.run_builder(
                 template_name=cfg.build.launch_template_name,
@@ -2074,9 +2094,11 @@ class _Pass:
         (``ImageState.archives_owed``) and ``_reconcile`` of every later pass tries again. S3 answers a delete of a
         key that was never written as a success, so a row whose upload never happened settles at the first try.
 
-        The owner check can be the first use of the account in this session, a provider call that takes time. With
-        ``not_after`` set, the clock is read once the check has passed, right before the S3 call: a delete that would
-        start at or after it does not start. The row is then left as it was (not tried, still owed) for a later pass.
+        The owner check can be the first use of the account in this session, a provider call that takes time, and the
+        first S3 call of the session builds its client, which takes time too. With ``not_after`` set, the clock is read
+        once the check has passed and again, by the adapter, once the client is built, right before the request: a
+        delete that would start at or after it does not start. The row is then left as it was (not tried, still owed)
+        for a later pass.
         """
         if not build.archive_key or not build.archive_bucket:
             return False
@@ -2088,7 +2110,14 @@ class _Pass:
             if not_after is not None and self.clock() >= not_after:
                 self.delete_attempted.discard(build.id)
                 return None
-            self.aws.delete_object(build.archive_bucket, build.archive_key, owner=build.archive_owner)
+            self.aws.delete_object(
+                build.archive_bucket, build.archive_key, owner=build.archive_owner, deadline=not_after
+            )
+        except DeadlineRefusal:
+            # The client of the first S3 call was built after the cutoff, so the adapter did not send the request: the
+            # delete never started, as in the check above.
+            self.delete_attempted.discard(build.id)
+            return None
         except ProviderRefusal as refusal:
             self.s.mark_archive_delete_tried(build.id, self.clock())
             self._note("archive:delete_failed")

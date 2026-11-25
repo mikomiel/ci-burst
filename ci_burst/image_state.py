@@ -15,7 +15,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
 from pathlib import Path
 
 from .errors import StateRefusal
@@ -182,8 +182,22 @@ class Build:
     verified_at: float | None = None
     source_pin: int | None = None
     #: The JSON object ``path -> sha256 of the file's content`` of the basis files read when the row was inserted,
-    #: keys sorted. ``build_file_hashes`` reads it.
+    #: keys sorted. ``build_file_hashes`` reads it. ``None`` when the column holds nothing that is text, or text that
+    #: is no UTF-8 (``_BUILD_COLUMNS``): ``build_file_hashes`` refuses the row either way.
     basis_file_hashes: str | None = None
+
+
+#: The columns that every reader of ``image_builds`` selects, in the order of ``Build``, and ``_build`` reads them.
+#: ``basis_file_hashes`` is selected as the raw bytes of a text value, and as ``NULL`` for any other value, so that
+#: SQLite does not decode it as the row is fetched: a file that something else damaged can hold text there that is no
+#: UTF-8, and SQLite raises its own error for it, which would end the read before ``build_file_hashes`` can refuse
+#: the row by its id. Every other column is read as before.
+_BUILD_COLUMNS = ", ".join(
+    "CASE WHEN typeof(basis_file_hashes) = 'text' THEN CAST(basis_file_hashes AS BLOB) END AS basis_file_hashes"
+    if field.name == "basis_file_hashes"
+    else field.name
+    for field in dataclass_fields(Build)
+)
 
 
 @dataclass(frozen=True)
@@ -505,7 +519,11 @@ class ImageState:
         return self.build(build_id)
 
     def build(self, build_id):
-        row = self._require().execute("SELECT * FROM image_builds WHERE id = ?", (build_id,)).fetchone()
+        row = (
+            self._require()
+            .execute(f"SELECT {_BUILD_COLUMNS} FROM image_builds WHERE id = ?", (build_id,))
+            .fetchone()
+        )
         return _build(row) if row else None
 
     def active_build(self, deployment):
@@ -513,7 +531,7 @@ class ImageState:
         row = (
             self._require()
             .execute(
-                f"SELECT * FROM image_builds WHERE deployment = ? AND state IN ({_ACTIVE_SQL})",
+                f"SELECT {_BUILD_COLUMNS} FROM image_builds WHERE deployment = ? AND state IN ({_ACTIVE_SQL})",
                 (deployment,),
             )
             .fetchone()
@@ -523,7 +541,7 @@ class ImageState:
     def builds(self, deployment):
         """Every build of ``deployment``, oldest first."""
         rows = self._require().execute(
-            "SELECT * FROM image_builds WHERE deployment = ? ORDER BY created_at, rowid", (deployment,)
+            f"SELECT {_BUILD_COLUMNS} FROM image_builds WHERE deployment = ? ORDER BY created_at, rowid", (deployment,)
         )
         return [_build(row) for row in rows]
 
@@ -538,7 +556,7 @@ class ImageState:
         the others.
         """
         rows = self._require().execute(
-            f"SELECT * FROM image_builds WHERE deployment = ? AND state NOT IN ({_ACTIVE_SQL})"
+            f"SELECT {_BUILD_COLUMNS} FROM image_builds WHERE deployment = ? AND state NOT IN ({_ACTIVE_SQL})"
             " AND archive_key IS NOT NULL AND archive_key != '' AND archive_bucket IS NOT NULL"
             " AND archive_deleted_at IS NULL"
             " ORDER BY archive_delete_seq IS NOT NULL, archive_delete_seq, created_at, rowid",
@@ -590,7 +608,7 @@ class ImageState:
         row = (
             self._require()
             .execute(
-                "SELECT * FROM image_builds WHERE deployment = ? AND state = 'candidate'"
+                f"SELECT {_BUILD_COLUMNS} FROM image_builds WHERE deployment = ? AND state = 'candidate'"
                 " AND verified_at IS NOT NULL ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (deployment,),
             )
@@ -649,7 +667,7 @@ class ImageState:
         row = (
             self._require()
             .execute(
-                "SELECT * FROM image_builds WHERE deployment = ? AND template_version = ?"
+                f"SELECT {_BUILD_COLUMNS} FROM image_builds WHERE deployment = ? AND template_version = ?"
                 " AND state IN ('candidate', 'promoted') ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (deployment, version),
             )
@@ -741,7 +759,8 @@ class ImageState:
         row = (
             self._require()
             .execute(
-                f"SELECT * FROM image_builds WHERE deployment = ?{clause} ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                f"SELECT {_BUILD_COLUMNS} FROM image_builds WHERE deployment = ?{clause}"
+                " ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 arguments,
             )
             .fetchone()
@@ -1018,7 +1037,16 @@ def _check_columns(fields, allowed):
 
 
 def _build(row):
-    return Build(**dict(row))
+    values = dict(row)
+    raw = values["basis_file_hashes"]
+    if raw is not None:
+        # The bytes of a text value (``_BUILD_COLUMNS``). Text that is no UTF-8 reads as no hashes, which
+        # ``build_file_hashes`` refuses by row; the decoding is as strict as SQLite's own.
+        try:
+            values["basis_file_hashes"] = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            values["basis_file_hashes"] = None
+    return Build(**values)
 
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -1037,8 +1065,9 @@ def build_file_hashes(build):
     """The basis-file hashes of a build row, or ``IMAGE_STATE_UNREADABLE`` when the row has none or they are damaged.
 
     A row that was inserted for a build always has them. A hand-edited or damaged file can hold anything in the
-    column, so the text is parsed and checked for the shape that ``insert_build`` writes. The refusal names the
-    row, never the value.
+    column (text that is no UTF-8 and a value that is no text included, which every reader hands over as ``None``),
+    so the text is parsed and checked for the shape that ``insert_build`` writes. The refusal names the row, never
+    the value.
 
     The decoder raises a ``ValueError`` for a JSON error, and a ``RecursionError`` (which is no ``ValueError``) for a
     value nested deeper than it allows. Both give this refusal, and neither brings the value with it.

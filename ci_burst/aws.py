@@ -1263,8 +1263,16 @@ class ImageAws:
                 items.append(StoredObject(key=key, size=size, last_modified=_timestamp(entry.get("LastModified"))))
         return items
 
-    def delete_object(self, bucket, key, *, owner=None):
-        self._invoke("s3", "delete_object", owner=owner, Bucket=bucket, Key=key)
+    def delete_object(self, bucket, key, *, owner=None, deadline=None):
+        """Delete one object, naming ``owner`` as the bucket's owner (see ``_bound_owner``).
+
+        With a ``deadline`` the clock is read once the S3 client is built, right before the request (``_invoke``): the
+        first S3 call of an adapter builds its client, which takes time, and a delete that would start at or after the
+        deadline is not sent (``DeadlineRefusal``).
+        """
+        self._invoke(
+            "s3", "delete_object", owner=owner, deadline=deadline, detail="archive delete", Bucket=bucket, Key=key
+        )
 
     def credential_expiry(self):
         """Epoch expiry of this session's credentials, or ``None`` when unknown.

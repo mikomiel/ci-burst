@@ -1928,6 +1928,75 @@ class StagingDeadlineTests(Base):
         self.assertEqual(self.names(), ["get_caller_identity", "list_objects_v2"])
 
 
+class SlowClientSession(FakeSession):
+    """A session whose clients take ``seconds`` of the test clock to build, as the first use of an SDK client can."""
+
+    def __init__(self, calls, ec2, s3, clock, seconds):
+        super().__init__(calls, ec2, s3)
+        self.clock = clock
+        self.seconds = seconds
+
+    def client(self, service, region_name=None, config=None):
+        self.clock.advance(self.seconds)
+        return super().client(service, region_name=region_name, config=config)
+
+
+class DeleteDeadlineTests(Base):
+    """A delete that has a deadline is not sent at or after it, whatever the build of the S3 client took.
+
+    The owner of a recorded archive is known, so a delete asks STS for nothing. It still builds the S3 client on its
+    first use, which takes time of its own. The deadline is read once the client is built, right before the request.
+    """
+
+    KEY = PREFIX + "build-0001.tar.gz"
+    LEFT = 5
+
+    def lazy(self, build_seconds):
+        """An adapter that has no S3 client: its first S3 call pays ``build_seconds`` of the clock for one."""
+        session = SlowClientSession(self.calls, self.ec2, self.s3, self.clock, build_seconds)
+        return self.image_aws(clients={}, session_factory=lambda profile: session)
+
+    def delete(self, aws, **keywords):
+        # The build of a client needs the SDK's configuration type, which this suite does not install.
+        with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
+            aws.delete_object(BUCKET, self.KEY, owner=ACCOUNT, **keywords)
+
+    def test_a_delete_whose_client_build_ends_at_or_after_the_deadline_is_not_sent(self):
+        for seconds in (self.LEFT, 30):
+            with self.subTest(build_seconds=seconds):
+                self.calls.clear()
+                self.clock.now = NOW
+                deadline = self.clock() + self.LEFT
+                with self.assertRaises(DeadlineRefusal) as raised:
+                    self.delete(self.lazy(seconds), deadline=deadline)
+                # Still the deadline refusal, not a provider failure that the call translated it into.
+                refusal = raised.exception
+                self.assertEqual((refusal.reason, refusal.detail), ("pass_deadline_exceeded", "archive delete"))
+                # The premise: the build started with time left, and ended at or after the deadline.
+                self.assertGreaterEqual(self.clock(), deadline)
+                self.assertEqual(self.names(), ["session.client"])
+
+    def test_a_delete_whose_client_build_ends_before_the_deadline_is_sent(self):
+        # The same delete with a quicker build, so the refusals above are the deadline's and not the fake's.
+        deadline = self.clock() + self.LEFT
+        self.delete(self.lazy(self.LEFT - 1), deadline=deadline)
+        self.assertLess(self.clock(), deadline)
+        self.assertEqual(self.names(), ["session.client", "delete_object"])
+        self.assertEqual(
+            self.requests("delete_object"), [{"Bucket": BUCKET, "Key": self.KEY, "ExpectedBucketOwner": ACCOUNT}]
+        )
+
+    def test_a_deadline_that_has_passed_sends_no_delete_when_the_client_exists_already(self):
+        with self.assertRaises(DeadlineRefusal) as raised:
+            self.delete(self.image_aws(), deadline=self.clock())
+        self.assertEqual(raised.exception.detail, "archive delete")
+        self.assertEqual(self.names(), [])
+
+    def test_a_delete_with_no_deadline_is_not_bounded_by_the_clock(self):
+        self.delete(self.lazy(10_000))
+        self.assertEqual(self.names(), ["session.client", "delete_object"])
+
+
 class PresignTests(Base):
     KEY = PREFIX + "build-0001.tar.gz"
 

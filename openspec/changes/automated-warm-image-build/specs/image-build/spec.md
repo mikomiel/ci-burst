@@ -262,7 +262,7 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 #### Scenario: The bucket does not exist
 - **WHEN** S3 answers `NoSuchBucket` to the upload of an archive, for instance because the bucket that a row recorded was removed
 - **THEN** the upload ends with `IMAGE_STAGING_BUCKET_MISSING`
-- **AND** a stage done again ends its row as a refused start with no failure counted, keeps the archive fields of the row and never marks it deleted
+- **AND** a stage done again ends its row as a refused start with no failure counted, keeps the archive fields of the row and marks it deleted only when the delete of its archive succeeds
 - **AND** a first stage fails the build, and an owed deletion at that bucket counts as failed and stays owed
 
 #### Scenario: The build ends

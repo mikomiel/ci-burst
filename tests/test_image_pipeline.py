@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from ci_burst import image, image_pipeline
+from ci_burst import aws as aws_module, image, image_pipeline
 from ci_burst.aws import (
     BASIS_DIGEST_TAG,
     BUILD_ID_TAG,
@@ -729,6 +729,39 @@ class UncachedAccountAws(ImageAws):
             clients={"ec2": world.ec2, "s3": world.s3, "sts": sts},
             clock=world.clock,
             expiry=world.clock() + world.credential_life,
+        )
+
+
+class SlowClientSession:
+    """The session of an adapter that has no S3 client yet: building the first one takes ``seconds`` of the clock."""
+
+    def __init__(self, world, seconds):
+        self.w = world
+        self.seconds = seconds
+        self.built = []
+
+    def client(self, service, region_name=None, config=None):
+        self.built.append(service)
+        self.w.clock.advance(self.seconds)
+        return {"ec2": self.w.ec2, "s3": self.w.s3}[service]
+
+
+class LazyClientAws(ImageAws):
+    """The real adapter on the world's EC2 client and no S3 client: its first S3 call builds one, from ``session``.
+
+    ``WorldAws`` hands the adapter both clients, so a pass never waits to build one. Here the first S3 call, which can
+    be an owed delete, pays for the client, as it does in a real pass.
+    """
+
+    def __init__(self, world, session):
+        super().__init__(
+            REGION,
+            PROFILE,
+            clients={"ec2": world.ec2},
+            clock=world.clock,
+            expiry=world.clock() + world.credential_life,
+            account=world.account,
+            session_factory=lambda profile: session,
         )
 
 
@@ -2653,6 +2686,70 @@ class FailureTests(PipelineCase):
         self.assertEqual(list(self.world.objects), [first.archive_key])
         self.assertEqual(self.events("image_build_failed"), [])
 
+    def a_pass_whose_last_listing_before_the_launch_takes(self, seconds):
+        """Run a pass that launches a builder, and make its last read before the launch call take ``seconds``.
+
+        The launch lists the builders once more after it presigned the URL (``_Pass._launch``): that listing starts
+        inside the pass, returns empty ``seconds`` later and is the last read before ``RunInstances``. The build deadline
+        is far off, so only the pass deadline can stop the launch. Returns the start of the pass and its result.
+        """
+        started_at = self.clock()
+        entered = []
+
+        def take_time(arguments):
+            if self.world.arguments("generate_presigned_url") and not entered:
+                entered.append(self.clock())
+                self.clock.advance(seconds)
+
+        self.world.hooks["describe_instances"] = take_time
+        result = self.apply()
+        del self.world.hooks["describe_instances"]
+        # The premise: the listing started before the pass deadline, so the adapter sent it.
+        self.assertEqual(len(entered), 1)
+        self.assertLess(entered[0], started_at + PASS_DEADLINE_SECONDS)
+        return started_at, result
+
+    def assert_a_last_listing_that_ended_the_pass_launched_nothing(self, started_at, result):
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        # The answer that matters most: no builder was launched after the pass deadline.
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        first = self.only_build()
+        # The row waits for the next pass to stage it again: no builder, no archive hash and no failure.
+        self.assert_unstaged(first)
+        # The build deadline is far off, so it did not stop the launch.
+        self.assertLess(self.clock(), first.deadline_at)
+        self.assertEqual(first.archive_key, f"{PREFIX}{first.id}.tar.gz")
+        self.assertEqual(list(self.world.objects), [first.archive_key])
+        # The next pass stages the archive again under the same key and launches.
+        result = self.apply()
+        self.assertEqual(result["decision"], "building", result)
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assertIsNotNone(build.builder_id)
+        self.assertEqual(build.archive_sha256, ARCHIVE_SHA)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_a_last_listing_that_ends_at_the_pass_deadline_launches_no_builder(self):
+        started_at, result = self.a_pass_whose_last_listing_before_the_launch_takes(PASS_DEADLINE_SECONDS)
+        self.assert_a_last_listing_that_ended_the_pass_launched_nothing(started_at, result)
+
+    def test_a_last_listing_that_ends_after_the_pass_deadline_launches_no_builder(self):
+        started_at, result = self.a_pass_whose_last_listing_before_the_launch_takes(PASS_DEADLINE_SECONDS + 60)
+        self.assert_a_last_listing_that_ended_the_pass_launched_nothing(started_at, result)
+
+    def test_a_last_listing_that_ends_just_inside_the_pass_deadline_launches_the_builder(self):
+        # The same pass with a listing that ends inside the deadline, so the refusals above are the deadline's.
+        started_at, _ = self.a_pass_whose_last_listing_before_the_launch_takes(PASS_DEADLINE_SECONDS - 1)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        build = self.only_build()
+        self.assertIsNotNone(build.builder_id)
+        self.assertEqual((build.state, build.archive_sha256), ("building", ARCHIVE_SHA))
+        self.assertEqual(self.events("image_build_failed"), [])
+
     def unstaged_build(self):
         """A build whose first pass ran out of time during the stage. That pass is over."""
         self.source.on_chunk = lambda: self.clock.advance(400)
@@ -4182,6 +4279,73 @@ class OwedArchiveBoundTests(PipelineCase):
         self.assertNotIn("archive:delete_deferred", result["notes"])
         self.assertNotIn(key, self.world.objects)
 
+    def lazy_s3_client(self, seconds):
+        """From now on a pass is handed an adapter with no S3 client: the first S3 call builds one, in ``seconds``.
+
+        The account is known, so the owner check asks STS for nothing and the client build is the only wait. In a
+        pass with no listing of the staging prefix (a cleanup pass) the owed delete is the first S3 call. Returns the
+        session, whose ``seconds`` a test can change for a later pass.
+        """
+        session = SlowClientSession(self.world, seconds)
+        # The build of a client needs the SDK's configuration type, which this suite does not install.
+        sdk_config = mock.patch.object(aws_module, "_sdk_config", return_value=object())
+        sdk_config.start()
+        self.addCleanup(sdk_config.stop)
+
+        def factory():
+            adapter = LazyClientAws(self.world, session)
+            self.sessions.append(adapter)
+            return adapter
+
+        self.aws_factory = factory
+        self.restart()
+        return session
+
+    def test_a_client_build_that_ends_inside_the_reserve_starts_no_owed_delete_in_a_cleanup_pass(self):
+        (key,) = self.owe(1)
+        # No gate and nothing in flight: the pass reads nothing before the owed delete. The account is known, so the
+        # owner check passes with the clock before the reserve, and the build of the S3 client that follows ends inside it.
+        self.configure(render_toml(gate=""))
+        session = self.lazy_s3_client(PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS + 5)
+        started_at = self.clock()
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_GATE_REQUIRED"), result)
+        # The premise: the client was built, and its build ended inside the reserve.
+        self.assertEqual(session.built, ["s3"])
+        self.assertGreater(self.clock(), started_at + PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS)
+        # No delete was sent, so the row is deferred as one that never started: not tried, not failed, not done.
+        self.assert_the_row_is_deferred_and_untouched(key)
+        reconcile = result["reconcile"]
+        self.assertEqual(
+            (reconcile["owed_archives_deleted"], reconcile["owed_archive_delete_failed"], reconcile["owed_archives_deferred"]),
+            (0, 0, 1),
+        )
+        self.assertIn("archive:delete_deferred", result["notes"])
+        self.assertNotIn("archive:delete_failed", result["notes"])
+        # The row lost nothing: a later pass, whose client builds quickly, deletes it.
+        session.seconds = 1
+        self.clock.advance(60)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1, result)
+        self.assertNotIn(key, self.world.objects)
+        self.assertIsNotNone(self.only_build_named("owed-00").archive_deleted_at)
+
+    def test_a_quick_client_build_leaves_the_owed_delete_to_start(self):
+        # The same pass as the first test with a client build that ends before the reserve: the delete starts, so the
+        # checks above can tell a deferred delete from one that never ran.
+        (key,) = self.owe(1)
+        self.configure(render_toml(gate=""))
+        session = self.lazy_s3_client(5)
+        started_at = self.clock()
+        result = self.apply()
+        self.assertEqual(session.built, ["s3"])
+        (start,) = self.starts
+        self.assertLess(start, started_at + PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS)
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1, result)
+        self.assertNotIn("archive:delete_deferred", result["notes"])
+        self.assertNotIn(key, self.world.objects)
+        self.assertIsNotNone(self.only_build_named("owed-00").archive_deleted_at)
+
     def a_stray_object_and_a_first_read_that_leaves_5_seconds(self, lookup_seconds):
         """A stray archive older than an hour, and a pass whose first read of reconcile leaves 5 seconds of it.
 
@@ -4705,6 +4869,31 @@ class RestageReadsNoBasisFileTests(PipelineCase):
             connection.close()
         mark = len(self.source.calls)
         self.refused(self.apply, "IMAGE_STATE_UNREADABLE", detail_lacks=("not json",))
+        self.assertEqual(self.source.calls[mark:], [])
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        build = self.only_build()
+        self.assertEqual((build.id, build.state), (first.id, "building"))
+
+    def test_recorded_hashes_that_are_not_utf8_text_are_damaged_state_and_the_row_stays(self):
+        # The column is text, and a file that something else damaged can hold bytes in it that are no UTF-8. SQLite
+        # refuses to hand such text to Python, so the pass must refuse the row, and not fail on the read that fetches it.
+        first = self.unstaged_build()
+        marker = "marker-before-the-bad-byte"
+        connection = sqlite3.connect(self.state_dir / "image-state.sqlite")
+        try:
+            connection.execute(
+                "UPDATE image_builds SET basis_file_hashes = CAST(? AS TEXT) WHERE id = ?",
+                (marker.encode() + b"\xff", first.id),
+            )
+            connection.commit()
+            # The premise: the value is stored as text, and Python cannot read it.
+            with self.assertRaises(sqlite3.OperationalError):
+                connection.execute("SELECT basis_file_hashes FROM image_builds").fetchall()
+        finally:
+            connection.close()
+        mark = len(self.source.calls)
+        self.refused(self.apply, "IMAGE_STATE_UNREADABLE", detail_has=(first.id,), detail_lacks=(marker,))
         self.assertEqual(self.source.calls[mark:], [])
         self.assertEqual(len(self.archive_keys()), 1)
         self.assertEqual(self.world.arguments("run_instances"), [])

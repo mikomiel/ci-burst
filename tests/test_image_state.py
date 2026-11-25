@@ -266,6 +266,95 @@ class ArchiveRecordTests(ImageStateCase):
                 self.assertNotIn(sentinel, raised.exception.detail)
                 self.assertNotIn(sentinel, repr(raised.exception.as_dict()))
 
+    def store_hashes(self, value, *, as_text):
+        """Write ``value`` (bytes) into the hash column of every row, as a text value or as a blob.
+
+        A file that something else damaged can hold either. A text value is cast, because SQLite stores the bytes of
+        a cast without checking that they are UTF-8.
+        """
+        expression = "CAST(? AS TEXT)" if as_text else "?"
+        connection = sqlite3.connect(self.state.path)
+        try:
+            connection.execute(f"UPDATE image_builds SET basis_file_hashes = {expression}", (value,))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def assert_sqlite_will_not_hand_the_hashes_over(self):
+        """The premise of the tests of text that is no UTF-8: it is stored as text, and Python cannot read it."""
+        connection = sqlite3.connect(self.state.path)
+        try:
+            kinds = {kind for (kind,) in connection.execute("SELECT typeof(basis_file_hashes) FROM image_builds")}
+            self.assertEqual(kinds, {"text"})
+            with self.assertRaises(sqlite3.OperationalError):
+                connection.execute("SELECT basis_file_hashes FROM image_builds").fetchall()
+        finally:
+            connection.close()
+
+    def assert_refused_by_row_and_never_echoed(self, build, marker):
+        with self.assertRaises(StateRefusal) as raised:
+            build_file_hashes(build)
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+        self.assertIn(build.id, raised.exception.detail)
+        self.assertNotIn(marker, raised.exception.detail)
+        self.assertNotIn(marker, repr(raised.exception.as_dict()))
+
+    def test_stored_hashes_that_are_not_utf8_text_are_refused_by_row_and_never_echoed(self):
+        # SQLite hands text to Python decoded, and raises its own error for text that is no UTF-8. The read of the row
+        # must not raise it, or the refusal of the row never gets its turn and the command line reports UNEXPECTED.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        marker = "marker-before-the-bad-byte"
+        self.store_hashes(marker.encode() + b"\xff", as_text=True)
+        self.assert_sqlite_will_not_hand_the_hashes_over()
+        self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), marker)
+
+    def test_every_reader_of_a_build_row_gives_a_row_whose_stored_hashes_are_not_utf8_text(self):
+        # The column is part of every row that a reader of the table gives, so each of them meets the damage.
+        self.add_build("owed", basis_file_hashes=GOOD_HASHES)
+        self.end("owed", "failed", archive_bucket="example-bucket", archive_key="prefix/owed.tar.gz")
+        self.add_build("candidate", basis_file_hashes=GOOD_HASHES)
+        self.end("candidate", "candidate", template_version=7)
+        with self.state.transaction():
+            self.state.record_verification(
+                "candidate", image_state="available", template_version_exists=1, drift_result="clean", verified_at=1.0
+            )
+        self.add_build("active", basis_file_hashes=GOOD_HASHES)
+        marker = "marker-before-the-bad-byte"
+        self.store_hashes(marker.encode() + b"\xff", as_text=True)
+        self.assert_sqlite_will_not_hand_the_hashes_over()
+        deployment = "example-deployment"
+        readers = {
+            "build": (lambda: [self.state.build("owed")], ["owed"]),
+            "active_build": (lambda: [self.state.active_build(deployment)], ["active"]),
+            "builds": (lambda: self.state.builds(deployment), ["owed", "candidate", "active"]),
+            "archives_owed": (lambda: self.state.archives_owed(deployment), ["owed"]),
+            "last_build": (lambda: [self.state.last_build(deployment)], ["active"]),
+            "last_failed_build": (lambda: [self.state.last_failed_build(deployment)], ["owed"]),
+            "candidate": (lambda: [self.state.candidate(deployment)], ["candidate"]),
+            "verified_candidate": (lambda: [self.state.verified_candidate(deployment)], ["candidate"]),
+            "version_owner": (lambda: [self.state.version_owner(deployment, 7)], ["candidate"]),
+        }
+        for name, (read, wanted) in readers.items():
+            with self.subTest(reader=name):
+                rows = read()
+                self.assertEqual([row.id for row in rows], wanted)
+                for row in rows:
+                    self.assert_refused_by_row_and_never_echoed(row, marker)
+
+    def test_stored_hashes_that_are_valid_utf8_text_with_non_ascii_characters_still_read(self):
+        # The control of the tests above: only text that is no UTF-8 is damage. A path with other characters is not.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        hashes = {"déjà-vu.lock": "e" * 64}
+        self.store_hashes(json.dumps(hashes, ensure_ascii=False).encode("utf-8"), as_text=True)
+        self.assertEqual(build_file_hashes(self.state.build("build-1")), hashes)
+
+    def test_hashes_stored_as_a_blob_are_refused_by_row_even_when_the_bytes_are_valid_json(self):
+        # Only text is accepted, as before: a value of another type is damage, whatever its bytes say.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        marker = "marker-path.lock"
+        self.store_hashes(json.dumps({marker: "e" * 64}).encode("utf-8"), as_text=False)
+        self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), marker)
+
     def test_an_archive_is_owed_by_a_finished_build_that_names_one_and_has_no_deletion_time(self):
         self.add_build("build-1", basis_file_hashes=GOOD_HASHES)
         self.state.advance_build("build-1", archive_bucket="example-bucket", archive_key="prefix/build-1.tar.gz")

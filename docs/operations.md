@@ -1267,6 +1267,20 @@ read (`IMAGE_STATE_UNREADABLE`), before retention runs. Retention reads the pin 
 build container must not run across a promotion
 ([container.md](container.md#run-the-image-commands)).
 
+#### Hand-built worker images
+
+No ci-burst command prunes the worker images made by hand, by the recipe in
+`deploy/runner/image/` or by the
+[manual warm-image runbook](warm-image.md#manual-runbook), or their
+launch-template versions. Their snapshot storage is billed and untracked, so
+tracked cost does not bound it (see
+[Cost tracking and the allowance](#cost-tracking-and-the-allowance)). The
+automated retention (`retain`, `retain_min_age_seconds`) covers only images that
+the pipeline built, which carry the `ci-burst:image-build` tag. Deleting a
+hand-built image, its snapshots or a template version is an operator decision;
+this guide gives no rule for it yet
+([#142](https://github.com/mikomiel/ci-burst/issues/142)).
+
 ### Image reason codes
 
 Where the code appears depends on how the command ended:

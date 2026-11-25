@@ -20,10 +20,10 @@ from pathlib import Path
 from .errors import StateRefusal
 from .money import hourly_cost_micros
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 #: Read-only commands accept every earlier schema so a running deployment keeps
 #: observing while the next writable run migrates the file.
-READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4)
+READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4, 5)
 NONTERMINAL = ("intent", "starting", "running", "terminating", "uncertain")
 TERMINAL = ("terminal", "failed")
 
@@ -41,6 +41,9 @@ _FLEET_TABLE_SQL = """
         offline_registrations INTEGER NOT NULL
     )
 """
+
+#: One definition used by every upgrade that reaches schema 5.
+_LIFETIME_COLUMN_SQL = "ALTER TABLE operations ADD COLUMN admitted_lifetime_seconds INTEGER"
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,10 @@ class Operation:
     #: row's admitted cost inputs, so its stored reservation remains the floor.
     #: A normally admitted row records 0.
     admitted_inputs_backfilled: int = 0
+    #: The ``aws.max_lifetime_seconds`` the intent was admitted under, which fixed
+    #: its expiry tag and reservation. ``None`` on a row that predates schema 5,
+    #: whose lifetime cannot be established.
+    admitted_lifetime_seconds: int | None = None
 
     def request(self):
         return json.loads(self.request_json)
@@ -160,6 +167,9 @@ class Ledger:
             elif version == 3:
                 self._migrate_v4(connection)
                 version = SCHEMA_VERSION
+            elif version == 4:
+                self._migrate_v5(connection)
+                version = SCHEMA_VERSION
             elif version != SCHEMA_VERSION:
                 raise StateRefusal("STATE_VERSION_UNSUPPORTED", f"schema {version}")
             self._version = version
@@ -227,7 +237,8 @@ class Ledger:
                 settled_at REAL,
                 admitted_incidental_per_hour_micros INTEGER,
                 admitted_buffer_micros INTEGER,
-                admitted_inputs_backfilled INTEGER NOT NULL DEFAULT 0
+                admitted_inputs_backfilled INTEGER NOT NULL DEFAULT 0,
+                admitted_lifetime_seconds INTEGER
             );
             CREATE INDEX operations_state ON operations (state);
             CREATE INDEX operations_window ON operations (reservation_window);
@@ -237,7 +248,7 @@ class Ledger:
         )
 
     def _migrate(self, connection, version, backfill):
-        """Upgrade a schema-1 or schema-2 file to schema 4, after a verified copy.
+        """Upgrade a schema-1 or schema-2 file to schema 5, after one verified copy.
 
         A version-1 file passes through the version-2 shape in the same
         transaction: its terminal operations are settled from their recorded
@@ -248,21 +259,16 @@ class Ledger:
         nonterminal row also records ``admitted_inputs_backfilled = 1``, which
         makes its reservation floor a persisted decision rather than an
         inference from an estimate that includes the current configuration. The
-        same transaction creates the fleet-observation table. The caller holds
+        same transaction creates the fleet-observation table and adds the
+        nullable ``admitted_lifetime_seconds`` column, which every existing row
+        keeps as ``NULL``. The caller holds
         the deployment writer lock; this method takes no lock of its own. A
         failed copy refuses before the first schema write, and an interrupted
         upgrade rolls the whole transaction back, so the file stays readable by
         the version that wrote it.
         """
         price_micros, incidental_per_hour, buffer_micros = backfill
-        backup = Path(str(self.path) + ".pre-v4.%d" % int(self._clock()))
-        try:
-            shutil.copy2(self.path, backup)
-            copied = backup.stat().st_size
-        except OSError as error:
-            raise StateRefusal("STATE_BACKUP_FAILED", type(error).__name__) from None
-        if copied != self.path.stat().st_size:
-            raise StateRefusal("STATE_BACKUP_FAILED", "copy size differs")
+        self._backup("pre-v4")
         now = self._clock()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -299,6 +305,7 @@ class Ledger:
                 (incidental_per_hour, buffer_micros, *NONTERMINAL),
             )
             connection.execute(_FLEET_TABLE_SQL)
+            connection.execute(_LIFETIME_COLUMN_SQL)
             connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
             connection.execute("COMMIT")
         except sqlite3.DatabaseError as error:
@@ -309,23 +316,19 @@ class Ledger:
             raise
 
     def _migrate_v4(self, connection):
-        """Add the fleet-observation table to a schema-3 file.
+        """Upgrade a schema-3 file to schema 5, after one verified copy.
 
-        The upgrade creates one table and writes no row, so it needs no
-        backfill parameters. It still copies the file first: the previous
-        release refuses schema 4, so the copy is the rollback path.
+        One transaction creates the fleet-observation table and adds the
+        nullable ``admitted_lifetime_seconds`` column; it writes no row, so it
+        needs no backfill parameters, and every existing row keeps ``NULL``.
+        The previous release refuses the new schema, so the copy is the
+        rollback path.
         """
-        backup = Path(str(self.path) + ".pre-v4.%d" % int(self._clock()))
-        try:
-            shutil.copy2(self.path, backup)
-            copied = backup.stat().st_size
-        except OSError as error:
-            raise StateRefusal("STATE_BACKUP_FAILED", type(error).__name__) from None
-        if copied != self.path.stat().st_size:
-            raise StateRefusal("STATE_BACKUP_FAILED", "copy size differs")
+        self._backup("pre-v4")
         try:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(_FLEET_TABLE_SQL)
+            connection.execute(_LIFETIME_COLUMN_SQL)
             connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
             connection.execute("COMMIT")
         except sqlite3.DatabaseError as error:
@@ -334,6 +337,43 @@ class Ledger:
         except BaseException:
             _rollback(connection)
             raise
+
+    def _migrate_v5(self, connection):
+        """Add the admitted-lifetime column to a schema-4 file, after a verified copy.
+
+        Every existing row keeps ``NULL``: the lifetime an earlier intent was
+        admitted under is not recoverable from the file, and a resume refuses a
+        row that records none. The previous release refuses schema 5, so the
+        copy is the rollback path. An older file reaches schema 5 in one
+        transaction of its own migration, never through this one.
+        """
+        self._backup("pre-v5")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_LIFETIME_COLUMN_SQL)
+            connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
+            connection.execute("COMMIT")
+        except sqlite3.DatabaseError as error:
+            _rollback(connection)
+            raise StateRefusal("STATE_MIGRATION_FAILED", type(error).__name__) from None
+        except BaseException:
+            _rollback(connection)
+            raise
+
+    def _backup(self, label):
+        """Copy the file beside itself and verify the copy's size, or refuse.
+
+        Runs before the first schema write, so a failed copy leaves the file
+        readable by the release that wrote it.
+        """
+        backup = Path(str(self.path) + ".%s.%d" % (label, int(self._clock())))
+        try:
+            shutil.copy2(self.path, backup)
+            copied = backup.stat().st_size
+        except OSError as error:
+            raise StateRefusal("STATE_BACKUP_FAILED", type(error).__name__) from None
+        if copied != self.path.stat().st_size:
+            raise StateRefusal("STATE_BACKUP_FAILED", "copy size differs")
 
     def close(self):
         if self._connection is not None:
@@ -408,8 +448,13 @@ class Ledger:
         price_micros=0,
         admitted_incidental_per_hour_micros=None,
         admitted_buffer_micros=None,
+        admitted_lifetime_seconds,
     ):
         """Insert frozen intent; the caller owns the enclosing transaction.
+
+        ``admitted_lifetime_seconds`` is the lifetime the intent's expiry and
+        reservation were computed from; a resume sends the frozen request only
+        while it still equals the configured one.
 
         A new admission passes the configured incidental rate and buffer, so the
         operation keeps the cost assumptions it was admitted under; ``None``
@@ -424,8 +469,8 @@ class Ledger:
             "INSERT INTO operations (id, client_token, state, created_at, updated_at, expires_at,"
             " reservation_micros, reservation_window, region, account, request_json, request_sha256,"
             " instance_id, detail, price_micros, admitted_incidental_per_hour_micros,"
-            " admitted_buffer_micros, admitted_inputs_backfilled)"
-            " VALUES (?, ?, 'intent', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0)",
+            " admitted_buffer_micros, admitted_inputs_backfilled, admitted_lifetime_seconds)"
+            " VALUES (?, ?, 'intent', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0, ?)",
             (
                 operation_id,
                 client_token,
@@ -442,6 +487,7 @@ class Ledger:
                 price_micros,
                 admitted_incidental_per_hour_micros,
                 admitted_buffer_micros,
+                admitted_lifetime_seconds,
             ),
         )
         return self.operation(operation_id)
@@ -679,6 +725,7 @@ def _operation(row):
         admitted_incidental_per_hour_micros=optional("admitted_incidental_per_hour_micros"),
         admitted_buffer_micros=optional("admitted_buffer_micros"),
         admitted_inputs_backfilled=optional("admitted_inputs_backfilled", 0) or 0,
+        admitted_lifetime_seconds=optional("admitted_lifetime_seconds"),
     )
 
 

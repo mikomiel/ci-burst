@@ -65,6 +65,9 @@ MAX_INSTANCE_TYPE_LENGTH = 64
 #: every configured type in every configured zone, so the bound keeps those
 #: synchronous provider reads predictable.
 _MAX_INSTANCE_TYPES = 4
+#: The worker's own lifetime. ``deploy/runner/bootstrap.sh`` arms its shutdown and bounds its job with this
+#: literal; a test compares the two. ``apply`` admits only under it (``Config.require_worker_lifetime``, #138).
+WORKER_LIFETIME_SECONDS = 3600
 
 #: How many basis paths one image build may hash. Each path is one raw read
 #: from the forge before any build starts, so the bound keeps that predictable.
@@ -242,6 +245,20 @@ class Config:
     budget: BudgetConfig
     state: StateConfig
     image: ImageConfig = field(default_factory=ImageConfig)
+
+    def require_worker_lifetime(self):
+        """Refuse admission unless ``aws.max_lifetime_seconds`` is the lifetime the worker bootstrap arms.
+
+        The expiry tag and the cost reservation of a new worker come from the configured value, its shutdown and its
+        job bound from the bootstrap's literal: one clock, not two (#138). Only admission refuses, so ``reap``,
+        ``status``, ``export`` and ``plan`` keep working on a file that still holds another value.
+        """
+        if self.aws.max_lifetime_seconds != WORKER_LIFETIME_SECONDS:
+            raise ConfigRefusal(
+                "WORKER_LIFETIME_MISMATCH",
+                f"aws.max_lifetime_seconds must be {WORKER_LIFETIME_SECONDS}, the lifetime that the worker bootstrap "
+                "arms on the instance; apply admits nothing until it is",
+            )
 
     def require_live_contract(self):
         """Refuse live admission until the operator declares live evidence."""

@@ -637,7 +637,7 @@ class _Telemetry:
             emit(
                 "ci_burst_image_console_latency_seconds",
                 "gauge",
-                "Seconds from the build start to the first sighting of the marker on the console.",
+                "Seconds from the build start to the latest sighting of the marker on the console.",
                 [({}, round(data["console_latency_seconds"], 3))],
             )
         emit(
@@ -983,15 +983,14 @@ class ImagePipeline:
         if not apply:
             return self.plan(force=force)
         script = self._inputs(apply=True)
-        opened = not self._state.available
-        self._state.connect()
         try:
-            self._state.acquire_writer()
+            self._state.acquire_writer()  # before the writable open, which rolls back a hot journal
+            self._state.connect()
             return _Pass(self, script, force).run()
         finally:
-            self._state.release_writer()
-            if opened:
-                self._state.close()
+            # The lock and the writable connection end together: a connection kept without the lock could roll
+            # back a journal that another writer left between passes. The next pass opens again under the lock.
+            self._state.close()
 
     def run_until_done(self, *, force=False):
         """Repeat passes, with a fixed sleep between them, until the build is over.
@@ -1539,7 +1538,16 @@ class _Pass:
                 alive = True  # a builder that was just recorded may not be listed yet
             if build.builder_id in self.ended:
                 alive = False  # reconcile ended it at the deadline, whatever the provider still lists
-            console = self.aws.console_output([build.builder_id], deadline=self.deadline).get(build.builder_id)
+            try:
+                console = self.aws.console_output([build.builder_id], deadline=self.deadline).get(build.builder_id)
+            except ProviderRefusal as refusal:
+                # An unreadable console is a blind one. Before the build deadline the pass refuses and the next pass
+                # reads again. At or after it, the build ends ``CONSOLE_BLIND`` here, as an empty console does at the
+                # deadline. The one clock reading decides both, so a clock that steps back cannot change the verdict.
+                if self.clock() < build.deadline_at:
+                    raise
+                self.notes.append(f"console_read:{refusal.reason}")
+                return self._fail(build, image_console.CONSOLE_BLIND)
             # The reads above can take time. Every check below, and the latency, use the time after the last of them.
             now = self.clock()
             marker = image_console.read_marker(console, build.archive_sha256)

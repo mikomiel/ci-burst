@@ -230,6 +230,20 @@ class SingleFlightTests(ImageStateCase):
 
 
 class LifecycleTests(ImageStateCase):
+    def test_close_releases_the_writer_lock_even_when_the_connection_close_raises(self):
+        self.state.acquire_writer()
+        real = self.state._connection
+        failing = mock.Mock()
+        failing.close.side_effect = sqlite3.OperationalError("synthetic close failure")
+        self.state._connection = failing
+        self.addCleanup(real.close)
+        with self.assertRaises(sqlite3.OperationalError):
+            self.state.close()
+        self.assertFalse(self.state.available)
+        other = ImageState(self.directory, clock=self.clock)
+        self.addCleanup(other.close)
+        other.acquire_writer()  # refuses IMAGE_STATE_LOCKED if close had kept the lock
+
     def test_a_lost_file_is_recreated_without_error(self):
         self.add_build()
         self.state.close()

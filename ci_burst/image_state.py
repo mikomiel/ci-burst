@@ -20,6 +20,12 @@ from .errors import StateRefusal
 
 SCHEMA_VERSION = 1
 STATE_FILE = "image-state.sqlite"
+#: A process that stopped inside a commit left a hot rollback journal, which only a writable connection rolls back.
+STATE_RECOVERY_NEEDED = "IMAGE_STATE_RECOVERY_NEEDED"
+_RECOVERY_DETAIL = (
+    "a write that stopped left a rollback journal; `image status --refresh` (no pin or account change), "
+    "`image run --apply` or `image promote --write` rolls it back under the writer lock"
+)
 
 BUILD_STATES = ("building", "imaging", "candidate", "failed", "promoted")
 #: The states that count as one builder in flight. The ``one_active`` index and
@@ -201,6 +207,9 @@ class ImageState:
         during reconcile, not from this file. A file at any other schema
         version is refused before it is written, so a newer image release's
         file is never altered by an older one.
+
+        A writable open rolls back a hot journal that a process left when it stopped inside a commit, so a
+        command takes the writer lock (``acquire_writer``) before it calls this.
         """
         if self._connection is not None:
             return self
@@ -282,6 +291,9 @@ class ImageState:
         except sqlite3.DatabaseError as error:
             if connection is not None:
                 connection.close()
+            if getattr(error, "sqlite_errorname", None) == "SQLITE_READONLY_ROLLBACK":
+                # The journal is left as it is: only a writing command, under its lock, may roll it back.
+                raise StateRefusal(STATE_RECOVERY_NEEDED, _RECOVERY_DETAIL) from None
             raise StateRefusal("IMAGE_STATE_UNREADABLE", type(error).__name__) from None
         except BaseException:
             if connection is not None:
@@ -290,6 +302,34 @@ class ImageState:
         self._connection = connection
         self._read_only = True
         return True
+
+    def probe_for_write(self):
+        """Say whether there is a state file to write, as ``connect_readonly`` does, and leave the state closed.
+
+        A writing command calls this before it takes its locks, to refuse without creating anything when there is
+        no state file. A file with a hot rollback journal (``IMAGE_STATE_RECOVERY_NEEDED`` on a read-only open) is
+        a file to write: the command's own ``connect``, under the writer lock, rolls the journal back.
+        """
+        try:
+            present = self.connect_readonly()
+        except StateRefusal as refusal:
+            if refusal.reason != STATE_RECOVERY_NEEDED:
+                raise
+            present = True
+        self.close()
+        return present
+
+    def refuse_a_hot_journal(self):
+        """Refuse ``IMAGE_STATE_RECOVERY_NEEDED`` when the file has a hot journal, through a separate read-only open.
+
+        For a caller that holds the writer lock and must not roll a journal back (plain ``status``): it keeps its
+        lock, and no connection is left open.
+        """
+        probe = ImageState(self.directory, clock=self._clock)
+        try:
+            probe.connect_readonly()
+        finally:
+            probe.close()
 
     def detached_copy(self):
         """A copy of the open database in memory, as an ``ImageState`` of its own: a view to plan against.
@@ -317,10 +357,13 @@ class ImageState:
         return copy
 
     def close(self):
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
-        self.release_writer()
+        """Close the connection and release the writer lock. The lock is released even when the close raises."""
+        connection, self._connection = self._connection, None
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            self.release_writer()
 
     @property
     def available(self):
@@ -806,6 +849,10 @@ class ImageState:
         assignments = ", ".join(f"{column} = ?" for column in fields)
         self._require().execute(f"UPDATE control SET {assignments} WHERE id = 1", tuple(fields.values()))
         return self.control_get()
+
+    def record_check_time(self, now):
+        """Write ``control.last_check_at`` and read nothing back, so the result reflects the write alone."""
+        self._require().execute("UPDATE control SET last_check_at = ? WHERE id = 1", (now,))
 
     def _require(self):
         if self._connection is None:

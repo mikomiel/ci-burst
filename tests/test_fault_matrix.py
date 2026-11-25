@@ -155,6 +155,7 @@ class FaultMatrixCase(unittest.TestCase):
                 window_start=current_window(self.clock.now, self.config.budget.window_seconds),
                 region=self.config.aws.region,
                 account="111122223333",
+                admitted_lifetime_seconds=3600,
             )
         if state != "intent" or instance_id:
             ledger.set_state(operation_id, state, instance_id=instance_id)

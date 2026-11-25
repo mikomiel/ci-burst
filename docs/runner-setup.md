@@ -263,6 +263,11 @@ The image must provide what the bootstrap below assumes:
   the bootstrap changes to that directory before starting `one-job`, which
   resolves the file relative to its working directory.
 
+The tools a CI job may rely on are listed in
+[What the image contains](../deploy/runner/image/README.md#what-the-image-contains),
+which the image README owns, together with the rule for what a job may rely on
+and how to qualify a heavy job.
+
 A deployment that starts from a stock image can bake the toolchain with the
 recipe, or put the install into the bootstrap it publishes. The versions and
 history recorded in the image directory describe the maintainers' deployment,

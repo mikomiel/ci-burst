@@ -17,7 +17,11 @@ created.
 A launch intent is durable before the cloud request. While an intent has no
 confirmed instance, apply resumes that same frozen request and client token
 instead of allocating a replacement; EC2 idempotency makes the retry safe and
-the 24-hour client-token validity bounds how long that is attempted.
+the 24-hour client-token validity bounds how long that is attempted. An intent
+more than fifteen minutes old is refused instead of sent: its frozen expiry tag
+counts from the admission of its batch, so a late worker could outlive the tag
+and be reaped mid-job. The bound caps the intent's age since its row was
+written, not the lifetime that the tag loses.
 """
 
 import hashlib
@@ -72,6 +76,17 @@ SCOPE_CHANGED = "SCOPE_CHANGED"
 #: EC2 documents a client token as valid for 24 hours. Beyond that a retry is
 #: no longer idempotent, so the unresolved intent blocks and needs an operator.
 CLIENT_TOKEN_MAX_AGE_SECONDS = 24 * 60 * 60
+
+#: The expiry tag is computed once, when a batch is admitted, and every row of
+#: the batch freezes it, but the worker arms its own lifetime when it boots. A
+#: send long after the row was written leaves a tag that ends before the
+#: worker's own deadline, so the reaper could terminate the worker mid-job
+#: (#222). The tag cannot be recomputed under the same client token, so an older
+#: unresolved intent blocks and needs an operator. The limit caps the intent's
+#: age, counted from the row's ``created_at``. It does not cap the lifetime that
+#: the tag loses: that is the age, plus the time from the batch's expiry basis to
+#: the row's write, plus the worker's boot time.
+MAX_RESUME_AGE_SECONDS = 900
 
 #: EC2 retains a terminated instance record for roughly an hour. Absence from a
 #: by-id read inside that window is not proof of termination; the operation
@@ -1100,6 +1115,14 @@ class Controller:
                 # keep the unresolved ownership and block admission instead.
                 attempt["decision"] = "refused"
                 attempt["reasons"] = ["unresolved_intent_lifetime_mismatch"]
+            elif now - operation.created_at > MAX_RESUME_AGE_SECONDS:
+                # The frozen expiry tag counts from the batch's admission and the
+                # worker arms its own lifetime at boot, so a late send could be
+                # reaped mid-job (#222). The tag cannot change under the same
+                # client token. Fail closed: keep the unresolved ownership and
+                # block admission instead.
+                attempt["decision"] = "refused"
+                attempt["reasons"] = ["unresolved_intent_lifetime_short"]
             else:
                 self._send(operation, operation.request(), attempt, "resumed", first_attempt=False)
             record = {

@@ -22,6 +22,8 @@ from ci_burst.errors import (
     StateRefusal,
 )
 from ci_burst.aws import Aws, DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
+from ci_burst.export import Exporter
+from ci_burst.launch_evidence import read_launch_evidence
 from ci_burst.ledger import Ledger, current_window
 from ci_burst.money import format_money
 
@@ -31,6 +33,7 @@ from support import (
     FakeObserver,
     futile_record,
     instance,
+    ledger_holding,
     observation_demand,
     observation_empty,
     runners_snapshot,
@@ -2735,6 +2738,11 @@ class FutileLaunchTests(ControllerCase):
 
     WINDOW = 3600
 
+    def setUp(self):
+        super().setUp()
+        #: The operations that the fixture recorded in the ledger, in the order it did.
+        self.recorded = []
+
     def fleet(self, max_instances=4, **sections):
         values = {"controller": {"max_instances": max_instances}}
         values.update(sections)
@@ -2743,8 +2751,35 @@ class FutileLaunchTests(ControllerCase):
     def record_path(self):
         return self.config.state.database.parent / "export" / "observed.json"
 
-    def write_records(self, records, *, mtime=None):
-        return write_observed(self.record_path(), records, mtime=self.clock.now if mtime is None else mtime)
+    def write_records(self, records, *, mtime=None, ledger=True):
+        """Write the record file, and by default the ledger rows that go with its workers.
+
+        A worker counts only when the ledger holds its operation. The default is
+        the state of a deployment that launched those workers and has since
+        reconciled their ended instances: one terminal row per operation, with no
+        instance identifier and no cost. ``ledger=False`` writes the file alone.
+        """
+        path = write_observed(self.record_path(), records, mtime=self.clock.now if mtime is None else mtime)
+        if ledger:
+            self.record_in_ledger(records)
+        return path
+
+    def record_in_ledger(self, records, *, instance_ids=None):
+        """Record the operation of each record as an ended one, once, whatever the file says.
+
+        ``instance_ids`` maps an operation to the instance that the row names; a
+        row that has no entry names none.
+        """
+        for record in records:
+            operation = record["operation"]
+            if operation is not None and operation not in self.recorded:
+                self.seed(
+                    state="terminal",
+                    operation_id=operation,
+                    instance_id=(instance_ids or {}).get(operation),
+                    reservation=0,
+                )
+                self.recorded.append(operation)
 
     def three_futile(self, newest_age=60):
         return [futile_record(self.clock.now - newest_age - 60 * index, index=index) for index in range(3)]
@@ -2754,7 +2789,12 @@ class FutileLaunchTests(ControllerCase):
         self.assertNotIn("template", names)
         self.assertNotIn("spot_quote", names)
         self.assertEqual(self.aws.mutations(), [])
-        self.assertEqual(self.reopened().operations(), [])
+        self.assert_no_operation_of_its_own()
+
+    def assert_no_operation_of_its_own(self):
+        """The pass recorded no operation: the ledger holds the fixture's rows and nothing else."""
+        held = [operation.id for operation in self.reopened().operations()]
+        self.assertEqual(sorted(held), sorted(self.recorded))
 
     def assert_held(self, result):
         self.assertEqual(result["decision"], "refused")
@@ -2976,7 +3016,7 @@ class FutileLaunchTests(ControllerCase):
             self.assertEqual(result["reasons"], ["recent_launches_futile"])
             self.assertEqual(result["launch_count"], 0)
             self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 3})
-        self.assertEqual(self.reopened().operations(), [])
+        self.assert_no_operation_of_its_own()
 
     def test_plan_reports_an_unreadable_record_and_plans_as_if_open(self):
         self.record_path().mkdir(parents=True)
@@ -2997,6 +3037,220 @@ class FutileLaunchTests(ControllerCase):
         # A record elsewhere in the state directory is not looked for.
         write_observed(self.root / "export" / "elsewhere.json", self.three_futile(), mtime=self.clock.now)
         self.assert_admits_as_before("missing")
+
+    # -- the ledger gates the evidence ---------------------------------------------
+    def test_workers_that_no_ledger_operation_names_are_no_evidence(self):
+        # ``export`` writes the operation tag of any owned instance that the
+        # provider lists, and reconciliation ignores a terminated instance that
+        # no operation names. The brake ignores it as well.
+        self.write_records(self.three_futile(), ledger=False)
+        result = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertNotIn("recent_launches_futile", result["reasons"])
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 0, "futile": 0})
+
+    def test_the_same_workers_hold_once_the_ledger_names_their_operations(self):
+        records = self.three_futile()
+        self.write_records(records, ledger=False)
+        before = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(before["decision"], "would_launch")
+        self.assertEqual(before["launch_evidence"], {"state": "fresh", "considered": 0, "futile": 0})
+        self.record_in_ledger(records)
+        after = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(after["decision"], "refused")
+        self.assertEqual(after["reasons"], ["recent_launches_futile"])
+        self.assertEqual(after["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 3})
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_plan_and_apply_agree_when_the_ledger_names_none_of_the_workers(self):
+        self.write_records(self.three_futile(), ledger=False)
+        planned = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        applied = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        for result, decision in ((planned, "would_launch"), (applied, "launched")):
+            with self.subTest(command=result["command"]):
+                self.assertEqual(result["decision"], decision)
+                self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 0, "futile": 0})
+
+    def test_a_worker_counts_only_under_the_instance_that_the_ledger_names(self):
+        # ``write_observed`` files the three records under ``WORKERS``.
+        first, second, _ = self.WORKERS
+        elsewhere = "i-0123456789abcdf99"
+        cases = (
+            ("the ledger names the instance of every worker", list(self.WORKERS), 3),
+            ("the ledger names no instance", [None, None, None], 3),
+            ("the ledger names another instance for one worker", [first, second, elsewhere], 2),
+        )
+        for name, named, considered in cases:
+            with self.subTest(name):
+                self.setUp()
+                records = self.three_futile()
+                self.write_records(records, ledger=False)
+                self.record_in_ledger(
+                    records,
+                    instance_ids={r["operation"]: n for r, n in zip(records, named) if n is not None},
+                )
+                result = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+                self.assertEqual(
+                    result["launch_evidence"], {"state": "fresh", "considered": considered, "futile": considered}
+                )
+                self.assertEqual(result["decision"], "refused" if considered == 3 else "would_launch")
+
+    # -- the record that export writes, read by the next pass ------------------------------
+    WORKERS = tuple(f"i-0123456789abcde{index:02x}" for index in range(3))
+
+    #: The console of a worker that registered and ran one job, and of one that
+    #: never registered, as the shipped first-boot script prints them.
+    REGISTERED_CONSOLE = (
+        "cloud-init: STEP mount-options\n"
+        "cloud-init: STEP register\n"
+        "cloud-init: bootstrap one-job completed rc=0\n"
+        "cloud-init: bootstrap exiting rc=0\n"
+    )
+    FAILED_CONSOLE = "cloud-init: STEP mount-options\ncloud-init: bootstrap exiting rc=1\n"
+
+    #: A one-job outcome that the exporter cannot have written.
+    DAMAGED_MARKERS = (["completed", 1], ["completed", "0"], ["unknown", 0], [], "completed")
+
+    #: The fields that show whether a worker registered, and that the reader requires.
+    REGISTRATION_FIELDS = ("registered", "steps", "job_process", "spot_interruption")
+
+    #: The two ways in which the first worker's record loses what shows its
+    #: registration, as the arguments of ``finished_workers``.
+    DAMAGES = (
+        *({"damaged": marker} for marker in DAMAGED_MARKERS),
+        *({"absent": field} for field in REGISTRATION_FIELDS),
+    )
+
+    def export_run(self, listed, consoles):
+        """Run the real exporter over the state directory that this controller reads.
+
+        The fake clock is not wall time, so the modification time that the run's own
+        write would carry is stated.
+        """
+        aws = FakeAws(instances=listed)
+        aws.consoles = consoles
+        result = Exporter(self.config, aws=aws, clock=self.clock).run(
+            events_file=self.root / "export" / "worker-events.ndjson",
+            metrics_file=self.root / "textfile" / "ci-burst.prom",
+            state_file=self.record_path(),
+        )
+        os.utime(self.record_path(), (self.clock.now, self.clock.now))
+        return result, aws
+
+    def exported_records(self):
+        return json.loads(self.record_path().read_text())["instances"]
+
+    def finished_workers(self, *, damaged=None, absent=None):
+        """Write the record of three ended workers, the first one damaged, and list them.
+
+        The first worker registered and ran one job, but its marker is damaged
+        (``damaged``) or its record lacks a field (``absent``), and no other field
+        of its record shows registration, so the record reads as one that never
+        registered once the loader has given a default to the marker or the field.
+        The other two never registered. The provider lists all three as terminated.
+        """
+        now = self.clock.now
+        self.config = self.fleet()
+        first = futile_record(now - 300, index=1, exit_code=0, errors=[], job_process=damaged)
+        if absent is not None:
+            del first[absent]
+        records = [
+            first,
+            futile_record(now - 240, index=2),
+            futile_record(now - 180, index=3),
+        ]
+        self.write_records(records, mtime=now - 30, ledger=False)
+        self.record_in_ledger(
+            records, instance_ids={record["operation"]: worker for worker, record in zip(self.WORKERS, records)}
+        )
+        listed = [
+            instance(worker, state="terminated", operation=record["operation"], zone="eu-central-1a")
+            for worker, record in zip(self.WORKERS, records)
+        ]
+        return records, listed
+
+    def test_a_damaged_record_is_read_again_and_cannot_turn_into_a_hold(self):
+        # The reader refuses a file with a marker that ``export`` cannot write, or
+        # with a record that lacks a field, so the gate is open. ``export`` then loads
+        # the record. A loader that replaced the marker by null, or gave a default to
+        # the field, would keep the ended worker, never read its console again and
+        # rewrite the file with a fresh heartbeat, so the next pass would hold on two
+        # real failures and one worker that registered.
+        for damage in self.DAMAGES:
+            with self.subTest(**damage):
+                self.setUp()
+                _, listed = self.finished_workers(**damage)
+                first, second, third = self.WORKERS
+                consoles = {first: self.REGISTERED_CONSOLE, second: self.FAILED_CONSOLE, third: self.FAILED_CONSOLE}
+                before = read_launch_evidence(self.record_path(), self.clock.now, ledger_holding(self.record_path()))
+                self.assertEqual(before.state, "malformed")
+
+                run, aws = self.export_run(listed, consoles)
+
+                self.assertIn("state_rebuilt", run["notes"])
+                self.assertEqual([call[1] for call in aws.calls if call[0] == "console_output"], [[first]])
+                self.assertEqual(self.exported_records()[first]["job_process"], ["completed", 0])
+                result = self.build(observation=observation_demand(1), config=self.config).apply()
+                self.assertEqual(result["decision"], "launched")
+                self.assertNotIn("recent_launches_futile", result["reasons"])
+                self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 2})
+
+    def test_a_damaged_record_of_an_instance_that_the_provider_no_longer_lists_is_no_evidence(self):
+        for damage in self.DAMAGES:
+            with self.subTest(**damage):
+                self.setUp()
+                _, listed = self.finished_workers(**damage)
+                first, second, third = self.WORKERS
+                consoles = {first: self.REGISTERED_CONSOLE, second: self.FAILED_CONSOLE, third: self.FAILED_CONSOLE}
+
+                run, aws = self.export_run(listed[1:], consoles)
+
+                self.assertIn("state_rebuilt", run["notes"])
+                self.assertEqual(aws.calls, [("owned_instances", "test-deployment")])
+                self.assertEqual(sorted(self.exported_records()), [second, third])
+                result = self.build(observation=observation_demand(1), config=self.config).apply()
+                self.assertEqual(result["decision"], "launched")
+                self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 2, "futile": 2})
+
+    def test_a_damaged_record_counts_when_its_console_still_shows_no_registration(self):
+        # The read is a new observation: a worker that really never registered is
+        # counted, so the hold rests on what the console shows now.
+        for damage in self.DAMAGES:
+            with self.subTest(**damage):
+                self.setUp()
+                _, listed = self.finished_workers(**damage)
+                consoles = {worker: self.FAILED_CONSOLE for worker in self.WORKERS}
+
+                run, _ = self.export_run(listed, consoles)
+
+                self.assertIn("state_rebuilt", run["notes"])
+                self.assertEqual(run["console_reads"], 1)
+                result = self.build(observation=observation_demand(1), config=self.config).apply()
+                self.assert_held(result)
+
+    def test_three_workers_that_never_registered_still_hold_after_an_export_run(self):
+        # The control of the tests above: nothing is damaged, so the run keeps the
+        # three ended records without reading them again, and the pass holds.
+        now = self.clock.now
+        self.config = self.fleet()
+        records = [futile_record(now - 60 - 60 * index, index=index + 1) for index in range(3)]
+        self.write_records(records, mtime=now - 30, ledger=False)
+        self.record_in_ledger(
+            records, instance_ids={record["operation"]: worker for worker, record in zip(self.WORKERS, records)}
+        )
+        listed = [
+            instance(worker, state="terminated", operation=record["operation"], zone="eu-central-1a")
+            for worker, record in zip(self.WORKERS, records)
+        ]
+
+        run, aws = self.export_run(listed, {worker: self.FAILED_CONSOLE for worker in self.WORKERS})
+
+        self.assertNotIn("state_rebuilt", run["notes"])
+        self.assertEqual(run["console_reads"], 0)
+        self.assertEqual(sorted(self.exported_records()), sorted(self.WORKERS))
+        result = self.build(observation=observation_demand(1), config=self.config).apply()
+        self.assert_held(result)
+        self.assert_no_launch_work()
 
 
 class BudgetHeadroomTests(ControllerCase):

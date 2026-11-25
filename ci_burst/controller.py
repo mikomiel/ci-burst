@@ -219,7 +219,7 @@ class Controller:
             result["decision"] = "refused"
             return result
         result["observation"] = observation.as_dict()
-        decision, _ = self._decide(observation, slot)
+        decision, _ = self._decide(observation, slot, _recorded_operations(state))
         result.update(decision)
         if result["decision"] == "launch_ready":
             result["decision"] = "would_launch"
@@ -257,7 +257,7 @@ class Controller:
                 return self._deferred(result, PHASE_RECONCILE)
             try:
                 with self.ledger.transaction():
-                    slot, discrepancies = self._reconcile(instances, account, deadline=deadline)
+                    slot, discrepancies, recorded = self._reconcile(instances, account, deadline=deadline)
             except DeadlineRefusal:
                 return self._deferred(result, PHASE_RECONCILE)
             if discrepancies:
@@ -296,7 +296,7 @@ class Controller:
                 return result
             result["observation"] = observation.as_dict()
             try:
-                decision, plans = self._decide(observation, slot, deadline=deadline)
+                decision, plans = self._decide(observation, slot, recorded, deadline=deadline)
             except DeadlineRefusal:
                 return self._deferred(result, PHASE_ADMISSION)
             # Every earlier mutating phase returns on its own action and the
@@ -668,8 +668,12 @@ class Controller:
             if operation["state"] in COVERING_STATES and now - operation["created_at"] < grace
         )
 
-    def _decide(self, observation, slot, *, deadline=None):
-        """Return the decision block and the ordered candidate plans behind it."""
+    def _decide(self, observation, slot, recorded, *, deadline=None):
+        """Return the decision block and the ordered candidate plans behind it.
+
+        ``recorded`` is the ledger snapshot that this pass already read, from the
+        operation identifier to its instance identifier (``_recorded_operations``).
+        """
         self._check_deadline(deadline, PHASE_ADMISSION)
         reasons, notes = [], []
         limit = slot["limit"]
@@ -712,7 +716,10 @@ class Controller:
         # A one-way brake: the record that ``export`` writes can only withhold a
         # launch. Missing, unreadable, stale or malformed evidence keeps the gate
         # open, and every check below still applies to a launch it lets through.
-        evidence = read_launch_evidence(default_record_path(self.config.state.database), self.clock())
+        # A worker counts only when the ledger holds its operation: reconciliation
+        # ignores a terminated instance that no operation names, and so does the
+        # brake.
+        evidence = read_launch_evidence(default_record_path(self.config.state.database), self.clock(), recorded)
         decision["launch_evidence"] = evidence.as_dict()
         if evidence.holds:
             decision["decision"] = "refused"
@@ -1245,7 +1252,11 @@ class Controller:
         return True
 
     def _reconcile(self, instances, account, *, deadline=None):
-        """Reconcile durable operations with the complete owned inventory."""
+        """Reconcile durable operations with the complete owned inventory.
+
+        Return the slot, the discrepancies and the ledger snapshot that the pass
+        decides on.
+        """
         self._check_deadline(deadline, PHASE_RECONCILE)
         operations = {operation.id: operation for operation in self.ledger.operations()}
         nonterminal = {operation.id: operation for operation in self.ledger.nonterminal_operations()}
@@ -1358,10 +1369,11 @@ class Controller:
             instance = by_operation.get(operation.id)
             if instance is not None:
                 self._reconcile_present(operation, instance)
-        slot = self._slot_from_state(self._read_state(required=True))
+        state = self._read_state(required=True)
+        slot = self._slot_from_state(state)
         if ignored:
             slot["ignored_discrepancies"] = ignored
-        return slot, discrepancies
+        return slot, discrepancies, _recorded_operations(state)
 
     def _reconcile_present(self, operation, instance):
         # Attach the identity first: an uncertain launch whose first provider
@@ -1467,6 +1479,11 @@ class Controller:
                     }
                 )
         return discrepancies, ignored
+
+
+def _recorded_operations(state):
+    """Return the operations in a ledger ``state`` as operation id -> instance id or ``None``."""
+    return {item["operation"]: item["instance_id"] for item in state.get("operations", [])}
 
 
 def _expiry(instance):

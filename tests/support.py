@@ -316,6 +316,24 @@ def write_observed(path, records=(), *, mtime, payload=None, raw=None):
     return path
 
 
+def ledger_holding(path):
+    """Return the ledger snapshot that records every operation the record at ``path`` names.
+
+    A reader test is about the record and not about the ledger, so it gives the
+    reader a ledger that holds each record's operation with no instance
+    identifier. A path that holds no record that parses, such as a missing file, a
+    directory or a pipe, gives an empty snapshot, which the reader never looks at
+    because it refuses the file first.
+    """
+    try:
+        if not Path(path).is_file():
+            return {}
+        records = json.loads(Path(path).read_bytes())["instances"].values()
+        return {record["operation"]: None for record in records if isinstance(record.get("operation"), str)}
+    except Exception:  # noqa: BLE001 - any file that does not parse is a file the reader refuses
+        return {}
+
+
 def write_config(tmp_path, *, config=None):
     """Render the default valid deployment configuration as TOML."""
     values = {

@@ -5,9 +5,10 @@
 `Controller._decide` gets one more gate. After the earlier wait reasons and
 before the launch template is read, the controller reads the observation record
 that `export` writes beside the ledger. When the three most recent finished
-workers in the last 3600 seconds all ended without registering, the decision is
-`refused` with the reason `recent_launches_futile`. A hold reads no template and
-no price and computes no budget.
+workers in the last 3600 seconds whose operations the ledger holds all ended
+without registering, the decision is `refused` with the reason
+`recent_launches_futile`. A hold reads no template and no price and computes no
+budget.
 
 The gate can only withhold a launch. It cannot add one, raise a count or relax a
 prerequisite. The count of three, the window of 3600 seconds and the staleness
@@ -29,8 +30,9 @@ Nothing in `_decide` looks at how earlier workers ended.
 | Record | `observed.json` in the `export` directory beside the ledger, at `<dirname(state.database)>/export/observed.json`. `export` writes it last, on every successful run. |
 | Ended | The record's provider state is `terminated` or `stopped`. These are the two states after which `export` reads the console no more, so the record is finished and its `seen` time no longer changes. |
 | Registration evidence | The record shows the registration step, a step that the shipped first-boot script prints only after registration, a one-job process outcome or a Spot interruption notice. |
-| Registered | Ended, has an operation identifier, shows registration evidence. |
-| Futile | Ended, has an operation identifier, shows the exit marker and no registration evidence. |
+| Recorded | The record has an operation identifier of the shape that this deployment generates, and the ledger snapshot of the pass holds that operation. When the ledger names an instance for the operation, the record is filed under that instance. |
+| Registered | Ended, recorded, shows registration evidence. |
+| Futile | Ended, recorded, shows the exit marker and no registration evidence. |
 | No evidence | Any other record. It is never counted. |
 | Considered set | The three registered or futile workers inside the window with the newest `seen`, plus any other inside the window whose `seen` equals the third's. |
 | Hold | A decision refused with `recent_launches_futile`. It needs at least three considered workers, all futile. |
@@ -41,6 +43,8 @@ Nothing in `_decide` looks at how earlier workers ended.
 | Source | Verdict |
 |---|---|
 | The record, read from the state directory that `apply` and `export` already mount | Taken. No new call, credential, mount or schema. |
+| The ledger snapshot that the pass has already read, to confirm that a worker belongs to a recorded launch | Taken. The controller passes it to the reader as an argument. No new call, read or schema. |
+| The operation tag on its own | Declined. `export` writes the tag of any owned instance that the provider lists, and reconciliation ignores a terminated instance that no ledger operation names. See "Why a worker needs a ledger operation". |
 | A signal that `export` writes into the ledger | Declined. The ledger has one writer by contract, and `export` opens it read-only. |
 | A console read inside `apply` | Declined. It adds provider calls and read time to a pass that a deadline bounds, and repeats what `export` already does. |
 | A lifetime rule: a worker that lived less than some minutes | Declined. It cannot tell a futile launch from a short job. |
@@ -128,6 +132,35 @@ the gate.
 | Ended, no exit marker, no registration evidence | No evidence | The console may not reach the end of the script. |
 | Not ended | No evidence | The record can still change. |
 | No operation identifier of this deployment | No evidence | It names no launch that this controller made. |
+| An operation that the ledger does not hold, or holds under another instance | No evidence | The controller has no record of that launch, and reconciliation ignores the instance. |
+
+## Why a worker needs a ledger operation
+
+`export` writes the operation tag of every owned instance that the provider lists
+with a tag of the right shape. It checks the shape and nothing else. The controller
+treats the same instances differently: reconciliation ignores a terminated
+instance whose operation the ledger does not hold, so such an instance cannot
+occupy a slot or change a decision. A gate that trusted the tag would let three
+of those instances hold admission, although the controller never recorded a
+launch for them.
+
+The gate therefore counts a worker only when the ledger snapshot of the same pass
+holds its operation. When the ledger names an instance for that operation, the
+record must be filed under that instance. When the ledger names none, the
+operation alone is enough. A record that fails the check is skipped before the
+newest three are chosen, so it takes no place among them and cannot hide an older
+worker that the ledger holds.
+
+The snapshot is the one that the pass already reads. `plan` reads the ledger state
+for its state block, and `apply` reads it at the end of reconciliation, in the
+same transaction. `_decide` passes the operations to the reader as a required
+argument. The reader stays a function of the file, the clock and that argument:
+it makes no call and keeps no state, and a caller that omits the argument fails at
+once instead of counting every record. No ledger column, record field or provider
+call is added.
+
+The check fails open. An empty ledger, or a ledger that `plan` cannot find, holds
+no operation, so the gate counts no worker and stays open.
 
 ## The clock
 
@@ -209,7 +242,9 @@ spend or access.
 | `export` loads a record that holds `NaN`, `Infinity` or `-Infinity`, or that names a JSON member twice | The loader decodes with the two refusals that the reader uses. They are `export`'s own and the reader imports them, so the two cannot disagree on these two refusals. The loader takes the branch for a file that does not decode: it drops the file whole, notes `state_rebuilt` and starts from an empty record. The emitted history and the cumulative counters start again, as when the record is deleted, and the run reads again the consoles that it selects within its per-run read budget (`MAX_CONSOLE_READS`, 16, live workers first). It cannot keep the last value of a repeat: that would keep a futile record in place of a registered one, skip its finished console and rewrite the file with a fresh heartbeat, so the next pass would hold on evidence that nobody read. |
 | The file is not UTF-8 JSON, has another version, or holds a record with a bad field | `malformed`. The whole file is dropped, because a skipped record could leave older futile records among the newest three. |
 | An `instances` key that `export` rejects, or a `job_process` or `spot_interruption` value that `export` cannot write | `malformed`. The reader asks the rule that `export` applies when it loads its own record, so a record under a key that is not an instance identifier, or an empty list read as registration evidence, cannot steer the gate. |
-| A record's provider state is null, or text outside the known six | That record has not ended. The file stays usable. `export` writes `unknown` for a state it cannot label, turns it into null when it next loads the record, and keeps that null until the record is pruned. |
+| `export` loads a record with a registration value that it cannot keep (a `job_process` or `spot_interruption` of a shape that it does not write, a `steps` list with an element that is not text, or a `registered` flag that is not true or false), or the record of an ended worker that lacks `registered`, `steps`, `job_process` or `spot_interruption` | The loader drops that record only and notes `state_rebuilt`. It does not keep the record with the value replaced by its default, or with a default for the key. An ended worker is not read again, so the default shows no registration, and the next run would write the record back under a fresh heartbeat as a futile launch that nobody observed. While the provider still lists the instance, the run reads its console again within its per-run read budget, so the record shows what the console shows now. An instance that the provider no longer lists leaves no record and is no evidence. The cost is the cost of any dropped record: the cumulative counters count the worker again, and the run emits its markers again under their stable identities. A value that the loader keeps with the evidence it carries, such as a Spot notice that it normalises or a `steps` list from which it removes an unknown name, does not drop the record. The record of a worker that has not ended may lack a key. While the provider lists the instance, the run reads its console again within its per-run read budget, and the console fills the key. Until then the hold counts no such worker. A record file that an older version wrote lacks the keys that the version did not write yet, so the first run that loads it drops the records of the workers that have ended. |
+| A record's operation is not in the ledger snapshot of the pass, or the ledger names another instance for it | The record is no evidence and takes no place among the newest three. An empty ledger, or none for `plan`, leaves no evidence, so the gate stays open. |
+| A record's provider state is null, or text outside the known six | That record has not ended. The file stays usable. `export` writes `unknown` for a state it cannot label, turns it into null when it next loads the record, and keeps that null until the record is pruned. It replaces a bad `operation` or `exit_code` by null in the same way and keeps the record, because the reader reads null there as no evidence for that record. A registration value is the exception: see the row for a value that `export` cannot keep. |
 | The file's owner-only mode denies a reader that runs as another user | `unreadable`. `export` creates the file through a temporary file, which is owner-only. |
 | `export` refused its last run, or its unit stopped | The file ages and reads as `stale` after 600 seconds. |
 | `export` cannot write its textfile | The record is written after the textfile, so it is not refreshed and reads as `stale` after 600 seconds. The run had published its events before the failure, and no record of the run was saved, so the next run rediscovers the owned instances and reads again the consoles that it selects within its per-run read budget (`MAX_CONSOLE_READS`, 16, live workers first). A marker that it still finds on one of them is emitted again under the same identity. A console that the run defers past the budget (`console_read_deferred`) is not read in that run, so the run emits nothing for it. An instance that left the provider's inventory, or a marker that scrolled out of the console, is not emitted again. The repeats count against the event file bound, so a long outage can push older lines out of the file. |
@@ -243,6 +278,23 @@ which `plan` does not.
   finished records only. The cost is a false hold; see the evidence gaps.
 - Skip an invalid record and use the rest. Declined: dropping a recent record can
   leave older futile records as the newest three.
+- Keep a record whose registration value `export` cannot keep, with the value
+  replaced by its default, or keep the record of an ended worker that lacks a
+  registration key, with a default for the key. Declined: an ended worker is
+  not read again, so the default shows no registration and the next run writes
+  the record back under a fresh heartbeat as a futile launch that nobody
+  observed. `export` drops the record instead (see "Failure behaviour").
+- Keep that record and set its provider state to null, so that it reads as not
+  ended. Declined: it adds a second repair beside the drop that `load_state`
+  already has, for the same effect on the gate. A dropped record of a listed
+  instance is read again, and a dropped record of an unlisted instance leaves no
+  evidence.
+- Count a worker by its operation tag alone. Declined: the tag proves a shape and
+  not a launch that the ledger holds (see "Why a worker needs a ledger
+  operation").
+- Read the ledger again inside `_decide` to check the operations. Declined: the
+  pass already holds a snapshot that the rest of its decision uses, and a second
+  read would add a query that can disagree with it.
 - Fail closed on a missing record. Declined for the reasons above.
 - Order records by `first_seen`. Declined: it can be null, and it is not the
   clock that the exporter's own retention uses.
@@ -282,6 +334,17 @@ image runs, the blunt lever above is the only way to open the gate early.
   Spend is unaffected.
 - A registered worker that still runs does not clear a hold. The bound is the same
   window.
+- A record that `export` dropped for registration evidence that it cannot keep is
+  rebuilt from its console alone. A registration line that has scrolled out of
+  the console reads as futile, as in the flood case above.
+- A record whose `state` or `operation` the loader replaced by null is not
+  classified, so it takes no place among the newest three, whatever its worker
+  did. When it is the one worker that registered, three older futile workers
+  can hold admission for what remains of their window. That hold rests on three
+  failures that `export` observed.
+- A ledger operation that names no instance counts every record that carries its
+  tag. The controller launches one instance for each operation, so two such
+  records need a tag that the controller did not write.
 - Records carry no deployment name. They live in a state directory that belongs to
   one deployment, and the controller already refuses a changed deployment scope. A
   directory shared by two deployments, or kept across a rename, would mix their

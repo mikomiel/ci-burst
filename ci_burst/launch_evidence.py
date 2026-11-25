@@ -12,6 +12,15 @@ The reader opens one regular file read-only, without blocking and without
 following a link. It never writes, repairs, locks or deletes it, makes no
 provider, queue or ledger call, and never raises.
 
+A worker counts only when the ledger records it. The caller passes the
+operations that its pass has already read from the ledger, as a mapping from the
+operation identifier to the instance identifier that the ledger holds for it, or
+``None`` while it holds none. A record whose operation is not in the mapping, or
+whose operation the ledger ties to another instance, is no evidence. ``export``
+writes the operation tag of any owned instance that the provider lists, and
+reconciliation ignores a terminated instance that no ledger operation names, so
+the tag alone does not show a launch of this deployment.
+
 The reader decides from the open descriptor before it reads a byte: a file that
 is not a regular one is ``unreadable``, a file outside the freshness bound is
 ``stale`` whatever its size, and a file above ``MAX_RECORD_BYTES`` is
@@ -31,7 +40,12 @@ refuse them are ``export``'s own (``_refuse_repeated_member`` says why), so
 ``export`` drops the same file when it loads its record. A value of the right
 type that ``export`` drops from ``state``, ``operation`` or ``steps`` is no
 evidence, which is also what ``export`` makes of it when it loads its own record,
-so it never creates a hold.
+so it never creates a hold. A value that bears on registration and that
+``export`` cannot keep drops its record there, and so does a registration key
+that the record of an ended worker lacks (``_registration_evidence_is_damaged``).
+The run reads the worker's console again while the provider lists the instance, and
+leaves no record when it does not: ``export`` never writes back, under a fresh
+heartbeat, a repaired record that shows no registration.
 The fields it reads, the record version and the rules that decide a shape are
 imported from ``export``; a contract test in ``tests/test_export.py`` fails when
 the two drift apart.
@@ -124,8 +138,14 @@ class LaunchEvidence:
         return {"state": self.state, "considered": self.considered, "futile": self.futile}
 
 
-def read_launch_evidence(path, now):
+def read_launch_evidence(path, now, recorded):
     """Return the launch evidence in the record at ``path`` against the clock ``now``.
+
+    ``recorded`` maps each operation identifier that the ledger holds to its
+    instance identifier, or to ``None`` while the ledger holds none. A worker
+    counts only when its operation is in it, under the instance that the record
+    names when the ledger names one. The argument is required, so that a caller
+    cannot count workers that no operation of this deployment launched.
 
     The states are tested in the order ``missing``, ``unreadable``, ``stale``,
     ``malformed``. A file above ``MAX_RECORD_BYTES`` is ``malformed``, and it is
@@ -134,7 +154,7 @@ def read_launch_evidence(path, now):
     must not fail for an optional brake.
     """
     try:
-        return _read(path, now)
+        return _read(path, now, recorded)
     except Exception:  # noqa: BLE001 - an optional brake never fails the pass
         return LaunchEvidence(UNREADABLE)
 
@@ -172,7 +192,7 @@ def _read_to_bound(descriptor):
     return b"".join(chunks)
 
 
-def _read(path, now):
+def _read(path, now, recorded):
     try:
         # The stream is unbuffered and only owns the descriptor: the content is
         # read from the descriptor itself, by ``_read_to_bound``.
@@ -206,11 +226,11 @@ def _read(path, now):
     records = _records(raw, now)
     if records is None:
         return LaunchEvidence(MALFORMED)
-    return _evaluate(records, now)
+    return _evaluate(records, now, recorded)
 
 
 def _records(raw, now):
-    """Return the validated records, or ``None`` when the file is malformed.
+    """Return the validated ``(instance identifier, record)`` pairs, or ``None`` if malformed.
 
     One invalid record drops the whole file: skipping it could leave older futile
     records among the newest three.
@@ -234,7 +254,7 @@ def _records(raw, now):
         # identifier, so a record filed under one is not its output.
         if _match(INSTANCE_PATTERN, instance_id) is None or not _record_is_valid(record, now):
             return None
-        records.append(record)
+        records.append((instance_id, record))
     return records
 
 
@@ -294,12 +314,18 @@ def classify(record):
     return None
 
 
-def _evaluate(records, now):
+def _is_recorded(instance_id, record, recorded):
+    """Return True when the ledger holds the operation, under this instance if it names one."""
+    operation = record["operation"]
+    return operation in recorded and recorded[operation] in (None, instance_id)
+
+
+def _evaluate(records, now, recorded):
     """Count the considered workers and the futile ones among them."""
     classified = []
-    for record in records:
+    for instance_id, record in records:
         verdict = classify(record)
-        if verdict is None:
+        if verdict is None or not _is_recorded(instance_id, record, recorded):
             continue
         seen = float(record["seen"])
         if now - seen <= FUTILE_LAUNCH_WINDOW_SECONDS:

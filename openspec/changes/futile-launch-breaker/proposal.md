@@ -19,7 +19,8 @@ The allowance still bounds spend, but every launch in the window can be wasted
 - The evidence is the record that `export` already writes beside the ledger.
   The controller reads it and never writes it. A worker counts as futile only
   when its record shows that the instance ended, shows the bootstrap's exit
-  marker, and shows no sign of registration.
+  marker, and shows no sign of registration, and when the ledger that the same
+  pass already read holds the worker's operation.
 - The gate sits in `_decide`, after the earlier wait reasons and before the
   launch template is read. It is a refusal like `budget_allowance_exhausted`,
   and the command exits 2 as it does for any refusal.

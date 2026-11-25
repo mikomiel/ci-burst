@@ -51,7 +51,7 @@ The controller MUST refuse a launch with the reason `recent_launches_futile` whe
 - **AND** no operator action was taken
 
 ### Requirement: Only ended workers with an operation are classified
-The controller MUST classify a worker only from a record that shows the instance has ended, meaning a provider state of `terminated` or `stopped`, and that carries an operation identifier of the shape this deployment generates. Any other record is no evidence and MUST NOT be counted.
+The controller MUST classify a worker only from a record that shows the instance has ended, meaning a provider state of `terminated` or `stopped`, and that carries an operation identifier of the shape this deployment generates. The ledger state that the same pass read MUST hold that operation, under the same instance when it names one. Any other record is no evidence and MUST NOT be counted.
 
 #### Scenario: The instance has not ended
 - **WHEN** a record shows the provider state `pending`, `running`, `shutting-down` or `stopping`, whatever else it shows
@@ -66,6 +66,32 @@ The controller MUST classify a worker only from a record that shows the instance
 - **WHEN** a record's provider state is null, or text that names none of the six provider states
 - **THEN** that record has not ended and is no evidence
 - **AND** the rest of the file is still usable
+
+#### Scenario: The ledger holds none of the operations
+- **WHEN** three ended records show the exit marker and no registration evidence, each carries an operation identifier of the right shape, and the ledger holds none of those operations
+- **THEN** the records are no evidence and the gate is open
+- **AND** the evidence reports `considered` 0 and `futile` 0
+
+#### Scenario: The ledger holds the operations
+- **WHEN** the same three records are read and the ledger holds their operations
+- **THEN** the gate holds
+
+#### Scenario: The ledger names another instance
+- **WHEN** the ledger holds the operation of a record and names an instance other than the one the record is filed under
+- **THEN** that record is no evidence
+
+#### Scenario: The ledger names no instance
+- **WHEN** the ledger holds the operation of a record and names no instance for it
+- **THEN** the record is evidence under any instance identifier
+
+#### Scenario: A worker that the ledger does not hold takes no place among the newest three
+- **WHEN** the three newest ended workers are not in the ledger, and the three next older workers are futile and in the ledger
+- **THEN** the older three are the considered workers
+- **AND** the gate holds
+
+#### Scenario: Planning and applying count the same workers
+- **WHEN** `plan` and `apply` read the same record against the same ledger
+- **THEN** both report the same `considered` and `futile` counts
 
 ### Requirement: An ended worker is registered or futile by its markers
 A classified worker MUST be registered when its record shows registration evidence: the registration step, a step that the shipped first-boot script prints only after registration, a one-job process outcome or a Spot interruption notice. It MUST be futile when its record shows the exit marker (the `bootstrap exiting rc=<n>` status) and no registration evidence.
@@ -124,7 +150,7 @@ The controller MUST treat a missing, unreadable, stale or malformed record as no
 - **THEN** the next pass reports `fresh` and evaluates the gate normally
 
 ### Requirement: The evidence is read from one file without side effects
-The controller MUST read the evidence only from `observed.json` in the `export` directory beside the ledger. It MUST NOT write, repair or delete that file and MUST NOT make a provider, queue or ledger call to read it. It MUST NOT block on the path and MUST read only a regular file that is not a link. The evidence state MUST be exactly one of `missing`, `unreadable`, `stale`, `malformed` or `fresh`, tested in that order.
+The controller MUST read the evidence only from `observed.json` in the `export` directory beside the ledger. It MUST NOT write, repair or delete that file. It MUST NOT make a provider or queue call, and MUST NOT read the ledger again, to read it or to count its workers. It MUST NOT block on the path and MUST read only a regular file that is not a link. The evidence state MUST be exactly one of `missing`, `unreadable`, `stale`, `malformed` or `fresh`, tested in that order.
 
 #### Scenario: The record cannot be read
 - **WHEN** the file exists and cannot be opened or read
@@ -183,6 +209,11 @@ The controller MUST read the evidence only from `observed.json` in the `export` 
 #### Scenario: The controller leaves the record alone
 - **WHEN** `plan` or `apply` runs
 - **THEN** the bytes and the modification time of the record are unchanged
+
+#### Scenario: The gate uses the ledger state that its pass read
+- **WHEN** `plan` or `apply` decides on a record that holds futile workers
+- **THEN** the workers are counted against the ledger state that the same pass already read
+- **AND** the gate makes no provider call, no queue call and no ledger read of its own
 
 ### Requirement: The evidence read is bounded and decided from the open file
 The controller MUST take the type, the modification time and the size of the record from the open file and decide before it reads any content. It MUST read the open file itself, not through a buffered stream, and fetch at most 16 MiB plus one byte from it, and MUST treat a file above 16 MiB as `malformed`. It MUST refuse the JSON constants `NaN`, `Infinity` and `-Infinity`, and a JSON object that names a member twice, when it decodes the file, so a file that holds one is `malformed`.

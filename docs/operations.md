@@ -405,6 +405,44 @@ a file that the hold would call `malformed` for either reason. A loader that kep
 the last value of a repeat could keep a futile record in place of a registered
 one, skip its finished console and rewrite the file with a fresh heartbeat.
 
+The same rule covers a stored value that bears on registration. The hold decides
+`registered` or `futile` from the `registered` flag, the `steps` list,
+`job_process` and `spot_interruption`. When one of them is present and `export`
+cannot keep it, `export` drops the whole record of that instance and notes
+`state_rebuilt`. Examples are a `job_process` whose outcome and status disagree,
+a `spot_interruption` of a shape that `export` does not write, a `steps` list
+with an element that is not text, and a `registered` flag that is not true or
+false. `export` does not keep the record with the value replaced by its default.
+A worker that has ended is not read again, so the kept record would show no
+registration, and the next run would write it back under a fresh heartbeat as a
+futile launch that nobody observed.
+
+A key that is absent is the same damage. The hold refuses a record file in
+which a record lacks one of those four keys. A record file that an older
+version wrote lacks the keys that the version did not write yet. When the
+record of a worker that has ended lacks one of them, `export` drops that
+record and notes `state_rebuilt`, for the reason above. The first run that
+loads such a file drops the records of the workers that have ended, and reads
+again, within its read budget, the consoles of those that the provider still
+lists. The record of a
+worker that has not ended may lack a key. While the provider lists the
+instance, the run reads its console again within its budget, and the console
+fills the key. Until then the hold counts no such worker.
+
+A dropped record has two outcomes. While the provider still lists the instance,
+the run reads its console again within the read budget, and the record shows what
+the console shows now. When the provider no longer lists the instance, the run
+writes no record for it, so it is no evidence. The cost is the cost of any
+dropped record: the cumulative counters count that worker again, and the run
+emits its markers again under their stable identities.
+
+`export` keeps a record when it can keep the evidence in it. A Spot notice whose
+registration identifier it normalises, and a `steps` list from which it removes a
+name outside the vocabulary, keep the evidence that they carry. A bad `state`,
+`operation` or `exit_code` becomes null, and the record stays. The hold reads that
+value as no evidence for the record, so the repaired record cannot count as a
+futile launch.
+
 The command never calls Forgejo and never mutates a resource, so it keeps working
 when the queue or the admission path is the thing that is broken.
 
@@ -1677,9 +1715,11 @@ before it registers. The slot frees, the job still waits, and the claim grace no
 longer covers it, so each pass would launch again. The hold thins that loop.
 
 `apply` and `plan` read the record that `export` writes, at
-`<ledger directory>/export/observed.json`. They never write it and make no other
-call to read it. They open it without blocking and read it only when it is a
-regular file that is not a link, so a FIFO at the path cannot stall a pass.
+`<ledger directory>/export/observed.json`. They never write it. The read makes no
+provider, queue or ledger call: it needs only the file and the ledger snapshot
+that the pass has already read (see below). They open the file without blocking
+and read it only when it is a regular file that is not a link, so a FIFO at the
+path cannot stall a pass.
 They take the type, the age and the size from the open file and decide before
 they read a byte: a file that is not regular is `unreadable`, a file past the
 freshness bound is `stale` whatever its size, and a file above 16 MiB is
@@ -1691,8 +1731,9 @@ byte from it.
 and does not look anywhere else.
 
 A worker is classified only when its record shows that the instance ended
-(`terminated` or `stopped`) and it carries an operation identifier of this
-deployment. It is:
+(`terminated` or `stopped`), it carries an operation identifier of the shape that
+this deployment generates, and the ledger holds that operation (see below). It
+is:
 
 - registered when the record shows the registration step, a later step
   (`job` or `claim-timeout`), a one-job process outcome or a Spot interruption
@@ -1702,10 +1743,23 @@ deployment. It is:
 
 Any other record is no evidence and is never counted: an ended worker with no
 exit marker and no registration evidence (an empty console, a hard kill before
-registration, a power-off), a worker that has not ended, and a record with no
-operation identifier of this deployment. A registered worker that ended without
-an exit marker, for example after a hard kill, is counted and can clear a hold.
-A worker that still runs is never counted, even when it registered.
+registration, a power-off), a worker that has not ended, a record with no
+operation identifier of this deployment, and a record whose operation the ledger
+does not hold. A registered worker that ended without an exit marker, for example
+after a hard kill, is counted and can clear a hold. A worker that still runs is
+never counted, even when it registered.
+
+A worker counts only when the ledger of the same pass holds its operation. `plan`
+takes the operations from the ledger state that it reads for its own state block.
+`apply` takes them from the state that reconciliation reads at its end, which
+also gives the slot. So the hold adds no provider call, no ledger read and no
+schema change. `export` writes the operation tag of any owned instance that the
+provider lists, and reconciliation ignores a terminated instance that no ledger
+operation names. The hold ignores it as well. When the ledger names an instance for the
+operation, the record must be filed under that instance. When the ledger names
+none, the operation alone is enough. A record that fails this check is not
+counted, and it takes no place among the newest three. A ledger that is empty, or
+absent for `plan`, leaves no evidence, and the hold stays open.
 
 The rule uses three fixed values. They are not configuration and there is no off
 switch.
@@ -1734,7 +1788,7 @@ state is `fresh`. The states, in the order they are tested:
 | `missing` | no file at the path |
 | `unreadable` | the file cannot be opened or read, is not a regular file (a FIFO, a directory) or is a link, or the reader failed in a way it did not foresee |
 | `stale` | the modification time is more than 600 seconds old, or after the controller clock |
-| `malformed` | larger than 16 MiB, not UTF-8 JSON (a `NaN`, `Infinity` or `-Infinity` constant counts as not JSON), a JSON object that names a member twice at any level (a decoder keeps only the last value, and `export` never writes one; `export` refuses a constant and a repeat in the same way when it loads its own record, § Worker evidence), another record version, or one record with a bad field the hold reads, an instance key that `export` rejects, or a registration marker (`job_process`, `spot_interruption`) of a shape that `export` does not write; the whole file is dropped |
+| `malformed` | larger than 16 MiB, not UTF-8 JSON (a `NaN`, `Infinity` or `-Infinity` constant counts as not JSON), a JSON object that names a member twice at any level (a decoder keeps only the last value, and `export` never writes one; `export` refuses a constant and a repeat in the same way when it loads its own record, § Worker evidence), another record version, or one record with a bad field the hold reads, an instance key that `export` rejects, or a registration marker (`job_process`, `spot_interruption`) of a shape that `export` does not write. The hold drops the whole file. When `export` loads its own record, it drops only the record that holds such a value, and the record of an ended worker that lacks a registration key (§ Worker evidence) |
 | `fresh` | the hold is evaluated |
 
 Only `fresh` evidence can hold. Every other state admits as if the hold did not
@@ -1776,6 +1830,12 @@ Known residual cases:
   scrolled out, and then ended through the exit path before any later marker
   reads as futile. Three such workers hold admission for at most one window.
 - A registered worker that still runs does not clear a hold.
+- A record that `export` dropped for a damaged registration value is rebuilt from
+  its console alone. The first case above applies to it: a registration line that
+  has scrolled out of the console reads as futile.
+- A ledger operation that names no instance counts every record that carries its
+  tag. The controller launches one instance for each operation, so two such
+  records need a tag that the controller did not write.
 - Records carry no deployment name. A state directory shared by two deployments,
   or kept across a rename, mixes their records.
 - `export` reads at most 16 consoles per run, so heavy turnover defers some

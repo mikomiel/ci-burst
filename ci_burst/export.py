@@ -404,6 +404,18 @@ def load_state(path):
     and the cumulative counters start again, as they do when the file is deleted,
     and the run reads again the consoles that it selects within
     ``MAX_CONSOLE_READS``.
+
+    One record is dropped, and the note is ``state_rebuilt``, when what it shows of
+    registration cannot be kept (``_registration_evidence_is_damaged``): a stored
+    value that bears on registration and that the loader cannot keep, or a
+    registration key that the record of an ended worker lacks.
+    The reader decides from those values and the run does not read an ended
+    worker again, so a record that lost one of them would be written back as a
+    futile launch under a fresh heartbeat. Without the record, the run reads the
+    console again while the provider lists the instance, and an instance that it
+    no longer lists leaves no evidence. The cost is that of any dropped record:
+    the cumulative totals count the worker again, and the run emits its markers
+    again under their stable identities.
     """
     empty = {"version": STATE_VERSION, "console_reads": 0, "totals": _empty_totals(), "instances": {}}
     try:
@@ -567,6 +579,51 @@ def _spot_interruption_value(value):
     return None
 
 
+def _registration_evidence_is_damaged(record):
+    """Return True when what a record shows of registration cannot be kept.
+
+    The launch evidence reader decides ``registered`` or ``futile`` from
+    ``registered``, ``steps``, ``job_process`` and ``spot_interruption``, and a
+    worker whose record shows none of them never registered. A worker that ended
+    is not read again, so a loader that gave a default to a value that it cannot
+    keep, or to a key that the record lacks, would keep a record that shows no
+    registration, and the next run would write it back with a fresh heartbeat: a
+    futile launch that nobody observed. Such a record is dropped instead
+    (``load_state``), and the run reads the console again while the provider
+    still lists the instance.
+
+    Two things are damage. One is a value that is present and cannot be kept. The
+    other is a key that the record of a worker that ended lacks, as the record of
+    an older version does for a key that the version did not write yet. The record
+    of a worker that has not ended may lack a key. While the provider lists the
+    instance, the run reads its console again within its budget, and the console
+    fills the key. Until then the reader counts no such worker.
+
+    A value that the loader keeps with the evidence it carries is not damaged: a
+    Spot notice whose registration identifier it normalises, and a ``steps`` list
+    from which it drops a name it does not know. The reader decides the same
+    verdict for the two spellings. The fields that gate a verdict (``state``,
+    ``operation`` and ``exit_code``) are not here: the reader reads the value that
+    the loader drops from one of them as no evidence for that record, so the
+    repaired record cannot count as a futile launch.
+    """
+    state = record.get("state")
+    if isinstance(state, str) and state in CONSOLE_FINAL_STATES:
+        if any(field not in record for field in ("registered", "steps", "job_process", "spot_interruption")):
+            return True
+    for field, stored in (
+        ("job_process", _job_process_value),
+        ("spot_interruption", _spot_interruption_value),
+    ):
+        value = record.get(field)
+        if value is not None and stored(value) is None:
+            return True
+    steps = record.get("steps", [])
+    if not isinstance(steps, list) or not all(isinstance(name, str) for name in steps):
+        return True
+    return not isinstance(record.get("registered", False), bool)
+
+
 def _sanitize_record(record):
     """Rebuild one persisted record from an explicit schema.
 
@@ -575,8 +632,11 @@ def _sanitize_record(record):
     ``emitted`` key would suppress or forge a publication. Only the fields this
     command writes survive, and each is validated against the same closed
     vocabulary as fresh console input. Returns ``(record, changed)``, or
-    ``None`` when the record is not usable at all.
+    ``None`` when the record is not usable at all. A record whose registration
+    evidence cannot be kept is not usable (``_registration_evidence_is_damaged``).
     """
+    if _registration_evidence_is_damaged(record):
+        return None
     changed = False
     steps = record.get("steps")
     steps = [name for name in steps if isinstance(name, str)] if isinstance(steps, list) else []

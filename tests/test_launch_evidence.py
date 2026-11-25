@@ -21,7 +21,7 @@ from ci_burst.launch_evidence import (
     read_launch_evidence,
 )
 
-from support import futile_record, operation_hex, registered_record, write_observed
+from support import futile_record, ledger_holding, operation_hex, registered_record, write_observed
 
 NOW = 1_800_000_000.0
 
@@ -80,7 +80,7 @@ class ReaderCase(unittest.TestCase):
         write_observed(self.path, records, payload=payload, raw=raw, mtime=mtime)
 
     def read(self, now=NOW):
-        return read_launch_evidence(self.path, now)
+        return read_launch_evidence(self.path, now, ledger_holding(self.path))
 
 
 class EvidenceStateTests(ReaderCase):
@@ -90,7 +90,7 @@ class EvidenceStateTests(ReaderCase):
         self.assertFalse(evidence.holds)
 
     def test_a_missing_directory_is_missing(self):
-        evidence = read_launch_evidence(Path(self._directory.name) / "absent" / "observed.json", NOW)
+        evidence = read_launch_evidence(Path(self._directory.name) / "absent" / "observed.json", NOW, {})
         self.assertEqual(evidence.state, "missing")
 
     def test_a_path_that_cannot_be_read_is_unreadable(self):
@@ -429,7 +429,7 @@ class NonRegularPathTests(ReaderCase):
         # leaves a link there, so a link is not its output.
         target = Path(self._directory.name) / "elsewhere.json"
         write_observed(target, [futile(index=index) for index in range(3)], mtime=NOW)
-        self.assertTrue(read_launch_evidence(target, NOW).holds)
+        self.assertTrue(read_launch_evidence(target, NOW, ledger_holding(target)).holds)
         self.path.parent.mkdir(parents=True)
         self.path.symlink_to(target)
         self.assert_unreadable(self.read_within_the_bound())
@@ -829,6 +829,94 @@ class ConsideredSetTests(ReaderCase):
         records = [futile(age=60 * index, index=index) for index in range(1, 4)]
         records += [registered(age=600, index=4), registered(age=600, index=5)]
         self.assertEqual(self.evidence(records), {"state": "fresh", "considered": 3, "futile": 3})
+
+
+class LedgerGateTests(ReaderCase):
+    """A worker counts only when the ledger records it.
+
+    ``export`` writes the operation tag of any owned instance that the provider
+    lists, and reconciliation ignores a terminated instance that no ledger
+    operation names. The caller passes the operations of its pass as ``recorded``: each
+    operation identifier that the ledger holds, with the instance identifier that
+    the ledger holds for it, or ``None`` while it holds none.
+    """
+
+    #: ``write_observed`` files the records under these instance identifiers, in order.
+    INSTANCE_IDS = tuple(f"i-0123456789abcde{index:02x}" for index in range(6))
+
+    def evidence(self, records, recorded):
+        self.write(records)
+        return read_launch_evidence(self.path, NOW, recorded).as_dict()
+
+    def test_the_ledger_argument_is_required(self):
+        # A caller that forgot it would otherwise count workers that no operation
+        # of this deployment launched.
+        self.write([futile(index=index) for index in range(3)])
+        with self.assertRaises(TypeError):
+            read_launch_evidence(self.path, NOW)
+
+    def test_workers_whose_operations_the_ledger_holds_hold(self):
+        records = [futile(age=60 * index, index=index) for index in range(1, 4)]
+        recorded = {operation_hex(index): None for index in range(1, 4)}
+        self.assertEqual(self.evidence(records, recorded), {"state": "fresh", "considered": 3, "futile": 3})
+        self.assertTrue(read_launch_evidence(self.path, NOW, recorded).holds)
+
+    def test_an_empty_ledger_leaves_no_evidence(self):
+        records = [futile(age=60 * index, index=index) for index in range(1, 4)]
+        self.assertEqual(self.evidence(records, {}), {"state": "fresh", "considered": 0, "futile": 0})
+        self.assertFalse(read_launch_evidence(self.path, NOW, {}).holds)
+
+    def test_a_worker_whose_operation_the_ledger_does_not_hold_is_no_evidence(self):
+        records = [futile(age=60 * index, index=index) for index in range(1, 4)]
+        recorded = {operation_hex(1): None, operation_hex(2): None, operation_hex(9): None}
+        self.assertEqual(self.evidence(records, recorded), {"state": "fresh", "considered": 2, "futile": 2})
+        self.assertFalse(read_launch_evidence(self.path, NOW, recorded).holds)
+
+    def test_the_instance_that_the_ledger_names_must_be_the_one_in_the_record(self):
+        records = [futile(age=60 * index, index=index) for index in range(1, 4)]
+        elsewhere = "i-0123456789abcdf99"
+        operations = [operation_hex(index) for index in range(1, 4)]
+        cases = (
+            ("the ledger names no instance", [None, None, None], 3),
+            ("the ledger names the instance of every worker", list(self.INSTANCE_IDS[:3]), 3),
+            ("the ledger names another instance for one worker", [*self.INSTANCE_IDS[:2], elsewhere], 2),
+            ("the ledger names another instance for every worker", [elsewhere] * 3, 0),
+        )
+        for name, named, considered in cases:
+            with self.subTest(name):
+                recorded = dict(zip(operations, named))
+                self.assertEqual(
+                    self.evidence(records, recorded),
+                    {"state": "fresh", "considered": considered, "futile": considered},
+                )
+
+    def test_a_worker_that_the_ledger_does_not_hold_takes_no_place_among_the_newest_three(self):
+        # The three newest records are not in the ledger. They are skipped before the
+        # newest three are chosen, so the older workers that the ledger holds decide.
+        newer_registered = [registered(age=10 * index, index=index) for index in range(1, 4)]
+        older_futile = [futile(age=600 + 60 * index, index=index) for index in range(4, 7)]
+        recorded = {operation_hex(index): None for index in range(4, 7)}
+        self.assertEqual(
+            self.evidence(newer_registered + older_futile, recorded),
+            {"state": "fresh", "considered": 3, "futile": 3},
+        )
+        self.assertTrue(read_launch_evidence(self.path, NOW, recorded).holds)
+
+        newer_futile = [futile(age=10 * index, index=index) for index in range(1, 4)]
+        older = [registered(age=600, index=4), futile(age=660, index=5), futile(age=720, index=6)]
+        self.assertEqual(
+            self.evidence(newer_futile + older, recorded),
+            {"state": "fresh", "considered": 3, "futile": 2},
+        )
+        self.assertFalse(read_launch_evidence(self.path, NOW, recorded).holds)
+
+    def test_the_state_of_the_evidence_does_not_depend_on_the_ledger(self):
+        records = [futile(index=index) for index in range(3)]
+        self.write(records, mtime=NOW - EVIDENCE_MAX_AGE_SECONDS - 1)
+        self.assertEqual(read_launch_evidence(self.path, NOW, {}).state, "stale")
+        self.write(raw=b"[]")
+        self.assertEqual(read_launch_evidence(self.path, NOW, {}).state, "malformed")
+        self.assertEqual(read_launch_evidence(self.path.parent / "absent.json", NOW, {}).state, "missing")
 
 
 if __name__ == "__main__":

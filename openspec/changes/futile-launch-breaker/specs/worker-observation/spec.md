@@ -75,6 +75,54 @@ change to the brake's reader.
 - **THEN** the command drops the file whole and reads the consoles of the three workers, so the worker that registered is recorded as registered
 - **AND** the controller's reader finds no hold in the record that the run writes
 
+#### Scenario: A record whose registration value cannot be kept is dropped
+- **WHEN** the record of an instance holds a `job_process` or `spot_interruption` of a shape that the command does not write, a `steps` list with an element that is not text, or a `registered` flag that is not true or false
+- **THEN** the command drops that record only and notes `state_rebuilt`
+- **AND** it does not keep the record with the value replaced by its default, because a worker that has ended is not read again and the run would write the record back under a fresh modification time as a futile launch that nobody observed
+
+#### Scenario: A dropped record is read again while the provider lists the instance
+- **WHEN** the record of an ended worker is dropped because its registration evidence cannot be kept, the provider still lists the instance, and the console shows that the worker registered
+- **THEN** the run reads that console again within its per-run read budget and records the worker as registered
+- **AND** the brake's reader finds no hold, although the record holds two other futile workers
+
+#### Scenario: A dropped record counts when its console shows no registration
+- **WHEN** the record of an ended worker is dropped because its registration evidence cannot be kept, and the console that the run reads shows the exit marker and no registration evidence
+- **THEN** the run records the worker as futile, on what the console shows now
+
+#### Scenario: A dropped record of an unlisted instance is no evidence
+- **WHEN** the record of an ended worker is dropped because its registration evidence cannot be kept, and the provider no longer lists the instance
+- **THEN** the run writes no record for it
+- **AND** the brake's reader has no evidence about that worker
+
+#### Scenario: A dropped record that the run does not read is no evidence
+- **WHEN** more dropped records of listed instances remain than the per-run read budget allows
+- **THEN** the run reads at most `MAX_CONSOLE_READS` consoles and notes `console_read_deferred`
+- **AND** a record that waits for a later run is absent from the file that this run writes
+
+#### Scenario: A dropped record costs only its own history
+- **WHEN** the command drops a record because its registration evidence cannot be kept
+- **THEN** the cumulative counters count that worker again, and the run emits its markers again under their stable identities
+- **AND** the command keeps every other record
+
+#### Scenario: A value that the command keeps with its evidence does not drop the record
+- **WHEN** a record holds a Spot notice whose registration identifier the command normalises, or a `steps` list with a name outside the vocabulary
+- **THEN** the command keeps the record with the evidence that it carries
+
+#### Scenario: A record of an ended worker that lacks a registration key is dropped
+- **WHEN** the record of a worker that has ended lacks `job_process`, `spot_interruption`, `steps` or `registered`, as a record that an older version wrote does
+- **THEN** the command drops that record only and notes `state_rebuilt`
+- **AND** it does not keep the record with a default for the key, because a worker that has ended is not read again and the run would write the record back under a fresh modification time as a futile launch that nobody observed
+
+#### Scenario: A record of a worker that has not ended may lack a registration key
+- **WHEN** the record of a worker that has not ended lacks one of those keys
+- **THEN** the command keeps the record, and the brake's reader does not count it, because the worker has not ended
+- **AND** while the provider lists the instance, the run reads its console again within its per-run read budget, and the console fills the key
+
+#### Scenario: A bad provider state, operation or exit code leaves the record in place
+- **WHEN** a record holds a `state`, `operation` or `exit_code` that the command cannot keep
+- **THEN** the command keeps the record with that value replaced by null
+- **AND** the brake's reader reads the null as no evidence for that record
+
 #### Scenario: The brake can read what the command writes
 - **WHEN** the command writes a record for a worker that ended after printing the exit marker and no registration evidence
 - **THEN** the controller's reader classifies that worker as futile

@@ -14,10 +14,10 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   lists the steps the shipped first-boot script prints only after the register
   step. Do not copy the step names into a second list.
 - [x] 1.3 Add `ci_burst/launch_evidence.py` with one function that takes the
-  record path and the controller clock reading and returns the evidence state,
-  the considered count and the futile count. It imports the record version, the
-  final provider states, the operation pattern and the constant from 1.2 from
-  `ci_burst/export.py`.
+  record path, the controller clock reading and the ledger operations of the pass
+  (see 1.9) and returns the evidence state, the considered count and the futile
+  count. It imports the record version, the final provider states, the operation
+  pattern and the constant from 1.2 from `ci_burst/export.py`.
 - [x] 1.4 Open the file once, without blocking and without following a link,
   take the type, the modification time and the size from the open descriptor, and
   decide before it reads any content. Read the file only when it is a regular
@@ -51,15 +51,44 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   six, is valid and has not ended.
 - [x] 1.7 Classify each record as registered, futile or no evidence, order by
   `seen`, keep the window edge inside, and build the considered set with the tie
-  rule from the spec.
+  rule from the spec. Skip a record that the ledger does not hold (see 1.9)
+  before the newest three are chosen.
 - [x] 1.8 Decode the record in `load_state` in `ci_burst/export.py` with the same
   two hooks. A file that holds a refused constant or a repeated member takes the
   branch of a file that does not decode: the loader drops it whole, notes
   `state_rebuilt` and starts from an empty record, so the emitted history and the
   cumulative counters start again, as when the record is deleted. Add no other
-  behaviour. A loader that kept the last value of a repeat would keep a record that
-  the reader calls `malformed`, skip its finished console and rewrite the file with
-  a fresh heartbeat.
+  behaviour here. A loader that kept the last value of a repeat would keep a
+  record that the reader calls `malformed`, skip its finished console and rewrite
+  the file with a fresh heartbeat. The same reasoning applies to a repaired
+  registration value and to a default for an absent registration key (see
+  1.10).
+- [x] 1.9 Count a worker only when the ledger holds its operation. The reader
+  takes the operations of the pass as a required argument: a mapping from each
+  operation identifier that the ledger holds to the instance identifier that it
+  holds for it, or to null while it holds none. A record counts when its operation
+  is in the mapping and the mapped instance is null or the instance that the
+  record is filed under. The reader makes no ledger call of its own. `export`
+  persists any well-shaped operation tag, and reconciliation ignores a terminated
+  instance that no ledger operation names, so the tag alone does not show a launch
+  that the ledger holds.
+- [x] 1.10 In `load_state`, drop the record of an instance when a stored value
+  that bears on registration is present and cannot be kept: a `job_process` or
+  `spot_interruption` that `export` does not write, a `steps` list with an element
+  that is not text, or a `registered` flag that is not true or false. Also drop
+  the record of a worker that has ended when it lacks `registered`, `steps`,
+  `job_process` or `spot_interruption`, as an older version wrote it. Use the
+  value rules for `job_process` and `spot_interruption` that the reader imports.
+  Keep the record of a worker that has not ended and lacks a key: the reader
+  counts no such worker, and the run reads its console again while the provider
+  lists the instance. Keep a Spot notice that the loader normalises and a
+  `steps` list from which it removes an unknown name. Keep the `state`,
+  `operation` and `exit_code` repair, which replaces a bad value by null. A worker
+  that has ended is not read again, so a record kept with a default
+  would be written back under a fresh heartbeat as a futile launch that nobody
+  observed. The dropped record is read again while the provider lists the
+  instance, within `MAX_CONSOLE_READS`, and leaves no evidence when the provider
+  does not.
 
 ## 2. Gate
 
@@ -76,6 +105,10 @@ instance identifiers and 32-character hexadecimal operation identifiers.
 - [x] 2.5 Correct the `ci_burst/export.py` module docstring, which says the
   record never influences admission, so that it names the one read-only brake and
   the duty to write the record last, on every successful run.
+- [x] 2.6 Give `_decide` the ledger operations of the pass and pass them to the
+  reader. `plan` takes them from the state block that it already reads. `apply`
+  takes them from the state that `_reconcile` reads at its end, in the same
+  transaction, so the gate adds no provider call and no ledger read.
 
 ## 3. Tests
 
@@ -131,7 +164,18 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   kept; and that a run over three finished workers, with one instance key repeated
   (registered first, futile last) and two other futile records, writes a record
   that the reader does not hold on. Add a test that the constant from 1.2 is a
-  subset of `STEP_NAMES` and excludes the registration step.
+  subset of `STEP_NAMES` and excludes the registration step. Further tests show
+  that the loader drops a record, and only that record, for each registration
+  value that it cannot keep and for each registration key that the record of an
+  ended worker lacks (see 1.10), and notes `state_rebuilt`; that the reader calls
+  the same file `malformed`; that the loader keeps a record whose Spot notice it
+  normalises, whose `steps` list holds an unknown name, whose `state`,
+  `operation` or `exit_code` it replaces by null, or whose worker has not ended
+  and lacks a key, and that the run fills that key from the console while the
+  provider lists the instance; that no
+  field that the reader requires can be missing from a record that the loader
+  keeps as futile; and that a run reads at most `MAX_CONSOLE_READS` dropped
+  records and notes `console_read_deferred` for the rest.
 - [x] 3.4 Exporter tests show that a successful run with nothing new still
   rewrites the record and advances its modification time, that a refused run
   leaves it unrewritten, that a run that cannot write its textfile leaves it
@@ -147,9 +191,33 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   no `launch_evidence`; the later reasons unchanged when the gate is open; `plan`
   and `apply` agreeing on the same record; `plan` reporting the state it found
   when it cannot read the record; and the record's bytes and modification time
-  unchanged after `plan` and `apply`.
+  unchanged after `plan` and `apply`. The class's fixture writes the terminal
+  ledger row of each operation that a record names, as reconciliation leaves it
+  for an ended instance, because a worker counts only when the ledger holds its
+  operation.
 - [x] 3.6 Update any existing assertion that compares a whole decision document
-  for the new key, and weaken no existing assertion.
+  for the new key, and weaken no existing assertion. The two assertions that the
+  ledger holds no operation after a hold now assert that it holds exactly the
+  rows that the fixture wrote, so a hold still creates no operation.
+- [x] 3.7 Ledger tests. Reader tests show that the ledger argument is required;
+  that workers whose operations the ledger holds hold, and that an empty ledger
+  leaves no evidence; that a worker whose operation the ledger does not hold is
+  no evidence; that the instance that the ledger names must be the one in the
+  record, and that a ledger which names none accepts the operation alone; that an
+  unrecorded worker takes no place among the newest three, in both directions; and
+  that the evidence state does not depend on the ledger. Controller tests show
+  that three futile workers whose operations the ledger does not hold do not hold
+  admission, that the same workers hold once the ledger names their operations,
+  that `plan` and `apply` agree, and that the ledger must name the instance that
+  the record is filed under.
+- [x] 3.8 Exporter-to-controller tests. Write the record of three ended workers
+  (one registered, two futile) with a `job_process` that `export` cannot write on
+  the registered one. Show that the reader calls the file `malformed`, that an
+  export run reads the console of that worker again and records it as registered,
+  and that the next `apply` is not held. Show that a worker whose instance the
+  provider no longer lists leaves no evidence, that a dropped record whose console
+  shows no registration counts, and, as the control, that three futile workers
+  that nothing damaged still hold after an export run.
 
 ## 4. Documentation
 
@@ -176,6 +244,12 @@ instance identifiers and 32-character hexadecimal operation identifiers.
 - [x] 4.3 In `docs/deployment.md` and `docs/container.md`, replace the wording
   that the observation unit is "independent of admission": it is optional and
   launches nothing, but where it runs, `apply` reads its record as a brake.
+- [x] 4.4 In `docs/operations.md`, state in "Worker evidence" that `export` drops
+  the record of an instance when a stored registration value cannot be kept, why,
+  what the run does next, what it costs and which values it keeps. State in the
+  hold section that a worker counts only when the ledger of the same pass holds
+  its operation, that the hold reads no ledger of its own, and add the two
+  residual cases that follow from these rules.
 
 ## 5. Verification
 

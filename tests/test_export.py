@@ -25,9 +25,18 @@ from ci_burst.export import (
     parse_console,
     prune_state,
 )
-from ci_burst.launch_evidence import FUTILE, REGISTERED, classify, read_launch_evidence
+from ci_burst.launch_evidence import FUTILE, RECORD_FIELDS, REGISTERED, classify, read_launch_evidence
 
-from support import FakeAws, futile_record, instance, operation_hex, registered_record, write_config, write_observed
+from support import (
+    FakeAws,
+    futile_record,
+    instance,
+    ledger_holding,
+    operation_hex,
+    registered_record,
+    write_config,
+    write_observed,
+)
 
 NOW = 1_800_000_000.0
 
@@ -1800,7 +1809,7 @@ class LaunchEvidenceContractTests(ExportCase):
                 self.UNLABELLED_ID: None,
             },
         )
-        evidence = read_launch_evidence(self.state_file, time.time())
+        evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
         self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 1})
 
         # Age the file, then run again with the unlabelled instance gone from
@@ -1813,14 +1822,14 @@ class LaunchEvidenceContractTests(ExportCase):
         records = self.records()
         self.assertIsNone(records[self.UNLABELLED_ID]["state"])
         self.assertIsNone(classify(records[self.UNLABELLED_ID]))
-        evidence = read_launch_evidence(self.state_file, time.time())
+        evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
         self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 1})
 
     def test_three_workers_that_never_registered_hold(self):
         console = "cloud-init: STEP mount-options\ncloud-init: bootstrap exiting rc=1\n"
         owned = [self.owned(f"i-0123456789abcdeb{index}", index) for index in range(3)]
         self.run_export(self.build(owned, {item.instance_id: console for item in owned}), now=time.time())
-        evidence = read_launch_evidence(self.state_file, time.time())
+        evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
         self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 3})
         self.assertTrue(evidence.holds)
 
@@ -1847,7 +1856,7 @@ class LaunchEvidenceContractTests(ExportCase):
             [records[key]["job_process"] for key in list(consoles)[2:]],
             [["completed", 0], ["failed", 42], ["timeout", 124]],
         )
-        evidence = read_launch_evidence(self.state_file, time.time())
+        evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
         # The workers share one read time, so all five are considered.
         self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 5, "futile": 0})
 
@@ -1889,7 +1898,8 @@ class LaunchEvidenceContractTests(ExportCase):
                 )
                 _, note = load_state(self.state_file)
                 self.assertEqual(note is None, accepted)
-                self.assertEqual(read_launch_evidence(self.state_file, NOW).state == "fresh", accepted)
+                evidence = read_launch_evidence(self.state_file, NOW, ledger_holding(self.state_file))
+                self.assertEqual(evidence.state == "fresh", accepted)
 
     def test_a_value_that_the_loader_drops_never_makes_the_reader_hold_alone(self):
         # ``state``, ``operation`` and ``steps`` are read leniently. A value of
@@ -1937,10 +1947,10 @@ class LaunchEvidenceContractTests(ExportCase):
                             "instances": {**older, "i-0123456789abcdef9": record},
                         },
                     )
-                    raw = read_launch_evidence(self.state_file, NOW)
+                    raw = read_launch_evidence(self.state_file, NOW, ledger_holding(self.state_file))
                     kept, _ = load_state(self.state_file)
                     write_observed(self.state_file, mtime=NOW, payload=kept)
-                    rewritten = read_launch_evidence(self.state_file, NOW)
+                    rewritten = read_launch_evidence(self.state_file, NOW, ledger_holding(self.state_file))
                     if raw.state == "fresh":
                         self.assertEqual(raw.as_dict(), rewritten.as_dict())
                     else:
@@ -1980,11 +1990,11 @@ class LaunchEvidenceContractTests(ExportCase):
         # again, so the hold rests on the file.
         now = time.time()
         _, exporter = self.finished_workers(now, repeated=False)
-        self.assertTrue(read_launch_evidence(self.state_file, now).holds)
+        self.assertTrue(read_launch_evidence(self.state_file, now, ledger_holding(self.state_file)).holds)
         result = self.run_export(exporter, now=now)
         self.assertNotIn("state_rebuilt", result["notes"])
         self.assertEqual(result["console_reads"], 0)
-        evidence = read_launch_evidence(self.state_file, time.time())
+        evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
         self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 3})
         self.assertTrue(evidence.holds)
 
@@ -2000,12 +2010,12 @@ class LaunchEvidenceContractTests(ExportCase):
         first = self.WORKER_IDS[0]
         self.assertEqual(raw.count(f'"{first}":'.encode("ascii")), 2)
         self.assertFalse(json.loads(raw)["instances"][first]["registered"], "the last value is the futile one")
-        self.assertEqual(read_launch_evidence(self.state_file, now).state, "malformed")
+        self.assertEqual(read_launch_evidence(self.state_file, now, ledger_holding(self.state_file)).state, "malformed")
 
         result = self.run_export(exporter, now=now)
 
         # What the next pass sees: the worker registered, so nothing holds.
-        evidence = read_launch_evidence(self.state_file, time.time())
+        evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
         self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 2})
         self.assertFalse(evidence.holds)
         # Why: the file was not loaded, so every worker was read again.
@@ -2042,11 +2052,12 @@ class LaunchEvidenceContractTests(ExportCase):
                         instances[self.WORKER_IDS[0]]["first_seen"] = constant
                     write_observed(self.state_file, mtime=now, payload=payload)
                     self.assertIn(word.encode("ascii"), self.state_file.read_bytes())
-                    self.assertEqual(read_launch_evidence(self.state_file, now).state, "malformed")
+                    evidence = read_launch_evidence(self.state_file, now, ledger_holding(self.state_file))
+                    self.assertEqual(evidence.state, "malformed")
 
                     result = self.run_export(self.build(owned, consoles), now=now)
 
-                    evidence = read_launch_evidence(self.state_file, time.time())
+                    evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
                     self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 0})
                     self.assertFalse(evidence.holds)
                     self.assertIn("state_rebuilt", result["notes"])
@@ -2091,7 +2102,184 @@ class LaunchEvidenceContractTests(ExportCase):
             with self.subTest(name):
                 write_observed(self.state_file, raw=text.encode("utf-8"), mtime=NOW)
                 self.assertEqual(load_state(self.state_file), (empty, "state_rebuilt"))
-                self.assertEqual(read_launch_evidence(self.state_file, NOW).state, "malformed")
+                evidence = read_launch_evidence(self.state_file, NOW, ledger_holding(self.state_file))
+                self.assertEqual(evidence.state, "malformed")
+
+    # -- a stored value that bears on registration -------------------------------------
+    #: Each value is a damaged form of registration evidence: the field is present
+    #: and the loader cannot keep it. The first worker of each record would read as
+    #: registered if the field were intact, and as futile once the loader replaced it.
+    DAMAGED_EVIDENCE = (
+        ("job_process", ["completed", 1]),
+        ("job_process", ["completed", "0"]),
+        ("job_process", ["unknown", 0]),
+        ("job_process", [["completed"], 0]),
+        ("job_process", []),
+        ("job_process", "completed"),
+        ("job_process", 0),
+        ("spot_interruption", ["evacuate", "../../etc/passwd", "not-a-uuid"]),
+        ("spot_interruption", ["terminate", "ip-10-0-0-1", 5]),
+        ("spot_interruption", []),
+        ("spot_interruption", "terminate"),
+        ("steps", None),
+        ("steps", "register"),
+        ("steps", ["register", 5]),
+        ("steps", ["register", None]),
+        ("registered", None),
+        ("registered", 1),
+        ("registered", "true"),
+    )
+
+    def write_workers(self, records, *, ids=None):
+        """Write a record of ended workers, filed under ``ids`` (``WORKER_IDS``) by position."""
+        ids = self.WORKER_IDS if ids is None else ids
+        write_observed(
+            self.state_file,
+            mtime=NOW,
+            payload={
+                "version": STATE_VERSION,
+                "console_reads": len(records),
+                "totals": {"launches": len(records), "registered": 0, "unregistered": len(records)},
+                "instances": dict(zip(ids, records)),
+            },
+        )
+
+    def test_a_record_whose_registration_evidence_cannot_be_kept_is_dropped(self):
+        # The reader refuses such a file whole, so the gate is open. The loader must
+        # not answer with a repaired record: an ended worker is never read again, so
+        # the run would write the record back under a fresh heartbeat as a futile
+        # launch that nobody observed. It drops the record instead.
+        others = [futile_record(NOW - 120, index=2), futile_record(NOW - 180, index=3)]
+        for field, value in self.DAMAGED_EVIDENCE:
+            with self.subTest(field=field, value=value):
+                self.write_workers([futile_record(NOW - 60, index=1, **{field: value}), *others])
+                evidence = read_launch_evidence(self.state_file, NOW, ledger_holding(self.state_file))
+                self.assertEqual(evidence.state, "malformed")
+
+                state, note = load_state(self.state_file)
+
+                self.assertEqual(note, "state_rebuilt")
+                self.assertEqual(sorted(state["instances"]), sorted(self.WORKER_IDS[1:]))
+
+    def test_a_value_that_the_loader_keeps_with_its_evidence_does_not_drop_the_record(self):
+        # The loader still repairs a value that it can keep without losing what the
+        # reader decides from. A Spot notice is normalised, and a step that is not in
+        # the vocabulary is dropped, as before. A field that gates a verdict is
+        # replaced by null, which never gives the record a futile verdict.
+        cases = (
+            ("spot_interruption", ["terminate", "ip-10-0-0-1", ""], REGISTERED),
+            ("spot_interruption", ["terminate", "ip-10-0-0-1", "unknown"], REGISTERED),
+            ("steps", ["register", "bogus"], REGISTERED),
+            ("steps", ["bogus"], FUTILE),
+            ("exit_code", 300, None),
+            ("exit_code", "1", None),
+            ("exit_code", 1.5, None),
+            ("state", "Terminated", None),
+            ("operation", "not-an-operation", None),
+        )
+        for field, value, verdict in cases:
+            with self.subTest(field=field, value=value):
+                self.write_workers([futile_record(NOW - 60, index=1, **{field: value})])
+
+                state, note = load_state(self.state_file)
+
+                self.assertEqual(note, "state_rebuilt")
+                self.assertEqual(classify(state["instances"][self.WORKER_IDS[0]]), verdict)
+
+    #: The fields that show whether a worker registered. The reader requires each of them.
+    REGISTRATION_FIELDS = ("registered", "steps", "job_process", "spot_interruption")
+
+    def test_a_record_of_an_ended_worker_that_lacks_a_registration_field_is_dropped(self):
+        # A record that an older version wrote lacks a field that the version did not
+        # write yet. The reader refuses such a file whole, so the gate is open. The
+        # loader must not answer with a default for that field. An ended worker is
+        # never read again, so the run would write the record back under a fresh
+        # heartbeat as a futile launch that nobody observed. It drops the record.
+        others = [futile_record(NOW - 120, index=2), futile_record(NOW - 180, index=3)]
+        for field in self.REGISTRATION_FIELDS:
+            with self.subTest(field=field):
+                first = futile_record(NOW - 60, index=1)
+                del first[field]
+                self.write_workers([first, *others])
+                evidence = read_launch_evidence(self.state_file, NOW, ledger_holding(self.state_file))
+                self.assertEqual(evidence.state, "malformed")
+
+                state, note = load_state(self.state_file)
+
+                self.assertEqual(note, "state_rebuilt")
+                self.assertEqual(sorted(state["instances"]), sorted(self.WORKER_IDS[1:]))
+
+    def test_a_record_of_a_worker_that_has_not_ended_may_lack_a_registration_field(self):
+        # The loader keeps the record. While the provider lists the worker, the run
+        # reads its console again, and the console fills the field. Before that the
+        # reader never counts the record, as it counts only a worker that ended.
+        first = self.WORKER_IDS[0]
+        runner = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
+        console = (
+            "cloud-init: STEP mount-options\n"
+            "cloud-init: STEP register\n"
+            "cloud-init: STEP job\n"
+            "cloud-init: bootstrap one-job completed rc=0\n"
+            f"cloud-init: bootstrap spot-interruption action=terminate host=ip-10-0-0-1 runner={runner}\n"
+        )
+        shown = {
+            "registered": True,
+            "steps": ["mount-options", "register", "job"],
+            "job_process": ["completed", 0],
+            "spot_interruption": ["terminate", "ip-10-0-0-1", runner],
+        }
+        for field in self.REGISTRATION_FIELDS:
+            with self.subTest(field=field):
+                record = futile_record(NOW - 60, index=1, state="running", exit_code=None)
+                del record[field]
+                self.write_workers([record])
+
+                state, _ = load_state(self.state_file)
+
+                self.assertEqual(sorted(state["instances"]), sorted(self.WORKER_IDS[:1]))
+                self.assertIsNone(classify(state["instances"][first]))
+                result = self.run_export(self.build([self.owned(first, 1, state="running")], {first: console}))
+                self.assertEqual(result["console_reads"], 1)
+                self.assertEqual(self.records()[first][field], shown[field])
+
+    def test_a_record_that_lacks_a_field_the_reader_requires_is_never_loaded_as_futile(self):
+        # The fields come from the reader, so a field that it starts to require is
+        # covered here. The reader refuses a record that lacks one of them, and no
+        # default that the loader gives may turn the refused record into a futile
+        # launch: the loader drops the record, or the reader finds no evidence in it.
+        for field in RECORD_FIELDS:
+            with self.subTest(field=field):
+                record = futile_record(NOW - 60, index=1)
+                del record[field]
+                self.write_workers([record])
+                evidence = read_launch_evidence(self.state_file, NOW, ledger_holding(self.state_file))
+                self.assertEqual(evidence.state, "malformed")
+
+                state, _ = load_state(self.state_file)
+
+                kept = state["instances"].get(self.WORKER_IDS[0])
+                self.assertNotEqual(None if kept is None else classify(kept), FUTILE)
+
+    def test_a_dropped_record_that_the_run_does_not_read_is_no_evidence(self):
+        # The run reads at most ``MAX_CONSOLE_READS`` consoles. A dropped record
+        # whose console waits for a later run is absent from the file that this run
+        # writes, so it is no evidence, and nothing that the run kept is damaged.
+        count = MAX_CONSOLE_READS + 4
+        ids = [f"i-0123456789abcf{index:03x}" for index in range(count)]
+        self.write_workers(
+            [futile_record(NOW - 60, index=index + 1, job_process=["completed", 1]) for index in range(count)],
+            ids=ids,
+        )
+        owned = [self.owned(instance_id, index + 1) for index, instance_id in enumerate(ids)]
+
+        result = self.run_export(self.build(owned, {instance_id: CLEAN_BOOT for instance_id in ids}))
+
+        self.assertEqual(result["console_reads"], MAX_CONSOLE_READS)
+        self.assertIn("console_read_deferred", result["notes"])
+        self.assertIn("state_rebuilt", result["notes"])
+        self.assertEqual(sorted(self.records()), sorted(ids[:MAX_CONSOLE_READS]))
+        for record in self.records().values():
+            self.assertEqual(classify(record), REGISTERED)
 
 
 class RecordCadenceTests(ExportCase):

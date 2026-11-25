@@ -442,6 +442,12 @@ IMAGE_SERVICES = frozenset({"ec2", "s3", "sts"})
 IMAGE_STAGING_BUCKET_DENIED = "IMAGE_STAGING_BUCKET_DENIED"
 _S3_DENIED_CODES = frozenset({"AccessDenied", "403"})
 
+#: The reason of an archive upload that S3 answered with ``NoSuchBucket``: the bucket does not exist, for instance
+#: because a rotation removed the one that a build row recorded. Only the upload maps it
+#: (``ImageAws.put_archive``): a delete or a listing at a missing bucket keeps its generic provider reason.
+IMAGE_STAGING_BUCKET_MISSING = "IMAGE_STAGING_BUCKET_MISSING"
+_S3_MISSING_CODE = "NoSuchBucket"
+
 #: Multipart part size. S3 refuses a part below 5 MiB except the last one.
 ARCHIVE_PART_BYTES = 8 * 1024 * 1024
 
@@ -1103,7 +1109,8 @@ class ImageAws:
         """Stream ``chunks`` into one multipart upload, hashing the bytes as they go.
 
         Every S3 call of the upload and of its cleanup names ``owner`` as the bucket's owner (see
-        ``_bound_owner``).
+        ``_bound_owner``). A bucket that does not exist refuses with ``IMAGE_STAGING_BUCKET_MISSING``, whether the
+        first call or a later one finds it, and ``AccessDenied`` with ``IMAGE_STAGING_BUCKET_DENIED``.
 
         The archive is never written to disk. Overrunning ``max_bytes``, a failed
         part or completion, or a failing source iterator aborts the upload and
@@ -1118,7 +1125,12 @@ class ImageAws:
         """
         self._check_deadline(deadline, "archive upload")
         owner = self._bound_owner(owner)
-        started = self._invoke("s3", "create_multipart_upload", owner=owner, Bucket=bucket, Key=key)
+        started = self._invoke(
+            "s3", "create_multipart_upload", owner=owner, absent=_S3_MISSING_CODE, Bucket=bucket, Key=key
+        )
+        if started is None:
+            # ``absent`` made the answer ``NoSuchBucket`` no response: no upload exists, so nothing needs cleaning up.
+            raise ProviderRefusal(IMAGE_STAGING_BUCKET_MISSING, _S3_MISSING_CODE)
         upload_id = started.get("UploadId")
         if not isinstance(upload_id, str) or not upload_id:
             raise ProviderRefusal("AWS_UNCERTAIN", "multipart upload returned no upload id", uncertain=True)
@@ -1141,7 +1153,12 @@ class ImageAws:
         except Exception as error:  # noqa: BLE001 - reported as a code only
             cleaned = self._discard_upload(bucket, key, upload_id, owner)
             code = (_error_code(error) or type(error).__name__)[:64]
-            reason = IMAGE_STAGING_BUCKET_DENIED if code in _S3_DENIED_CODES else "IMAGE_ARCHIVE_UPLOAD_FAILED"
+            if code in _S3_DENIED_CODES:
+                reason = IMAGE_STAGING_BUCKET_DENIED
+            elif code == _S3_MISSING_CODE:
+                reason = IMAGE_STAGING_BUCKET_MISSING
+            else:
+                reason = "IMAGE_ARCHIVE_UPLOAD_FAILED"
             raise ProviderRefusal(reason, _cleanup_detail(code, cleaned)) from None
         except BaseException:
             self._discard_upload(bucket, key, upload_id, owner)

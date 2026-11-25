@@ -322,7 +322,10 @@ image you are about to pin. Do not widen the mount to `/etc/ci-burst`, which hol
 the credential directories.
 
 While any image command runs, do not edit a setting of the file other than the pin,
-replace or re-link the file, swap a mount or move the state directory.
+replace or re-link the file, swap a mount or move the state directory. The one
+exception is `enabled = false`, which stops the image path. It does not stop a
+running command: follow [Rolling back an image](operations.md#rolling-back-an-image)
+and wait until no `image run --apply` runs.
 [Operator contract while an image command runs](operations.md#operator-contract-while-an-image-command-runs)
 says what ci-burst checks and what it does not promise.
 

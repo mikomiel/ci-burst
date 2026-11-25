@@ -1754,6 +1754,41 @@ class StagingOwnerTests(Base):
         self.assertEqual([name for name, _ in self.s3_requests()], ["delete_object", "list_objects_v2"])
         self.assert_every_call_names_the_account(["delete_object", "list_objects_v2"])
 
+    def test_a_bucket_that_does_not_exist_refuses_an_upload_with_its_own_reason_before_anything_is_sent(self):
+        self.s3.errors["create_multipart_upload"] = ProviderError("NoSuchBucket")
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10)
+        refusal = raised.exception
+        self.assertEqual(
+            (refusal.reason, refusal.detail, refusal.uncertain), ("IMAGE_STAGING_BUCKET_MISSING", "NoSuchBucket", False)
+        )
+        self.assertNotIn(LEAKY_MESSAGE, str(refusal))
+        self.assertNotIn(BUCKET, refusal.detail)
+        # One refused call: no upload exists, so there is no part, no completion and nothing to clean up.
+        self.assertEqual([name for name, _ in self.s3_requests()], ["create_multipart_upload"])
+        self.assertEqual(self.s3.uploaded, [])
+
+    def test_a_bucket_that_goes_away_between_parts_is_the_same_refusal_and_is_cleaned_up(self):
+        self.s3.errors["upload_part"] = ProviderError("NoSuchBucket")
+        with self.assertRaises(ProviderRefusal) as raised:
+            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10)
+        self.assertEqual(raised.exception.reason, "IMAGE_STAGING_BUCKET_MISSING")
+        self.assertNotIn("complete_multipart_upload", self.names())
+        self.assert_every_call_names_the_account(
+            ["create_multipart_upload", "upload_part", "abort_multipart_upload", "delete_object"]
+        )
+
+    def test_a_missing_bucket_keeps_the_generic_reason_for_a_delete_and_a_listing(self):
+        # Only the upload maps it: a delete of an owed archive and the stray listing stay as they were.
+        self.s3.errors["delete_object"] = ProviderError("NoSuchBucket")
+        with self.assertRaises(ProviderRefusal) as deleted:
+            self.image_aws().delete_object(BUCKET, self.KEY)
+        self.assertEqual((deleted.exception.reason, deleted.exception.uncertain), ("AWS_UNCERTAIN", True))
+        self.s3.errors["list_objects_v2"] = ProviderError("NoSuchBucket")
+        with self.assertRaises(ProviderRefusal) as listed:
+            self.image_aws().list_objects(BUCKET, PREFIX)
+        self.assertEqual((listed.exception.reason, listed.exception.uncertain), ("AWS_UNCERTAIN", True))
+
     def test_an_owner_that_a_caller_gives_is_named_on_every_call_in_place_of_the_account_of_the_identity(self):
         aws = self.image_aws()
         aws.put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10, owner=self.OTHER)

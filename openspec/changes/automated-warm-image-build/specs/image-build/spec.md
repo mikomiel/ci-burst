@@ -259,6 +259,12 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 - **AND** the row records that account as `archive_owner` with the bucket and the key, and a stage done again and every delete of the archive name the recorded owner
 - **AND** an `AccessDenied` answer sends nothing more and gives `IMAGE_STAGING_BUCKET_DENIED`: a stage done again ends its row as a refused start with no failure counted, a first stage fails the build, and a refused delete counts as failed and stays owed
 
+#### Scenario: The bucket does not exist
+- **WHEN** S3 answers `NoSuchBucket` to the upload of an archive, for instance because the bucket that a row recorded was removed
+- **THEN** the upload ends with `IMAGE_STAGING_BUCKET_MISSING`
+- **AND** a stage done again ends its row as a refused start with no failure counted, keeps the archive fields of the row and never marks it deleted
+- **AND** a first stage fails the build, and an owed deletion at that bucket counts as failed and stays owed
+
 #### Scenario: The build ends
 - **WHEN** a build whose row records an archive key reaches `candidate` or `failed`
 - **THEN** the pass deletes the object at the recorded bucket and key and records `archive_deleted_at`
@@ -983,8 +989,9 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **AND** it changes no row, event, deployment file, state file or rollback journal of either state, and creates nothing in the state the file names now; only its own lock files may be created
 
 #### Scenario: A concurrent change during a command is outside the operator contract
-- **WHEN** an operator edits a non-pin setting of the deployment file, replaces or re-links the file or its `--config` path, swaps a bind mount, or moves, restores or replaces the image state directory while `image run`, `image promote` or `image status --refresh` runs
+- **WHEN** an operator edits a non-pin setting of the deployment file other than `[image].enabled = false`, replaces or re-links the file or its `--config` path, swaps a bind mount, or moves, restores or replaces the image state directory while `image run`, `image promote` or `image status --refresh` runs
 - **THEN** the change is outside the operator contract, and the product makes no promise about it beyond the refusals that this specification already requires (this requirement names `PROMOTE_FILE_CHANGED`, `PROMOTE_FILE_STALE` and `PROMOTE_STATE_CHANGED`)
+- **AND** setting `[image].enabled = false` is the one allowed edit: it does not stop a running command, so the operator waits until no `image run --apply` runs
 
 ### Requirement: Promotion runs in an isolated operator container
 `promote` MUST run only as an operator-invoked one-off. The shipped documentation MUST give a container line that has no network, no AWS credential directory and no forge token. `promote --write` MUST refuse with `PROMOTE_DIRECTORY_NOT_DEDICATED` when the directory of the TOML holds anything other than the TOML, its `.bak.*` files, its lock file and its promote temporary file. A test MUST assert that `promote` constructs no AWS client.

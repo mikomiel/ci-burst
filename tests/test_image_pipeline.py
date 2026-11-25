@@ -42,6 +42,7 @@ from ci_burst.aws import (
     DEPLOYMENT_TAG,
     EXPIRES_TAG,
     IMAGE_BUILD_TAG,
+    READ_TIMEOUT_SECONDS,
     ImageAws,
     SecurityGroup,
 )
@@ -699,6 +700,36 @@ class WorldAws(ImageAws):
     def terminate(self, instance_ids):
         self._refuse("terminate")
         return super().terminate(instance_ids)
+
+
+class WorldSts:
+    """``GetCallerIdentity`` of the world: the answer takes ``seconds`` of the fake clock, as a slow STS does."""
+
+    def __init__(self, world, seconds):
+        self.w = world
+        self.seconds = seconds
+
+    def get_caller_identity(self):
+        self.w.enter("get_caller_identity", {})
+        self.w.clock.advance(self.seconds)
+        return {"Account": self.w.account}
+
+
+class UncachedAccountAws(ImageAws):
+    """The real adapter on the world's clients, handed no account: its first ``account_id`` is a call to ``sts``.
+
+    ``WorldAws`` injects the account, so a pass never waits for it. Here the first use of the account, which can be the
+    owner check of an owed delete, pays for the lookup, and the adapter caches the answer as it does in a real pass.
+    """
+
+    def __init__(self, world, sts):
+        super().__init__(
+            REGION,
+            PROFILE,
+            clients={"ec2": world.ec2, "s3": world.s3, "sts": sts},
+            clock=world.clock,
+            expiry=world.clock() + world.credential_life,
+        )
 
 
 class FakeSource:
@@ -3764,6 +3795,67 @@ class ArchiveOwedTests(PipelineCase):
         self.assertEqual(self.world.arguments("run_instances"), [])
         self.assertNotIn("upload_part", self.world.names())
 
+    def removed_bucket(self, bucket):
+        """S3 answers ``NoSuchBucket`` to the upload and to the delete at ``bucket``, as after its removal."""
+
+        def removed(arguments):
+            if arguments["Bucket"] == bucket:
+                raise ProviderError("NoSuchBucket")
+
+        for method in ("create_multipart_upload", "delete_object"):
+            self.world.hooks[method] = removed
+
+    def test_a_restage_into_a_bucket_that_was_removed_is_refused_and_counts_no_failure(self):
+        first = self.unstaged_with_an_archive()
+        # A rotation removed the recorded bucket, and the configuration names another one.
+        self.removed_bucket(BUCKET)
+        other_bucket = "example-other-staging"
+        self.configure(render_toml(prefix=self.OTHER_PREFIX).replace(BUCKET, other_bucket))
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_STAGING_BUCKET_MISSING"), result)
+        # One upload was opened and refused: no part, no completion, no launch and no URL.
+        names = self.world.names(mark)
+        self.assertEqual(names.count("create_multipart_upload"), 1)
+        for name in ("upload_part", "complete_multipart_upload", "run_instances", "generate_presigned_url"):
+            self.assertNotIn(name, names)
+        # No failure: the cooldown, the count and the block stay as they were, and no failed build is reported.
+        control = self.control()
+        self.assertEqual((control.consecutive_failures, control.cooldown_until, control.blocked), (0, None, False))
+        self.assertEqual(self.events("image_build_failed"), [])
+        # The row ended, and it keeps its archive: the delete at the removed bucket is refused too, so the deletion is
+        # owed and the row is never marked done.
+        ended = self.only_build()
+        self.assertEqual((ended.id, ended.state, ended.reason_code), (first.id, "failed", "IMAGE_STAGING_BUCKET_MISSING"))
+        self.assertEqual((ended.archive_bucket, ended.archive_key, ended.archive_owner), (BUCKET, first.archive_key, ACCOUNT))
+        self.assertIsNone(ended.archive_deleted_at)
+        self.assertIsNotNone(ended.archive_delete_tried_at)
+        self.assertEqual(self.query(lambda state: state.archives_owed(DEPLOYMENT)), [ended])
+        self.assertEqual(
+            self.world.arguments("delete_object"),
+            [{"Bucket": BUCKET, "Key": first.archive_key, "ExpectedBucketOwner": ACCOUNT}],
+        )
+        self.assertIn("archive:delete_failed", result["notes"])
+        # The next pass decides from the configuration: a row for the configured bucket. The old row stays owed.
+        self.clock.advance(DAY)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(result["reconcile"]["owed_archive_delete_failed"], 1)
+        rows = {row.id: row for row in self.builds()}
+        self.assertEqual(len(rows), 2)
+        (new,) = [row for row in rows.values() if row.id != first.id]
+        self.assertEqual(new.archive_bucket, other_bucket)
+        self.assertIsNone(rows[first.id].archive_deleted_at)
+
+    def test_a_new_row_whose_bucket_does_not_exist_is_a_failed_build_that_counts(self):
+        self.world.fail("create_multipart_upload", ProviderError("NoSuchBucket"))
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("failed", "IMAGE_STAGING_BUCKET_MISSING"), result)
+        self.assertEqual(self.control().consecutive_failures, 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertNotIn("upload_part", self.world.names())
+
     def test_an_owed_delete_in_a_bucket_of_another_account_counts_as_failed_and_stays_owed(self):
         released = "example-released-staging"
         key = f"{PREFIX}owed-00.tar.gz"
@@ -3971,6 +4063,102 @@ class OwedArchiveBoundTests(PipelineCase):
         self.assertGreaterEqual(self.starts[-1] + self.seconds_per_delete, limit)
         self.assertIn("archive:delete_deferred", result["notes"])
         self.assertEqual(result["decision"], "candidate", result)
+
+    def uncached_account(self, seconds):
+        """From now on a pass is handed no account: its first ``account_id`` asks STS, and the answer takes ``seconds``.
+
+        Returns the STS client of the world, whose ``seconds`` a test can change for a later pass. In an ordinary pass
+        the stray listing of reconcile asks first and the answer is cached before the owed tail runs, so a test that
+        wants the owed delete to pay for the lookup must end the pass before that listing, or have no listing at all.
+        """
+        sts = WorldSts(self.world, seconds)
+
+        def factory():
+            session = UncachedAccountAws(self.world, sts)
+            self.sessions.append(session)
+            return session
+
+        self.aws_factory = factory
+        self.restart()
+        return sts
+
+    def assert_the_row_is_deferred_and_untouched(self, key):
+        """No call was made about the object: the row is owed in its place, never tried and never marked done."""
+        self.assertEqual(self.starts, [])
+        self.assertEqual(self.world.arguments("delete_object"), [])
+        self.assertEqual(self.world.objects[key][0], b"archive")
+        row = self.only_build_named("owed-00")
+        self.assertIsNone(row.archive_deleted_at)
+        self.assertIsNone(row.archive_delete_tried_at)
+        self.assertIsNone(row.archive_delete_seq)
+        self.assertEqual(self.query(lambda state: [owed.id for owed in state.archives_owed(DEPLOYMENT)]), ["owed-00"])
+
+    def test_an_account_lookup_that_ends_inside_the_reserve_starts_no_owed_delete_in_a_cleanup_pass(self):
+        (key,) = self.owe(1)
+        # No gate and nothing in flight: the pass reads nothing before the owed delete, so its owner check is the first
+        # use of the account. The clock is before the reserve when the pass asks, and the answer ends inside it.
+        self.configure(render_toml(gate=""))
+        sts = self.uncached_account(PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS + 5)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_GATE_REQUIRED"), result)
+        self.assertEqual(len(self.world.arguments("get_caller_identity")), 1)
+        self.assert_the_row_is_deferred_and_untouched(key)
+        reconcile = result["reconcile"]
+        self.assertEqual(
+            (reconcile["owed_archives_deleted"], reconcile["owed_archive_delete_failed"], reconcile["owed_archives_deferred"]),
+            (0, 0, 1),
+        )
+        self.assertIn("archive:delete_deferred", result["notes"])
+        self.assertNotIn("archive:delete_failed", result["notes"])
+        # The row lost nothing: a later pass, whose lookup is quick, deletes it.
+        sts.seconds = 1
+        self.clock.advance(60)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1, result)
+        self.assertNotIn(key, self.world.objects)
+        self.assertIsNotNone(self.only_build_named("owed-00").archive_deleted_at)
+
+    def test_an_account_lookup_after_a_refused_read_starts_no_owed_delete_inside_the_reserve(self):
+        (key,) = self.owe(1)
+        sts = self.uncached_account(READ_TIMEOUT_SECONDS)
+        # The first read of the pass takes 190 seconds and is refused, so the pass ends before the stray listing and the
+        # owed tail is the first use of the account. 10 seconds remain before the reserve, and the lookup takes 30.
+        self.world.hooks["describe_instances"] = lambda arguments: self.clock.advance(190)
+        self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)
+        started_at = self.clock()
+        self.refused(self.apply, "AWS_UNCERTAIN")
+        del self.world.hooks["describe_instances"]
+        # The premise: the lookup did end inside the reserve.
+        self.assertGreater(self.clock(), started_at + PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS)
+        self.assertEqual(len(self.world.arguments("get_caller_identity")), 1)
+        self.assert_the_row_is_deferred_and_untouched(key)
+        (event,) = self.events("image_reconciled")
+        self.assertEqual(
+            (event["owed_archives_deleted"], event["owed_archive_delete_failed"], event["owed_archives_deferred"]),
+            (0, 0, 1),
+        )
+        sts.seconds = 1
+        self.pin_current()
+        self.clock.advance(60)
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1, result)
+        self.assertNotIn(key, self.world.objects)
+        self.assertIsNotNone(self.only_build_named("owed-00").archive_deleted_at)
+
+    def test_a_quick_account_lookup_leaves_the_owed_delete_to_start(self):
+        # The same pass as the first test with a lookup that ends before the reserve: the delete starts, so the checks
+        # above can tell a deferred delete from one that never ran.
+        (key,) = self.owe(1)
+        self.configure(render_toml(gate=""))
+        self.uncached_account(5)
+        started_at = self.clock()
+        result = self.apply()
+        self.assertEqual(len(self.world.arguments("get_caller_identity")), 1)
+        (start,) = self.starts
+        self.assertLess(start, started_at + PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS)
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1, result)
+        self.assertNotIn("archive:delete_deferred", result["notes"])
+        self.assertNotIn(key, self.world.objects)
 
     def test_an_active_build_advances_in_a_pass_that_meets_a_slow_refused_backlog(self):
         self.owe(12, stuck=range(12))

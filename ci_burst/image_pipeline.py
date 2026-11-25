@@ -77,7 +77,9 @@ pass retries them last (``_Pass._owed_tail``). The end of a build deletes its ow
 archive at once. A pass starts at most ``OWED_ARCHIVES_PER_PASS`` of them
 after its own work, on the time that work leaves, and also when the pass ended on a
 refusal: none starts once the pass deadline is less than ``OWED_DELETE_RESERVE_SECONDS``
-away. A backlog of slow refused deletions cannot take the time that a stage, a decision
+away. The owner check of a delete can be the first use of the account of this session, a provider
+call that takes time, so the clock is read again after the check, right before the S3 call. A backlog
+of slow refused deletions cannot take the time that a stage, a decision
 or a build needs. If passes never leave that time, the bucket lifecycle rule stays the
 backstop. A refused
 one takes the next place in ``archive_delete_seq`` (and records its time, for diagnosis) and goes behind the
@@ -85,7 +87,9 @@ rows not yet tried and the rows tried before it, so it cannot keep another row f
 clock does. The row also records the account that owned its bucket when it was first staged (``archive_owner``).
 Every S3 call about the archive names it, and no call is made about the archive of a row whose owner is not the
 account of this session, or is unknown: a stage done again is refused (``IMAGE_STAGING_OWNER_CHANGED``) and a
-delete counts as failed and stays owed. Rows that the
+delete counts as failed and stays owed. A stage done again that S3 refuses for the bucket is refused the same
+way, with no failure counted: ``IMAGE_STAGING_BUCKET_DENIED``, or ``IMAGE_STAGING_BUCKET_MISSING`` when the
+bucket that the row recorded no longer exists. Rows that the
 bound left are noted ``archive:delete_deferred``.
 
 The gate requirement (``IMAGE_GATE_REQUIRED``: neither a gate command nor the
@@ -143,6 +147,7 @@ from .aws import (
     DEPLOYMENT_TAG,
     IMAGE_BUILD_TAG,
     IMAGE_STAGING_BUCKET_DENIED,
+    IMAGE_STAGING_BUCKET_MISSING,
     READ_TIMEOUT_SECONDS,
 )
 from .errors import DeadlineRefusal, ImageRefusal, ProviderRefusal, Refusal
@@ -166,8 +171,9 @@ SUPERVISOR_SLEEP_SECONDS = 30
 STRAY_ARCHIVE_AGE_SECONDS = 3600
 #: One pass starts at most this many owed archive deletions, after its own work and on the time that work leaves. A
 #: deletion starts only while the clock is before the pass deadline minus ``OWED_DELETE_RESERVE_SECONDS``: the read
-#: timeout of the SDK client, which one delete can use up, and a margin. A backlog of slow refused deletions cannot
-#: take the time that a stage, a decision or a build needs.
+#: timeout of the SDK client, which one delete can use up, and a margin. The clock is read again after the owner check,
+#: which can ask the provider for the account first, so the S3 call itself never starts inside the reserve. A backlog
+#: of slow refused deletions cannot take the time that a stage, a decision or a build needs.
 OWED_ARCHIVES_PER_PASS = 8
 OWED_DELETE_RESERVE_SECONDS = READ_TIMEOUT_SECONDS + 10
 
@@ -207,8 +213,10 @@ IMAGE_STAGING_OWNER_CHANGED = "IMAGE_STAGING_OWNER_CHANGED"
 #: configuration: ``_start_refusal`` returns it once, first, and this filter does not hold it.
 START_REFUSALS = (IMAGE_CREDENTIAL_SHORT, IMAGE_BUILD_ALREADY_ACTIVE)
 
-#: The refusals of a staging bucket that end a stage done again as a refused start (``_stage``).
-STAGING_BUCKET_REFUSALS = (IMAGE_STAGING_BUCKET_DENIED, IMAGE_STAGING_OWNER_CHANGED)
+#: The refusals of the staging bucket that a row recorded, which end a stage done again as a refused start (``_stage``):
+#: S3 refuses the bucket (``IMAGE_STAGING_BUCKET_DENIED``), it no longer exists (``IMAGE_STAGING_BUCKET_MISSING``), or
+#: it was staged in another account than the one of this pass's role (``IMAGE_STAGING_OWNER_CHANGED``).
+STAGING_BUCKET_REFUSALS = (IMAGE_STAGING_BUCKET_DENIED, IMAGE_STAGING_BUCKET_MISSING, IMAGE_STAGING_OWNER_CHANGED)
 
 #: Tag keys that ``CreateImage`` adds to the ones the adapter sets. The build
 #: policy (``deploy/iam/image-build-policy.json``) allows exactly these keys, and
@@ -1380,25 +1388,32 @@ class _Pass:
         """Retry the owed archive deletions, within the bound of the pass.
 
         At most ``OWED_ARCHIVES_PER_PASS`` start, and none once the pass deadline is less than
-        ``OWED_DELETE_RESERVE_SECONDS`` away; the clock is read before each one. ``ImageState.archives_owed`` lists
-        the rows never tried first, then the least recently tried, so a deletion that stays refused cannot keep a
-        newer row from its turn. A row whose delete this pass attempted (``delete_attempted``) is not tried again in it. Rows that the bound left
+        ``OWED_DELETE_RESERVE_SECONDS`` away. The clock is read before each one, and again after its owner check
+        (``_delete_archive``), which can be the first use of the account and so take time. ``ImageState.archives_owed``
+        lists the rows never tried first, then the least recently tried, so a deletion that stays refused cannot keep
+        a newer row from its turn. A row whose delete this pass attempted (``delete_attempted``) is not tried again
+        in it. The rows that the bound left, and the row whose owner check ended inside the reserve, stay owed and
         are noted as ``archive:delete_deferred``.
         """
         self.owed_done = True
         # A row whose delete was attempted in this pass already, for instance at the end of its own build, is not
         # tried again. The set lives in memory, so a clock that moved does not decide it.
         rows = [row for row in self.s.archives_owed(self.dep) if row.id not in self.delete_attempted]
+        cutoff = self.deadline - OWED_DELETE_RESERVE_SECONDS
         started = 0
         for index, owed in enumerate(rows):
-            if started >= OWED_ARCHIVES_PER_PASS or self.clock() >= self.deadline - OWED_DELETE_RESERVE_SECONDS:
+            outcome = None
+            if started < OWED_ARCHIVES_PER_PASS and self.clock() < cutoff:
+                started += 1
+                outcome = self._delete_archive(owed, not_after=cutoff)
+            if outcome is None:
+                # No delete started: the bound is met, or the owner check of this row ended inside the reserve.
                 self._note("archive:delete_deferred")
                 summary["owed_archives_deferred"] += len(rows) - index
                 break
-            started += 1
             # Each outcome is counted as its attempt ends, so that a later attempt that raises (a state write that
             # fails, say) leaves the counts of the earlier ones for ``_owed_event``.
-            if self._delete_archive(owed):
+            if outcome:
                 summary["owed_archives_deleted"] += 1
                 self.tele.leak("archive", 1)
             else:
@@ -1553,10 +1568,11 @@ class _Pass:
         """Stage the archive and launch the builder, and settle every way that can end short of a launch.
 
         A staging bucket that S3 refuses (``IMAGE_STAGING_BUCKET_DENIED``: the bucket is owned by another account,
-        or the role may not use it) ends a restage as a refused start: the row records the bucket of its earlier
-        stage, which a rotation may have released, and the next pass inserts a row for the configured one. For a
-        new row it is a failed build and counts, so that a configured bucket that is refused ends in the cooldown
-        and the block instead of in one row per pass.
+        or the role may not use it) or that does not exist (``IMAGE_STAGING_BUCKET_MISSING``) ends a restage as a
+        refused start: the row records the bucket of its earlier stage, which a rotation may have released or
+        removed, and the next pass inserts a row for the configured one. For a new row it is a failed build and
+        counts, so that a configured bucket that is refused or missing ends in the cooldown and the block instead
+        of in one row per pass.
         """
         try:
             return self._stage_and_launch(build)
@@ -2047,12 +2063,17 @@ class _Pass:
             blocked=control.blocked,
         )
 
-    def _delete_archive(self, build):
+    def _delete_archive(self, build, *, not_after=None):
         """Delete the archive that the row names, at the bucket and the key it recorded, and record the deletion.
 
-        The result says whether the object is gone. A failure here is no failed build: the row stays owed
+        The result says whether the object is gone: ``True`` when it is, ``False`` when the delete failed, and ``None``
+        when it did not start (``not_after``). A failure here is no failed build: the row stays owed
         (``ImageState.archives_owed``) and ``_reconcile`` of every later pass tries again. S3 answers a delete of a
         key that was never written as a success, so a row whose upload never happened settles at the first try.
+
+        The owner check can be the first use of the account in this session, a provider call that takes time. With
+        ``not_after`` set, the clock is read once the check has passed, right before the S3 call: a delete that would
+        start at or after it does not start. The row is then left as it was (not tried, still owed) for a later pass.
         """
         if not build.archive_key or not build.archive_bucket:
             return False
@@ -2061,6 +2082,9 @@ class _Pass:
         try:
             # No call is made about the archive of a row that another account owns, or that records no owner.
             self._check_archive_owner(build)
+            if not_after is not None and self.clock() >= not_after:
+                self.delete_attempted.discard(build.id)
+                return None
             self.aws.delete_object(build.archive_bucket, build.archive_key, owner=build.archive_owner)
         except ProviderRefusal as refusal:
             self.s.mark_archive_delete_tried(build.id, self.clock())

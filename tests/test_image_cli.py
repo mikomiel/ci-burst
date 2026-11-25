@@ -21,9 +21,10 @@ import io
 import json
 import sqlite3
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from ci_burst import cli, image
+from ci_burst import cli, image, image_promote
 from ci_burst.errors import ObservationRefusal, ProviderRefusal
 from ci_burst.image_state import PIN_RECORD_REASON, ImageState
 from ci_burst.image_status import VERSION_NOT_FOUND
@@ -34,6 +35,8 @@ from test_image_pipeline import (
     DAY,
     DEPLOYMENT,
     FAILED,
+    GATE,
+    NO_GATE,
     NOW,
     PIN,
     READY,
@@ -279,6 +282,218 @@ class DisabledTests(CliCase):
         self.write_deployment(self.image_toml(image_extra="retian = 3\n"))
         code, payload = self.invoke("image", "plan")
         self.assertEqual((code, payload["error"]["reason"]), (2, "CONFIG_INVALID"))
+
+
+class MountedFileTests(CliCase):
+    """An ``image`` command refuses a deployment file that is itself a mount point, before it opens anything (#202)."""
+
+    def mounted(self):
+        return mock.patch.object(image_promote, "is_mount_point", return_value=True)
+
+    def test_every_form_is_refused_with_exit_two_and_creates_nothing(self):
+        self.forbid_clients()
+        before = snapshot_tree(self.dir)
+        for form in FORMS:
+            with self.subTest(form=" ".join(form)), self.mounted() as check:
+                code, payload = self.invoke(*form)
+                self.assertEqual((code, payload["error"]["reason"]), (2, image_promote.IMAGE_CONFIG_MOUNTED))
+                check.assert_called_once_with(self.config_path)
+        self.assertEqual(snapshot_tree(self.dir), before)
+        self.assertFalse(self.state_dir.exists())
+        self.assertEqual((self.sessions, self.source_sessions, self.world.calls), ([], 0, []))
+
+    def test_the_detail_names_no_path(self):
+        with self.mounted():
+            code, payload = self.invoke("image", "status")
+        self.assertEqual(code, 2)
+        detail = payload["error"]["detail"]
+        self.assertIn("mount", detail)
+        for text in (str(self.dir), str(self.config_path), self.config_path.name, str(self.state_dir)):
+            self.assertNotIn(text, detail)
+
+    def test_a_file_that_is_not_a_mount_point_is_served(self):
+        with mock.patch.object(image_promote, "is_mount_point", return_value=False) as check:
+            code, payload = self.invoke("image", "status")
+        self.assertEqual(code, 0, payload)
+        # The dispatch of the command asks, and so does the read of the file that ``status`` makes (``read_authoritative``).
+        self.assertEqual(check.call_args_list, [mock.call(self.config_path)] * 2)
+
+    def test_an_unreadable_mount_table_on_linux_refuses_before_the_state_opens(self):
+        # The status cannot be established, so it is not a pass: no path in the detail, no state file.
+        self.forbid_clients()
+        before = snapshot_tree(self.dir)
+        with (
+            mock.patch.object(image_promote, "_MOUNTINFO", self.dir / "no-such-table"),
+            mock.patch("sys.platform", "linux"),
+        ):
+            code, payload = self.invoke("image", "status")
+        self.assertEqual((code, payload["error"]["reason"]), (2, image_promote.IMAGE_CONFIG_MOUNTED))
+        for text in (str(self.dir), self.config_path.name, str(self.state_dir)):
+            self.assertNotIn(text, payload["error"]["detail"])
+        self.assertEqual(snapshot_tree(self.dir), before)
+        self.assertFalse(self.state_dir.exists())
+
+    def link_to_a_mount_point(self):
+        """``--config`` is a link to a mount-point file with the image path enabled; an ordinary file has it disabled."""
+        enabled = self.config_path.read_text(encoding="utf-8")
+        self.write_deployment(with_image=False)
+        disabled = self.config_path.read_text(encoding="utf-8")
+        mounted, plain, link = (self.config_dir / name for name in ("mounted.toml", "plain.toml", "link.toml"))
+        mounted.write_text(enabled, encoding="utf-8")
+        plain.write_text(disabled, encoding="utf-8")
+        link.symlink_to(mounted)
+        self.config_path = link
+        return link, mounted, plain
+
+    @staticmethod
+    def retarget(link, other):
+        link.unlink()
+        link.symlink_to(other)
+
+    def assert_refused_as_mounted_with_nothing_opened(self, code, payload):
+        self.assertEqual((code, payload["error"]["reason"]), (2, image_promote.IMAGE_CONFIG_MOUNTED))
+        self.assertFalse(self.state_dir.exists())
+        self.assertEqual((self.sessions, self.source_sessions, self.world.calls), ([], 0, []))
+
+    def test_a_link_to_a_mount_point_that_is_retargeted_after_the_load_is_still_refused(self):
+        # The settings of the command and the mount answer come from one read of one file: a later look at the path,
+        # which now leads to an ordinary file with the image path disabled, decides nothing (#202).
+        self.forbid_clients()
+        link, mounted, plain = self.link_to_a_mount_point()
+        real_loads, retargeted = cli.loads, []
+
+        def loads(text, path):
+            config = real_loads(text, path)
+            self.retarget(link, plain)  # the bytes are in and parsed: the path now leads to the ordinary file
+            retargeted.append(True)
+            return config
+
+        with (
+            mock.patch.object(cli, "loads", loads),
+            mock.patch.object(image_promote, "is_mount_point", lambda path: Path(path).resolve() == mounted.resolve()),
+        ):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual(retargeted, [True])
+        self.assertEqual(link.resolve(), plain.resolve())
+        self.assert_refused_as_mounted_with_nothing_opened(code, payload)
+
+    def test_a_link_that_is_retargeted_while_the_mount_table_is_asked_is_refused_as_mounted(self):
+        self.forbid_clients()
+        link, mounted, plain = self.link_to_a_mount_point()
+
+        def asked(path):
+            answer = Path(path).resolve() == mounted.resolve()
+            self.retarget(link, plain)
+            return answer
+
+        with mock.patch.object(image_promote, "is_mount_point", asked):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assert_refused_as_mounted_with_nothing_opened(code, payload)
+
+    def test_a_disabled_image_table_still_answers_disabled(self):
+        self.configure("\n[image]\nenabled = false\n")
+        with self.mounted() as check:
+            code, payload = self.invoke("image", "status")
+        self.assertEqual((code, payload), (0, {"decision": "disabled"}))
+        check.assert_not_called()
+
+
+class UntilDoneThroughTheCommandTests(CliCase):
+    """The loop reloads the file the command was given, so an unchanged file must load to the settings it started with."""
+
+    def setUp(self):
+        super().setUp()
+        self.world.console_plan = [(100.0, WAITING), (300.0, READY)]
+
+    def test_an_unchanged_file_is_supervised_to_a_candidate(self):
+        code, payload = self.invoke("image", "run", "--apply", "--until-done")
+        self.assertEqual((code, payload["decision"]), (0, "candidate"), payload)
+
+    def test_a_file_edited_during_the_run_ends_it_with_exit_two_before_another_pass(self):
+        edited = []
+        real = self.sleep
+
+        def sleep(seconds):
+            if not edited:
+                edited.append(True)
+                text = self.config_path.read_text(encoding="utf-8")
+                self.config_path.write_text(text.replace(GATE, NO_GATE), encoding="utf-8")
+            real(seconds)
+
+        self.sleep = sleep
+        code, payload = self.invoke("image", "run", "--apply", "--until-done")
+        self.assertEqual(edited, [True])
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual(len(self.sessions), 1)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.only_build().state, "building")
+
+    def test_a_file_edited_before_the_journal_is_resolved_gives_the_change_not_a_divergence(self):
+        # A row is pending, and the file is edited between the load of the command and the resolution: without the
+        # check, the resolution reads the new bytes and finds that they match neither hash of the row.
+        self.add_pending(old_sha="0" * 64, new_sha=self.file_sha())
+        real = cli.ImageState
+
+        def state(*arguments, **keywords):
+            text = self.config_path.read_text(encoding="utf-8")
+            self.config_path.write_text(text.replace(GATE, NO_GATE), encoding="utf-8")
+            return real(*arguments, **keywords)
+
+        before = self.dump()
+        with mock.patch.object(cli, "ImageState", state):
+            code, payload = self.invoke("image", "run", "--apply", "--until-done")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(self.dump(), before)
+        self.assertEqual((self.sessions, self.world.calls), ([], []))
+
+    def test_the_snapshot_that_resolves_a_row_must_give_the_settings_of_the_run(self):
+        # The settings check passes (the file is as loaded), then the file changes before the recovery reads it: the
+        # row must not be resolved from the hash of the new bytes (#202).
+        edited = self.config_path.read_text(encoding="utf-8").replace(GATE, NO_GATE)
+        digest = hashlib.sha256(edited.encode("utf-8")).hexdigest()
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        real = image_promote.read_snapshot
+
+        def read_snapshot(*arguments, **keywords):
+            self.config_path.write_text(edited, encoding="utf-8")
+            return real(*arguments, **keywords)
+
+        before = self.dump()
+        with mock.patch.object(image_promote, "read_snapshot", read_snapshot):
+            code, payload = self.invoke("image", "run", "--apply", "--until-done")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(self.dump(), before)
+        self.assertEqual((self.sessions, self.world.calls), ([], []))
+
+    def edit_before_the_state_opens(self, old, new):
+        """``old`` becomes ``new`` in the file after the command has loaded it and before its recovery reads it."""
+        real = cli.ImageState
+
+        def state(*arguments, **keywords):
+            text = self.config_path.read_text(encoding="utf-8")
+            self.config_path.write_text(text.replace(old, new, 1), encoding="utf-8")
+            return real(*arguments, **keywords)
+
+        return mock.patch.object(cli, "ImageState", state)
+
+    def test_a_pin_edit_without_until_done_is_still_a_divergence(self):
+        # A pin is the one thing that may differ from the file the command loaded: a single pass keeps its behaviour,
+        # and the row that matches neither hash diverges.
+        self.add_pending(old_sha="0" * 64, new_sha=self.file_sha())
+        with self.edit_before_the_state_opens(f"launch_template_version = {PIN}", f"launch_template_version = {PIN + 1}"):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTION_JOURNAL_DIVERGED"))
+
+    def test_a_setting_edit_without_until_done_is_refused_as_a_changed_configuration(self):
+        # Since the run-context rule (#202), every fresh read of a run is compared with the file it loaded first,
+        # not only the loop's: an edit of anything but the pins is no divergence of a row, it is another file.
+        self.add_pending(old_sha="0" * 64, new_sha=self.file_sha())
+        with self.edit_before_the_state_opens(GATE, NO_GATE):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
 
 
 class GuardTests(CliCase):
@@ -898,6 +1113,67 @@ class RefreshTests(CliCase):
         self.assertEqual([row["id"] for row in after["image_builds"]], [build.id, f"pin-{PIN}"])
         for name in ("pin_log", "promotion_journal", "control"):
             self.assertEqual(after[name], before[name], name)
+
+    def another_template_with_the_same_versions(self, name="example-other-template"):
+        """The account also holds ``name``, with the version numbers of the worker template and other images."""
+        self.world.templates[name] = {
+            "LaunchTemplateName": name,
+            "LaunchTemplateId": "lt-0123456789abcdef9",
+            "DefaultVersionNumber": 1,
+            "LatestVersionNumber": PIN,
+        }
+        for (template, number), version in list(self.world.versions.items()):
+            if template == WORKER:
+                self.world.set_version(name, number, {"ImageId": ami(0xE0 + number)})
+        return name
+
+    def switch_after_the_load(self, old, new):
+        """The file says ``new`` for ``old`` from the moment that the command has loaded it."""
+        real = cli._load_image_config
+        switched = []
+
+        def load(path):
+            config = real(path)
+            text = self.config_path.read_text(encoding="utf-8")
+            self.assertEqual(text.count(old), 1, old)
+            self.config_path.write_text(text.replace(old, new), encoding="utf-8")
+            switched.append(True)
+            return config
+
+        return mock.patch.object(cli, "_load_image_config", load), switched
+
+    def test_a_refresh_whose_file_names_another_template_than_the_command_started_on_records_nothing(self):
+        # The state file and the client are the command's; the version lookups would use another template (#202).
+        self.build_candidate()
+        other = self.another_template_with_the_same_versions()
+        before = self.dump()
+        mark = len(self.world.calls)
+        patch, switched = self.switch_after_the_load(f'launch_template_name = "{WORKER}"', f'launch_template_name = "{other}"')
+        with patch:
+            code, payload = self.invoke("image", "status", "--refresh")
+        self.assertEqual(switched, [True])
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertNotIn(str(self.dir), payload["error"].get("detail", ""))
+        self.assertEqual(self.dump(), before)
+        self.assertEqual(self.world.names(mark), [])
+
+    def test_a_refresh_whose_file_only_moved_the_pin_still_records(self):
+        self.build_candidate()
+        patch, switched = self.switch_after_the_load(f"launch_template_version = {PIN}", f"launch_template_version = {PIN}\n# a note")
+        with patch:
+            code, payload = self.invoke("image", "status", "--refresh")
+        self.assertEqual((code, payload["decision"]), (0, "refreshed"))
+        self.assertEqual(switched, [True])
+
+    def test_a_status_whose_file_names_another_deployment_is_refused(self):
+        self.build_candidate()
+        before = self.dump()
+        patch, switched = self.switch_after_the_load(f'deployment = "{DEPLOYMENT}"', 'deployment = "example-other-deployment"')
+        with patch:
+            code, payload = self.invoke("image", "status")
+        self.assertEqual(switched, [True])
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual(self.dump(), before)
 
     def test_refresh_names_what_it_refreshed(self):
         build = self.build_candidate()

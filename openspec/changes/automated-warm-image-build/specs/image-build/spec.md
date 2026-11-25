@@ -410,7 +410,7 @@ A pass that stages a build again MUST first recompute the digest over the basis 
 - **AND** the ended row counts toward `max_builds_per_day` and `min_build_interval_seconds`
 
 ### Requirement: A run can supervise a build to completion
-Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run --apply --until-done` MUST repeat bounded passes with a fixed sleep between them until the build reaches `candidate` or `failed`, or the build deadline passes. Without `--until-done`, `run --apply` MUST run one pass. Rerunning the same command MUST resume an interrupted supervisor from the state file. `--until-done` MUST be refused without `--apply`.
+Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run --apply --until-done` MUST repeat bounded passes with a fixed sleep between them until the build reaches `candidate` or `failed`, or the build deadline passes. Without `--until-done`, `run --apply` MUST run one pass. Rerunning the same command MUST resume an interrupted supervisor from the state file. `--until-done` MUST be refused without `--apply`. It MUST end with `IMAGE_CONFIG_CHANGED` when the settings change.
 
 #### Scenario: The marker arrives after the first pass
 - **WHEN** the first pass ends at its deadline before the marker and the marker appears later
@@ -437,6 +437,27 @@ Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run
 #### Scenario: Until-done without apply
 - **WHEN** an operator passes `--until-done` without `--apply`
 - **THEN** the command refuses with exit 2 and does nothing
+
+#### Scenario: Until-done meets a changed file
+- **WHEN** the deployment file no longer loads, or gives other settings (a withdrawn gate, a new pin) than the run loaded, after a pass and before the next
+- **THEN** the run ends with `IMAGE_CONFIG_CHANGED` before that pass and launches nothing more
+- **AND** the state file keeps the build, and a fresh run resumes it with the file as it is
+
+#### Scenario: Until-done meets a changed file before it resolves a pending promotion
+- **WHEN** a promotion row is pending and the deployment file is edited after the command loaded it and before the row is resolved
+- **THEN** the run ends with `IMAGE_CONFIG_CHANGED`, not `PROMOTION_JOURNAL_DIVERGED`, and the row stays pending
+
+#### Scenario: Until-done meets a file that became a mount point
+- **WHEN** `--config` is a link that is retargeted between passes to a file that is itself a mount point
+- **THEN** the run ends with `IMAGE_CONFIG_MOUNTED` before the next pass, and the deletion rule that loads the same file refuses with `IMAGE_DELETION_UNSAFE`
+
+#### Scenario: The recovery snapshot gives other settings
+- **WHEN** a promotion row is pending, the settings check passes, and the file then changes before recovery reads it
+- **THEN** `--until-done` ends with `IMAGE_CONFIG_CHANGED` because the bytes that would resolve the row give other settings, and the row stays pending
+
+#### Scenario: Until-done meets a rewrite that changes no setting
+- **WHEN** the file is rewritten between passes and gives the same settings
+- **THEN** the loop goes on as it would without the rewrite
 
 ### Requirement: Provider reads are bounded by the pass deadline
 Every provider read of a pass, except the read that confirms a deregistration, MUST be bounded by the pass deadline. A read that would start at or after the deadline MUST NOT be made. Where the pass advances or stages a build, it MUST then note `pass_deadline_exceeded` and leave the row as its last write left it. A refused read of the base image or of the build's image, the deadline included, MUST NOT delay `CreateImage`: the pass notes `base_image:<reason>` or `image_lookup:<reason>`.
@@ -881,7 +902,7 @@ The next `promote --write`, `promote --rollback --write` or `image run --apply` 
 - **AND** the row, the state file and the TOML are unchanged
 
 ### Requirement: Promotion keeps a backup and refuses a changed file
-Before the rename, `promote --write` MUST write a timestamped backup and MUST refuse with `PROMOTE_FILE_CHANGED` when the file differs from the bytes it read. Every command that reads the file to promote, roll back or resolve a journal row MUST refuse with `PROMOTE_FILE_STALE` when no name links the open file any more.
+Before the rename, `promote --write` MUST write a timestamped backup and MUST refuse with `PROMOTE_FILE_CHANGED` when the file differs from the bytes it read. Every command that reads the file to promote, roll back or resolve a journal row MUST refuse with `PROMOTE_FILE_STALE` when the open file has no link left or is no longer the file its path names.
 
 #### Scenario: A backup exists
 - **WHEN** a write succeeds
@@ -895,10 +916,57 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **WHEN** a container mounted the file itself, a write elsewhere replaced the file by a rename before or during the read, and the open file has no link left (`st_nlink == 0`) once its bytes are read
 - **THEN** a command in that container that resolves the journal, promotes or rolls back refuses with `PROMOTE_FILE_STALE` and writes nothing
 
+#### Scenario: A replacement during the read that a hard link survives
+- **WHEN** a rename replaces the file during the read while another hard link keeps the old file named, so that its link count stays above zero
+- **THEN** the command refuses with `PROMOTE_FILE_STALE`, because the path no longer names the open file, and writes nothing
+
+#### Scenario: The file is edited in place during the read
+- **WHEN** the file is rewritten in place (same inode and name) while a command reads it, so that its change time, modification time or size differ after the read
+- **THEN** the command refuses with `PROMOTE_FILE_CHANGED`, and no pending row is resolved from the hash of the bytes that were read, and a deletion load refuses with `IMAGE_DELETION_UNSAFE`
+
+#### Scenario: The file is edited after the verification read buffered it
+- **WHEN** `promote --write` or the recovery verifies the file once more and the file is edited in place after those bytes were read
+- **THEN** the verification refuses (`PROMOTE_FILE_CHANGED`), the file is not overwritten, no backup is written and a pending row stays pending
+
+#### Scenario: A link that names the file switches during the read
+- **WHEN** `--config` is a symbolic link and it is switched to another file during the read, so that the file it resolved to is still named
+- **THEN** the command refuses with `PROMOTE_FILE_STALE` because the path as given no longer names the open file, and no pending row is resolved
+
 #### Scenario: The file names another state than the command opened
 - **WHEN** `[image].state_directory` (compared as written, without following a link) or `deployment` changes between the start of `promote` (with or without `--write`, `--rollback` included) and a read of the file it plans or writes from, the read under the locks of `--write` included
 - **THEN** the command refuses with `PROMOTE_STATE_CHANGED` and names no path
 - **AND** it changes no row, event, deployment file, state file or rollback journal of either state, and creates nothing in the state the file names now; only its own lock files may be created
+
+### Requirement: Every decision rests on one checked read of one open file
+Every read that a decision rests on MUST be one read of one open file, checked after its last byte for identity, name and mount status on that same file, and a read whose mount status cannot be shown MUST be refused. `promote --write` MUST verify the file again after the pending row is committed and right before the rename.
+
+#### Scenario: Which reads are covered
+- **WHEN** a command promotes, rolls back, previews, recovers a journal row, verifies before a write, loads the deployment file for a deletion, or reloads it for `--until-done`
+- **THEN** the read is the one checked read, and no command checks identity, name or mount on a different open file than the one whose bytes it uses
+
+#### Scenario: A fresh read from another deployment is refused
+- **WHEN** a fresh read in the middle of a run (recovery, `status`, `status --refresh`, `promote` or the deletion rule) gives a file whose deployment, template, state directory or image settings differ from the file the command loaded first, apart from the launch-template pins
+- **THEN** the command refuses and does nothing: it deregisters nothing, records no verification evidence and resolves no journal row
+
+#### Scenario: A window remains after the last check
+- **WHEN** the file changes after the last check and before the bytes are used
+- **THEN** the product cannot exclude it, because it cannot lock an operator's editor, and recovery resolves a pending row from the file as it is found
+
+#### Scenario: The file changes during the journal commit
+- **WHEN** the file is edited or replaced after the `pending` row is committed and before the rename
+- **THEN** `promote --write` does not rename over it, leaves the row `pending` with its backup, and refuses with `PROMOTE_FILE_CHANGED`
+
+#### Scenario: Recovery reads a file that is a mount point
+- **WHEN** the file that supplies the hash of a pending row is itself a mount point
+- **THEN** the command refuses with `IMAGE_CONFIG_MOUNTED` and resolves no row
+
+#### Scenario: The file is replaced while its mount status is checked
+- **WHEN** a rename replaces the file after its bytes were read and while the mount table is read
+- **THEN** the read refuses with `PROMOTE_FILE_STALE`, because the mount answer is not about the file that was read
+
+#### Scenario: The until-done reload meets a change during its read
+- **WHEN** the file is rewritten in place while the reload of `--until-done` reads it
+- **THEN** the run ends with `IMAGE_CONFIG_CHANGED` before the next pass
 
 ### Requirement: Promotion runs in an isolated operator container
 `promote` MUST run only as an operator-invoked one-off. The shipped documentation MUST give a container line that has no network, no AWS credential directory and no forge token. `promote --write` MUST refuse with `PROMOTE_DIRECTORY_NOT_DEDICATED` when the directory of the TOML holds anything other than the TOML, its `.bak.*` files, its lock file and its promote temporary file. A test MUST assert that `promote` constructs no AWS client.
@@ -979,8 +1047,17 @@ Every path that deregisters an image or deletes a snapshot (retention and every 
 - **THEN** no deletion path removes the image of either pin of either row until a newer row completes
 
 #### Scenario: A stale view of the file at a deletion
-- **WHEN** the deployment file that a pass reads is a view of a file that a rename replaced before or during the read, and the open file has no link left (`st_nlink == 0`) once its bytes are read
+- **WHEN** the deployment file that a pass reads is a view of a file that a rename replaced before or during the read, and the open file has no link left (`st_nlink == 0`) or is not the file the path names once its bytes are read, a hard link that keeps the old file included
 - **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE` and no path deletes anything
+
+#### Scenario: The file changes after the protected set was resolved
+- **WHEN** the deployment file is edited or replaced after the set was resolved and before a plan is acted on
+- **THEN** the deletion is refused with `IMAGE_DELETION_UNSAFE`, because the device, inode, change and modification times or size differ, and nothing is deregistered or deleted
+
+#### Scenario: The file changes during a batch of deletions
+- **WHEN** the file is edited after the first image of a plan was deregistered, and the edit pins the second
+- **THEN** the file is checked again before each deregistration and each snapshot deletion, and the batch ends with `IMAGE_DELETION_UNSAFE` before the next call
+- **AND** the deletions that were made stay reported and counted, and the second image stays registered
 
 #### Scenario: A pin of an unsettled row is malformed
 - **WHEN** a pin of a journal row newer than the newest completed one is not a positive version number
@@ -1056,7 +1133,7 @@ An event value MUST NOT hold `://`. The console tail of a failed-build event MUS
 - **THEN** the write is an error and is neither continued nor retried
 
 ### Requirement: Image configuration is strict
-The `[image]` tables MUST refuse unknown keys and out-of-range values with `CONFIG_INVALID` before any call. A phase 2 key MUST be accepted only when the code that uses it is present. Examples and tests MUST use synthetic names only.
+The `[image]` tables MUST refuse unknown keys and out-of-range values with `CONFIG_INVALID` before any call. A phase 2 key MUST be accepted only when the code that uses it is present. Examples and tests MUST use synthetic names only. Every `image` command MUST refuse a deployment file that is itself a mount point with `IMAGE_CONFIG_MOUNTED`, before it opens the state, and on Linux MUST refuse it when the mount table cannot be read.
 
 #### Scenario: An unknown key
 - **WHEN** `[image]` contains an unknown key
@@ -1069,6 +1146,24 @@ The `[image]` tables MUST refuse unknown keys and out-of-range values with `CONF
 #### Scenario: A basis path escapes the archive
 - **WHEN** a basis path contains `..` or starts with `/`
 - **THEN** loading refuses with `CONFIG_INVALID`
+
+#### Scenario: The deployment file is itself a mount point
+- **WHEN** the image path is enabled and the file that `--config` names is a bind mount of that file
+- **THEN** every `image` command refuses with `IMAGE_CONFIG_MOUNTED` and exit 2 before it opens the state, and the detail names no path
+- **AND** no state file is created, and a disabled image path still answers `disabled`
+
+#### Scenario: The link to a mount point is retargeted after the read
+- **WHEN** `--config` is a link to a mount-point file with the image path enabled, and the link is switched to an ordinary file with the image path disabled once the command has read it
+- **THEN** `image run --apply` refuses with `IMAGE_CONFIG_MOUNTED`, creates no state file and makes no provider call, because the settings and the mount answer come from the same open file
+
+#### Scenario: The file is edited while the mount table is asked
+- **WHEN** the file is rewritten in place while the mount table is read for it
+- **THEN** the read refuses with `PROMOTE_FILE_CHANGED`, a verification of a snapshot of the old bytes fails, and a pending journal row stays `pending`
+
+#### Scenario: The mount table cannot be read
+- **WHEN** the image path is enabled on Linux and the mount table of the process cannot be read
+- **THEN** every `image` command refuses with `IMAGE_CONFIG_MOUNTED` before it opens the state, and the detail names no path
+- **AND** only where no such table exists (not Linux) the device comparison of the platform decides
 
 ### Requirement: The timer is enabled only after manual qualification
 The shipped `ci-burst-image` timer unit MUST be a one-shot container that mounts the configuration read-only, mounts the image state directory writable and the image role's profile directory read-only, and mounts no scaling credential and no scaling state. Documentation MUST state that the timer is enabled only after one manual build succeeded and about three clean promotions, and that the operator qualifies the unit with a refresh-script check.

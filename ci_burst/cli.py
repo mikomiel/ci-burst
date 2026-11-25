@@ -22,12 +22,12 @@ from pathlib import Path
 
 from . import image_promote, image_status
 from .aws import ImageAws
-from .config import load
+from .config import load, loads
 from .controller import Controller
-from .errors import ImageRefusal, ProviderRefusal, Refusal
+from .errors import ConfigRefusal, ImageRefusal, ProviderRefusal, Refusal
 from .export import Exporter
 from .forgejo import ForgejoSource
-from .image_pipeline import ImagePipeline, write_event
+from .image_pipeline import IMAGE_CONFIG_CHANGED, ImagePipeline, write_event
 from .image_state import ImageState
 
 FAILED_DECISIONS = ("launch_failed", "cleanup_failed", "cleanup_degraded", "uncertain")
@@ -100,7 +100,7 @@ def main(argv=None):
     arguments = build_parser().parse_args(argv)
     try:
         _check_arguments(arguments)
-        config = load(arguments.config)
+        config = _load_image_config(arguments.config) if arguments.command == "image" else load(arguments.config)
         if arguments.command == "image":
             result = _image(config, arguments)
         elif arguments.command == "export":
@@ -193,6 +193,28 @@ class _Sessions:
         return self.last
 
 
+def _load_image_config(path):
+    """The configuration of an ``image`` command, from the one checked read of the file (``read_authoritative``).
+
+    The settings and the answer to "is this file a mount point" come from the same open file, so a link that leads to a
+    mount point cannot be switched to an ordinary file between the two. A file with the image path enabled that is a
+    mount point is refused (``IMAGE_CONFIG_MOUNTED``) before anything is opened. A file whose settings leave the image
+    path disabled is not asked: it still answers ``disabled``.
+    """
+    loaded = []
+
+    def enabled(data):
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ConfigRefusal("CONFIG_UNREADABLE", f"{path}: {error}") from None
+        loaded.append(loads(text, path))
+        return loaded[-1].image.enabled
+
+    image_promote.read_authoritative(path, mount_applies=enabled)
+    return loaded[-1]
+
+
 def _image(config, arguments):
     """Dispatch one ``image`` command. A deployment without the image path answers ``disabled`` at once."""
     if not config.image.enabled:
@@ -237,7 +259,11 @@ def _apply(config, arguments, pipeline, sessions, state):
     resolution of a crashed promotion lives here (``_resolve_journal``).
     """
     try:
-        resolved = _resolve_journal(config, state)
+        if arguments.until_done:
+            # Before the writable open and the resolution, which read the file again: an edit since this command
+            # loaded it must give ``IMAGE_CONFIG_CHANGED``, not a divergence of a row that the edit caused (#202).
+            pipeline.check_settings_unchanged()
+        resolved = _resolve_journal(config, state, same_settings=arguments.until_done)
         if arguments.until_done:
             result = pipeline.run_until_done(force=arguments.force)
         else:
@@ -249,7 +275,7 @@ def _apply(config, arguments, pipeline, sessions, state):
         state.close()
 
 
-def _resolve_journal(config, state):
+def _resolve_journal(config, state, *, same_settings=False):
     """Resolve the pending journal row of a promotion that crashed, from the hash of the deployment file.
 
     The state is left open with the writer lock held, so the pass that follows runs
@@ -265,7 +291,16 @@ def _resolve_journal(config, state):
     state.acquire_writer()  # before the writable open, which rolls back a hot journal
     state.connect()
     state.journal_check()
-    return image_promote.resolve_pending(state, image_promote.read_snapshot(config).sha256)
+    snapshot = image_promote.read_snapshot(config)
+    if snapshot.config != config if same_settings else not image_promote.same_context(config, snapshot.config):
+        # ``--until-done``: the hash that resolves a row must be of bytes that give the settings of this run. The check
+        # before this call read the file once; this is the file that the hash comes from (#202).
+        raise ImageRefusal(
+            IMAGE_CONFIG_CHANGED,
+            "the deployment file changed since this run loaded it; run again to resume the build with the file as it "
+            "is now",
+        )
+    return image_promote.resolve_pending(state, snapshot.sha256)
 
 
 def _stamp_pins(config, state, sessions):

@@ -306,12 +306,20 @@ with the image role and nothing from the forge, so keep the mounts and leave out
 env-file. `image status` without `--refresh` makes no provider call, so it needs
 neither the profile directory nor the token.
 
-The line mounts the directory, never the file. `promote --write` replaces the TOML
-atomically, and a mount of the single file keeps serving the file that was there
-when the container started. With the directory mounted, retention reads the replacement
+The line mounts the dedicated directory of the TOML, never the file itself and never
+all of `/etc/ci-burst`. `promote --write` replaces the TOML atomically, and a bind
+mount of the single file keeps serving the replaced inode, with the old pins. Every
+`image` command refuses a file that is itself a mount point (`IMAGE_CONFIG_MOUNTED`), and
+on Linux also when the mount table of the process (`/proc/self/mountinfo`) cannot be read:
+the container must keep it readable, and `image` never treats an unreadable table as a pass. The
+check runs again when `--until-done` reloads the file and when the deletion rule loads it, so a
+`--config` link that is retargeted to a mounted file ends the run.
+With the directory mounted, retention reads the replacement
 file that a promotion wrote on its next pass: retention reloads the
 TOML on every pass, to find the pins it must keep. The rest of a run keeps the
-configuration that the container loaded when it started. So finish or stop a running
+configuration that the container loaded when it started: `--until-done` loads the file
+again before every pass and ends with `IMAGE_CONFIG_CHANGED` when the settings differ.
+So finish or stop a running
 `image run --apply --until-done` container before `promote --write`,
 `promote --rollback --write` or a hand edit of the pin, and start a fresh container
 afterwards: the state file keeps the active build, and the fresh container resumes
@@ -319,7 +327,7 @@ it. A hand edit of the pin takes no lock, so before one also pause any scheduler
 of image runs and wait until no `image run --apply` is running: a pass that has
 already planned its deletions does not read the pin again, and can remove the
 image you are about to pin. Do not widen the mount to `/etc/ci-burst`, which holds
-the credential directories.
+the credential directories and the env-files.
 
 To promote a candidate, or to roll back, run the promotion line. Before the final
 preview, pause any scheduler of image runs and wait until no `image run --apply`
@@ -356,10 +364,12 @@ diff with the same mounts. For a rollback, use `--rollback` in place of
 `--version N`. The directory must hold
 only the TOML, its `.bak.*` backups, its lock file and its promote temporary file,
 or the command refuses with `PROMOTE_DIRECTORY_NOT_DEDICATED`
-([deployment.md](deployment.md#the-dedicated-toml-directory)). The shipped units
-still mount the TOML as one file: change only the host side of the `--volume` that
-each unit uses for it, so that it reads the file in this directory; the container
-side and `--config` stay as they are.
+([deployment.md](deployment.md#the-dedicated-toml-directory)). The shipped scaling
+units still mount the TOML as one file. They run no `image` command, so
+`IMAGE_CONFIG_MOUNTED` does not concern them: change only the host side of the
+`--volume` that each unit uses for it, so that it reads the file in this directory;
+the container side and `--config` stay as they are. An `image` command always runs
+with the directory mounted.
 
 A manual run is named `ci-burst-image-manual` or `ci-burst-promote-manual`. If one
 does not exit after `Ctrl-C`, remove it by name with `podman rm --force`; a

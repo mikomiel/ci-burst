@@ -106,9 +106,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import image, image_console, image_deletion
+from . import image, image_console, image_deletion, image_promote
 from .aws import BASIS_DIGEST_TAG, BUILD_ID_TAG, BUILDER_STATES, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
-from .errors import DeadlineRefusal, ImageRefusal, ProviderRefusal, Refusal
+from .config import loads
+from .errors import ConfigRefusal, DeadlineRefusal, ImageRefusal, ProviderRefusal, Refusal
 from .export import _label, _write_atomic
 from .forgejo import require_protected
 from .image_state import ACTIVE_STATES, BUILD_STATES, Control
@@ -143,6 +144,7 @@ IN_PROGRESS = ("building", "imaging")
 #: Reason codes that this module adds. ``IMAGE_ORPHAN_RECORDED`` is the reason of
 #: a row that records an image nobody built here; it is not a failure.
 IMAGE_GATE_REQUIRED = "IMAGE_GATE_REQUIRED"
+IMAGE_CONFIG_CHANGED = "IMAGE_CONFIG_CHANGED"
 IMAGE_BUILD_TEMPLATE_UNSAFE = "IMAGE_BUILD_TEMPLATE_UNSAFE"
 IMAGE_BUILDER_GONE = "IMAGE_BUILDER_GONE"
 IMAGE_NOT_AVAILABLE = "IMAGE_NOT_AVAILABLE"
@@ -938,6 +940,7 @@ class ImagePipeline:
         protected = image_deletion.protected_set(
             aws,
             self._config_path,
+            run_config=self._config,
             previous_pin=facts.previous_pin,
             promoted_pin=facts.promoted_pin,
             latest_pins=facts.latest_pins,
@@ -947,7 +950,7 @@ class ImagePipeline:
             deadline=deadline,
         )
         deployment = self._config.deployment
-        return image_deletion.plan_deletions(
+        plan = image_deletion.plan_deletions(
             aws.images(deployment, deadline=deadline),
             aws.snapshots(deployment, deadline=deadline),
             protected,
@@ -957,6 +960,9 @@ class ImagePipeline:
             config=self._image,
             builds=facts.builds,
         )
+        # The listings took time: the pins the set protects must still be the file's when the plan is acted on.
+        image_deletion.check_unchanged(protected)
+        return plan
 
     def _deletion_plan(self, aws, facts, now, deadline):
         """What the deletion rule would remove now, as a dry run: nothing is called."""
@@ -992,6 +998,29 @@ class ImagePipeline:
             # back a journal that another writer left between passes. The next pass opens again under the lock.
             self._state.close()
 
+    def check_settings_unchanged(self):
+        """Refuse ``IMAGE_CONFIG_CHANGED`` when the deployment file no longer loads to the settings of this run.
+
+        The command calls it before it resolves a pending promotion (``--until-done``), and the loop calls it before
+        every pass.
+        """
+        try:
+            read = image_promote.read_authoritative(self._config_path)
+            current = loads(read.data.decode("utf-8"), self._config_path)
+        except ImageRefusal as refusal:
+            if refusal.reason == image_promote.IMAGE_CONFIG_MOUNTED:
+                raise  # as at the dispatch of the command: the file is itself a mount point
+            raise ImageRefusal(IMAGE_CONFIG_CHANGED, f"the deployment file no longer loads ({refusal.reason})") from None
+        except (ConfigRefusal, UnicodeDecodeError) as refusal:
+            reason = refusal.reason if isinstance(refusal, ConfigRefusal) else "CONFIG_UNREADABLE"
+            raise ImageRefusal(IMAGE_CONFIG_CHANGED, f"the deployment file no longer loads ({reason})") from None
+        if current != self._config:
+            raise ImageRefusal(
+                IMAGE_CONFIG_CHANGED,
+                "the deployment file changed since this run loaded it; run again to resume the build with the file "
+                "as it is now",
+            )
+
     def run_until_done(self, *, force=False):
         """Repeat passes, with a fixed sleep between them, until the build is over.
 
@@ -1007,6 +1036,9 @@ class ImagePipeline:
             return {"decision": DISABLED}
         first = True
         while True:
+            # Every pass runs on the settings the command loaded at its start. A file that says something else now
+            # (a withdrawn gate, a new pin, another state directory) ends the loop, and a fresh run reads it (#202).
+            self.check_settings_unchanged()
             result = self.run_pass(apply=True, force=force and first)
             first = False
             if result["decision"] not in IN_PROGRESS:
@@ -1831,4 +1863,8 @@ class _Pass:
                 failed=counts["failed"],
                 skipped=counts["skipped"],
             )
+        for row in report:
+            if row["result"] == image_deletion.REFUSED:
+                # The deployment file changed during the batch: the rows before this one were done and are counted.
+                counts["refused"] = row["code"]
         return counts

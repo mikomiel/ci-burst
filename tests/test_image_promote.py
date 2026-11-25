@@ -13,6 +13,7 @@ files are left as the real process would leave them. Every value is synthetic.
 """
 
 import contextlib
+import dataclasses
 import errno
 import fcntl
 import hashlib
@@ -30,10 +31,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
-from ci_burst import image, image_deletion, image_pipeline, image_promote
+from ci_burst import cli, image, image_deletion, image_pipeline, image_promote
 from ci_burst.aws import BASIS_DIGEST_TAG
-from ci_burst.config import load
-from ci_burst.errors import ImageRefusal, StateRefusal
+from ci_burst.config import load, loads
+from ci_burst.errors import ConfigRefusal, ImageRefusal, StateRefusal
 from ci_burst.image_state import ImageState
 
 from support import Clock
@@ -263,6 +264,7 @@ class PromoteCase(CliCase):
         return image_deletion.protected_set(
             WorldAws(self.world),
             self.config_path,
+            run_config=self.config,
             previous_pin=None,
             pending_journal=pending,
             candidate=None,
@@ -1805,7 +1807,7 @@ class StaleViewTests(PromoteCase):
             replacement.write_bytes(target.read_bytes())
             os.replace(replacement, target)
             with self.assertRaises(ImageRefusal) as raised:
-                image_promote._read_open_file(self.config, target, descriptor)
+                image_promote._read_descriptor(descriptor, target, self.config.path)
         finally:
             os.close(descriptor)
         self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
@@ -1828,18 +1830,316 @@ class StaleViewTests(PromoteCase):
 
         try:
             with mock.patch("os.read", read), self.assertRaises(ImageRefusal) as raised:
-                image_promote._read_open_file(self.config, target, descriptor)
+                image_promote._read_descriptor(descriptor, target, self.config.path)
         finally:
             os.close(descriptor)
         self.assertEqual(renamed, [True])
         self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
+
+    @contextlib.contextmanager
+    def replaced_during_the_read(self):
+        """The first read of the deployment file renames a copy over it, while a hard link keeps the old file named.
+
+        The old file keeps a link, so a check of the link count alone sees nothing (#202). The yield gives the
+        target; the old file is also named ``kept.toml`` outside the deployment directory.
+        """
+        target = Path(self.config.path).resolve()
+        os.link(target, self.dir / "kept.toml")
+        replacement = target.parent / "replacement.tmp"
+        inode = os.stat(target).st_ino
+        real = os.read
+        renamed = []
+
+        def read(descriptor, size):
+            if not renamed and os.fstat(descriptor).st_ino == inode:
+                renamed.append(True)
+                replacement.write_bytes(target.read_bytes())
+                os.replace(replacement, target)
+            return real(descriptor, size)
+
+        with mock.patch("os.read", read):
+            yield target
+        self.assertEqual(renamed, [True])
+
+    def test_a_replacement_during_the_read_that_a_hard_link_survives_is_refused_as_stale(self):
+        with self.replaced_during_the_read() as target:
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.read_snapshot(self.config)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
+        self.assertEqual((self.dir / "kept.toml").read_bytes(), target.read_bytes())
+
+    def test_a_promote_preview_and_write_are_refused_when_a_hard_link_survives_the_replacement(self):
+        for write in (False, True):
+            with self.subTest(write=write), self.replaced_during_the_read():
+                self.refusal((), "PROMOTE_FILE_STALE", write=write)
+            (self.dir / "kept.toml").unlink()
+        self.assertEqual(self.backups(), [])
+
+    @contextlib.contextmanager
+    def link_switched_during_the_read(self):
+        """``--config`` is a symbolic link to the file; the first read of the file points the link at another file.
+
+        The other file holds the same bytes, so the resolved target still names the open file, and only the path
+        that was given shows that the link moved (#202).
+        """
+        target = Path(self.config.path).resolve()
+        other = self.dir / "other.toml"
+        other.write_bytes(target.read_bytes())
+        link = self.dir / "link.toml"
+        link.symlink_to(target)
+        self.config_path = link
+        self.config = load(link)
+        inode = os.stat(target).st_ino
+        real = os.read
+        switched = []
+
+        def read(descriptor, size):
+            if not switched and os.fstat(descriptor).st_ino == inode:
+                switched.append(True)
+                moved = self.dir / "link.tmp"
+                moved.symlink_to(other)
+                os.replace(moved, link)
+            return real(descriptor, size)
+
+        with mock.patch("os.read", read):
+            yield target
+        self.assertEqual(switched, [True])
+
+    @contextlib.contextmanager
+    def edited_in_place_during_the_read(self):
+        """The first read of the deployment file ends, and the file is then rewritten in place (same inode, same name).
+
+        Every byte that the command uses was read before the edit, so a check of the name and the inode sees
+        nothing; the hash of those bytes is of a file that no longer exists (#202).
+        """
+        target = Path(self.config.path).resolve()
+        text = target.read_text(encoding="utf-8")
+        inode = os.stat(target).st_ino
+        real = os.read
+        edited = []
+
+        def read(descriptor, size):
+            data = real(descriptor, size)
+            if not data and not edited and os.fstat(descriptor).st_ino == inode:
+                edited.append(True)
+                target.write_text(text + "\n# a hand edit\n", encoding="utf-8")
+            return data
+
+        with mock.patch("os.read", read):
+            yield target
+        self.assertEqual(edited, [True])
+        self.assertEqual(os.stat(target).st_ino, inode)
+
+    @contextlib.contextmanager
+    def edited_in_place_during_the_verification(self):
+        """The verification read of ``promote --write`` (``_is_unchanged``) ends, and the file is then rewritten.
+
+        The verifier has the old bytes buffered, so the hash matches the snapshot; only the file itself shows the
+        edit. The reads of ``read_snapshot`` are not touched, and nor is any later verification (#202). The yield gives
+        the edited bytes.
+        """
+        target = Path(self.config.path).resolve()
+        text = target.read_text(encoding="utf-8")
+        edited_bytes = (text + "\n# a hand edit\n").encode("utf-8")
+        real_check, real_read = image_promote._is_unchanged, os.read
+        verifying, edited = [], []
+
+        def checking(snapshot):
+            verifying.append(True)
+            try:
+                return real_check(snapshot)
+            finally:
+                verifying.pop()
+
+        def read(descriptor, size):
+            data = real_read(descriptor, size)
+            if not data and verifying and not edited:
+                edited.append(True)
+                target.write_bytes(edited_bytes)
+            return data
+
+        with mock.patch.object(image_promote, "_is_unchanged", checking), mock.patch("os.read", read):
+            yield edited_bytes
+        self.assertEqual(edited, [True])
+
+    @contextlib.contextmanager
+    def changed_during_the_journal_commit(self, change):
+        """``change(target)`` runs right after the ``pending`` journal row is committed, before the rename."""
+        target = Path(self.config.path).resolve()
+        real = ImageState.journal_insert
+
+        def insert(state, **keywords):
+            row = real(state, **keywords)
+            change(target)
+            return row
+
+        with mock.patch.object(ImageState, "journal_insert", insert):
+            yield target
+
+    @contextlib.contextmanager
+    def changed_after_the_journal_commit_returns(self, change):
+        """``change(target)`` runs once the transaction that inserted the ``pending`` row has committed and returned."""
+        target = Path(self.config.path).resolve()
+        real_insert, real_transaction = ImageState.journal_insert, ImageState.transaction
+        inserted, fired = [], []
+
+        def insert(state, **keywords):
+            inserted.append(True)
+            return real_insert(state, **keywords)
+
+        @contextlib.contextmanager
+        def transaction(state):
+            with real_transaction(state) as connection:
+                yield connection
+            if inserted and not fired and not state._in_transaction:  # the outer transaction is over: COMMIT returned
+                fired.append(True)
+                change(target)
+
+        with (
+            mock.patch.object(ImageState, "journal_insert", insert),
+            mock.patch.object(ImageState, "transaction", transaction),
+        ):
+            yield target
+        self.assertEqual(fired, [True])
+
+    def test_the_verification_read_refuses_an_edit_that_lands_after_the_bytes_are_in(self):
+        snapshot = image_promote.read_snapshot(self.config)
+        self.assertTrue(image_promote._is_unchanged(snapshot))
+        with self.edited_in_place_during_the_verification():
+            self.assertFalse(image_promote._is_unchanged(snapshot))
+
+    def test_promote_write_does_not_overwrite_an_edit_that_lands_during_the_verification(self):
+        before = self.dump()
+        with self.edited_in_place_during_the_verification() as edited:
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual(self.config_path.read_bytes(), edited)
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(self.dump(), before)
+
+    def test_an_edit_during_the_journal_commit_is_not_overwritten_and_the_row_stays_pending(self):
+        edited = (Path(self.config.path).read_text(encoding="utf-8") + "\n# a hand edit\n").encode("utf-8")
+        with self.changed_during_the_journal_commit(lambda target: target.write_bytes(edited)) as target:
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual(target.read_bytes(), edited)
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(len(self.backups()), 1)  # the row names it
+        self.assertEqual(sorted(path.name for path in target.parent.iterdir() if path.name.endswith(".promote-tmp")), [])
+
+    def test_an_edit_after_the_journal_commit_has_returned_is_not_overwritten_and_the_row_stays_pending(self):
+        edited = (Path(self.config.path).read_text(encoding="utf-8") + "\n# a hand edit\n").encode("utf-8")
+        with self.changed_after_the_journal_commit_returns(lambda target: target.write_bytes(edited)) as target:
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual(target.read_bytes(), edited)
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(len(self.backups()), 1)
+        self.assertEqual(sorted(path.name for path in target.parent.iterdir() if path.name.endswith(".promote-tmp")), [])
+
+    def test_a_replacement_during_the_journal_commit_is_not_overwritten_and_the_row_stays_pending(self):
+        def replace(target):
+            other = target.parent / "replacement.tmp"
+            other.write_bytes(target.read_bytes())
+            os.replace(other, target)
+
+        with self.changed_during_the_journal_commit(replace) as target:
+            replaced = os.stat(target).st_ino
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertNotEqual(os.stat(target).st_ino, replaced)
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+
+    def test_the_row_that_an_edit_during_the_commit_left_pending_is_resolved_from_the_file_as_found(self):
+        original = Path(self.config.path).read_bytes()
+        edited = original + b"\n# a hand edit\n"
+        with self.changed_during_the_journal_commit(lambda target: target.write_bytes(edited)) as target:
+            self.write_pin()
+        target.write_bytes(original)  # the operator undoes the edit: the file has the hash of the row's old bytes
+        payload = self.promoted()  # the next write resolves the row from the file as it is, then promotes again
+        self.assertEqual(payload["resolved"], [{"journal_id": 1, "kind": "promotion", "resolution": "aborted"}])
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["aborted", "complete"])
+    def test_a_pending_row_is_not_resolved_when_an_edit_lands_during_the_verification(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        before = self.dump()
+        with self.edited_in_place_during_the_verification() as edited:
+            code, payload = self.write_pin()
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(self.config_path.read_bytes(), edited)
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(self.dump(), before)
+
+    def test_an_in_place_edit_during_the_read_is_refused_as_a_changed_file(self):
+        with self.edited_in_place_during_the_read():
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.read_snapshot(self.config)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_CHANGED")
+
+    def test_a_pending_row_is_not_resolved_from_a_file_edited_in_place_during_the_read(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        with self.edited_in_place_during_the_read():
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+
+    def test_a_promote_preview_and_write_are_refused_when_the_file_is_edited_in_place_during_the_read(self):
+        for write in (False, True):
+            with self.subTest(write=write), self.edited_in_place_during_the_read():
+                code, payload = (self.write_pin if write else self.show)()
+            self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(self.journal_rows(), [])
+
+    def test_a_link_that_is_switched_during_the_read_is_refused_as_stale(self):
+        with self.link_switched_during_the_read():
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.read_snapshot(self.config)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
+
+    def test_a_link_that_is_not_switched_is_read(self):
+        target = Path(self.config.path).resolve()
+        link = self.dir / "link.toml"
+        link.symlink_to(target)
+        snapshot = image_promote.read_snapshot(load(link))
+        self.assertEqual(snapshot.data, target.read_bytes())
+
+    def test_a_pending_row_is_not_resolved_through_a_link_that_is_switched_during_the_read(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        with self.link_switched_during_the_read():
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_STALE"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+
+    def test_still_named_is_true_for_the_file_the_path_names_and_false_for_any_other(self):
+        target = Path(self.config.path).resolve()
+        descriptor = os.open(target, os.O_RDONLY)
+        try:
+            self.assertTrue(image_promote.still_named(descriptor, target))
+            kept = self.dir / "kept.toml"
+            os.link(target, kept)
+            self.assertTrue(image_promote.still_named(descriptor, target))
+            replacement = target.parent / "replacement.tmp"
+            replacement.write_bytes(target.read_bytes())
+            os.replace(replacement, target)
+            self.assertEqual(os.fstat(descriptor).st_nlink, 1)
+            self.assertFalse(image_promote.still_named(descriptor, target))
+            kept.unlink()
+            self.assertFalse(image_promote.still_named(descriptor, target))
+            target.unlink()
+            self.assertFalse(image_promote.still_named(descriptor, target))
+        finally:
+            os.close(descriptor)
 
     def test_the_same_file_still_linked_is_read(self):
         # The control: nothing but the rename separates this read from the one above.
         target = Path(self.config.path).resolve()
         descriptor = os.open(target, os.O_RDONLY)
         try:
-            snapshot = image_promote._read_open_file(self.config, target, descriptor)
+            snapshot = image_promote._read_descriptor(descriptor, target, self.config.path)
         finally:
             os.close(descriptor)
         self.assertEqual(snapshot.data, target.read_bytes())
@@ -1870,6 +2170,177 @@ class StaleViewTests(PromoteCase):
         with self.stale_view():
             self.refusal(("--rollback",), "PROMOTE_FILE_STALE")
             self.refusal((), "PROMOTE_FILE_STALE", write=False)
+
+
+class AuthoritativeReadTests(PromoteCase):
+    """Every read that a decision rests on is ``read_authoritative``: identity, name and mount of the one open file (#202)."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+
+    def mounted(self, answer=True):
+        return mock.patch.object(image_promote, "is_mount_point", return_value=answer)
+
+    def test_it_returns_the_bytes_the_identity_and_the_resolved_target_and_closes_the_file(self):
+        target = Path(self.config.path).resolve()
+        link = self.dir / "link.toml"
+        link.symlink_to(target)
+        read = image_promote.read_authoritative(link)
+        self.assertEqual((read.data, read.target, read.held), (target.read_bytes(), target, None))
+        self.assertEqual(read.identity[:2], (os.stat(target).st_dev, os.stat(target).st_ino))
+
+    def test_with_hold_the_descriptor_stays_open_for_the_caller(self):
+        read = image_promote.read_authoritative(self.config.path, hold=True)
+        try:
+            self.assertEqual(os.fstat(read.held).st_ino, os.stat(self.config.path).st_ino)
+        finally:
+            os.close(read.held)
+
+    def test_a_file_that_is_not_a_regular_file_is_refused_and_never_waited_for(self):
+        fifo = self.dir / "fifo.toml"
+        os.mkfifo(fifo)
+        with self.assertRaises(ConfigRefusal) as raised:
+            image_promote.read_authoritative(fifo)
+        self.assertEqual(raised.exception.reason, "CONFIG_UNREADABLE")
+
+    def test_the_mount_question_is_about_the_resolved_target_that_was_read(self):
+        target = Path(self.config.path).resolve()
+        link = self.dir / "link.toml"
+        link.symlink_to(target)
+        with self.mounted(False) as asked:
+            image_promote.read_authoritative(link)
+        asked.assert_called_once_with(target)
+
+    def test_a_file_that_is_a_mount_point_is_refused_by_every_read(self):
+        snapshot = image_promote.read_snapshot(self.config)
+        with self.mounted():
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.read_snapshot(self.config)
+            self.assertEqual(raised.exception.reason, "IMAGE_CONFIG_MOUNTED")
+            self.assertNotIn(str(self.dir), raised.exception.detail)
+            self.assertFalse(image_promote._is_unchanged(snapshot))
+        self.assertTrue(image_promote._is_unchanged(snapshot))
+
+    def edited_while_the_mount_table_is_asked(self, *, on_call=1):
+        """``is_mount_point`` edits the file in place on its ``on_call``-th call and answers "no mount point"."""
+        target = Path(self.config.path).resolve()
+        edited_bytes = target.read_bytes() + b"\n# a hand edit\n"
+        calls = []
+
+        def asked(path):
+            calls.append(path)
+            if len(calls) == on_call:
+                target.write_bytes(edited_bytes)
+            return False
+
+        return mock.patch.object(image_promote, "is_mount_point", asked), edited_bytes
+
+    def test_an_edit_in_place_while_the_mount_table_is_asked_is_refused_by_every_read(self):
+        snapshot = image_promote.read_snapshot(self.config)
+        patch, _ = self.edited_while_the_mount_table_is_asked()
+        with patch, self.assertRaises(ImageRefusal) as raised:
+            image_promote.read_snapshot(self.config)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_CHANGED")
+        # The file is now edited, so the first snapshot is out of date by its identity whatever the read says.
+        self.assertFalse(image_promote._is_unchanged(snapshot))
+
+    def test_an_edit_while_the_mount_table_is_asked_makes_the_verification_refuse(self):
+        snapshot = image_promote.read_snapshot(self.config)
+        patch, _ = self.edited_while_the_mount_table_is_asked()
+        with patch:
+            self.assertFalse(image_promote._is_unchanged(snapshot))
+
+    def test_a_pending_row_is_not_resolved_when_the_file_is_edited_while_the_recovery_asks_the_mount_table(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        # The first question is the dispatch load of the command; the second is the read of the recovery snapshot.
+        patch, edited = self.edited_while_the_mount_table_is_asked(on_call=2)
+        with patch:
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "PROMOTE_FILE_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+        self.assertEqual(self.config_path.read_bytes(), edited)
+
+    def test_a_replacement_while_the_mount_status_is_checked_is_refused_as_stale(self):
+        # The bytes were read and the name held; the file is then replaced as the mount table is read. The answer
+        # (not a mount point) is about a file that no longer is the deployment file.
+        target = Path(self.config.path).resolve()
+
+        def replace(path):
+            other = target.parent / "replacement.tmp"
+            other.write_bytes(target.read_bytes())
+            os.replace(other, target)
+            return False
+
+        with mock.patch.object(image_promote, "is_mount_point", replace):
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.read_snapshot(self.config)
+        self.assertEqual(raised.exception.reason, "PROMOTE_FILE_STALE")
+
+    def test_the_snapshot_that_resolves_a_pending_row_is_refused_when_the_file_is_a_mount_point(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        answers = iter([False])  # the dispatch of the command; the read of the recovery snapshot is the next question
+        with mock.patch.object(image_promote, "is_mount_point", lambda path: next(answers, True)):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_MOUNTED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+
+
+class RunContextTests(PromoteCase):
+    """A fresh read in the middle of a run must be of the deployment the run started on; only the pins may differ (#202)."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+
+    def config_with(self, old, new):
+        text = self.config_path.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), 1, old)
+        return loads(text.replace(old, new), self.config.path)
+
+    def test_the_pins_may_differ_and_nothing_else_may(self):
+        run = self.config
+        self.assertTrue(image_promote.same_context(run, run))
+        pin = self.config_with(f"launch_template_version = {PIN}", f"launch_template_version = {PIN + 1}")
+        self.assertNotEqual(pin, run)
+        self.assertTrue(image_promote.same_context(run, pin))
+        for old, new in (
+            (f'launch_template_name = "{WORKER}"', 'launch_template_name = "example-other-template"'),
+            (f'deployment = "{DEPLOYMENT}"', 'deployment = "example-other-deployment"'),
+            ('max_spot_price = "0.0400"', 'max_spot_price = "0.0500"'),
+        ):
+            with self.subTest(old=old):
+                self.assertFalse(image_promote.same_context(run, self.config_with(old, new)))
+
+    def test_a_pending_row_is_not_resolved_from_a_file_of_another_template(self):
+        digest = sha(Path(self.config.path).read_bytes())
+        self.add_pending(old_sha="0" * 64, new_sha=digest)
+        real = cli._load_image_config
+
+        def load(path):
+            config = real(path)
+            text = self.config_path.read_text(encoding="utf-8")
+            self.config_path.write_text(
+                text.replace(f'launch_template_name = "{WORKER}"', 'launch_template_name = "example-other-template"'),
+                encoding="utf-8",
+            )
+            return config
+
+        with mock.patch.object(cli, "_load_image_config", load):
+            code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["error"]["reason"]), (2, "IMAGE_CONFIG_CHANGED"))
+        self.assertEqual([row["status"] for row in self.journal_rows()], ["pending"])
+
+    def test_the_state_owner_check_refuses_a_file_of_another_template(self):
+        snapshot = image_promote.read_snapshot(self.config)
+        other = self.config_with(f'launch_template_name = "{WORKER}"', 'launch_template_name = "example-other-template"')
+        snapshot = dataclasses.replace(snapshot, config=other)
+        state = ImageState(self.config.image.state_directory, clock=lambda: 0)
+        with self.assertRaises(ImageRefusal) as raised:
+            image_promote.check_state_owner(self.config, snapshot, state)
+        self.assertEqual(raised.exception.reason, "PROMOTE_STATE_CHANGED")
 
 
 class StateOwnerTests(PromoteCase):
@@ -2682,6 +3153,159 @@ class EventTests(PromoteCase):
 
 
 # -- the module stays local ------------------------------------------------------------------
+
+
+class MountPointTests(unittest.TestCase):
+    """``is_mount_point`` reads the mount table of the process: a bind mount of one file hides from a device check."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.dir = Path(directory.name).resolve()
+        self.table = self.dir / "mountinfo"
+        patch = mock.patch.object(image_promote, "_MOUNTINFO", self.table)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def listing(self, *mount_points):
+        lines = [f"{number} 1 8:1 /source {point} rw,relatime shared:1 - ext4 /dev/example rw" for number, point in enumerate(mount_points, start=30)]
+        self.table.write_text("\n".join(["29 1 0:5 / / rw - rootfs rootfs rw", *lines]) + "\n", encoding="utf-8")
+
+    def made(self, name="deployment.toml"):
+        path = self.dir / name
+        path.write_text("x", encoding="utf-8")
+        return path
+
+    def test_each_escape_of_the_mount_table_is_undone(self):
+        for escaped, plain in (
+            (b"\\040", b" "),
+            (b"\\011", b"\t"),
+            (b"\\012", b"\n"),
+            (b"\\134", b"\\"),
+        ):
+            with self.subTest(escaped=escaped):
+                self.assertEqual(image_promote._unescape_mount_point(b"/a" + escaped + b"b"), b"/a" + plain + b"b")
+        self.assertEqual(
+            image_promote._unescape_mount_point(b"/a\\040b\\011c\\012d\\134e"), b"/a b\tc\nd\\e"
+        )
+        self.assertEqual(image_promote._unescape_mount_point(b"/plain/path"), b"/plain/path")
+
+    def test_a_backslash_that_spells_an_escape_stays_a_backslash(self):
+        # A name that holds a backslash and the digits 040 is written as \134 and 040: it is not a space.
+        self.assertEqual(image_promote._unescape_mount_point(b"/a\\134040b"), b"/a\\040b")
+
+    def test_a_listed_path_is_a_mount_point(self):
+        path = self.made()
+        self.listing(str(path))
+        self.assertTrue(image_promote.is_mount_point(path))
+
+    def test_a_path_that_is_not_listed_is_not_a_mount_point(self):
+        path = self.made()
+        self.listing(str(self.dir / "another.toml"), str(self.dir))
+        self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_a_mount_of_the_directory_is_not_a_mount_of_the_file(self):
+        path = self.made()
+        self.listing(str(self.dir))
+        self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_a_listed_path_with_a_space_is_a_mount_point(self):
+        path = self.made("deployment file.toml")
+        self.listing(str(path).replace(" ", "\\040"))
+        self.assertTrue(image_promote.is_mount_point(path))
+
+    def test_a_symbolic_link_to_a_listed_file_is_a_mount_point(self):
+        path = self.made()
+        link = self.dir / "link.toml"
+        link.symlink_to(path)
+        self.listing(str(path))
+        self.assertTrue(image_promote.is_mount_point(link))
+
+    def test_a_mount_table_with_a_name_that_is_not_utf8_is_read(self):
+        path = self.made()
+        other = b"/mnt/caf\xe9"
+        first = b"31 1 8:1 /a " + other + b" rw - ext4 /dev/example rw\n"
+        second = b"32 1 8:1 /b " + os.fsencode(path) + b" rw - ext4 /dev/example rw\n"
+        self.table.write_bytes(first + second)
+        self.assertTrue(image_promote.is_mount_point(path))
+        self.table.write_bytes(first)
+        self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_a_mount_point_with_a_separator_that_is_not_a_line_feed_in_its_name_is_found(self):
+        # The kernel escapes a line feed only. U+2028, U+0085, a carriage return and the like stay in the name, and a
+        # reader that splits on every line boundary of Python cuts the line in two and misses the mount point.
+        for name in ("a\u2028b.toml", "a\u0085b.toml", "a\rb.toml", "a\x1cb.toml"):
+            with self.subTest(name=ascii(name)):
+                path = self.made(name)
+                self.table.write_bytes(
+                    b"29 1 0:5 / / rw - rootfs rootfs rw\n32 1 8:1 /b " + os.fsencode(path) + b" rw - ext4 /dev/example rw\n"
+                )
+                self.assertTrue(image_promote.is_mount_point(path))
+                self.table.write_bytes(b"29 1 0:5 / / rw - rootfs rootfs rw\n")
+                self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_a_short_or_empty_line_of_the_table_is_ignored(self):
+        path = self.made()
+        self.table.write_text("\n29 1 0:5\n", encoding="utf-8")
+        self.assertFalse(image_promote.is_mount_point(path))
+
+    def listed_bytes(self, field):
+        self.table.write_bytes(
+            b"29 1 0:5 / / rw - rootfs rootfs rw\n32 1 8:1 /b " + field + b" rw - ext4 /dev/example rw\n"
+        )
+
+    def test_a_name_with_escaped_bytes_matches_as_bytes(self):
+        # Tab and backslash are escaped in the table; the text \040 in a name is a backslash and three digits.
+        for name, field in (
+            ("a\tb\\c.toml", b"a\\011b\\134c.toml"),
+            ("a\\040b.toml", b"a\\134040b.toml"),
+        ):
+            with self.subTest(name=ascii(name)):
+                path = self.made(name)
+                self.listed_bytes(os.fsencode(self.dir) + b"/" + field)
+                self.assertTrue(image_promote.is_mount_point(path))
+                self.listed_bytes(os.fsencode(self.dir) + b"/a b.toml")
+                self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_a_name_that_is_not_utf8_matches_as_bytes(self):
+        name = os.fsdecode(b"caf\xe9.toml")
+        path = self.made(name)
+        self.listed_bytes(os.fsencode(self.dir) + b"/caf\xe9.toml")
+        self.assertTrue(image_promote.is_mount_point(path))
+        # The same bytes in another spelling (the UTF-8 letter) are another name.
+        self.listed_bytes(os.fsencode(self.dir) + b"/caf\xc3\xa9.toml")
+        self.assertFalse(image_promote.is_mount_point(path))
+
+    def test_an_unreadable_table_on_linux_refuses_and_names_no_path(self):
+        path = self.made()
+        self.assertFalse(self.table.exists())
+        with mock.patch("sys.platform", "linux"), mock.patch("os.path.ismount", return_value=False) as ismount:
+            with self.assertRaises(ImageRefusal) as raised:
+                image_promote.is_mount_point(path)
+        self.assertEqual(raised.exception.reason, "IMAGE_CONFIG_MOUNTED")
+        self.assertIn("mount table", raised.exception.detail)
+        for text in (str(self.dir), path.name, str(self.table)):
+            self.assertNotIn(text, raised.exception.detail)
+        ismount.assert_not_called()
+
+    def test_an_unreadable_table_off_linux_falls_back_to_the_device_comparison(self):
+        path = self.made()
+        self.assertFalse(self.table.exists())
+        for answer in (True, False):
+            with (
+                self.subTest(answer=answer),
+                mock.patch("sys.platform", "darwin"),
+                mock.patch("os.path.ismount", return_value=answer) as ismount,
+            ):
+                self.assertEqual(image_promote.is_mount_point(path), answer)
+            ismount.assert_called_once_with(str(path))
+
+    def test_a_readable_table_decides_without_the_device_comparison(self):
+        path = self.made()
+        self.listing()
+        with mock.patch("os.path.ismount", return_value=True) as ismount:
+            self.assertFalse(image_promote.is_mount_point(path))
+        ismount.assert_not_called()
 
 
 class PureLocalTests(unittest.TestCase):

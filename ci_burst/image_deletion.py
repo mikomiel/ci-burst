@@ -46,7 +46,8 @@ from dataclasses import InitVar, dataclass, field
 
 from .aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
 from .config import loads
-from .errors import ConfigRefusal, ImageRefusal, ProviderRefusal
+from .errors import ConfigRefusal, ImageRefusal, ProviderRefusal, Refusal
+from . import image_promote
 from .image_state import ACTIVE_STATES
 from .image_template import TEMPLATE_DRIFT
 
@@ -85,6 +86,8 @@ DEREGISTER_UNCONFIRMED = "deregister_unconfirmed"
 SNAPSHOT_DELETED = "snapshot_deleted"
 SNAPSHOT_FAILED = "snapshot_failed"
 SNAPSHOT_KEPT = "snapshot_kept"
+#: The result of the one row that ends a batch the deployment file changed under (``IMAGE_DELETION_UNSAFE``).
+REFUSED = "refused"
 
 _DEREGISTERED_STATE = "deregistered"
 
@@ -116,6 +119,9 @@ class ProtectedSet:
     image_ids: frozenset
     _proof: InitVar[object] = None
     _resolved: object = field(default=None, init=False, repr=False, compare=False)
+    #: The deployment file the set was resolved from, and its identity then (``check_unchanged``).
+    _config_path: object = field(default=None, init=False, repr=False, compare=False)
+    _config_identity: object = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self, proof):
         if proof is not _PROVENANCE or not isinstance(self.image_ids, frozenset) or not self.image_ids:
@@ -131,39 +137,57 @@ def _is_resolved(protected):
     return isinstance(protected, ProtectedSet) and protected._resolved is _PROVENANCE and bool(protected.image_ids)
 
 
-def _load_deployment(config_path):
-    """The deployment configuration, read from one open file whose link count is checked after the read.
+#: What ``_load_deployment`` says for each refusal of ``image_promote.read_authoritative``. No detail names a path.
+_UNSAFE_READ = {
+    image_promote.PROMOTE_FILE_STALE: "the deployment file is a view of a file that was replaced",
+    image_promote.PROMOTE_FILE_CHANGED: "the deployment file changed while it was read",
+    image_promote.IMAGE_CONFIG_MOUNTED: "the deployment file is itself a mount point, or its mount status cannot be shown",
+}
 
-    A bind mount of the file itself keeps the inode that was mounted. Once a rename elsewhere replaced the file,
-    that inode has no name left, and its pins and the journal rows that a pass resolved from it are old. The check
-    runs on the descriptor that supplied the bytes, after they were read, so a replacement during the read is seen.
+
+def _load_deployment(config_path):
+    """The deployment configuration and the identity of the file it came from, read once (``read_authoritative``).
+
+    A bind mount of the file itself keeps the inode that was mounted, so its pins and the journal rows that a pass
+    resolved from it can be old. The one read checks the identity, the name and the mount status of the open file the
+    bytes came from; a refusal of it is ``IMAGE_DELETION_UNSAFE``, and a deletion is never planned from a file that was
+    not shown to be the current one. The identity lets ``check_unchanged`` see a change after the read.
     """
     unreadable = "the deployment configuration could not be loaded"
     try:
-        descriptor = os.open(config_path, os.O_RDONLY | os.O_CLOEXEC)
-    except OSError:
-        raise _unsafe(unreadable) from None
+        read = image_promote.read_authoritative(config_path)
+    except Refusal as refusal:
+        raise _unsafe(_UNSAFE_READ.get(refusal.reason, unreadable)) from None
     try:
-        chunks = []
-        while chunk := os.read(descriptor, 1 << 16):
-            chunks.append(chunk)
-        stale = os.fstat(descriptor).st_nlink == 0
-    except OSError:
-        raise _unsafe(unreadable) from None
-    finally:
-        os.close(descriptor)
-    if stale:
-        raise _unsafe("the deployment file is a view of a file that was replaced")
-    try:
-        return loads(b"".join(chunks).decode("utf-8"), config_path)
+        return loads(read.data.decode("utf-8"), config_path), read.identity
     except (UnicodeDecodeError, ConfigRefusal):
         raise _unsafe(unreadable) from None
+
+
+def _identity(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns, metadata.st_mtime_ns, metadata.st_size)
+
+
+def check_unchanged(protected):
+    """Refuse ``IMAGE_DELETION_UNSAFE`` unless the deployment file is still the one ``protected`` was resolved from.
+
+    ``protected_set`` reads the pins, then the provider; the deletions come after. A hand edit or a replacement of
+    the file in between can pin an image that the set does not protect, so the caller checks right before it acts:
+    the path must give the same device, inode, change and modification times and size (#202).
+    """
+    try:
+        current = _identity(os.stat(protected._config_path))
+    except (OSError, TypeError):
+        current = None
+    if current is None or current != protected._config_identity:
+        raise _unsafe("the deployment file changed after the protected set was read")
 
 
 def protected_set(
     aws,
     config_path,
     *,
+    run_config,
     previous_pin,
     pending_journal,
     candidate,
@@ -207,7 +231,8 @@ def protected_set(
       active build is protected whatever its row records.
 
     ``config_path`` is the deployment file. Every call loads it again, so a pin
-    written after the caller's own load is seen. A pending journal row protects
+    written after the caller's own load is seen. ``run_config`` is the configuration the run started on: the file
+    must be of the same context (``image_promote.same_context``), or the rule refuses. A pending journal row protects
     both of its pins until a later task resolves the row. Resolving a row from
     the hash of the file is task 6.4 and is out of scope here: this function
     never reads the file's bytes and never decides which of a row's two pins is
@@ -215,15 +240,20 @@ def protected_set(
 
     It refuses with ``IMAGE_DELETION_UNSAFE`` when the deployment file is a
     view of a file that a rename replaced (no name links its inode), when the
-    configuration cannot be loaded, when a pin is not a version number, when the read does not return
-    exactly the pinned versions, when a version cannot be read, or when a version
+    configuration cannot be loaded or is of another deployment or template than the run, when a pin is not a
+    version number, when the read does not return exactly the pinned versions, when a version cannot be read, or when
+    a version
     names no literal image (an alias that resolves later says which image is in
     use only at launch). Then no path may delete anything: ``plan_deletions``
     cannot be called without the result, and no other way to make one exists
     (see ``ProtectedSet``). A refusal of the deadline passes unchanged. The
     detail names a version number at most, never a provider message.
     """
-    config = _load_deployment(config_path)
+    config, identity = _load_deployment(config_path)
+    if not image_promote.same_context(run_config, config):
+        # Every provider read below names the template of ``config``: the file must be of the deployment that the run,
+        # its state and its listings belong to. Only the pins may differ.
+        raise _unsafe("the deployment file is of another deployment or template than the run")
     pins = [config.aws.launch_template_version]
     pins.extend(zone.launch_template_version for zone in config.aws.zones)
     if previous_pin is not None:
@@ -254,7 +284,10 @@ def protected_set(
         image_ids.add(candidate.image_id)
     if active is not None and active.image_id is not None:
         image_ids.add(active.image_id)
-    return ProtectedSet(frozenset(image_ids), _PROVENANCE)
+    protected = ProtectedSet(frozenset(image_ids), _PROVENANCE)
+    object.__setattr__(protected, "_config_path", config_path)
+    object.__setattr__(protected, "_config_identity", identity)
+    return protected
 
 
 def plan_deletions(images, snapshots, protected, *, deployment, mode, now, config, builds):
@@ -357,6 +390,8 @@ def plan_deletions(images, snapshots, protected, *, deployment, mode, now, confi
         for image in eligible[:surplus]:
             plan.append(_image_item(RETENTION, image, _owner(image, deployment), None, by_snapshot, deployment))
     plan.sort(key=lambda item: (PATHS.index(item["path"]), item["image_id"] or "", item["snapshot_ids"]))
+    for item in plan:
+        item._protected = protected  # ``apply_deletions`` asks it before each call that removes something
     return plan
 
 
@@ -390,6 +425,14 @@ def apply_deletions(aws, plan, *, apply):
     ``deregister_failed``, ``deregister_unconfirmed``, ``snapshot_deleted``,
     ``snapshot_failed`` and ``snapshot_kept`` (not tried, because the image's
     deregistration was not confirmed).
+
+    Right before each deregistration and each snapshot deletion the deployment
+    file is checked again (``check_unchanged``): the provider reads and calls of
+    a batch take time, and an edit that pins an image later in the plan must keep
+    it. A file that changed ends the batch. The rows of the actions that were done
+    stay, and one last row with the result ``refused`` and the code
+    ``IMAGE_DELETION_UNSAFE`` names the action that was not made; nothing after
+    it runs (#202).
     """
     report = []
     for item in _decided_items(plan):
@@ -401,6 +444,9 @@ def apply_deletions(aws, plan, *, apply):
         confirmed = True
         if item["action"] == DEREGISTER:
             if apply:
+                if _changed(item):
+                    report.append(_row(item, DEREGISTER, REFUSED, code=IMAGE_DELETION_UNSAFE))
+                    return report
                 result, code = _deregister(aws, item["image_id"])
                 confirmed = result == DEREGISTERED
             else:
@@ -411,6 +457,11 @@ def apply_deletions(aws, plan, *, apply):
                 result, code = PLANNED, None
             elif not confirmed:
                 result, code = SNAPSHOT_KEPT, None
+            elif _changed(item):
+                report.append(
+                    _row(item, DELETE_SNAPSHOT, REFUSED, snapshot_id=snapshot_id, code=IMAGE_DELETION_UNSAFE)
+                )
+                return report
             else:
                 result, code = _delete_snapshot(aws, snapshot_id)
             report.append(_row(item, DELETE_SNAPSHOT, result, snapshot_id=snapshot_id, code=code))
@@ -425,6 +476,18 @@ def _unsafe(detail):
     return ImageRefusal(IMAGE_DELETION_UNSAFE, detail)
 
 
+def _changed(item):
+    """Whether the deployment file is no longer the one that the protected set of this item was resolved from."""
+    protected = getattr(item, "_protected", None)
+    if not _is_resolved(protected):
+        return True
+    try:
+        check_unchanged(protected)
+    except ImageRefusal:
+        return True
+    return False
+
+
 class _PlanItem(dict):
     """A plan item: a plain ``dict`` that also keeps a copy of what was decided.
 
@@ -433,7 +496,7 @@ class _PlanItem(dict):
     makes the item differ from it.
     """
 
-    __slots__ = ("_decided",)
+    __slots__ = ("_decided", "_protected")
 
     def unchanged(self):
         decided = getattr(self, "_decided", None)

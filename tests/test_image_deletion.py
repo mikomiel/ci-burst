@@ -24,7 +24,7 @@ from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ci_burst import image_deletion
+from ci_burst import image_deletion, image_promote
 from ci_burst.aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG, Image, ImageAws, Snapshot
 from ci_burst.config import ImageConfig, load
 from ci_burst.errors import DeadlineRefusal, ImageRefusal, ProviderRefusal
@@ -178,6 +178,7 @@ class DeletionCase(unittest.TestCase):
             aws["availability_zones"] = zones
         self.deployment_file = write_config(self.directory, config={"deployment": DEPLOYMENT, "aws": aws})
         self.deployment_file.write_text(self.deployment_file.read_text(encoding="utf-8") + IMAGE_TOML, encoding="utf-8")
+        self.run_config = load(self.deployment_file)  # the file as the run started on it
 
     def set_version(self, number, image_id):
         self.ec2.versions_store[(WORKER, number)] = {
@@ -267,6 +268,7 @@ class DeletionCase(unittest.TestCase):
     def resolve(self, **overrides):
         values = dict(previous_pin=None, pending_journal=(), candidate=None, active=None)
         values.update(overrides)
+        values.setdefault("run_config", self.run_config)
         return protected_set(self.aws, self.deployment_file, **values)
 
     def plan(
@@ -508,6 +510,89 @@ class ProtectedSetRefusalTests(DeletionCase):
         self.assertIn("replaced", refusal.detail)
         self.assertEqual(self.ec2.calls, [])
 
+    def test_a_replacement_during_the_read_that_a_hard_link_survives_is_unsafe_and_reads_no_version(self):
+        # The old file keeps a link, so its link count stays above zero: only the path, which names the new file
+        # now, tells the two apart (#202).
+        target = Path(self.deployment_file)
+        os.link(target, self.directory / "kept.toml")
+        replacement = target.parent / "replacement.tmp"
+        replacement.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+        real = os.read
+        renamed = []
+
+        def read(descriptor, size):
+            if not renamed:
+                renamed.append(True)
+                os.replace(replacement, target)
+            return real(descriptor, size)
+
+        with mock.patch("os.read", read):
+            refusal = self.refused()
+        self.assertEqual(renamed, [True])
+        self.assertEqual(os.stat(self.directory / "kept.toml").st_nlink, 1)
+        self.assertIn("replaced", refusal.detail)
+        self.assertEqual(self.ec2.calls, [])
+
+    def test_a_link_switched_to_another_file_during_the_read_is_unsafe_and_reads_no_version(self):
+        # The path that was given is a link: it must still name the file that the bytes came from (#202).
+        target = Path(self.deployment_file)
+        other = self.directory / "other.toml"
+        other.write_bytes(target.read_bytes())
+        link = self.directory / "link.toml"
+        link.symlink_to(target)
+        real = os.read
+        switched = []
+
+        def read(descriptor, size):
+            if not switched:
+                switched.append(True)
+                moved = self.directory / "link.tmp"
+                moved.symlink_to(other)
+                os.replace(moved, link)
+            return real(descriptor, size)
+
+        with mock.patch("os.read", read), self.assertRaises(ImageRefusal) as raised:
+            protected_set(
+                self.aws, link, run_config=load(link), previous_pin=None, pending_journal=(), candidate=None, active=None
+            )
+        self.assertEqual(switched, [True])
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertIn("replaced", raised.exception.detail)
+        self.assertEqual(self.ec2.calls, [])
+
+    def mount_table(self, *mount_points):
+        table = self.directory / "mountinfo"
+        lines = [f"{number} 1 8:1 /a {point} rw - ext4 /dev/example rw" for number, point in enumerate(mount_points, 30)]
+        table.write_text("\n".join(["29 1 0:5 / / rw - rootfs rootfs rw", *lines]) + "\n", encoding="utf-8")
+        return mock.patch.object(image_promote, "_MOUNTINFO", table)
+
+    def test_a_deployment_file_that_is_a_mount_point_is_unsafe_and_reads_no_version(self):
+        # A link that was retargeted to a file that is a bind mount is read through the mount no more (#202).
+        link = self.directory / "link.toml"
+        link.symlink_to(self.deployment_file)
+        with self.mount_table(str(Path(self.deployment_file).resolve())), self.assertRaises(ImageRefusal) as raised:
+            protected_set(
+                self.aws, link, run_config=load(link), previous_pin=None, pending_journal=(), candidate=None, active=None
+            )
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertIn("mount point", raised.exception.detail)
+        self.assertNotIn(str(self.directory), raised.exception.detail)
+        self.assertEqual(self.ec2.calls, [])
+
+    def test_a_file_that_is_not_listed_as_a_mount_point_is_loaded(self):
+        with self.mount_table(str(self.directory / "another.toml")):
+            self.assertTrue(self.resolve())
+
+    def test_an_unreadable_mount_table_on_linux_is_unsafe(self):
+        with (
+            mock.patch.object(image_promote, "_MOUNTINFO", self.directory / "no-such-table"),
+            mock.patch("sys.platform", "linux"),
+            self.assertRaises(ImageRefusal) as raised,
+        ):
+            self.resolve()
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertEqual(self.ec2.calls, [])
+
     def test_an_unreadable_version_is_unsafe_and_leaks_nothing(self):
         self.ec2.errors["describe_launch_template_versions"] = ProviderError("RequestLimitExceeded")
         refusal = self.refused()
@@ -596,6 +681,214 @@ class ProtectedSetRefusalTests(DeletionCase):
         self.ec2.versions_store[(WORKER, PIN)]["LaunchTemplateData"] = {"ImageId": "resolve:ssm:/example/alias"}
         refusal = self.refused()
         self.assertNotIn("alias", refusal.detail)
+
+
+class RunContextTests(DeletionCase):
+    """The file the rule reads must be of the deployment the run started on: only the pins may differ (#202)."""
+
+    def write_other_deployment(self, **keywords):
+        """Another deployment and template with the same version numbers, whose versions name other images."""
+        text = self.deployment_file.read_text(encoding="utf-8")
+        for old, new in keywords.items():
+            self.assertEqual(text.count(old), 1, old)
+            text = text.replace(old, new)
+        self.deployment_file.write_text(text, encoding="utf-8")
+
+    def test_a_file_of_another_template_with_the_same_version_numbers_is_unsafe_and_reads_no_version(self):
+        run = self.run_config
+        for number, image_id in VERSION_IMAGES.items():
+            self.ec2.versions_store[("example-other-template", number)] = {
+                "VersionNumber": number,
+                "LaunchTemplateId": "lt-0123456789abcdef9",
+                "LaunchTemplateData": {"ImageId": ami(0xF0 + number)},
+            }
+        self.write_other_deployment(**{f'launch_template_name = "{WORKER}"': 'launch_template_name = "example-other-template"'})
+        with self.assertRaises(ImageRefusal) as raised:
+            self.resolve(run_config=run)
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertIn("another deployment or template", raised.exception.detail)
+        self.assertNotIn(str(self.directory), raised.exception.detail)
+        self.assertEqual(self.ec2.calls, [])
+
+    def test_a_file_of_another_deployment_is_unsafe(self):
+        run = self.run_config
+        self.write_other_deployment(**{f'deployment = "{DEPLOYMENT}"': 'deployment = "example-other-deployment"'})
+        with self.assertRaises(ImageRefusal) as raised:
+            self.resolve(run_config=run)
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertEqual(self.ec2.calls, [])
+
+    def test_a_file_that_only_moved_its_pin_is_resolved(self):
+        run = self.run_config
+        text = self.deployment_file.read_text(encoding="utf-8")
+        self.deployment_file.write_text(text.replace(f"launch_template_version = {PIN}", "launch_template_version = 4", 1), encoding="utf-8")
+        self.assertIn(VERSION_IMAGES[4], self.resolve(run_config=run).image_ids)
+
+
+class ConfigChangedTests(DeletionCase):
+    """``check_unchanged``: the pins the set protects must still be the file's when the plan is acted on (#202)."""
+
+    def refused(self, protected):
+        with self.assertRaises(ImageRefusal) as raised:
+            image_deletion.check_unchanged(protected)
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertNotIn(str(self.directory), raised.exception.detail)
+        return raised.exception
+
+    def test_a_file_that_is_as_it_was_read_passes(self):
+        protected = self.resolve()
+        image_deletion.check_unchanged(protected)
+        image_deletion.check_unchanged(protected)
+
+    def test_an_edit_after_the_read_is_unsafe(self):
+        protected = self.resolve()
+        text = self.deployment_file.read_text(encoding="utf-8")
+        self.deployment_file.write_text(text + "\n# a hand edit\n", encoding="utf-8")
+        self.refused(protected)
+
+    def test_an_edit_that_keeps_the_size_is_unsafe(self):
+        protected = self.resolve()
+        size = self.deployment_file.stat().st_size
+        data = self.deployment_file.read_bytes()
+        self.deployment_file.write_bytes(data.replace(b"example-deployment", b"example-deploymenu", 1))
+        os.utime(self.deployment_file, ns=(0, 1))
+        self.assertEqual(self.deployment_file.stat().st_size, size)
+        self.refused(protected)
+
+    def test_a_replacement_with_the_same_bytes_is_unsafe(self):
+        protected = self.resolve()
+        replacement = self.deployment_file.parent / "replacement.tmp"
+        replacement.write_bytes(self.deployment_file.read_bytes())
+        os.replace(replacement, self.deployment_file)
+        self.refused(protected)
+
+    def test_an_in_place_edit_during_the_read_is_unsafe_and_reads_no_version(self):
+        # The same inode keeps its name, so only the identity of the open file, taken before the first byte and
+        # again after the last, tells the bytes that were used from the file that the edit left (#202).
+        real = os.read
+        edited = []
+        text = self.deployment_file.read_text(encoding="utf-8")
+
+        def read(descriptor, size):
+            data = real(descriptor, size)
+            if not data and not edited:  # the end of the file: every byte that will be used is in
+                edited.append(True)
+                self.deployment_file.write_text(text + "\n# a hand edit\n", encoding="utf-8")
+            return data
+
+        with mock.patch("os.read", read), self.assertRaises(ImageRefusal) as raised:
+            self.resolve()
+        self.assertEqual(edited, [True])
+        self.assertEqual(raised.exception.reason, UNSAFE)
+        self.assertIn("changed while it was read", raised.exception.detail)
+        self.assertEqual(self.ec2.calls, [])
+
+    def two_failed_images(self):
+        self.reset()
+        self.made(1, "failed")
+        self.made(2, "failed")
+        plan = self.plan("all")
+        self.assertEqual(
+            [(item["action"], item["image_id"]) for item in plan],
+            [("deregister", ami(1)), ("deregister", ami(2))],
+        )
+        return plan
+
+    def edit_file(self):
+        self.deployment_file.write_text(
+            self.deployment_file.read_text(encoding="utf-8") + "\n# a hand edit\n", encoding="utf-8"
+        )
+
+    def edit_after(self, method):
+        """The first call of ``method`` of the session works, then the deployment file is edited."""
+        real = getattr(self.aws, method)
+        done = []
+
+        def call(identifier):
+            result = real(identifier)
+            if not done:
+                done.append(True)
+                self.edit_file()
+            return result
+
+        return mock.patch.object(self.aws, method, call)
+
+    def test_an_edit_after_the_first_deregistration_keeps_the_second_image_and_reports_the_first(self):
+        plan = self.two_failed_images()
+        with self.edit_after("deregister_image"):
+            report = apply_deletions(self.aws, plan, apply=True)
+        self.assertEqual(
+            [(row["action"], row["image_id"], row["result"]) for row in report],
+            [
+                ("deregister", ami(1), "deregistered"),
+                ("delete_snapshot", ami(1), "refused"),
+            ],
+        )
+        self.assertEqual(report[-1]["code"], UNSAFE)
+        self.assertEqual(self.requests("deregister_image"), [{"ImageId": ami(1)}])
+        self.assertEqual(self.requests("delete_snapshot"), [])
+        self.assertIn(ami(2), self.stored_images())
+        self.assertIn(snap(2), self.stored_snapshots())
+
+    def test_an_edit_after_the_first_image_is_gone_keeps_the_second_image(self):
+        plan = self.two_failed_images()
+        with self.edit_after("delete_snapshot"):
+            report = apply_deletions(self.aws, plan, apply=True)
+        self.assertEqual(
+            [(row["action"], row["image_id"], row["result"]) for row in report],
+            [
+                ("deregister", ami(1), "deregistered"),
+                ("delete_snapshot", ami(1), "snapshot_deleted"),
+                ("deregister", ami(2), "refused"),
+            ],
+        )
+        self.assertEqual(report[-1]["code"], UNSAFE)
+        self.assertEqual(self.requests("deregister_image"), [{"ImageId": ami(1)}])
+        self.assertIn(ami(2), self.stored_images())
+
+    def test_an_unchanged_file_lets_the_whole_batch_run(self):
+        plan = self.two_failed_images()
+        report = apply_deletions(self.aws, plan, apply=True)
+        self.assertEqual(self.results(report).count(("deregister", "deregistered")), 2)
+        self.assertNotIn("refused", [row["result"] for row in report])
+
+    def test_a_dry_run_makes_no_check_and_no_call(self):
+        plan = self.two_failed_images()
+        self.edit_file()
+        report = apply_deletions(self.aws, plan, apply=False)
+        self.assertEqual({row["result"] for row in report}, {"planned"})
+        self.assertEqual(self.mutations(), [])
+
+    def test_a_copied_plan_keeps_the_check(self):
+        for copier in (copy.copy, copy.deepcopy):
+            with self.subTest(copier=copier.__name__):
+                plan = copier(self.two_failed_images())
+                self.edit_file()
+                report = apply_deletions(self.aws, plan, apply=True)
+                self.assertEqual([row["result"] for row in report], ["refused"])
+                self.assertEqual(self.mutations(), [])
+
+    def test_a_file_that_is_gone_is_unsafe(self):
+        protected = self.resolve()
+        self.deployment_file.unlink()
+        self.refused(protected)
+
+    def test_a_set_that_no_file_was_read_for_is_unsafe(self):
+        self.refused(forged_set({ami(1)}))
+
+    def test_an_edit_between_the_plan_and_the_deletions_leaves_every_image_registered(self):
+        # The pipeline resolves the set, lists the account, plans, and checks the file again before it acts.
+        self.reset()
+        self.made(1, "failed")
+        protected = self.resolve()
+        plan = self.plan("all", protected=protected)
+        self.assertEqual([(item["action"], item["image_id"]) for item in plan], [("deregister", ami(1))])
+        self.deployment_file.write_text(
+            self.deployment_file.read_text(encoding="utf-8") + "\n# a hand edit\n", encoding="utf-8"
+        )
+        self.refused(protected)
+        self.assertEqual(self.mutations(), [])
+        self.assertIn(ami(1), self.stored_images())
 
 
 class FailClosedTests(DeletionCase):

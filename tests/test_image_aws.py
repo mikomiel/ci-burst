@@ -1754,6 +1754,30 @@ class StagingOwnerTests(Base):
         self.assertEqual([name for name, _ in self.s3_requests()], ["delete_object", "list_objects_v2"])
         self.assert_every_call_names_the_account(["delete_object", "list_objects_v2"])
 
+    def test_an_owner_that_a_caller_gives_is_named_on_every_call_in_place_of_the_account_of_the_identity(self):
+        aws = self.image_aws()
+        aws.put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10, owner=self.OTHER)
+        with self.assertRaises(ProviderRefusal):
+            aws.put_archive(BUCKET, self.KEY, [b"x" * 60, b"y" * 60], max_bytes=100, part_bytes=10, owner=self.OTHER)
+        aws.delete_object(BUCKET, self.KEY, owner=self.OTHER)
+        self.s3.pages = [{"Contents": []}]
+        aws.list_objects(BUCKET, PREFIX, owner=self.OTHER)
+        calls = self.s3_requests()
+        self.assertTrue(calls)
+        for name, arguments in calls:
+            with self.subTest(call=name):
+                self.assertEqual(arguments["ExpectedBucketOwner"], self.OTHER)
+
+    def test_an_owner_that_is_no_account_number_sends_no_s3_call(self):
+        aws = self.image_aws()
+        for owner in ("", "not-an-account", "12345", 123456789012):
+            with self.subTest(owner=owner):
+                with self.assertRaises(ProviderRefusal):
+                    aws.delete_object(BUCKET, self.KEY, owner=owner)
+                with self.assertRaises(ProviderRefusal):
+                    aws.put_archive(BUCKET, self.KEY, [b"x"], max_bytes=100, owner=owner)
+        self.assertEqual(self.s3_requests(), [])
+
     def test_another_s3_error_keeps_its_own_reason(self):
         self.s3.errors["delete_object"] = ProviderError("SlowDown")
         with self.assertRaises(ProviderRefusal) as raised:

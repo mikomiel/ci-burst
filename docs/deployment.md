@@ -465,6 +465,11 @@ checks run in `promote`, and a hand-written pin bypasses them. Before a promotio
 a rollback or a hand edit, finish or stop a running build container, and start a
 fresh one afterwards.
 
+While any image command runs, do not edit a setting of the file other than the pin,
+replace or re-link the file, swap a mount or move the state directory.
+[Operator contract while an image command runs](operations.md#operator-contract-while-an-image-command-runs)
+says what ci-burst checks and what it does not promise.
+
 ## 5. Write the deployment TOML
 
 `/etc/ci-burst/deployment.toml` on both hosts, identical content. If you use the
@@ -742,10 +747,15 @@ Notes on the values:
   build rows still name.
 - Every S3 call that ci-burst makes against a staging bucket names the account of the image
   role as the bucket's expected owner (`ExpectedBucketOwner`), which it reads once per pass
-  from `sts:GetCallerIdentity` and which asks for no permission. A bucket name that was
-  released and now belongs to another account is refused with `IMAGE_STAGING_BUCKET_DENIED`,
-  never written to or deleted from, and never retried without the owner. The staging bucket
-  must therefore be in the account of the image role. The build policy carries the same bound
+  from `sts:GetCallerIdentity` and which asks for no permission. The row of a build records
+  that account (`archive_owner`) with the bucket and the key when the archive is first
+  staged, and a stage done again and every delete of that archive name the recorded one. A
+  pass whose role is in another account than the one that staged the archive makes no S3
+  call about it: a stage done again ends refused with `IMAGE_STAGING_OWNER_CHANGED`, and a
+  delete counts as failed and stays owed, even where a bucket of that name exists in the new
+  account. A bucket name that was released and now belongs to another account is refused with
+  `IMAGE_STAGING_BUCKET_DENIED`, never written to or deleted from, and never retried without
+  the owner. The staging bucket must therefore be in the account of the image role. The build policy carries the same bound
   as an `s3:ResourceAccount` condition on both S3 statements: replace `<account-id>` there
   with that account.
 - The staging bucket and its lifecycle rule are yours: the row of a build records

@@ -922,7 +922,12 @@ class PipelineCase(unittest.TestCase):
         return self.query(lambda state: state.control_get())
 
     def add_build(self, build_id, state="failed", *, age=5 * DAY, digest="c" * 64, **fields):
-        """A build row of an earlier run, started ``age`` seconds ago."""
+        """A build row of an earlier run, started ``age`` seconds ago.
+
+        A row that names an archive was staged by the identity of the world, unless the test says another owner.
+        """
+        if fields.get("archive_key") and "archive_owner" not in fields:
+            fields["archive_owner"] = ACCOUNT
         created = NOW - age
         writer = ImageState(self.state_dir, clock=lambda: created)
         writer.connect()
@@ -3652,6 +3657,105 @@ class ArchiveOwedTests(PipelineCase):
         self.assertEqual(new.archive_bucket, other_bucket)
         self.assertIsNone(rows[first.id].archive_deleted_at)
 
+    def test_the_row_records_the_owner_with_the_bucket_before_the_upload_and_every_call_names_it(self):
+        seen = []
+        self.world.hooks["create_multipart_upload"] = lambda arguments: seen.append(
+            (arguments, self.query(lambda state: state.active_build(DEPLOYMENT)))
+        )
+        self.apply()
+        ((arguments, row),) = seen
+        self.assertEqual((row.archive_bucket, row.archive_owner), (BUCKET, ACCOUNT))
+        self.assertEqual(arguments["ExpectedBucketOwner"], row.archive_owner)
+        self.assertEqual(self.only_build().archive_owner, ACCOUNT)
+
+    def role_moves_to_another_account(self):
+        """The stage of a row ran in the account of the world. The state file stays, and the role is in B now."""
+        self.world.account = self.OTHER_ACCOUNT
+
+    def test_a_restage_after_the_role_moved_to_another_account_sends_nothing_and_is_refused(self):
+        first = self.unstaged_with_an_archive()
+        self.assertEqual(first.archive_owner, ACCOUNT)
+        # The recorded bucket name exists in the account of the role now: the world owns it under that account.
+        self.role_moves_to_another_account()
+        other_bucket = "example-other-staging"
+        self.configure(render_toml(prefix=self.OTHER_PREFIX).replace(BUCKET, other_bucket))
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_STAGING_OWNER_CHANGED"), result)
+        names = self.world.names(mark)
+        for name in (
+            "create_multipart_upload",
+            "upload_part",
+            "complete_multipart_upload",
+            "delete_object",
+            "run_instances",
+            "generate_presigned_url",
+        ):
+            self.assertNotIn(name, names)
+        for name, call in self.staging_calls(mark):
+            self.assertNotEqual(call["Bucket"], BUCKET, name)
+        ended = self.only_build()
+        self.assertEqual((ended.id, ended.state, ended.reason_code), (first.id, "failed", "IMAGE_STAGING_OWNER_CHANGED"))
+        # No call was made, so the deletion is owed and was never marked done.
+        self.assertIsNone(ended.archive_deleted_at)
+        self.assertEqual(ended.archive_owner, ACCOUNT)
+        self.assertEqual(self.query(lambda state: state.archives_owed(DEPLOYMENT)), [ended])
+        self.assertEqual(self.control().consecutive_failures, 0)
+        self.assertIn("archive:delete_failed", result["notes"])
+        self.assertIn("archive:owner_changed", result["notes"])
+        self.assertNotIn(self.OTHER_ACCOUNT, json.dumps(result))
+
+    def test_an_owed_delete_after_the_role_moved_to_another_account_makes_no_s3_call_and_counts_as_failed(self):
+        key = f"{PREFIX}owed-00.tar.gz"
+        self.add_build("owed-00", archive_bucket=BUCKET, archive_key=key)
+        self.world.objects[key] = (b"archive", NOW)
+        self.role_moves_to_another_account()
+        other_bucket = "example-other-staging"
+        self.configure(render_toml(prefix=self.OTHER_PREFIX).replace(BUCKET, other_bucket))
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 0)
+        self.assertEqual(result["reconcile"]["owed_archive_delete_failed"], 1)
+        self.assertIn("archive:owner_changed", result["notes"])
+        self.assertEqual([call for call in self.world.arguments("delete_object") if call["Key"] == key], [])
+        self.assertEqual(self.world.objects[key][0], b"archive")
+        row = [row for row in self.builds() if row.id == "owed-00"][0]
+        self.assertIsNone(row.archive_deleted_at)
+        self.assertEqual(row.archive_delete_seq, 1)
+        self.assertEqual(self.query(lambda state: [r.id for r in state.archives_owed(DEPLOYMENT)]), ["owed-00"])
+
+    def test_a_row_that_records_no_owner_is_refused_like_another_owner(self):
+        key = f"{PREFIX}owed-00.tar.gz"
+        self.add_build("owed-00", archive_bucket=BUCKET, archive_key=key, archive_owner=None)
+        self.world.objects[key] = (b"archive", NOW)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archive_delete_failed"], 1)
+        self.assertIn("archive:owner_changed", result["notes"])
+        self.assertEqual([call for call in self.world.arguments("delete_object") if call["Key"] == key], [])
+        self.assertEqual(self.world.objects[key][0], b"archive")
+
+    def test_a_restage_of_a_row_that_records_no_owner_sends_nothing_and_is_refused(self):
+        first = self.unstaged_with_an_archive()
+        self.write(
+            lambda state: state._require().execute("UPDATE image_builds SET archive_owner = NULL WHERE id = ?", (first.id,))
+        )
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_STAGING_OWNER_CHANGED"), result)
+        self.assertNotIn("create_multipart_upload", self.world.names(mark))
+        self.assertIsNone(self.only_build().archive_deleted_at)
+
+    def test_an_owed_delete_names_the_owner_that_the_row_recorded(self):
+        key = f"{PREFIX}owed-00.tar.gz"
+        self.add_build("owed-00", archive_bucket=BUCKET, archive_key=key, archive_owner=ACCOUNT)
+        self.world.objects[key] = (b"archive", NOW)
+        self.world.console_plan = [(30.0, READY)]
+        self.apply()
+        (call,) = [call for call in self.world.arguments("delete_object") if call["Key"] == key]
+        self.assertEqual(call["ExpectedBucketOwner"], ACCOUNT)
+        self.assertEqual(self.world.objects.get(key), None)
+
     def test_a_new_row_whose_upload_is_denied_is_a_failed_build_that_counts(self):
         self.world.fail("create_multipart_upload", ProviderError("AccessDenied"))
         result = self.apply()
@@ -3909,6 +4013,36 @@ class OwedArchiveBoundTests(PipelineCase):
         self.assertEqual(third["reconcile"]["owed_archives_deleted"], 1, third)
         self.assertNotIn(keys[0], self.world.objects)
         self.assertIsNotNone(self.only_build_named("owed-00").archive_deleted_at)
+
+    def test_the_ninth_row_is_tried_within_two_passes_when_the_clock_stepped_back_after_its_own_attempt(self):
+        keys = self.owe(9)
+        ninth = keys[8]
+        deletable = {ninth}
+
+        def refuse(arguments):
+            if arguments["Key"] not in deletable:
+                raise ProviderError("RequestLimitExceeded")
+
+        self.world.hooks["delete_object"] = refuse
+        # The ninth row was refused first, at a clock reading that is far ahead of the readings of the eight others,
+        # which were refused later, after the clock had stepped back. By the times, the ninth is behind all eight.
+        self.write(lambda state: state.mark_archive_delete_tried("owed-08", NOW + 100_000))
+        for number in range(8):
+            self.write(lambda state, number=number: state.mark_archive_delete_tried(f"owed-{number:02d}", NOW))
+        self.world.console_plan = [(30.0, READY)]
+        settled = []
+        for attempt in range(2):
+            result = self.apply()
+            self.pin_current()
+            row = self.only_build_named("owed-08")
+            settled.append(row.archive_deleted_at is not None)
+            if settled[-1]:
+                break
+        self.assertTrue(any(settled), settled)
+        self.assertNotIn(ninth, self.world.objects)
+        # The eight rows that stay refused are still owed.
+        owed = self.query(lambda state: [row.id for row in state.archives_owed(DEPLOYMENT)])
+        self.assertEqual(sorted(row for row in owed if row.startswith("owed-")), [f"owed-{n:02d}" for n in range(8)])
 
     def test_a_restage_that_needs_most_of_the_pass_is_not_held_by_an_owed_delete_that_times_out(self):
         key = f"{PREFIX}owed-slow.tar.gz"

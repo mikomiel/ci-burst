@@ -808,14 +808,26 @@ class ImageAws:
             self._account_cache = account
         return self._account_cache
 
-    def _invoke(self, service, method, *, read=False, absent=None, **arguments):
+    def _bound_owner(self, owner):
+        """The account that an S3 call names as the bucket's owner.
+
+        ``owner`` is the account that a row recorded for its archive. ``None`` means this identity's own account.
+        Anything that is no account number refuses, so no S3 call goes out without an owner.
+        """
+        if owner is None:
+            return self.account_id()
+        if not isinstance(owner, str) or not re.fullmatch(r"[0-9]{12}", owner):
+            raise ProviderRefusal("AWS_ACCOUNT_UNKNOWN", "the bucket owner is no account number")
+        return owner
+
+    def _invoke(self, service, method, *, read=False, absent=None, owner=None, **arguments):
         """Call the provider. ``absent`` is an error code that means "not there".
 
-        An S3 call carries the account as the bucket's owner, and it is refused here, before any call, when the
-        account is unknown. ``AccessDenied`` from S3 leaves as ``IMAGE_STAGING_BUCKET_DENIED``.
+        An S3 call carries ``owner`` (see ``_bound_owner``) as the bucket's owner, and it is refused here, before
+        any call, when there is none. ``AccessDenied`` from S3 leaves as ``IMAGE_STAGING_BUCKET_DENIED``.
         """
         if service == "s3":
-            arguments["ExpectedBucketOwner"] = self.account_id()
+            arguments["ExpectedBucketOwner"] = self._bound_owner(owner)
         client = self._client(service)
         try:
             return getattr(client, method)(**arguments)
@@ -1087,8 +1099,11 @@ class ImageAws:
         return number
 
     # -- source archive storage -------------------------------------------
-    def put_archive(self, bucket, key, chunks, *, max_bytes, part_bytes=ARCHIVE_PART_BYTES, deadline=None):
+    def put_archive(self, bucket, key, chunks, *, max_bytes, part_bytes=ARCHIVE_PART_BYTES, deadline=None, owner=None):
         """Stream ``chunks`` into one multipart upload, hashing the bytes as they go.
+
+        Every S3 call of the upload and of its cleanup names ``owner`` as the bucket's owner (see
+        ``_bound_owner``).
 
         The archive is never written to disk. Overrunning ``max_bytes``, a failed
         part or completion, or a failing source iterator aborts the upload and
@@ -1102,14 +1117,15 @@ class ImageAws:
         ends the upload instead of finishing it.
         """
         self._check_deadline(deadline, "archive upload")
-        started = self._invoke("s3", "create_multipart_upload", Bucket=bucket, Key=key)
+        owner = self._bound_owner(owner)
+        started = self._invoke("s3", "create_multipart_upload", owner=owner, Bucket=bucket, Key=key)
         upload_id = started.get("UploadId")
         if not isinstance(upload_id, str) or not upload_id:
             raise ProviderRefusal("AWS_UNCERTAIN", "multipart upload returned no upload id", uncertain=True)
         try:
-            return self._stream_parts(bucket, key, upload_id, chunks, max_bytes, part_bytes, deadline)
+            return self._stream_parts(bucket, key, upload_id, chunks, max_bytes, part_bytes, deadline, owner)
         except _ArchiveTooLarge:
-            cleaned = self._discard_upload(bucket, key, upload_id)
+            cleaned = self._discard_upload(bucket, key, upload_id, owner)
             raise ProviderRefusal("IMAGE_ARCHIVE_TOO_LARGE", _cleanup_detail(f"over {max_bytes} bytes", cleaned)) from None
         except Refusal as refusal:
             # The source iterator's refusal can carry a URL or a token in its
@@ -1118,21 +1134,21 @@ class ImageAws:
             # caller that catches a ``ProviderRefusal`` or a ``DeadlineRefusal``
             # still does; the deadline refusal takes only a detail, so it is
             # rebuilt on its own line.
-            cleaned = self._discard_upload(bucket, key, upload_id)
+            cleaned = self._discard_upload(bucket, key, upload_id, owner)
             if isinstance(refusal, DeadlineRefusal):
                 raise DeadlineRefusal(_cleanup_detail("archive upload", cleaned)) from None
             raise _rebuilt_refusal(refusal, _cleanup_detail("archive source refused", cleaned)) from None
         except Exception as error:  # noqa: BLE001 - reported as a code only
-            cleaned = self._discard_upload(bucket, key, upload_id)
+            cleaned = self._discard_upload(bucket, key, upload_id, owner)
             code = (_error_code(error) or type(error).__name__)[:64]
             reason = IMAGE_STAGING_BUCKET_DENIED if code in _S3_DENIED_CODES else "IMAGE_ARCHIVE_UPLOAD_FAILED"
             raise ProviderRefusal(reason, _cleanup_detail(code, cleaned)) from None
         except BaseException:
-            self._discard_upload(bucket, key, upload_id)
+            self._discard_upload(bucket, key, upload_id, owner)
             raise
 
-    def _stream_parts(self, bucket, key, upload_id, chunks, max_bytes, part_bytes, deadline):
-        s3, owner = self._client("s3"), self.account_id()
+    def _stream_parts(self, bucket, key, upload_id, chunks, max_bytes, part_bytes, deadline, owner):
+        s3 = self._client("s3")
         digest, parts, buffer, total = hashlib.sha256(), [], bytearray(), 0
 
         def send(body):
@@ -1172,9 +1188,9 @@ class ImageAws:
         )
         return ArchiveUpload(key=key, size=total, sha256=digest.hexdigest())
 
-    def _discard_upload(self, bucket, key, upload_id):
+    def _discard_upload(self, bucket, key, upload_id, owner):
         """Abort the upload and delete the key. True only when both calls succeeded."""
-        s3, owner = self._client("s3"), self.account_id()
+        s3 = self._client("s3")
         clean = True
         # A completion whose response was lost may have created the object, so
         # the delete runs whether or not the abort found an upload.
@@ -1191,7 +1207,7 @@ class ImageAws:
                 clean = False
         return clean
 
-    def list_objects(self, bucket, prefix, *, deadline=None):
+    def list_objects(self, bucket, prefix, *, deadline=None, owner=None):
         items = []
         for response in self._pages(
             "s3",
@@ -1202,6 +1218,7 @@ class ImageAws:
             "ListObjectsV2 page",
             Bucket=bucket,
             Prefix=prefix,
+            owner=owner,
         ):
             for entry in response.get("Contents") or []:
                 key = entry.get("Key") if isinstance(entry, Mapping) else None
@@ -1211,8 +1228,8 @@ class ImageAws:
                 items.append(StoredObject(key=key, size=size, last_modified=_timestamp(entry.get("LastModified"))))
         return items
 
-    def delete_object(self, bucket, key):
-        self._invoke("s3", "delete_object", Bucket=bucket, Key=key)
+    def delete_object(self, bucket, key, *, owner=None):
+        self._invoke("s3", "delete_object", owner=owner, Bucket=bucket, Key=key)
 
     def credential_expiry(self):
         """Epoch expiry of this session's credentials, or ``None`` when unknown.

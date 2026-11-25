@@ -870,6 +870,48 @@ with `PROMOTE_FILE_STALE` when it has none, so no journal row is resolved and no
 pin is written from a stale view. A replaced file that another hard link still
 names is not detected: do not keep hard links to the deployment TOML.
 
+#### Operator contract while an image command runs
+
+ci-burst expects this of the operator while an image command runs (`image run`,
+`image promote` or `image status --refresh`). You do not:
+
+- hand-edit a setting of the deployment file other than the pin;
+- replace or re-link the deployment file or the path that `--config` names;
+- swap a bind mount;
+- move, restore or replace the image state directory.
+
+A hand edit of the pin itself follows the pause rule above: pause any scheduler of
+image runs and wait until no `image run --apply` is running before you make one.
+
+Setting `enabled = false` to stop the image path is the one edit you may make while
+a command runs. It does not stop that command: follow
+[Rolling back an image](#rolling-back-an-image) and wait until no `image run --apply` runs.
+
+ci-burst still makes these checks. The text above and the reason codes below give
+the detail:
+
+- A command that reads the deployment file to resolve a journal row, to promote or
+  to roll back refuses with `PROMOTE_FILE_STALE` when the open file has no name
+  left. When the deletion rule reads the file through a stale view, it deletes
+  nothing (`IMAGE_DELETION_UNSAFE`).
+- `promote` refuses with `PROMOTE_FILE_CHANGED` when the file changed after it was
+  read. It refuses with `PROMOTE_STATE_CHANGED` when the file names another
+  `[image].state_directory` or `deployment` than the one the command opened at its
+  start. The command compares the two values as written and follows no link on the
+  path.
+- `promote --write` commits a journal row before the rename. The next resolving
+  command settles the row from the hash of the file. A hash that matches neither
+  value refuses with `PROMOTION_JOURNAL_DIVERGED` and changes nothing.
+- The writer lock of the state file (`IMAGE_STATE_LOCKED`) and the lock file of the
+  TOML (`PROMOTE_BUSY`) keep two ci-burst commands from writing at once.
+
+ci-burst does not promise more than these checks. They run at fixed points of a
+command, and the product does not lock an operator's editor. A race with an edit of
+a file, a link, a mount or the state directory during one command is outside the
+contract, and the product makes no promise about it. Findings of that class are
+tracked in [#226](https://github.com/mikomiel/ci-burst/issues/226). They are not
+fixed one by one.
+
 #### Promote reason codes
 
 A refusal names the item and the recorded value, never a secret.
@@ -1164,10 +1206,20 @@ time that a stage, a decision or a build needs. A pass starts at most 8 owed del
 margin); the clock is read before each one. A row whose delete this pass attempted,
 whatever the outcome, is not tried again in it: the pass keeps the ids of its attempts in
 memory, so a clock that moves does not decide it. When owed rows remain
-after the bound, the pass notes `archive:delete_deferred`. Each failed attempt records
-its time in the row (`archive_delete_tried_at`), which only orders the rows. The rows never tried go first, then
-the least recently tried, then the oldest, so a deletion that stays refused goes
-behind the newer ones and cannot keep them from their turn.
+after the bound, the pass notes `archive:delete_deferred`. Each failed attempt takes the next
+place in the row's `archive_delete_seq` (one more than the largest place of any row, set with the
+attempt) and records its time (`archive_delete_tried_at`) for diagnosis only. The rows never
+tried go first, then the rows by `archive_delete_seq`, the least recently tried first, then the
+oldest, so a deletion that stays refused goes behind the other rows and cannot keep them from
+their turn, and a clock that steps back changes nothing.
+
+The row also records the account that owned its bucket when the archive was first staged
+(`archive_owner`). Every delete and every stage done again names it as the bucket's expected
+owner. When the role of the pass is in another account, or the row records no owner, no S3 call
+is made about that archive: the delete counts in `owed_archive_delete_failed`, the pass notes
+`archive:delete_failed` and `archive:owner_changed`, and the row stays owed and is never marked
+deleted. Restore the role's account, or remove the object by hand, and let the lifecycle rule
+age it out; do not edit the state file.
 
 A pass runs for an owed deletion even when the gate is withdrawn (`gate_command`
 empty and `allow_no_gate` false) and no build is in flight. That cleanup pass runs
@@ -1283,6 +1335,7 @@ and the codes of `promote` in [Promote reason codes](#promote-reason-codes).
 | `IMAGE_BUILD_TEMPLATE_UNSAFE` | the build launch template or its version is missing or fails a safety check; the detail names the properties, never a value. On a stage done again the row ends `failed`, uncounted, and the pass answers `refused`. A read of the template that the provider refuses, such as a version that EC2 reports as not found, is the provider's own refusal instead: it is raised (exit `1`), and on a stage done again it leaves the row for the next pass |
 | `IMAGE_USERDATA_TOO_LARGE` | in `image plan`: the user data, rendered with a synthetic URL, is 16384 bytes or more. In an applying run it ends the build `failed` instead (first table) |
 | `IMAGE_STAGING_BUCKET_DENIED` | S3 answered `AccessDenied` to a staging call. Every one names the account of the image role as the bucket's owner, so the bucket now belongs to another account (a released name that was reassigned), or the role may not use it. Nothing was written or deleted, and no call is made without the owner. A stage done again at the bucket that its row recorded ends the row `failed` with this code, counts no failure and answers `refused`; the next pass stages under the configured bucket. The row's delete is refused at the same bucket: it counts in `owed_archive_delete_failed` and stays owed. A first stage ends the build as a failure (first table), and a refused listing of the sweep refuses the pass |
+| `IMAGE_STAGING_OWNER_CHANGED` | a stage done again found that the account that owned the row's bucket when the archive was first staged (`archive_owner`) is not the account of this pass's role, or that the row records none. No S3 call is made. The row ends `failed` with this code, counts no failure and the pass answers `refused`; its delete is owed and counts as failed (see [Leaked builders and the backstop](#leaked-builders-and-the-backstop)). The next pass stages under the configured bucket |
 | `IMAGE_SCRIPT_MISSING` | the container image does not hold the shipped warm script |
 | `pass_deadline_exceeded` | the 240-second budget of a pass ran out. It is raised in `image plan` and before a decision. Elsewhere it is a `notes` entry, alone (the row waits for the next pass) or after the name of a lookup that the pass then goes without (such as `image_lookup:` or `base_image:`), or the `refused` code of the `retention` or `deletion` part |
 | `IMAGE_STATE_LOCKED` | another pass, refresh or `promote --write` holds the writer lock of the state file; an applying run also meets it when it resolves a pending journal row |

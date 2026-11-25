@@ -20,8 +20,8 @@ from pathlib import Path
 
 from .errors import StateRefusal
 
-#: Schema 2 added ``archive_bucket``, ``archive_deleted_at``, ``archive_delete_tried_at`` and ``basis_file_hashes``
-#: to ``image_builds``. A file at schema 1 is refused, not migrated: no deployment held one when schema 2 was made,
+#: Schema 2 added ``archive_bucket``, ``archive_owner``, ``archive_deleted_at``, ``archive_delete_tried_at``,
+#: ``archive_delete_seq`` and ``basis_file_hashes`` to ``image_builds``. A file at schema 1 is refused, not migrated: no deployment held one when schema 2 was made,
 #: so a pre-release file is removed by hand.
 SCHEMA_VERSION = 2
 STATE_FILE = "image-state.sqlite"
@@ -55,10 +55,12 @@ _SCHEMA_SQL = f"""
         basis_digest TEXT NOT NULL,
         source_sha TEXT NOT NULL,
         archive_bucket TEXT,
+        archive_owner TEXT,
         archive_key TEXT,
         archive_sha256 TEXT,
         archive_deleted_at REAL,
         archive_delete_tried_at REAL,
+        archive_delete_seq INTEGER,
         builder_id TEXT,
         image_id TEXT,
         template_version INTEGER,
@@ -117,6 +119,7 @@ _SCHEMA_STATEMENTS = tuple(part.strip() for part in _SCHEMA_SQL.split(";") if pa
 #: Columns ``advance_build`` may change. The identity columns stay fixed.
 _BUILD_UPDATABLE = (
     "archive_bucket",
+    "archive_owner",
     "archive_key",
     "archive_sha256",
     "archive_deleted_at",
@@ -152,12 +155,20 @@ class Build:
     #: Where the staged archive goes, written before the upload starts: a stage that is done again, and the
     #: deletion at the end of the build, use these two and never the configuration of the day.
     archive_bucket: str | None = None
+    #: The account that owned the bucket when the archive was first staged: the account of the image identity then,
+    #: written with the bucket and the key. Every S3 call about this archive names it as the bucket's expected owner,
+    #: and a pass whose identity is in another account acts on no archive of the row. ``None`` (a row of an earlier
+    #: state of this unreleased schema) is no owner: it is refused like another one.
+    archive_owner: str | None = None
     archive_key: str | None = None
     archive_sha256: str | None = None
     #: When the archive was deleted. A terminal row that names a key and has no such time still owes the deletion.
     archive_deleted_at: float | None = None
-    #: When a deletion last failed, for the turn of the owed rows (``ImageState.archives_owed``).
+    #: When a deletion last failed. For diagnosis only: the turn of the owed rows is ``archive_delete_seq``.
     archive_delete_tried_at: float | None = None
+    #: The place of the last failed deletion in the order of all of them (``mark_archive_delete_tried``): it only
+    #: grows, whatever the clock does, and orders the owed rows (``ImageState.archives_owed``).
+    archive_delete_seq: int | None = None
     builder_id: str | None = None
     image_id: str | None = None
     template_version: int | None = None
@@ -522,14 +533,15 @@ class ImageState:
         A terminal state, an ``archive_key`` and no ``archive_deleted_at``: the deletion stays owed until it
         succeeds, however many passes it takes and whatever the configuration says by then. A row that names a key
         without a bucket cannot be deleted from and is not listed: both are written together. The order is the turn:
-        rows never tried first, then the least recently tried, then oldest first, so a deletion that stays refused
-        goes behind the others.
+        rows never tried first, then by ``archive_delete_seq``, which grows with every failed attempt whatever the
+        clock does (the least recently tried first), then oldest first, so a deletion that stays refused goes behind
+        the others.
         """
         rows = self._require().execute(
             f"SELECT * FROM image_builds WHERE deployment = ? AND state NOT IN ({_ACTIVE_SQL})"
             " AND archive_key IS NOT NULL AND archive_key != '' AND archive_bucket IS NOT NULL"
             " AND archive_deleted_at IS NULL"
-            " ORDER BY archive_delete_tried_at IS NOT NULL, archive_delete_tried_at, created_at, rowid",
+            " ORDER BY archive_delete_seq IS NOT NULL, archive_delete_seq, created_at, rowid",
             (deployment,),
         )
         return [_build(row) for row in rows]
@@ -708,9 +720,17 @@ class ImageState:
         return self.build(build_id)
 
     def mark_archive_delete_tried(self, build_id, tried_at):
-        """Record the time of a deletion attempt that failed, and change nothing else (``updated_at`` stays)."""
+        """Record a deletion attempt that failed, and change nothing else (``updated_at`` stays).
+
+        The attempt takes the next place in ``archive_delete_seq``: one more than the largest place of any row, set
+        by the one statement that records the time. The order of the owed rows follows it, so a clock that moves
+        back, or a time that is wrong, does not change the turn. ``tried_at`` is for diagnosis.
+        """
         cursor = self._require().execute(
-            "UPDATE image_builds SET archive_delete_tried_at = ? WHERE id = ?", (tried_at, build_id)
+            "UPDATE image_builds SET archive_delete_tried_at = ?,"
+            " archive_delete_seq = (SELECT COALESCE(MAX(archive_delete_seq), 0) + 1 FROM image_builds)"
+            " WHERE id = ?",
+            (tried_at, build_id),
         )
         if cursor.rowcount != 1:
             raise StateRefusal("IMAGE_BUILD_UNKNOWN", build_id)

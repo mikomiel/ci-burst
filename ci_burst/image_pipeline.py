@@ -80,8 +80,12 @@ refusal: none starts once the pass deadline is less than ``OWED_DELETE_RESERVE_S
 away. A backlog of slow refused deletions cannot take the time that a stage, a decision
 or a build needs. If passes never leave that time, the bucket lifecycle rule stays the
 backstop. A refused
-one records the attempt time (``archive_delete_tried_at``) and goes behind the
-rows not yet tried, so it cannot keep a newer row from its turn. Rows that the
+one takes the next place in ``archive_delete_seq`` (and records its time, for diagnosis) and goes behind the
+rows not yet tried and the rows tried before it, so it cannot keep another row from its turn, whatever the
+clock does. The row also records the account that owned its bucket when it was first staged (``archive_owner``).
+Every S3 call about the archive names it, and no call is made about the archive of a row whose owner is not the
+account of this session, or is unknown: a stage done again is refused (``IMAGE_STAGING_OWNER_CHANGED``) and a
+delete counts as failed and stays owed. Rows that the
 bound left are noted ``archive:delete_deferred``.
 
 The gate requirement (``IMAGE_GATE_REQUIRED``: neither a gate command nor the
@@ -192,12 +196,19 @@ IMAGE_CREDENTIAL_SHORT = "IMAGE_CREDENTIAL_SHORT"
 #: Nothing was launched, so it is no failure. ``_restage`` raises it as it raises ``IMAGE_BUILD_TEMPLATE_UNSAFE``, so
 #: ``START_REFUSALS``, the filter of the checks of a start, does not hold it.
 IMAGE_INPUTS_CHANGED = "IMAGE_INPUTS_CHANGED"
+#: The row records the account that owned its bucket (``archive_owner``), and this pass runs in another one, or the
+#: row records none. No S3 call is made about the archive of such a row. A stage done again is refused like
+#: ``IMAGE_STAGING_BUCKET_DENIED``; a delete counts as failed and stays owed.
+IMAGE_STAGING_OWNER_CHANGED = "IMAGE_STAGING_OWNER_CHANGED"
 
 #: The refusals that end a start without a failed build. Both are checked before anything is staged and again
 #: once the archive is up, because either can change in between. Neither counts toward the cooldown or the block.
 #: ``IMAGE_GATE_REQUIRED`` refuses a launch too, and counts no failure either, but a pass never changes its own
 #: configuration: ``_start_refusal`` returns it once, first, and this filter does not hold it.
 START_REFUSALS = (IMAGE_CREDENTIAL_SHORT, IMAGE_BUILD_ALREADY_ACTIVE)
+
+#: The refusals of a staging bucket that end a stage done again as a refused start (``_stage``).
+STAGING_BUCKET_REFUSALS = (IMAGE_STAGING_BUCKET_DENIED, IMAGE_STAGING_OWNER_CHANGED)
 
 #: Tag keys that ``CreateImage`` adds to the ones the adapter sets. The build
 #: policy (``deploy/iam/image-build-policy.json``) allows exactly these keys, and
@@ -1112,8 +1123,8 @@ class _Pass:
         #: True once the owed deletions ran: the cleanup-only pass runs them inside its own work.
         self.owed_done = False
         #: The ids of the rows whose archive delete this pass has attempted, whatever the outcome: the end of a build
-        #: records its own, and ``_delete_owed`` skips them. The persisted ``archive_delete_tried_at`` only orders
-        #: the rows (``ImageState.archives_owed``).
+        #: records its own, and ``_delete_owed`` skips them. The persisted ``archive_delete_seq`` orders the
+        #: rows (``ImageState.archives_owed``).
         self.delete_attempted = set()
 
     def run(self):
@@ -1556,7 +1567,7 @@ class _Pass:
             self.hold = True
             return self.s.build(build.id)
         except Refusal as refusal:
-            if refusal.reason in START_REFUSALS or (restage and refusal.reason == IMAGE_STAGING_BUCKET_DENIED):
+            if refusal.reason in START_REFUSALS or (restage and refusal.reason in STAGING_BUCKET_REFUSALS):
                 return self._end_refused(build, refusal.reason)
             # Nothing was launched: a launch whose outcome is unknown is handled inside ``_stage_and_launch`` and
             # does not come here.
@@ -1640,14 +1651,18 @@ class _Pass:
     def _stage_and_launch(self, build):
         s, aws, cfg = self.s, self.aws, self.cfg
         if not (build.archive_key and build.archive_bucket):
-            # The first stage of the row. The bucket and the key go into the row before the upload starts, so that a
-            # pass that stops anywhere after it leaves an object that the row names. A stage that is done again finds
-            # them in the row and uses them, whatever the configuration says by then.
+            # The first stage of the row. The bucket, the key and the account that owns the bucket (the account of
+            # this identity) go into the row before the upload starts, so that a pass that stops anywhere after it
+            # leaves an object that the row names. A stage that is done again finds them in the row and uses them,
+            # whatever the configuration says by then.
             build = s.advance_build(
                 build.id,
                 archive_bucket=cfg.storage.bucket,
+                archive_owner=aws.account_id(),
                 archive_key=f"{_archive_prefix(cfg.storage.prefix)}{build.id}.tar.gz",
             )
+        else:
+            self._check_archive_owner(build)
         chunks = self._source().archive(build.source_sha, cfg.source.max_archive_bytes, deadline=self.deadline)
         try:
             upload = aws.put_archive(
@@ -1656,6 +1671,7 @@ class _Pass:
                 chunks,
                 max_bytes=cfg.source.max_archive_bytes,
                 deadline=self.deadline,
+                owner=build.archive_owner,
             )
         finally:
             close = getattr(chunks, "close", None)
@@ -1690,6 +1706,17 @@ class _Pass:
             deadline_at=build.deadline_at,
         )
         return build
+
+    def _check_archive_owner(self, build):
+        """Refuse with ``IMAGE_STAGING_OWNER_CHANGED`` unless the row's owner is the account of this session.
+
+        The recorded bucket name may exist in the account that this identity is in now, and it is not the bucket
+        that the row staged to. A row with no recorded owner is refused too. The detail holds no account number.
+        """
+        if build.archive_owner != self.aws.account_id():
+            raise ProviderRefusal(
+                IMAGE_STAGING_OWNER_CHANGED, "the account of the archive's bucket is not the account of this session"
+            )
 
     def _launch(self, build, upload):
         """Presign, render, check the tags and launch. The URL and the user data live only here.
@@ -2032,10 +2059,14 @@ class _Pass:
         # Before the call: an attempt that ends in an error that is no refusal is an attempt too.
         self.delete_attempted.add(build.id)
         try:
-            self.aws.delete_object(build.archive_bucket, build.archive_key)
-        except ProviderRefusal:
+            # No call is made about the archive of a row that another account owns, or that records no owner.
+            self._check_archive_owner(build)
+            self.aws.delete_object(build.archive_bucket, build.archive_key, owner=build.archive_owner)
+        except ProviderRefusal as refusal:
             self.s.mark_archive_delete_tried(build.id, self.clock())
             self._note("archive:delete_failed")
+            if refusal.reason == IMAGE_STAGING_OWNER_CHANGED:
+                self._note("archive:owner_changed")
             return False
         self.s.mark_archive_deleted(build.id, self.clock())
         return True

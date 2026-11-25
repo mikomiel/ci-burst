@@ -225,8 +225,9 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 
 #### Scenario: A refused deletion takes its turn
 - **WHEN** an owed deletion is refused
-- **THEN** the row records the attempt time (`archive_delete_tried_at`) and the next pass tries the rows never tried first, then the least recently tried, then the oldest
-- **AND** a deletion that stays refused does not keep a newer owed row from being deleted
+- **THEN** the row takes the next place in `archive_delete_seq`, one more than the largest place of any row, and records the attempt time (`archive_delete_tried_at`) for diagnosis only
+- **AND** the next pass tries the rows never tried first, then the rows by `archive_delete_seq`, then the oldest
+- **AND** a deletion that stays refused does not keep another owed row from being deleted, and a clock that steps back changes none of this
 
 #### Scenario: A cancellation starts no deletion
 - **WHEN** a pass is cancelled (a `BaseException` that is no `Exception`, such as `KeyboardInterrupt`) while an archive deletion is owed
@@ -246,9 +247,16 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 - **WHEN** a part upload fails
 - **THEN** the upload is aborted and no builder is launched
 
+#### Scenario: The role moves to another account
+- **WHEN** a pass runs in an account other than the `archive_owner` of a row, or the row records no owner, and a bucket of the recorded name exists in the new account
+- **THEN** no S3 call is made about the archive of that row
+- **AND** a stage done again ends the row `failed` with `IMAGE_STAGING_OWNER_CHANGED`, counts no failure and answers `refused`
+- **AND** an owed deletion counts as failed, the row stays owed and is never marked deleted
+
 #### Scenario: A staging call is bound to the account that owns the bucket
 - **WHEN** a pass makes an S3 call against a staging bucket: the upload, its abort, a delete or a listing
 - **THEN** the call names the account of the image identity as the expected bucket owner, read once per pass from `GetCallerIdentity`, and no call goes out without it
+- **AND** the row records that account as `archive_owner` with the bucket and the key, and a stage done again and every delete of the archive name the recorded owner
 - **AND** an `AccessDenied` answer sends nothing more and gives `IMAGE_STAGING_BUCKET_DENIED`: a stage done again ends its row as a refused start with no failure counted, a first stage fails the build, and a refused delete counts as failed and stays owed
 
 #### Scenario: The build ends
@@ -973,6 +981,10 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **WHEN** `[image].state_directory` (compared as written, without following a link) or `deployment` changes between the start of `promote` (with or without `--write`, `--rollback` included) and a read of the file it plans or writes from, the read under the locks of `--write` included
 - **THEN** the command refuses with `PROMOTE_STATE_CHANGED` and names no path
 - **AND** it changes no row, event, deployment file, state file or rollback journal of either state, and creates nothing in the state the file names now; only its own lock files may be created
+
+#### Scenario: A concurrent change during a command is outside the operator contract
+- **WHEN** an operator edits a non-pin setting of the deployment file, replaces or re-links the file or its `--config` path, swaps a bind mount, or moves, restores or replaces the image state directory while `image run`, `image promote` or `image status --refresh` runs
+- **THEN** the change is outside the operator contract, and the product makes no promise about it beyond the refusals that this specification already requires (this requirement names `PROMOTE_FILE_CHANGED`, `PROMOTE_FILE_STALE` and `PROMOTE_STATE_CHANGED`)
 
 ### Requirement: Promotion runs in an isolated operator container
 `promote` MUST run only as an operator-invoked one-off. The shipped documentation MUST give a container line that has no network, no AWS credential directory and no forge token. `promote --write` MUST refuse with `PROMOTE_DIRECTORY_NOT_DEDICATED` when the directory of the TOML holds anything other than the TOML, its `.bak.*` files, its lock file and its promote temporary file. A test MUST assert that `promote` constructs no AWS client.

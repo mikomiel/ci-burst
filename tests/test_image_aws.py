@@ -1820,6 +1820,114 @@ class StagingOwnerTests(Base):
         self.assertNotEqual(raised.exception.reason, "IMAGE_STAGING_BUCKET_DENIED")
 
 
+class SlowSts(FakeSts):
+    """``GetCallerIdentity`` that answers after ``seconds`` of the test clock, as a slow STS does."""
+
+    def __init__(self, calls, clock, seconds, account=ACCOUNT):
+        super().__init__(calls, account=account)
+        self.clock = clock
+        self.seconds = seconds
+
+    def get_caller_identity(self):
+        response = super().get_caller_identity()
+        self.clock.advance(self.seconds)
+        return response
+
+
+class StagingDeadlineTests(Base):
+    """An S3 call that has a deadline is not sent at or after it, whatever the lookup of the bucket's owner took.
+
+    The first S3 call of an adapter asks STS for the account that it names as the bucket's owner, and that answer
+    takes time of its own. The deadline is read before the lookup, so none starts late, and once the owner is known,
+    right before the request.
+    """
+
+    KEY = PREFIX + "build-0001.tar.gz"
+    LEFT = 5
+
+    def uncached(self, lookup_seconds):
+        """An adapter that is handed no account: its first S3 call pays ``lookup_seconds`` of the clock for it."""
+        sts = SlowSts(self.calls, self.clock, lookup_seconds)
+        return self.image_aws(account=None, clients={"ec2": self.ec2, "s3": self.s3, "sts": sts})
+
+    def again(self):
+        """Forget the calls of an earlier case of a test and put the clock back."""
+        self.calls.clear()
+        self.clock.now = NOW
+
+    def test_a_listing_whose_account_lookup_ends_at_or_after_the_deadline_is_not_sent(self):
+        self.s3.pages = [{"Contents": [{"Key": self.KEY, "Size": 1}]}]
+        for seconds in (self.LEFT, 30):
+            with self.subTest(lookup_seconds=seconds):
+                self.again()
+                deadline = self.clock() + self.LEFT
+                with self.assertRaises(DeadlineRefusal) as raised:
+                    self.uncached(seconds).list_objects(BUCKET, PREFIX, deadline=deadline)
+                # Still the deadline refusal, not a provider failure that the call translated it into.
+                refusal = raised.exception
+                self.assertEqual((refusal.reason, refusal.detail), ("pass_deadline_exceeded", "ListObjectsV2 page"))
+                # The premise: the lookup started with time left, and ended at or after the deadline.
+                self.assertGreaterEqual(self.clock(), deadline)
+                self.assertEqual(self.names(), ["get_caller_identity"])
+
+    def test_a_listing_whose_account_lookup_ends_before_the_deadline_is_sent(self):
+        # The same listing with a quicker lookup, so the refusals above are the deadline's and not the fake's.
+        self.s3.pages = [{"Contents": [{"Key": self.KEY, "Size": 1}]}]
+        deadline = self.clock() + self.LEFT
+        found = self.uncached(self.LEFT - 1).list_objects(BUCKET, PREFIX, deadline=deadline)
+        self.assertEqual([item.key for item in found], [self.KEY])
+        self.assertLess(self.clock(), deadline)
+        self.assertEqual(self.names(), ["get_caller_identity", "list_objects_v2"])
+
+    def test_an_upload_whose_account_lookup_ends_at_or_after_the_deadline_opens_no_upload(self):
+        for seconds in (self.LEFT, 30):
+            with self.subTest(lookup_seconds=seconds):
+                self.again()
+                deadline = self.clock() + self.LEFT
+                aws = self.uncached(seconds)
+                with self.assertRaises(DeadlineRefusal) as raised:
+                    aws.put_archive(BUCKET, self.KEY, [b"x" * 5], max_bytes=100, part_bytes=10, deadline=deadline)
+                self.assertEqual(raised.exception.detail, "archive upload")
+                self.assertGreaterEqual(self.clock(), deadline)
+                # No upload was opened, so there is nothing to abort or to delete either.
+                self.assertEqual(self.names(), ["get_caller_identity"])
+                self.assertEqual(self.s3.uploaded, [])
+
+    def test_an_upload_whose_account_lookup_ends_before_the_deadline_goes_up(self):
+        deadline = self.clock() + self.LEFT
+        result = self.uncached(self.LEFT - 1).put_archive(
+            BUCKET, self.KEY, [b"x" * 5], max_bytes=100, part_bytes=10, deadline=deadline
+        )
+        self.assertEqual(result.size, 5)
+        self.assertLess(self.clock(), deadline)
+        self.assertEqual(
+            self.names(),
+            ["get_caller_identity", "create_multipart_upload", "upload_part", "complete_multipart_upload"],
+        )
+
+    def test_a_deadline_that_has_passed_asks_for_no_account_at_all(self):
+        # The early read stays: a lookup is a provider call too, and none starts at or after the deadline.
+        self.s3.pages = [{"Contents": []}]
+        operations = {
+            "list_objects": lambda aws, deadline: aws.list_objects(BUCKET, PREFIX, deadline=deadline),
+            "put_archive": lambda aws, deadline: aws.put_archive(
+                BUCKET, self.KEY, [b"x"], max_bytes=100, deadline=deadline
+            ),
+        }
+        for name, operation in operations.items():
+            with self.subTest(operation=name):
+                self.again()
+                with self.assertRaises(DeadlineRefusal):
+                    operation(self.uncached(30), self.clock())
+                self.assertEqual(self.names(), [])
+
+    def test_a_call_with_no_deadline_is_not_bounded_by_the_clock(self):
+        self.s3.pages = [{"Contents": []}]
+        aws = self.uncached(10_000)
+        aws.list_objects(BUCKET, PREFIX)
+        self.assertEqual(self.names(), ["get_caller_identity", "list_objects_v2"])
+
+
 class PresignTests(Base):
     KEY = PREFIX + "build-0001.tar.gz"
 

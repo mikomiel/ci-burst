@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import sqlite3
 import tempfile
@@ -234,6 +235,36 @@ class ArchiveRecordTests(ImageStateCase):
                 self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
                 self.assertIn("build-1", raised.exception.detail)
                 self.assertNotIn(sentinel, raised.exception.detail)
+
+    def test_a_stored_value_nested_past_the_decoder_is_refused_by_row_and_never_echoed(self):
+        # ``json.loads`` raises ``RecursionError``, which is no ``ValueError``, for a document nested deeper than the
+        # decoder allows, and a hand-edited or damaged file can hold one. The depth is far past the limit of any
+        # interpreter, which differs by version.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        sentinel = "sentinel-value"
+        depth = 100_000
+        inner = '"' + sentinel + '"'
+        for label, stored in (
+            ("arrays", "[" * depth + inner + "]" * depth),
+            ("objects", '{"a":' * depth + inner + "}" * depth),
+            ("a hash that holds a nested value", '{"a.lock": ' + "[" * depth + inner + "]" * depth + "}"),
+        ):
+            with self.subTest(label):
+                # The premise: the decoder gives up on this value with the error that the refusal must catch.
+                with self.assertRaises(RecursionError):
+                    json.loads(stored)
+                connection = sqlite3.connect(self.state.path)
+                try:
+                    connection.execute("UPDATE image_builds SET basis_file_hashes = ? WHERE id = 'build-1'", (stored,))
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(StateRefusal) as raised:
+                    build_file_hashes(self.state.build("build-1"))
+                self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+                self.assertIn("build-1", raised.exception.detail)
+                self.assertNotIn(sentinel, raised.exception.detail)
+                self.assertNotIn(sentinel, repr(raised.exception.as_dict()))
 
     def test_an_archive_is_owed_by_a_finished_build_that_names_one_and_has_no_deletion_time(self):
         self.add_build("build-1", basis_file_hashes=GOOD_HASHES)

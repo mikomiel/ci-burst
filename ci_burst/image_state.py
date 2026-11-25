@@ -1039,6 +1039,9 @@ def build_file_hashes(build):
     A row that was inserted for a build always has them. A hand-edited or damaged file can hold anything in the
     column, so the text is parsed and checked for the shape that ``insert_build`` writes. The refusal names the
     row, never the value.
+
+    The decoder raises a ``ValueError`` for a JSON error, and a ``RecursionError`` (which is no ``ValueError``) for a
+    value nested deeper than it allows. Both give this refusal, and neither brings the value with it.
     """
     refusal = StateRefusal("IMAGE_STATE_UNREADABLE", f"build row {build.id} holds no valid basis_file_hashes")
     text = build.basis_file_hashes
@@ -1047,6 +1050,6 @@ def build_file_hashes(build):
     try:
         hashes = json.loads(text)
         _check_file_hashes(hashes)
-    except ValueError:  # a JSON error is a ValueError too
+    except (ValueError, RecursionError):
         raise refusal from None
     return hashes

@@ -826,15 +826,22 @@ class ImageAws:
             raise ProviderRefusal("AWS_ACCOUNT_UNKNOWN", "the bucket owner is no account number")
         return owner
 
-    def _invoke(self, service, method, *, read=False, absent=None, owner=None, **arguments):
+    def _invoke(self, service, method, *, read=False, absent=None, owner=None, deadline=None, detail="", **arguments):
         """Call the provider. ``absent`` is an error code that means "not there".
 
         An S3 call carries ``owner`` (see ``_bound_owner``) as the bucket's owner, and it is refused here, before
         any call, when there is none. ``AccessDenied`` from S3 leaves as ``IMAGE_STAGING_BUCKET_DENIED``.
+
+        With a ``deadline`` the clock is read once more after the owner is known and the client is built, right
+        before the request: the first owner check of an adapter asks STS for the account, and a call that waited
+        for the answer can be at or after the deadline. The request is then not sent (``DeadlineRefusal`` with
+        ``detail``).
         """
         if service == "s3":
             arguments["ExpectedBucketOwner"] = self._bound_owner(owner)
         client = self._client(service)
+        # Outside the ``try`` below, which would translate the refusal into a provider failure.
+        self._check_deadline(deadline, detail)
         try:
             return getattr(client, method)(**arguments)
         except Exception as error:  # noqa: BLE001 - classified below
@@ -853,7 +860,9 @@ class ImageAws:
     def _pages(self, service, method, request_token, response_token, deadline, detail, absent=None, **arguments):
         """Yield every response page, refusing when the listing would be partial.
 
-        An ``absent`` error code ends the listing as empty.
+        An ``absent`` error code ends the listing as empty. With a ``deadline`` no page is requested at or after it:
+        the clock is read before each page, so that no owner lookup starts late, and again once the owner is known,
+        right before the request (``_invoke``).
         """
         token, pages = None, 0
         while True:
@@ -861,7 +870,7 @@ class ImageAws:
             page = dict(arguments)
             if token:
                 page[request_token] = token
-            response = self._invoke(service, method, read=True, absent=absent, **page)
+            response = self._invoke(service, method, read=True, absent=absent, deadline=deadline, detail=detail, **page)
             if response is None:
                 return
             if not isinstance(response, Mapping):
@@ -1119,14 +1128,23 @@ class ImageAws:
         iterator raises leaves here as a new one with the same reason code and a
         fixed detail, of the same class where the class can be rebuilt from its
         reason, detail and uncertainty (see ``_rebuilt_refusal``). ``deadline`` is
-        checked before the upload opens, before each chunk and each part, and
+        checked before the upload opens, again right before the call that opens it (with no ``owner``, the lookup of
+        the account comes between the two and takes time), before each chunk and each part, and
         immediately before completion, so a stalled stream or a slow last part
-        ends the upload instead of finishing it.
+        ends the upload instead of finishing it. A deadline that ends before the opening call leaves no upload to
+        clean up.
         """
         self._check_deadline(deadline, "archive upload")
         owner = self._bound_owner(owner)
         started = self._invoke(
-            "s3", "create_multipart_upload", owner=owner, absent=_S3_MISSING_CODE, Bucket=bucket, Key=key
+            "s3",
+            "create_multipart_upload",
+            owner=owner,
+            absent=_S3_MISSING_CODE,
+            deadline=deadline,
+            detail="archive upload",
+            Bucket=bucket,
+            Key=key,
         )
         if started is None:
             # ``absent`` made the answer ``NoSuchBucket`` no response: no upload exists, so nothing needs cleaning up.

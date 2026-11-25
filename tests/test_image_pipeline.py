@@ -3848,6 +3848,28 @@ class ArchiveOwedTests(PipelineCase):
         self.assertEqual(new.archive_bucket, other_bucket)
         self.assertIsNone(rows[first.id].archive_deleted_at)
 
+    def test_the_delete_that_ends_a_restage_into_a_removed_bucket_counts_only_when_a_later_pass_retries_it(self):
+        first = self.unstaged_with_an_archive()
+        self.removed_bucket(BUCKET)
+        other_bucket = "example-other-staging"
+        self.configure(render_toml(prefix=self.OTHER_PREFIX).replace(BUCKET, other_bucket))
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_STAGING_BUCKET_MISSING"), result)
+        # The delete as the row ended was tried and refused: it is noted and the row stays owed. The owed deletions at
+        # the end of the pass skip a row that the pass attempted, so the pass adds nothing to the failed count.
+        self.assertIn("archive:delete_failed", result["notes"])
+        attempts = [call for call in self.world.arguments("delete_object") if call["Key"] == first.archive_key]
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(result["reconcile"]["owed_archive_delete_failed"], 0)
+        self.assertEqual(self.query(lambda state: [row.id for row in state.archives_owed(DEPLOYMENT)]), [first.id])
+        # A later pass retries it with the other owed deletions, and that refusal is counted.
+        self.clock.advance(DAY)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["reconcile"]["owed_archive_delete_failed"], 1, result)
+        attempts = [call for call in self.world.arguments("delete_object") if call["Key"] == first.archive_key]
+        self.assertEqual(len(attempts), 2)
+
     def test_a_new_row_whose_bucket_does_not_exist_is_a_failed_build_that_counts(self):
         self.world.fail("create_multipart_upload", ProviderError("NoSuchBucket"))
         result = self.apply()
@@ -4159,6 +4181,57 @@ class OwedArchiveBoundTests(PipelineCase):
         self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1, result)
         self.assertNotIn("archive:delete_deferred", result["notes"])
         self.assertNotIn(key, self.world.objects)
+
+    def a_stray_object_and_a_first_read_that_leaves_5_seconds(self, lookup_seconds):
+        """A stray archive older than an hour, and a pass whose first read of reconcile leaves 5 seconds of it.
+
+        The adapter is handed no account, so the stray listing that follows is the first use of it: it asks STS, and
+        the answer takes ``lookup_seconds``. Returns the stray key, the pass deadline and the clock readings at which
+        STS was asked (a hook sees the reading before the answer takes its time).
+        """
+        stray = f"{PREFIX}stray.tar.gz"
+        self.world.objects[stray] = (b"stray", NOW - 2 * HOUR)
+        self.uncached_account(lookup_seconds)
+        deadline = self.clock() + PASS_DEADLINE_SECONDS
+        spent, asked = [], []
+
+        def read_for_most_of_the_pass(arguments):
+            if not spent:
+                spent.append(True)
+                self.clock.advance(PASS_DEADLINE_SECONDS - 5)
+
+        self.world.hooks["describe_instances"] = read_for_most_of_the_pass
+        self.world.hooks["get_caller_identity"] = lambda arguments: asked.append(self.clock())
+        return stray, deadline, asked
+
+    def test_a_stray_listing_whose_account_lookup_ends_after_the_pass_deadline_is_not_sent_and_sweeps_nothing(self):
+        stray, deadline, asked = self.a_stray_object_and_a_first_read_that_leaves_5_seconds(READ_TIMEOUT_SECONDS)
+        refusal = self.refused(self.apply, "pass_deadline_exceeded")
+        # The refusal is the listing's, not that of a later read of the pass.
+        self.assertEqual(refusal.detail, "ListObjectsV2 page")
+        # The premise: the lookup started inside the pass and ended at or after its deadline.
+        (asked_at,) = asked
+        self.assertLess(asked_at, deadline)
+        self.assertGreaterEqual(self.clock(), deadline)
+        # So the listing was never sent, and no delete followed it: the stray object is still there.
+        self.assertEqual(len(self.world.arguments("get_caller_identity")), 1)
+        self.assertEqual(self.world.arguments("list_objects_v2"), [])
+        self.assertEqual(self.world.arguments("delete_object"), [])
+        self.assertEqual(self.world.objects[stray][0], b"stray")
+        # Nothing after the listing ran: no image read, no build.
+        self.assertNotIn("describe_images", self.world.names())
+        self.assertEqual(self.builds(), [])
+
+    def test_a_stray_listing_whose_account_lookup_ends_before_the_pass_deadline_is_sent_and_sweeps(self):
+        # The same pass with a lookup of 4 of the 5 seconds, so the refusal above is the deadline's.
+        stray, deadline, asked = self.a_stray_object_and_a_first_read_that_leaves_5_seconds(4)
+        result = self.apply()
+        (asked_at,) = asked
+        self.assertLess(asked_at + 4, deadline)
+        self.assertEqual(len(self.world.arguments("list_objects_v2")), 1)
+        self.assertEqual([call["Key"] for call in self.world.arguments("delete_object")], [stray])
+        self.assertNotIn(stray, self.world.objects)
+        self.assertEqual(result["reconcile"]["archives_deleted"], 1)
 
     def test_an_active_build_advances_in_a_pass_that_meets_a_slow_refused_backlog(self):
         self.owe(12, stuck=range(12))

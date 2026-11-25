@@ -18,7 +18,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, fields as dataclass_fields
 from pathlib import Path
 
-from .errors import StateRefusal
+from .config import _image_basis_paths
+from .errors import ConfigRefusal, StateRefusal
 
 #: Schema 2 added ``archive_bucket``, ``archive_owner``, ``archive_deleted_at``, ``archive_delete_tried_at``,
 #: ``archive_delete_seq`` and ``basis_file_hashes`` to ``image_builds``. A file at schema 1 is refused, not migrated: no deployment held one when schema 2 was made,
@@ -477,7 +478,9 @@ class ImageState:
 
         ``basis_file_hashes`` maps each basis path to the hex sha256 of the file's content, as ``image.file_hashes``
         gives it. It is stored once, as sorted JSON, and never changes: a stage that is done again recomputes the
-        digest from it and reads no file. A row that no build made (an orphan, a pin record) has none.
+        digest from it and reads no file. A row that no build made (an orphan, a pin record) has none. A map that
+        ``build_file_hashes`` would refuse is refused here (``ValueError``) and nothing is written, so a map that is
+        stored is a map that reads back.
         """
         _check_columns(fields, _BUILD_UPDATABLE)
         if basis_file_hashes is not None:
@@ -1052,11 +1055,42 @@ def _build(row):
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
+def _decode_file_hashes(text):
+    """Decode the JSON text of a hash map, and refuse (``ValueError``) a name that two members share.
+
+    ``json.loads`` keeps the last of the members that share a name, so a map that names a path twice would read as
+    the one it ends with, and a first value that is no hash would never be seen. The names are compared as decoded,
+    so a name that a JSON escape spells another way is the same name.
+    """
+
+    def one_member_per_name(members):
+        names = [name for name, _ in members]
+        if len(set(names)) != len(names):
+            raise ValueError("a member name occurs twice")
+        return dict(members)
+
+    return json.loads(text, object_pairs_hook=one_member_per_name)
+
+
 def _check_file_hashes(hashes):
-    """Refuse (``ValueError``) anything but a non-empty ``path -> 64 lower-case hex`` mapping."""
-    ok = isinstance(hashes, dict) and bool(hashes)
-    ok = ok and all(isinstance(path, str) and path for path in hashes)
+    """Refuse (``ValueError``) anything but a ``path -> 64 lower-case hex`` mapping of paths that can be basis paths.
+
+    The configuration is the only source of a basis path, so the paths are checked by the rules that it applies to
+    ``image.source.basis_paths`` (``_image_basis_paths``): a non-empty list of non-empty paths with no control
+    character, no ``..`` and no leading ``/``, and no more of them than it takes. A path that it would refuse was
+    never the input of a build. Nor was a path that is no text in UTF-8, a lone surrogate: its file is TOML, which
+    cannot spell one, and the rules do not name it. ``str.encode`` raises an error that names the character, so it is
+    caught here, and the error that leaves holds no path.
+    """
+    ok = isinstance(hashes, dict)
     ok = ok and all(isinstance(value, str) and _SHA256_HEX.fullmatch(value) for value in hashes.values())
+    if ok:
+        try:
+            _image_basis_paths({"basis_paths": list(hashes)}, "basis_file_hashes", required=True)
+            for path in hashes:
+                path.encode("utf-8")
+        except (ConfigRefusal, UnicodeEncodeError):
+            ok = False
     if not ok:
         raise ValueError("basis_file_hashes must map each basis path to a lower-case hex sha256")
 
@@ -1066,8 +1100,9 @@ def build_file_hashes(build):
 
     A row that was inserted for a build always has them. A hand-edited or damaged file can hold anything in the
     column (text that is no UTF-8 and a value that is no text included, which every reader hands over as ``None``),
-    so the text is parsed and checked for the shape that ``insert_build`` writes. The refusal names the row, never
-    the value.
+    so the text is parsed and checked for the shape that ``insert_build`` writes: each path named once, and each path
+    one that the configuration could hold. A path that it could never hold is damage. It must not read as a change
+    of the inputs, which ends the build and deletes its archive. The refusal names the row, never the value.
 
     The decoder raises a ``ValueError`` for a JSON error, and a ``RecursionError`` (which is no ``ValueError``) for a
     value nested deeper than it allows. Both give this refusal, and neither brings the value with it.
@@ -1077,7 +1112,7 @@ def build_file_hashes(build):
     if type(text) is not str:
         raise refusal
     try:
-        hashes = json.loads(text)
+        hashes = _decode_file_hashes(text)
         _check_file_hashes(hashes)
     except (ValueError, RecursionError):
         raise refusal from None

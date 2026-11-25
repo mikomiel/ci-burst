@@ -1591,15 +1591,14 @@ class _Pass:
         removed, and the next pass inserts a row for the configured one. For a new row it is a failed build and
         counts, so that a configured bucket that is refused or missing ends in the cooldown and the block instead
         of in one row per pass.
+
+        The pass deadline ends the stage without ending the build, unless the build deadline has passed too
+        (``_settle_a_cut_stage``).
         """
         try:
             return self._stage_and_launch(build)
         except DeadlineRefusal:
-            # The pass ran out of time, not the build. The row stays ``building`` with no builder and no staged
-            # archive, and the next pass stages it again (``_restage``).
-            self.notes.append("pass_deadline_exceeded")
-            self.hold = True
-            return self.s.build(build.id)
+            return self._settle_a_cut_stage(build)
         except Refusal as refusal:
             if refusal.reason in START_REFUSALS or (restage and refusal.reason in STAGING_BUCKET_REFUSALS):
                 return self._end_refused(build, refusal.reason)
@@ -1607,14 +1606,30 @@ class _Pass:
             # does not come here.
             return self._fail(build, refusal.reason, builder_alive=False)
 
+    def _settle_a_cut_stage(self, build):
+        """Settle a build whose stage the pass deadline cut before a builder was launched.
+
+        The cut can fall anywhere: in the checks that come before the upload, in the upload stream, or in the last
+        read before the launch call. The row stays ``building`` with no builder and no staged archive, and the next
+        pass stages it again (``_restage``). A build that is out of time ends here instead, in the pass that sees it,
+        as ``_restage`` ends it on entry: ``CONSOLE_BLIND``, and ``_fail`` deletes the archive that the row names. The
+        pass deadline never decides before the build deadline.
+        """
+        if self.clock() >= build.deadline_at:
+            return self._fail(build, image_console.CONSOLE_BLIND, builder_alive=False)
+        self.notes.append("pass_deadline_exceeded")
+        self.hold = True
+        return self.s.build(build.id)
+
     def _restage(self, build):
         """Stage again a build that has no builder and no staged archive, because the pass deadline ended its stage.
 
         The key and the bucket are the recorded ones (``_stage_and_launch``), so the new archive replaces whatever the
         earlier stage left, even when the configured prefix or bucket has changed since. The build deadline still
         bounds the build: past it the build fails with the code of a console that never showed anything, and
-        ``_fail`` deletes the archive the row names. The deadline is checked here on entry and again in ``_launch``,
-        right before the provider call, because the upload and the reads in between take time.
+        ``_fail`` deletes the archive the row names. The deadline is checked here on entry, again in ``_launch``,
+        before the last listing and right before the provider call, and wherever the pass deadline cuts the stage
+        (``_settle_a_cut_stage``), because the checks, the upload and the reads in between take time.
 
         The inputs are checked first: the hashes of the basis files that the row recorded when it was inserted, the
         warm settings and the script, as this pass reads them, must give the digest that the row was inserted under,
@@ -1625,8 +1640,9 @@ class _Pass:
 
         The template check of a start runs again, because the template and the rules of its groups can change
         between two passes. An unsafe template ends the row the same way, with its own code. The pass deadline inside
-        that check leaves the row as it is for the next pass; any other refusal of a read is raised and leaves it
-        too.
+        that check, or inside the start checks that run last, leaves the row as it is for the next pass, or ends it
+        when the build deadline has passed by then (``_settle_a_cut_stage``); any other refusal of a read is raised
+        and leaves it too.
 
         The gate requirement runs between the two, before the template is read. The file can lose its gate command
         and the opt-out while the row waits, and the digest does not hold the opt-out: a row inserted under it gives
@@ -1643,12 +1659,13 @@ class _Pass:
                 raise ImageRefusal(IMAGE_GATE_REQUIRED)
             self.p._check_build_template(self.aws, self.deadline)
         except DeadlineRefusal:
-            self.notes.append("pass_deadline_exceeded")
-            self.hold = True
-            return self.s.build(build.id)
+            return self._settle_a_cut_stage(build)
         except ImageRefusal as refusal:
             return self._end_refused(build, refusal.reason)
-        reason = self._start_refusal()
+        try:
+            reason = self._start_refusal()
+        except DeadlineRefusal:
+            return self._settle_a_cut_stage(build)
         if reason is not None:
             return self._end_refused(build, reason)
         return self._stage(build, restage=True)
@@ -1722,7 +1739,8 @@ class _Pass:
             instance_id = self._launch(build, upload)
         except DeadlineRefusal:
             # The pass ran out of time before the launch call, so no builder was launched: the row goes back to
-            # "not staged" and the next pass stages again. The key stays, so the end of the build deletes the object.
+            # "not staged" and the next pass stages again (``_stage`` ends it instead when the build is out of time
+            # too). The key stays, so the end of the build deletes the object.
             s.advance_build(build.id, archive_sha256=None)
             raise
         if instance_id is None:
@@ -1752,6 +1770,14 @@ class _Pass:
                 IMAGE_STAGING_OWNER_CHANGED, "the account of the archive's bucket is not the account of this session"
             )
 
+    def _refuse_past_the_build_deadline(self, build):
+        """Refuse with ``CONSOLE_BLIND`` at or after the build deadline.
+
+        ``_stage`` ends the build with this code, and ``_fail`` deletes the archive that the row names.
+        """
+        if self.clock() >= build.deadline_at:
+            raise ImageRefusal(image_console.CONSOLE_BLIND)
+
     def _launch(self, build, upload):
         """Presign, render, check the tags and launch. The URL and the user data live only here.
 
@@ -1759,15 +1785,22 @@ class _Pass:
         with an unknown outcome: the builder may exist, and the next pass adopts
         it by its build-id tag or fails the build.
 
-        The clock is read once, after the last read and right before the call, and no builder is launched at or after
-        either deadline. At or after the build deadline the call is refused with ``CONSOLE_BLIND``, the code of a
+        The build deadline decides before the pass deadline. The upload that ended the stage can end after both, and
+        the last read, the listing of the builders, raises ``DeadlineRefusal`` once the pass is out of time. So the
+        build deadline is read before that listing, which a build that is out of time does not ask for. A listing that
+        the pass deadline refuses reaches ``_stage`` as ``DeadlineRefusal``, which reads the build deadline again
+        (``_settle_a_cut_stage``).
+
+        The clock is read once more, after the last read and right before the call, and no builder is launched at or
+        after either deadline. At or after the build deadline the call is refused with ``CONSOLE_BLIND``, the code of a
         console that never showed anything. At or after the pass deadline it is refused with ``DeadlineRefusal``: the
-        last read, the listing of the builders, starts inside the pass and can end after it, and the row then waits for
-        the next pass to stage it again (``_stage_and_launch``, ``_stage``).
+        listing starts inside the pass and can end after it, and the row then waits for the next pass to stage it
+        again (``_stage_and_launch``, ``_stage``), unless the build deadline has passed by then.
         """
         aws, cfg = self.aws, self.cfg
         url = aws.presign_get(build.archive_bucket, upload.key, cfg.source.presign_seconds)
         user_data = image.render_user_data(self.script, image.warm_exports(cfg, url, upload.sha256))
+        self._refuse_past_the_build_deadline(build)
         self._check_no_builder()
         now = self.clock()
         if now >= build.deadline_at:

@@ -419,7 +419,7 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **AND** the pass answers `refused` and counts no failure
 
 #### Scenario: A builder appears before the launch
-- **WHEN** a builder of the deployment exists at the check before the launch call
+- **WHEN** a builder of the deployment exists at the check before the launch call, and the build deadline has not passed when that check starts
 - **THEN** the row ends `failed` with `IMAGE_BUILD_ALREADY_ACTIVE`, the pass tries to delete its archive and no builder is launched
 - **AND** the pass answers `refused`, counts no failure and leaves that builder to the next pass's reconcile
 
@@ -478,6 +478,30 @@ The row MUST record the hash of each basis file when it is inserted. A pass that
 - **THEN** the next pass decides from the current inputs like after any ended row
 - **AND** the ended row counts toward `max_builds_per_day` and `min_build_interval_seconds`
 
+### Requirement: Recorded hashes are valid only as the configuration could have produced them
+Valid hashes MUST name each path once, with a lower-case hex sha256, and MUST name only paths that `basis_paths` could hold: non-empty, no control character, no `..`, no leading `/`, text that UTF-8 encodes, and at most as many paths as it takes. A row whose hashes are not valid MUST raise `IMAGE_STATE_UNREADABLE`, MUST stay as it is and MUST NOT end as `IMAGE_INPUTS_CHANGED`. The insert MUST refuse hashes that are not valid. The error MUST name the row and MUST NOT name a path or a value.
+
+#### Scenario: The row records a path that `basis_paths` could never hold
+- **WHEN** a pass stages again a row whose `basis_file_hashes` names an empty path, or a path with a control character, a `..` or a leading `/`, or names more paths than `basis_paths` takes
+- **THEN** the pass raises `IMAGE_STATE_UNREADABLE` and does not end the row as `IMAGE_INPUTS_CHANGED`
+- **AND** the pass reads no file of the forge, deletes no archive, launches no builder and leaves the row as it is
+- **AND** the error names the row and never the path
+
+#### Scenario: The row records a path that is not text in UTF-8
+- **WHEN** a pass stages again a row whose `basis_file_hashes` names a path with a lone surrogate, which the TOML file of `basis_paths` cannot spell
+- **THEN** the pass raises `IMAGE_STATE_UNREADABLE` and does not end the row as `IMAGE_INPUTS_CHANGED`
+- **AND** the pass reads no file of the forge, deletes no archive, launches no builder and leaves the row as it is
+- **AND** the error names the row and never the path
+
+#### Scenario: The row records one path twice
+- **WHEN** a pass stages again a row whose `basis_file_hashes` holds two members with one name, whatever their values
+- **THEN** the pass raises `IMAGE_STATE_UNREADABLE`, launches no builder and leaves the row as it is
+- **AND** the error names the row and never a value
+
+#### Scenario: The insert refuses hashes that are not valid
+- **WHEN** a row is inserted with hashes that name a path that `basis_paths` could never hold, a path that is not text in UTF-8 included
+- **THEN** the insert is refused and no row is written
+
 ### Requirement: A run can supervise a build to completion
 Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run --apply --until-done` MUST repeat bounded passes with a fixed sleep between them until the build reaches `candidate` or `failed`, or the build deadline passes. Without `--until-done`, `run --apply` MUST run one pass. Rerunning the same command MUST resume an interrupted supervisor from the state file. `--until-done` MUST be refused without `--apply`.
 
@@ -494,7 +518,7 @@ Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run
 - **THEN** the supervisor ends the build with `MARKER_TIMEOUT` or `CONSOLE_BLIND`
 
 #### Scenario: The pass deadline ends the staging
-- **WHEN** the pass deadline passes during the template precheck of a resumed stage, during the upload or before the launch call
+- **WHEN** the pass deadline passes during the checks before the upload of a resumed stage (the template precheck and the start checks), during the upload, or before the launch call, and the build deadline has not passed by then
 - **THEN** the row stays `building` with no builder and no `archive_sha256`
 - **AND** the next pass stages again under the same archive key and no failure is counted
 
@@ -609,6 +633,17 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **WHEN** the build deadline passes during the upload of a resumed stage, or during the reads between the upload and the launch call
 - **THEN** no builder is launched and the build fails with `CONSOLE_BLIND`
 - **AND** the pass tries to delete the archive that the row names
+
+#### Scenario: A resumed stage outlasts both deadlines
+- **WHEN** a read in the checks before the upload of a resumed stage, a wait in the stream of the upload, the completion of the upload, or the last listing of the builders before the launch call, ends at or after the build deadline and at or after the pass deadline
+- **THEN** no builder is launched and the build fails with `CONSOLE_BLIND` in that pass, and the row is not left for the next pass to stage again
+- **AND** the pass tries to delete the archive that the row names
+- **AND** a build that is out of time before that listing asks for no listing
+
+#### Scenario: A resumed stage outlasts only the pass deadline
+- **WHEN** a read in the checks before the upload of a resumed stage, a wait in the stream of the upload, the completion of the upload, or the last listing of the builders before the launch call, ends at or after the pass deadline and before the build deadline
+- **THEN** no builder is launched and the row stays `building` with no builder and no `archive_sha256`
+- **AND** the next pass stages again and no failure is counted
 
 #### Scenario: A failed build recovers
 - **WHEN** the basis digest changes or an operator runs `run --apply --force`

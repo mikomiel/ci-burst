@@ -712,7 +712,9 @@ Two refusals belong to the start itself and count no failure:
 `IMAGE_CREDENTIAL_SHORT` (the role session would not outlive the archive URL, or its expiry is unknown, see
 [deployment.md](deployment.md#image-build-role-and-source-identity-optional)) and
 `IMAGE_BUILD_ALREADY_ACTIVE`. A pass checks both before it writes the build row
-and again just before the launch. A wrong input is raised, not answered, and
+and again just before the launch. A build that is out of time before that second
+check starts ends with `CONSOLE_BLIND` instead, because the build deadline decides
+first. A wrong input is raised, not answered, and
 nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge on the branch or
 basis reads (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
 or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
@@ -741,13 +743,27 @@ be the recorded set. A different digest or a different set of paths ends the row
 `failed` with `IMAGE_INPUTS_CHANGED`. No basis file is read again: the files at a
 commit do not change. A row whose recorded hashes are missing or malformed is
 damaged state, raised as `IMAGE_STATE_UNREADABLE`, and is not read from the forge
-instead. The gate command is in the digest, so removing a configured gate ends the
-row this way too. A file that
+instead. Malformed includes an empty path, a path that `basis_paths` could never
+hold (a control character, a `..` or a leading `/`, or a lone surrogate, which is
+no text in UTF-8 and which the TOML file cannot spell), more paths than `basis_paths`
+takes, and a path that the stored text names twice, whatever its values. That is
+damage and not a changed input, so the row stays as it is: it is not ended and its
+archive is not deleted. The error names the row and never a path or a value, and the
+insert of a row refuses such a map too. The gate command is in the digest, so
+removing a configured gate ends the
+row with `IMAGE_INPUTS_CHANGED` too. A file that
 lost the opt-out of a row inserted under `allow_no_gate` keeps the digest and ends
 the row with `IMAGE_GATE_REQUIRED`; an unsafe build template then ends it with
 `IMAGE_BUILD_TEMPLATE_UNSAFE`. Each is answered `refused`, counts no failure, writes
 no `image_build_failed` event and tries to delete the row's archive. A pass past
-the build deadline that reaches its deadline check ends the row instead. `lifetime_seconds` and `snapshot_seconds` are not in the digest: a
+the build deadline that reaches its deadline check ends the row instead. The build
+deadline decides before the pass deadline, wherever the pass deadline cuts the stage:
+in a read of the checks before the upload, in the stream of the upload, at its
+completion or in the last listing of the builders before the launch. When the cut falls
+at or after the build deadline, the pass ends the build `failed` with `CONSOLE_BLIND` in
+that pass and tries to delete the archive, and a build that is out of time before the
+last listing of the builders asks for none. When only the pass deadline has passed, the row stays and the
+next pass stages it again. `lifetime_seconds` and `snapshot_seconds` are not in the digest: a
 stage that launches renders them from the file as it reads it then.
 
 A build that has no verdict by `build_deadline_seconds` ends `failed` in a pass that
@@ -1297,7 +1313,7 @@ A build that ends `failed` carries one of the reasons below, in its
 `image_build_failed` event and in `reason`; the failure counts, sets the cooldown
 and moves the count toward `blocked`. A refusal that ends the stage of the archive
 or the launch of the builder ends the build in this way, whatever its code. The
-exceptions are a pass deadline, which leaves the row for the next pass; a launch
+exceptions are a pass deadline before the build deadline, which leaves the row for the next pass; a launch
 whose outcome is uncertain, which leaves the row `building` with the note
 `run_builder:uncertain` (the next pass adopts the builder, or ends the build
 `IMAGE_BUILDER_GONE` when it finds none); and the two start refusals of
@@ -1312,7 +1328,7 @@ passing plan does not rule these out.
 | `WARM_FAILED` | the builder printed a failure marker: the script failed, for example in the archive fetch, a warm command or the gate. Read the cause in the framed tail of the event or the console |
 | `IMAGE_MARKER_DIGEST_MISMATCH` | the builder reports another archive digest than the staged one |
 | `MARKER_TIMEOUT` | no ready marker by the build deadline, or the marker was first read at or after it while the builder was still running |
-| `CONSOLE_BLIND` | the console returned no text by the deadline, the provider refused the console read in a pass at or after the deadline (`notes` holds `console_read:<reason>`), or the launch fell at or after it. A console read refused before the deadline makes the pass raise, and the next pass reads again |
+| `CONSOLE_BLIND` | the console returned no text by the deadline, the provider refused the console read in a pass at or after the deadline (`notes` holds `console_read:<reason>`), or the launch fell at or after it. A stage that the pass deadline cuts at or after the build deadline ends this way too, in that pass: in a read of the checks before the upload, in the stream of the upload, at its completion or in the last listing of the builders. A build that is out of time before the last listing of the builders asks for none. A console read refused before the deadline makes the pass raise, and the next pass reads again |
 | `IMAGE_BUILDER_GONE` | a pass did not see the builder as active, or no builder was recorded, while the build had no recorded image. It is not proof that the builder ended. A later applying pass asks the provider to terminate a tagged builder that it lists and that is not the active build's, and does not check the result: verify the final state yourself. Find the instance by the failed row's `builder_id` or its `ci-burst:build-id` tag, not by the deployment tags alone, which also match a newer builder ([Leaked builders and the backstop](#leaked-builders-and-the-backstop)). An image may still exist; the deletion rule handles it as the image of a failed build |
 | `IMAGE_NOT_AVAILABLE` | the image failed, or was not `available` by the deadline |
 | `TEMPLATE_DRIFT` | the candidate version differs from the pin in a field other than `ImageId`, or does not carry the build's image; `drift_fields` names them |
@@ -1343,7 +1359,7 @@ and the codes of `promote` in [Promote reason codes](#promote-reason-codes).
 | --- | --- |
 | `IMAGE_UNTIL_DONE_NEEDS_APPLY` | `--until-done` without `--apply` |
 | `IMAGE_GATE_REQUIRED` | `[image.warm].gate_command` is empty and `allow_no_gate` is `false`. Raised before any client is built by `image plan` and a run without `--apply`, and by an applying pass when no build is in flight and no archive deletion is owed; a pass that settles a build in flight or an owed deletion answers it `refused` for the launch it would make, or when it started with no build in flight (a cleanup pass: owed deletions only, no other provider read, no forge read), and a stage done again of a row inserted under `allow_no_gate` ends its row `failed` with it (a row inserted with a gate command ends as `IMAGE_INPUTS_CHANGED`) |
-| `IMAGE_INPUTS_CHANGED` | a stage done again found that the recorded hashes of the basis files, the warm or gate commands, `strip_components` or the script no longer give the row's digest, or that `basis_paths` is no longer the recorded set. No basis file is read. Answered `refused`; the row ends `failed`, the delete of its archive is attempted when it recorded one, and no failure is counted |
+| `IMAGE_INPUTS_CHANGED` | a stage done again found that the recorded hashes of the basis files, the warm or gate commands, `strip_components` or the script no longer give the row's digest, or that `basis_paths` is no longer the recorded set. No basis file is read. Answered `refused`; the row ends `failed`, the delete of its archive is attempted when it recorded one, and no failure is counted. A recorded path that `basis_paths` could never hold is damage and not this code: it is `IMAGE_STATE_UNREADABLE`, and the row stays |
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the image token while the branch or a basis file was read, or, in `image plan`, the first chunk of the archive. The same answer to the archive request of a staging run ends the build `failed` (first table) |
 | `IMAGE_BRANCH_UNPROTECTED` | the configured branch is not protected on the forge |
 | `IMAGE_BASIS_PATH_MISSING` | the forge answered `404` for a `basis_paths` file, or the path escapes the repository, at the branch head that a decision reads |
@@ -1355,7 +1371,7 @@ and the codes of `promote` in [Promote reason codes](#promote-reason-codes).
 | `IMAGE_SCRIPT_MISSING` | the container image does not hold the shipped warm script |
 | `pass_deadline_exceeded` | the 240-second budget of a pass ran out. It is raised in `image plan` and before a decision. Elsewhere it is a `notes` entry, alone (the row waits for the next pass) or after the name of a lookup that the pass then goes without (such as `image_lookup:` or `base_image:`), or the `refused` code of the `retention` or `deletion` part |
 | `IMAGE_STATE_LOCKED` | another pass, refresh or `promote --write` holds the writer lock of the state file; an applying run also meets it when it resolves a pending journal row |
-| `IMAGE_STATE_VERSION_UNSUPPORTED`, `IMAGE_STATE_UNREADABLE` | the state file has a schema this version does not know, or cannot be opened as the state file, or a build row holds damage that a pass reads (the recorded `basis_file_hashes` of a row that a stage done again checks); keep the file and do not edit it. Schema 2 added `archive_bucket`, `archive_deleted_at`, `archive_delete_tried_at` and `basis_file_hashes` to `image_builds` and has no migration: remove a schema 1 state file from a pre-release run, since no deployment holds one with `[image]` enabled |
+| `IMAGE_STATE_VERSION_UNSUPPORTED`, `IMAGE_STATE_UNREADABLE` | the state file has a schema this version does not know, or cannot be opened as the state file, or a build row holds damage that a pass reads (the recorded `basis_file_hashes` of a row that a stage done again checks: text that is not a JSON object of hashes, a path that `basis_paths` could never hold or that is no text in UTF-8, or a path named twice); the error names the row and never the value, and the row stays as it is. Keep the file and do not edit it. Schema 2 added `archive_bucket`, `archive_deleted_at`, `archive_delete_tried_at` and `basis_file_hashes` to `image_builds` and has no migration: remove a schema 1 state file from a pre-release run, since no deployment holds one with `[image]` enabled |
 | `IMAGE_STATE_RECOVERY_NEEDED` | a process stopped inside a commit and left a rollback journal (`image-state.sqlite-journal`) that a read-only open cannot roll back; `status`, `plan`, the previews and `run` without `--apply` refuse and leave it. A writing command rolls it back: `image run --apply`, `image promote --write` (with or without `--rollback`) or `image status --refresh` takes the writer lock before its writable open, which rolls the journal back, and then does what it always does (a run resolves a pending row and runs its pass; a promotion also writes the pin). Another holder of the lock gives `IMAGE_STATE_LOCKED` with the journal left as it is. Do not delete the journal file: it holds the pages that make the file consistent |
 | `IMAGE_PROFILE_INVALID` | the image role profile is missing or breaks the profile rules of [deployment.md](deployment.md#image-build-role-and-source-identity-optional); a provider failure, exit `1` |
 | `IMAGE_DELETION_UNSAFE` | the deletion rule could not resolve the images it must protect, or read the deployment file through a stale view, so it deleted nothing. It appears inside the `retention` part of a pass result (`deletion` in a plan) and does not fail the command; that part can carry another refusal code, such as a provider code, in the same way |

@@ -4,15 +4,16 @@ import os
 import sqlite3
 import tempfile
 import threading
+import tomllib
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from ci_burst import image_state
-from ci_burst.config import load
+from ci_burst.config import _image_basis_paths, load
 from ci_burst.controller import Controller
-from ci_burst.errors import StateRefusal
+from ci_burst.errors import ConfigRefusal, StateRefusal
 from ci_burst.image_state import (
     PIN_RECORD_PREFIX,
     PIN_RECORD_REASON,
@@ -168,6 +169,53 @@ class SchemaTests(ImageStateCase):
 
 
 GOOD_HASHES = {"b-file.lock": "e" * 64, "a-file.lock": "f" * 64}
+
+MARKER = "marker-path"
+#: Paths that the configuration refuses for ``image.source.basis_paths``: a control character, a ``..`` or a leading
+#: ``/``. Each holds ``MARKER``, so that a test can show that a refusal does not echo the path.
+REFUSED_PATHS = (
+    f"{MARKER}\nsecond-line.lock",
+    f"{MARKER}\r\nsecond-line.lock",
+    f"{MARKER}\x00.lock",
+    f"{MARKER}\t.lock",
+    f"{MARKER}\x1b.lock",
+    f"{MARKER}\x7f.lock",
+    f"../{MARKER}.lock",
+    f"a/../{MARKER}.lock",
+    f"{MARKER}/..",
+    f"/{MARKER}.lock",
+    f"{MARKER}..lock",
+)
+#: Paths that the configuration accepts, the ones with characters beyond ASCII included.
+ACCEPTED_PATHS = (
+    "example.lock",
+    "dir/sub/example.lock",
+    "a b.lock",
+    ".hidden",
+    "a.b.c",
+    "-dash.lock",
+    "d\u00e9j\u00e0-vu.lock",
+    "emoji-\U0001f600.lock",
+)
+#: Paths that are no text in UTF-8: a lone surrogate has no UTF-8 form. ``json.dumps`` writes each as ASCII escapes,
+#: so the text that a map of them is stored as is valid UTF-8, and ``json.loads`` gives the surrogates back. They are
+#: not in ``REFUSED_PATHS``, because the rules of ``image.source.basis_paths`` do not name them: its file is TOML, which
+#: cannot spell one. Each holds ``MARKER``.
+UNENCODABLE_PATHS = (
+    chr(0xD83D) + MARKER,  # a lone high surrogate
+    MARKER + chr(0xDE00),  # a lone low surrogate
+    MARKER + chr(0xDE00) + chr(0xD83D) + ".lock",  # a low and then a high one, which JSON does not read as a pair
+    "a-" + MARKER + chr(0xD83D) + "-b.lock",  # in the middle of a name
+)
+
+
+def configuration_accepts(*paths):
+    """Whether the configuration takes ``paths`` as ``image.source.basis_paths``."""
+    try:
+        _image_basis_paths({"basis_paths": list(paths)}, "image.source", required=True)
+    except ConfigRefusal:
+        return False
+    return True
 
 
 class ArchiveRecordTests(ImageStateCase):
@@ -354,6 +402,184 @@ class ArchiveRecordTests(ImageStateCase):
         marker = "marker-path.lock"
         self.store_hashes(json.dumps({marker: "e" * 64}).encode("utf-8"), as_text=False)
         self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), marker)
+
+    # -- a stored map with a path the configuration could never produce, or one name twice ------------------------
+    # The map is read back as the record of the inputs of the build. A path that no ``image.source.basis_paths`` can
+    # hold would pass the digest check as a changed set of paths, which ends the row and deletes its archive, and a
+    # name that two members share is read as its last member, so that a damaged first value is never seen.
+
+    def store_text(self, text):
+        self.store_hashes(text.encode("utf-8"), as_text=True)
+
+    def test_the_refused_paths_are_the_ones_the_configuration_refuses_and_the_accepted_paths_the_ones_it_takes(self):
+        # The premise of the tests below: the rules of a stored path are the rules of the configuration.
+        for path in REFUSED_PATHS:
+            with self.subTest(refused=path):
+                self.assertFalse(configuration_accepts(path))
+        for path in ACCEPTED_PATHS:
+            with self.subTest(accepted=path):
+                self.assertTrue(configuration_accepts(path))
+
+    def test_a_stored_path_that_the_configuration_refuses_is_refused_by_row_and_never_echoed(self):
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        for path in REFUSED_PATHS:
+            for shape, hashes in (("alone", {path: "e" * 64}), ("among valid paths", {**GOOD_HASHES, path: "e" * 64})):
+                with self.subTest(path=path, shape=shape):
+                    self.store_text(json.dumps(hashes))
+                    self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_a_stored_empty_path_is_still_refused_by_row(self):
+        # The check that the rules of the configuration replace: a name is text, and JSON gives no other kind.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        for label, stored in (
+            ("alone", '{"": "' + "e" * 64 + '"}'),
+            ("among valid paths", '{"a.lock": "' + "e" * 64 + '", "": "' + "e" * 64 + '"}'),
+        ):
+            with self.subTest(label):
+                self.store_text(stored)
+                self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_a_stored_map_of_more_paths_than_the_configuration_takes_is_refused_by_row(self):
+        # The configuration takes a list of at most so many paths, so a map of more is not one that it produced. The
+        # control is the largest map that it takes, which still reads.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        for count, readable in ((32, True), (33, False)):
+            hashes = {f"file-{number:02d}.lock": "e" * 64 for number in range(count)}
+            with self.subTest(count=count):
+                self.assertEqual(configuration_accepts(*hashes), readable)
+                self.store_text(json.dumps(hashes, sort_keys=True))
+                if readable:
+                    self.assertEqual(build_file_hashes(self.state.build("build-1")), hashes)
+                else:
+                    self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_a_stored_map_that_names_a_path_twice_is_refused_by_row_and_never_echoed(self):
+        # ``json.loads`` keeps the last of the members that share a name: a first value that is no hash would pass
+        # unseen, and the map would pass for one that it is not.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        valid, invalid, other = "e" * 64, "E" * 64, "f" * 64
+        name = MARKER + ".lock"
+        for label, members in (
+            ("an invalid hash first and a valid one last", [(name, invalid), (name, valid)]),
+            ("a valid hash first and an invalid one last", [(name, valid), (name, invalid)]),
+            ("two valid hashes", [(name, valid), (name, other)]),
+            ("one hash twice", [(name, valid), (name, valid)]),
+            ("among other paths", [("a.lock", valid), (name, valid), ("b.lock", other), (name, other)]),
+        ):
+            with self.subTest(label):
+                self.store_text("{" + ", ".join(f'"{path}": "{digest}"' for path, digest in members) + "}")
+                self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_a_stored_map_that_spells_one_path_two_ways_is_refused_by_row_and_never_echoed(self):
+        # The decoder reads both names as one path, so the hook sees the same name twice.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        valid, invalid = "e" * 64, "E" * 64
+        spelled_out = "".join(f"\\u{ord(character):04x}" for character in MARKER)
+        for label, stored in (
+            ("one escaped letter", f'{{"{MARKER}": "{invalid}", "{MARKER[:-1]}\\u{ord(MARKER[-1]):04x}": "{valid}"}}'),
+            ("every letter escaped", f'{{"{MARKER}": "{invalid}", "{spelled_out}": "{valid}"}}'),
+        ):
+            with self.subTest(label):
+                premise = json.loads(stored, object_pairs_hook=lambda pairs: [path for path, _ in pairs])
+                self.assertEqual(premise, [MARKER, MARKER])
+                self.store_text(stored)
+                self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_a_lone_surrogate_is_a_path_that_the_rules_of_the_configuration_do_not_name_and_its_file_cannot_spell(self):
+        # The premise of the tests below: the rules of ``basis_paths`` take these paths, and the TOML file cannot hold
+        # them, so only a check of the stored map can say that a map which holds one is damaged.
+        for path in UNENCODABLE_PATHS:
+            with self.subTest(path=path):
+                self.assertTrue(configuration_accepts(path))
+                with self.assertRaises(UnicodeEncodeError):
+                    path.encode("utf-8")
+                text = json.dumps({path: "e" * 64})
+                self.assertTrue(text.isascii())
+                self.assertEqual(json.loads(text), {path: "e" * 64})
+        for spelled in ('"\\ud83d"', '"\\ude00"', '"\\ud83d\\ude00"'):
+            with self.subTest(toml=spelled), self.assertRaises(tomllib.TOMLDecodeError):
+                tomllib.loads(f"path = {spelled}")
+
+    def test_a_stored_path_that_is_no_text_in_utf8_is_refused_by_row_and_never_echoed(self):
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        for path in UNENCODABLE_PATHS:
+            for shape, hashes in (("alone", {path: "e" * 64}), ("among valid paths", {**GOOD_HASHES, path: "e" * 64})):
+                with self.subTest(path=path, shape=shape):
+                    self.store_text(json.dumps(hashes))
+                    self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_stored_maps_of_distinct_paths_that_the_configuration_takes_still_read(self):
+        # The control of the tests above: nothing that a build can write changes how it reads.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        for path in ACCEPTED_PATHS:
+            hashes = {path: "e" * 64, "z-file.lock": "f" * 64}
+            for ascii_only in (True, False):
+                with self.subTest(path=path, ascii_only=ascii_only):
+                    self.store_text(json.dumps(hashes, ensure_ascii=ascii_only, sort_keys=True))
+                    self.assertEqual(build_file_hashes(self.state.build("build-1")), hashes)
+        every_path = {path: "e" * 64 for path in ACCEPTED_PATHS}
+        self.store_text(json.dumps(every_path, sort_keys=True))
+        self.assertEqual(build_file_hashes(self.state.build("build-1")), every_path)
+
+    def test_the_insert_refuses_a_path_that_the_configuration_refuses(self):
+        for path in REFUSED_PATHS:
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError) as raised:
+                    self.add_build("build-bad", basis_file_hashes={path: "e" * 64})
+                self.assertNotIn(MARKER, str(raised.exception))
+        self.assertIsNone(self.state.build("build-bad"))
+
+    def test_the_insert_refuses_a_path_that_is_no_text_at_all(self):
+        # The insert has no type check of its own: ``_image_basis_paths`` takes only text paths. The second map names
+        # ``"1"`` once as text and once as the number 1, which ``json.dumps`` would write as one name.
+        refused = (
+            {1: "e" * 64},
+            {1: "e" * 64, "1": "e" * 64},
+            {None: "e" * 64},
+            {b"x.lock": "e" * 64},
+            {},
+        )
+        for hashes in refused:
+            with self.subTest(hashes=hashes):
+                with self.assertRaises(ValueError) as raised:
+                    self.add_build("build-bad", basis_file_hashes=hashes)
+                self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(self.state.build("build-bad"))
+
+    def test_the_insert_refuses_a_path_that_is_no_text_in_utf8_and_does_not_echo_it(self):
+        for path in UNENCODABLE_PATHS:
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError) as raised:
+                    self.add_build("build-bad", basis_file_hashes={path: "e" * 64})
+                self.assertNotIn(MARKER, str(raised.exception))
+                # ``str.encode`` raises an error that names the character, and it is not the one that leaves.
+                self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(self.state.build("build-bad"))
+
+    def test_the_insert_writes_every_accepted_path_once_and_the_row_reads_back(self):
+        for number, path in enumerate(ACCEPTED_PATHS):
+            with self.subTest(path=path):
+                hashes = {path: "e" * 64, "z-file.lock": "f" * 64}
+                built = self.add_build(f"build-{number}", basis_file_hashes=hashes)
+                # Decoded with a hook that sees every member, the stored text names each path once.
+                members = json.loads(built.basis_file_hashes, object_pairs_hook=lambda pairs: pairs)
+                self.assertEqual(sorted(name for name, _ in members), sorted(hashes))
+                self.assertEqual(build_file_hashes(self.state.build(f"build-{number}")), hashes)
+                self.end(f"build-{number}")
+
+    def test_the_insert_refuses_two_paths_that_the_json_text_would_give_one_name(self):
+        # The only way for a dict to give two members of one name: ``json.dumps`` writes a lone high surrogate that
+        # a lone low surrogate follows as the pair of one astral character, which another path is. The configuration
+        # cannot produce either of them (its file is UTF-8 and the surrogate has no UTF-8 form), and the insert refuses
+        # a path that is no text in UTF-8, so the text that it writes never names a path twice.
+        pair = chr(0xD83D) + chr(0xDE00)
+        astral = chr(0x1F600)
+        self.assertNotEqual(pair, astral)
+        hashes = {pair: "e" * 64, astral: "f" * 64}
+        self.assertEqual(json.dumps(hashes).count('"\\ud83d\\ude00"'), 2)
+        with self.assertRaises(ValueError):
+            self.add_build("build-bad", basis_file_hashes=hashes)
+        self.assertIsNone(self.state.build("build-bad"))
 
     def test_an_archive_is_owed_by_a_finished_build_that_names_one_and_has_no_deletion_time(self):
         self.add_build("build-1", basis_file_hashes=GOOD_HASHES)

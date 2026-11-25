@@ -3121,6 +3121,346 @@ class FailureTests(PipelineCase):
         self.assertEqual(spent, [True])
         self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
 
+    # -- the build deadline decides before the pass deadline, from the end of the upload on ----------------------
+    # A stage that outlasts the build deadline ends the build ``CONSOLE_BLIND`` in the pass that sees it, also when it
+    # outlasts the pass deadline too. The pass deadline alone leaves the row for the next pass.
+
+    def assert_no_listing_before_the_row_ends(self, mark):
+        """No builder is listed between the completion of the upload and the delete that ends the row.
+
+        The pass that began at call ``mark`` lists builders earlier too (reconcile and the start check), so the
+        completion splits the two, and ``_fail`` sends the delete as the first call of the row's end.
+        """
+        names = self.world.names(mark)
+        completed = names.index("complete_multipart_upload")
+        deleted = names.index("delete_object", completed)
+        self.assertNotIn("describe_instances", names[completed:deleted])
+
+    def a_call_that_takes(self, call, seconds):
+        """Make the provider call ``call`` take ``seconds`` of the clock. Returns the times it began at."""
+        began = []
+
+        def slow(arguments):
+            began.append(self.clock())
+            self.clock.advance(seconds)
+
+        self.world.hooks[call] = slow
+        return began
+
+    def a_completion_that_takes(self, seconds):
+        """Make the completion of the multipart upload take ``seconds`` of the clock. Returns the times it began at."""
+        return self.a_call_that_takes("complete_multipart_upload", seconds)
+
+    @contextmanager
+    def a_last_listing_of_two_pages_that_takes(self, seconds):
+        """Make the listing that the launch runs after it presigned the URL return a first page that took ``seconds``.
+
+        The page promises a second one. The adapter reads the clock before it requests a page, so it refuses the second
+        page once the pass deadline has passed. The fake provider never paginates, which would leave that refusal,
+        inside the launch, unreachable. Yields the times at which a first page was cut this way.
+        """
+        real = WorldEc2.describe_instances
+        cut = []
+
+        def first_page_of_two(ec2, **arguments):
+            response = real(ec2, **arguments)
+            if ec2.w.arguments("generate_presigned_url") and not cut and arguments.get("NextToken") is None:
+                cut.append(ec2.w.clock())
+                ec2.w.clock.advance(seconds)
+                response = {**response, "NextToken": "second-page"}
+            return response
+
+        with mock.patch.object(WorldEc2, "describe_instances", first_page_of_two):
+            yield cut
+
+    def requested_second_pages(self):
+        return [call for call in self.world.arguments("describe_instances") if call["NextToken"]]
+
+    def test_a_resumed_stage_whose_upload_outlasts_both_deadlines_ends_the_build_blind_and_deletes_the_archive(self):
+        # The completion starts before both deadlines and returns after both. The build deadline decides: the row
+        # ends in this pass, and the pass deadline does not leave it for the next pass to stage again.
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_completion_that_takes(PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the completion began inside both deadlines and ended after both.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assertGreaterEqual(self.clock(), max(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+        self.assert_no_listing_before_the_row_ends(mark)
+
+    def test_a_resumed_stage_whose_upload_outlasts_the_build_deadline_asks_for_no_builder_listing_before_it_ends(self):
+        # Inside the pass deadline the adapter would send the listing. The launch reads the build deadline before it
+        # asks for one, because a stage that is out of time can only end in a launch that the deadline then refuses.
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_completion_that_takes(150)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+        self.assert_no_listing_before_the_row_ends(mark)
+
+    def test_a_resumed_stage_whose_upload_outlasts_only_the_pass_deadline_is_staged_again_by_the_next_pass(self):
+        # The control of the two tests above: the same completion, with the build deadline far off, leaves the row for
+        # the next pass. The pass deadline alone never ends a build.
+        first = self.unstaged_build()
+        began = self.a_completion_that_takes(PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assert_unstaged(build)
+        self.assertLess(self.clock(), build.deadline_at)
+        # The row still names the archive that the stage stored, and nothing deleted it.
+        self.assertEqual(list(self.world.objects), [build.archive_key])
+        self.assertNotIn("delete_object", self.world.names(mark))
+        # The next pass stages the archive again under the same key and launches.
+        del self.world.hooks["complete_multipart_upload"]
+        result = self.apply()
+        self.assertEqual(result["decision"], "building", result)
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assertIsNotNone(build.builder_id)
+        self.assertEqual(build.archive_sha256, ARCHIVE_SHA)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_a_last_listing_that_runs_out_of_both_deadlines_ends_the_build_blind(self):
+        # The listing starts inside both deadlines. Its first page returns after both, and the adapter refuses the
+        # second page for the pass deadline. The build deadline decides all the same.
+        first = self.resumed_stage_with_100_seconds_left()
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        with self.a_last_listing_of_two_pages_that_takes(PASS_DEADLINE_SECONDS + 60) as cut:
+            result = self.apply()
+        self.assertEqual(len(cut), 1)
+        self.assertLess(cut[0], min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assertGreaterEqual(self.clock(), max(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assertEqual(self.requested_second_pages(), [])
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+
+    def test_a_last_listing_that_runs_out_of_only_the_pass_deadline_leaves_the_build_for_the_next_pass(self):
+        # The control of the test above: the same listing, with the build deadline far off, is the pass deadline's
+        # refusal, and the row waits for the next pass.
+        first = self.unstaged_build()
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        with self.a_last_listing_of_two_pages_that_takes(PASS_DEADLINE_SECONDS + 60) as cut:
+            result = self.apply()
+        self.assertEqual(len(cut), 1)
+        self.assertLess(cut[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual(self.requested_second_pages(), [])
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assert_unstaged(build)
+        self.assertLess(self.clock(), build.deadline_at)
+        self.assertEqual(list(self.world.objects), [build.archive_key])
+        self.assertNotIn("delete_object", self.world.names(mark))
+        # The next pass stages the archive again under the same key and launches.
+        result = self.apply()
+        self.assertEqual(result["decision"], "building", result)
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assertIsNotNone(build.builder_id)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    # -- the same rule where the pass deadline cuts the stage itself -------------------------------------------------
+    # The pass can run out of time in the upload stream and in the checks that come before the stage, as well as in
+    # the launch. The build deadline decides there too: a build that is out of time ends ``CONSOLE_BLIND`` in the pass
+    # that sees it, and the pass deadline alone leaves the row for the next pass.
+
+    def a_source_that_stalls(self, seconds):
+        """Make the source take ``seconds`` of the clock before its first chunk. Returns the times it began at.
+
+        The adapter checks the pass deadline before it takes a chunk, so a stall that ends after that deadline cuts the
+        upload: the adapter aborts it, deletes the key itself and refuses with ``DeadlineRefusal``.
+        """
+        began = []
+
+        def stall():
+            began.append(self.clock())
+            self.clock.advance(seconds)
+
+        self.source.on_chunk = stall
+        return began
+
+    def assert_an_upload_cut_by_both_deadlines_ended_the_build_blind(self, result, mark):
+        """The upload was cut and the build ended ``CONSOLE_BLIND`` in the same pass. Returns the row.
+
+        The adapter deletes the key of a cut upload itself, so two deletes follow the abort: its own, and the one that
+        ends the row (``_fail``), which is the only one that records the deletion. Nothing else is asked after the cut:
+        no listing of the builders and no launch.
+        """
+        build = self.assert_failed(result, "CONSOLE_BLIND")
+        names = self.world.names(mark)
+        self.assertNotIn("complete_multipart_upload", names)
+        self.assertEqual(
+            names[names.index("abort_multipart_upload") :], ["abort_multipart_upload", "delete_object", "delete_object"]
+        )
+        self.assertNotIn("generate_presigned_url", names)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.arguments("terminate_instances"), [])
+        self.assertEqual(self.world.objects, {})
+        self.assertIsNotNone(build.archive_deleted_at)
+        self.assertEqual(self.query(lambda state: state.archives_owed(DEPLOYMENT)), [])
+        self.assertEqual(self.control().consecutive_failures, 1)
+        return build
+
+    def test_a_resumed_stage_whose_upload_stream_is_cut_by_both_deadlines_ends_the_build_blind_and_deletes_the_archive(self):
+        # The source stalls before its first chunk, and the stall ends after both deadlines. The adapter refuses for the
+        # pass deadline. The build deadline decides all the same: the row ends in this pass, and no later pass has to
+        # find it out of time.
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_source_that_stalls(PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the stall began inside both deadlines and ended after both.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assertGreaterEqual(self.clock(), max(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        build = self.assert_an_upload_cut_by_both_deadlines_ended_the_build_blind(result, mark)
+        self.assertEqual(build.id, first.id)
+        # The first pass opened one upload, and this pass opened the one that it cut.
+        self.assertEqual(len(self.archive_keys()), 2)
+
+    def test_a_resumed_stage_whose_upload_stream_is_cut_by_only_the_pass_deadline_is_staged_again_by_the_next_pass(self):
+        # The control of the test above: the same stall, with the build deadline far off, leaves the row for the next pass.
+        first = self.unstaged_build()
+        began = self.a_source_that_stalls(PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assert_unstaged(build)
+        self.assertLess(self.clock(), build.deadline_at)
+        # Only the adapter cleaned up after the cut. Nothing ended the row, so nothing recorded a deletion.
+        names = self.world.names(mark)
+        self.assertEqual(names[names.index("abort_multipart_upload") :], ["abort_multipart_upload", "delete_object"])
+        self.assertIsNone(build.archive_deleted_at)
+        # The next pass stages the archive again under the same key and launches.
+        self.source.on_chunk = None
+        result = self.apply()
+        self.assertEqual(result["decision"], "building", result)
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assertIsNotNone(build.builder_id)
+        self.assertEqual(build.archive_sha256, ARCHIVE_SHA)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_a_first_stage_whose_upload_stream_is_cut_by_both_deadlines_ends_the_build_blind_and_deletes_the_archive(self):
+        # A new row is staged from the row that was inserted a moment before, which holds no key yet: the delete that
+        # ends the build names the key that the stage recorded before it opened the upload. The clock jumps past the
+        # build deadline, as it does on a host that was suspended during the pass.
+        began = self.a_source_that_stalls(BUILD_DEADLINE + 60)
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        build = self.assert_an_upload_cut_by_both_deadlines_ended_the_build_blind(result, mark)
+        deleted = [kwargs for name, kwargs in self.world.calls[mark:] if name == "delete_object"]
+        request = {"Bucket": BUCKET, "Key": f"{PREFIX}{build.id}.tar.gz", "ExpectedBucketOwner": ACCOUNT}
+        self.assertEqual(deleted, [request, request])
+        self.assertEqual(len(self.archive_keys()), 1)
+
+    def assert_ended_blind_before_a_second_stage(self, result, first, mark):
+        """A check that runs before the stage ran out of both deadlines: the row ends ``CONSOLE_BLIND`` in the same pass.
+
+        No archive is staged again. The delete that ends the row is the only one, and it names the key that the first
+        stage recorded.
+        """
+        build = self.assert_failed(result, "CONSOLE_BLIND")
+        self.assertEqual(build.id, first.id)
+        self.assertNotIn("create_multipart_upload", self.world.names(mark))
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.arguments("terminate_instances"), [])
+        self.assertEqual(self.world.objects, {})
+        deleted = [kwargs for name, kwargs in self.world.calls[mark:] if name == "delete_object"]
+        self.assertEqual(deleted, [{"Bucket": BUCKET, "Key": f"{PREFIX}{first.id}.tar.gz", "ExpectedBucketOwner": ACCOUNT}])
+        self.assertIsNotNone(build.archive_deleted_at)
+        self.assertEqual(self.control().consecutive_failures, 1)
+
+    def test_a_resumed_stage_whose_template_check_outlasts_both_deadlines_ends_the_build_blind_and_deletes_the_archive(self):
+        # The first read of the check that runs before the stage ends after both deadlines, and the next read is the
+        # one that the adapter refuses for the pass deadline. The control is
+        # ``test_a_resumed_stage_whose_template_check_runs_out_of_time_leaves_the_build_for_the_next_pass``.
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_call_that_takes("describe_launch_templates", PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assertGreaterEqual(self.clock(), max(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+
+    def test_a_resumed_stage_whose_start_checks_outlast_both_deadlines_end_the_build_blind_and_delete_the_archive(self):
+        # The last read of the template check ends after both deadlines, so the listing of the builders that the start
+        # checks make next is the one that the adapter refuses for the pass deadline.
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_call_that_takes("describe_security_groups", PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assertGreaterEqual(self.clock(), max(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+        names = self.world.names(mark)
+        self.assertNotIn("describe_instances", names[names.index("describe_security_groups") :])
+
+    def test_a_resumed_stage_whose_start_checks_outlast_only_the_pass_deadline_leave_the_build_for_the_next_pass(self):
+        # The control of the test above: the same read, with the build deadline far off, leaves the row for the next pass.
+        first = self.unstaged_build()
+        began = self.a_call_that_takes("describe_security_groups", PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assert_unstaged(build)
+        self.assertLess(self.clock(), build.deadline_at)
+        names = self.world.names(mark)
+        self.assertNotIn("describe_instances", names[names.index("describe_security_groups") :])
+        self.assertNotIn("create_multipart_upload", names)
+        self.assertNotIn("delete_object", names)
+        # The next pass reads again, stages the archive again and launches.
+        del self.world.hooks["describe_security_groups"]
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(len(self.archive_keys()), 2)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
     def test_a_forge_that_fails_during_the_stage_fails_the_build_by_its_code_alone(self):
         self.source.fail_after_first = ObservationRefusal("FORGEJO_UNAVAILABLE", "token=" + TOKEN)
         result = self.apply()
@@ -4899,6 +5239,124 @@ class RestageReadsNoBasisFileTests(PipelineCase):
         self.assertEqual(self.world.arguments("run_instances"), [])
         build = self.only_build()
         self.assertEqual((build.id, build.state), (first.id, "building"))
+
+    # -- a recorded map that the row could never have been written with ----------------------------------------
+    # The text is valid JSON, and every value in it is a hash. What is wrong is the set of members, and the pass must
+    # not take that for a change of the inputs, which ends the row and deletes its archive, or read past it.
+
+    def record_hashes(self, build, stored):
+        connection = sqlite3.connect(self.state_dir / "image-state.sqlite")
+        try:
+            connection.execute("UPDATE image_builds SET basis_file_hashes = ? WHERE id = ?", (stored, build.id))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def assert_damaged_state_and_the_row_is_left_as_it_was(self, first, marker):
+        """The pass refuses the row by its id and never by its value, and it ends, deletes and launches nothing."""
+        mark = len(self.source.calls)
+        world_mark = len(self.world.calls)
+        self.refused(self.apply, "IMAGE_STATE_UNREADABLE", detail_has=(first.id,), detail_lacks=(marker,))
+        self.assertEqual(self.source.calls[mark:], [])
+        self.assertFalse(
+            {"delete_object", "create_multipart_upload", "run_instances"} & set(self.world.names(world_mark)),
+            self.world.names(world_mark),
+        )
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        build = self.only_build()
+        self.assertEqual((build.id, build.state, build.reason_code), (first.id, "building", ""))
+        self.assertIsNone(build.archive_deleted_at)
+        self.assertEqual(self.control().consecutive_failures, 0)
+
+    def test_a_recorded_path_that_the_configuration_could_never_hold_is_damaged_state_and_the_row_stays(self):
+        # A newline in a path, or a parent directory, is something that no basis path of the configuration is. It is
+        # not a change of the inputs, which ends the row as ``IMAGE_INPUTS_CHANGED`` and deletes its archive.
+        first = self.unstaged_build()
+        recorded = json.loads(first.basis_file_hashes)
+        (digest,) = recorded.values()
+        marker = "marker-path"
+        for label, damaged in (
+            ("a newline in the one path", {f"example.lock\n{marker}": digest}),
+            ("a path with a newline beside the right one", {**recorded, f"{marker}\nsecond.lock": digest}),
+            ("a parent directory beside the right path", {**recorded, f"../{marker}.lock": digest}),
+        ):
+            with self.subTest(label):
+                self.record_hashes(first, json.dumps(damaged))
+                self.assert_damaged_state_and_the_row_is_left_as_it_was(first, marker)
+
+    def test_a_recorded_path_that_is_no_text_in_utf8_is_damaged_state_and_the_row_stays(self):
+        # The configuration is read from a UTF-8 file, and TOML cannot spell a lone surrogate, so the configuration
+        # never held one. The rules of a basis path do not name it, so without a check of its own the path would pass
+        # as a path that the configuration lost: a change of the inputs, which ends the row and deletes its archive.
+        first = self.unstaged_build()
+        recorded = json.loads(first.basis_file_hashes)
+        (digest,) = recorded.values()
+        marker = "marker-path"
+        high, low = chr(0xD83D), chr(0xDE00)
+        for label, damaged in (
+            ("a lone high surrogate in the one path", {f"example.lock{high}{marker}": digest}),
+            ("a lone low surrogate beside the right path", {**recorded, f"{low}{marker}.lock": digest}),
+            ("a low and a high surrogate that are no pair", {**recorded, f"{marker}-{low}{high}.lock": digest}),
+        ):
+            with self.subTest(label):
+                text = json.dumps(damaged)
+                # The premise: the text is ASCII, so that SQLite takes it, and the decoder gives the surrogate back.
+                self.assertTrue(text.isascii())
+                self.assertEqual(json.loads(text), damaged)
+                self.record_hashes(first, text)
+                self.assert_damaged_state_and_the_row_is_left_as_it_was(first, marker)
+
+    def test_a_recorded_path_beyond_the_basic_plane_still_launches(self):
+        # The control of the test above: a path of a character that one UTF-8 sequence spells and JSON spells as a
+        # pair of escapes is text, and the stage that is done again goes on under it.
+        single = 'basis_paths = ["example.lock"]'
+        self.assertIn(single, render_toml())
+        path = "emoji-\U0001f600.lock"
+        self.configure(render_toml().replace(single, f'basis_paths = ["{path}"]'))
+        self.source.files = {path: LOCK_FILE}
+        first = self.unstaged_build()
+        self.assertEqual(list(json.loads(first.basis_file_hashes)), [path])
+        self.assertIn("\\ud83d\\ude00", first.basis_file_hashes)
+        mark = len(self.source.calls)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(self.source.calls[mark:], [("archive", SOURCE_SHA)])
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_a_recorded_map_that_names_a_path_twice_is_damaged_state_and_nothing_is_launched(self):
+        # ``json.loads`` keeps the last of two members with one name: with the right hash last, the wrong one before
+        # it would pass unseen, the digest would match, and the pass would launch from a row that it cannot read.
+        first = self.unstaged_build()
+        (digest,) = json.loads(first.basis_file_hashes).values()
+        marker = "marker-value"
+        for label, stored in (
+            ("a first value that is no hash", f'{{"example.lock": "{marker}", "example.lock": "{digest}"}}'),
+            ("a first hash that is another hash", '{"example.lock": "' + "e" * 64 + f'", "example.lock": "{digest}"}}'),
+        ):
+            with self.subTest(label):
+                self.record_hashes(first, stored)
+                self.assert_damaged_state_and_the_row_is_left_as_it_was(first, marker)
+
+    def test_a_recorded_map_that_is_sound_and_written_another_way_still_launches(self):
+        # The control of the two tests above: the same row and pass launch when the map is sound. The text has another
+        # order and other spacing, which the decoder reads as the same map.
+        self.two_basis_paths()
+        first = self.unstaged_build()
+        recorded = json.loads(first.basis_file_hashes)
+        self.assertEqual(sorted(recorded), sorted(self.PATHS))
+        self.record_hashes(first, json.dumps(dict(reversed(list(recorded.items()))), indent=2))
+        mark = len(self.source.calls)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(self.source.calls[mark:], [("archive", SOURCE_SHA)])
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
 
 
 class GateEvidenceTests(PipelineCase):

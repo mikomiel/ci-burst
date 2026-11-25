@@ -53,6 +53,74 @@ Debian repositories at build time, so a later rebuild can carry different OS
 package versions even with the same tool pins. Pin a Debian snapshot
 repository if the OS layer must be reproducible.
 
+## What the image contains
+
+This section lists the tools that a CI job may rely on in the worker image. A CI
+group may rely only on the tools listed here. A tool that is not listed can be
+present, for example as a dependency of a listed package, but nothing guarantees
+it.
+
+The list covers what [`provision.sh`](provision.sh) installs and what its
+inventory probe requires. [Why the inventory check exists](#why-the-inventory-check-exists)
+describes the probe. A job may also rely on the shell and core utilities of the
+Debian 13 base, such as `bash` and the GNU core utilities, because no job runs
+without them. The recipe neither installs nor checks them, so this list does not
+name them one by one.
+
+The list describes the recipe, not one built image. The recipe does not pin the
+apt packages. [Build inputs](#build-inputs) records what one build resolved.
+
+If this section and `provision.sh` disagree, `provision.sh` is right. A change
+to an install step in `provision.sh` updates this section in the same change.
+
+### Base recipe
+
+Every number in the last column is a line of `provision.sh`. "Pin" marks the line
+that sets the version.
+
+| Tool | Installed as | Version pin | Source line |
+|---|---|---|---|
+| `uv`, `uvx` | pinned download | 0.13.7 | 134 (pin), 144-152 |
+| `node`, `npm`, `npx` | pinned download; `npm` and `npx` come with the node release | node 24.22.1 | 136 (pin), 154-163 |
+| `ruff` | package from the Python package index, installed with `uv tool install` | the `RUFF_VERSION` input; it is required and has no default and no checksum | 54-58 (pin), 172-175 |
+| `promtool` (this binary only, not the Prometheus server) | pinned download | 3.16.0 | 140 (pin), 177-183 |
+| `forgejo-runner` | pinned download | 13.2.1 | 138 (pin), 185-190 |
+| `git`, `curl`, `rsync`, `unzip`, `xz` (`xz-utils`), `file`, `jq`, `zsh`, `bats`, `shellcheck` | package (Debian apt) | not pinned | 66 |
+| `make`, `gcc`, `libc6-dev` (so that `gcc` can link) | package (Debian apt) | not pinned | 67; link check 230-237 |
+| `podman` and the Quadlet generator `/usr/libexec/podman/quadlet` | package (Debian apt) | not pinned | 67; Quadlet check 223-229 |
+| `python3` and its `yaml` module (`python3-yaml`); no `pip` ([warm-image.md](../../../docs/warm-image.md#pip)) | package (Debian apt) | not pinned | 68 |
+| `aws` (`awscli`), `iptables`; the bootstrap uses both as root | package (Debian apt) | not pinned | 68 |
+| `postgres` and `initdb` in `/usr/lib/postgresql/*/bin/`, not on `PATH`; `psql` | package (Debian apt); `psql` arrives as a dependency of `postgresql-17` | major version 17 in the package name, minor version not pinned | 69; checks 204-205, 214-222 |
+| `Xvfb` (`xvfb`); not `xvfb-run`, which needs `xauth`, and the recipe installs no recommended package | package (Debian apt) | not pinned | 69 |
+| `ca-certificates`, `zlib1g`, fonts (`fonts-*`, `xfonts-scalable`) and shared libraries (`lib*`) for a browser; no browser is installed | package (Debian apt) | not pinned | 66, 69-75 |
+| `tar`, `flock`, `systemd-tmpfiles`, `dpkg-query` | Debian 13 base image; the recipe does not install them, and its probe fails the build when one is missing | not pinned | 204 |
+
+### Optional warm layer
+
+[`warm-cache.sh`](warm-cache.sh) installs no package and no tool. It creates the
+cache directory `/var/lib/forgejo-runner/cache` (lines 324-325). It runs the
+consumer's warm commands as the `runner` account (lines 327-331). The clean-up
+then keeps only that directory in the runner home (lines 339-351).
+
+What the warm commands leave in the cache is consumer-defined, so this section
+lists none of it. Warm-layer contents are not on the list above, so a job may not
+rely on them. [`docs/warm-image.md`](../../../docs/warm-image.md) owns the layer.
+
+### Qualify a heavy job
+
+A passing run alone does not qualify a job: a job that does not find a tool can
+skip the checks that need it and still pass
+([operations.md](../../../docs/operations.md#worker-image-and-launch-template)). To qualify a heavy job:
+
+1. Make the job fail when a tool it needs is absent, instead of skipping.
+2. Run it on a burst worker, a worker that ci-burst launched from this image.
+3. Check from its log that the intended checks ran, not only that it passed.
+
+If the job needs a tool that is not listed, add the tool to
+[`provision.sh`](provision.sh) and its row to the table in the same change, and
+qualify the job again on the new image. The tool reaches workers only through a
+new image and a new launch-template version ([Build](#build)).
+
 ## Deployment-specific provenance
 
 The recipe was recovered on 2026-11-12 from the deployment's launch-template

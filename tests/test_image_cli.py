@@ -1057,7 +1057,12 @@ class RefreshTests(CliCase):
         # test_image_promote imports this module.
         from test_image_promote import EditTests
 
-        self.add_pending(old_sha="0" * 64, new_sha=self.file_sha())
+        # The promotion died after the rename: the file already pins the candidate, and the pending row names the
+        # hash of the file before the rename and the hash of the file now.
+        self.add_world_candidate("build-b", 5, 0xB1, age=600)
+        before = self.file_sha()
+        EditTests.edit_file(self, f"launch_template_version = {PIN}".encode(), b"launch_template_version = 5")
+        self.add_pending(old_sha=before, new_sha=self.file_sha(), candidate_id="build-b")
         rows = self.journal_rows()
         EditTests.leave_a_hot_journal(self)
         deployment = self.config_path.read_bytes()

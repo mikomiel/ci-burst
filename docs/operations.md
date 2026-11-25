@@ -1167,23 +1167,48 @@ storage is billed and untracked, so tracked cost does not bound it (see
 automated retention (`retain`, `retain_min_age_seconds`) covers only images that
 the pipeline built, which carry the `ci-burst:image-build` tag.
 
-To clean them up by hand, use this rule:
+To clean them up by hand, first stop admission: stop `apply`, a pass that is
+running included ([Scheduler, cleanup and rollback](#scheduler-cleanup-and-rollback);
+[container.md](container.md#rollback), step 1, gives the commands for the shipped
+units). Then use this rule:
 
-1. Keep every template version that the deployment file pins:
+1. Keep every version of the worker template that the deployment file pins:
    `aws.launch_template_version`, and each zone candidate's
    `launch_template_version`. Keep the previously pinned version too.
-2. Delete the other template versions that reference a hand-built image, with
-   `aws ec2 delete-launch-template-versions`. Do not delete a candidate version
-   that the image pipeline added (its image carries `ci-burst:image-build`): the
-   pipeline owns it, and a pending promotion may still need it. AWS refuses to
-   delete the template's default version, so make a kept version the default
-   first.
-3. Keep every image that a remaining version references.
-4. Deregister the other hand-built images, then delete their snapshots.
-
-A bootstrap-only version, which changes only the user data, uses the same image
-as its source version. Check the image of every kept version before you
-deregister an image.
+2. Keep every version that the promotion journal names, as
+   [Retention](#retention) lists them: the previous pin, the new pin of the newest
+   completed promotion or rollback, both pins of every journal row since that one
+   (an aborted row included), and the pins of a pending promotion. A hand-built
+   version can be among them. `image status` lists only some of these pins
+   ([Image commands](#image-commands)). If you delete one, the deletion rule
+   refuses with `IMAGE_DELETION_UNSAFE` and removes nothing until a later promotion
+   or rollback completes.
+3. Keep every version that an unresolved launch intent names. `apply` retries such
+   an intent with its frozen request, version included. If that version is gone,
+   the retry is rejected, the intent stays unresolved and admission stays blocked
+   ([Durable state and ownership](#durable-state-and-ownership)). `status` lists an
+   unresolved intent in `slot.operations` as an operation whose `instance_id` is
+   `null`, but it does not print the template version. While `slot.operations`
+   lists one, delete no version of the worker template: skip step 4 and repeat the
+   cleanup once the intent is resolved. Count an empty list only when
+   `state.available` is `true`: a `status` run without the ledger lists no intent.
+4. Delete the other versions of the worker template that reference a hand-built
+   image, with `aws ec2 delete-launch-template-versions`. Delete no version of
+   another template, the build template that `[image.build]` pins included. Do not
+   delete a candidate version that the image pipeline added (its image carries
+   `ci-burst:image-build`): the pipeline owns it, and a pending promotion may still
+   need it. AWS refuses to delete the template's default version, so make a kept
+   version the default first.
+5. Keep every image that a remaining template version references. A bootstrap-only
+   version, which changes only the user data, uses the image of its source
+   version. Check the remaining versions of the worker template (zone pins
+   included), the version of the build template that `[image.build]` pins (its
+   image is the cold base image,
+   [deployment.md](deployment.md#the-image-tables-optional)), and every other
+   template that names the image, such as a canary template
+   ([warm-image.md](warm-image.md#canary-and-cutover)).
+6. Deregister the other hand-built images, then delete their snapshots.
+7. Start `apply` again.
 
 ### Image reason codes
 

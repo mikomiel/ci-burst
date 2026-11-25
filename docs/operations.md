@@ -1157,6 +1157,34 @@ read (`IMAGE_STATE_UNREADABLE`), before retention runs. Retention reads the pin 
 build container must not run across a promotion
 ([container.md](container.md#run-the-image-commands)).
 
+#### Retention of hand-built worker images
+
+The worker images made by hand, by the recipe in `deploy/runner/image/` or by the
+[manual warm-image runbook](warm-image.md#manual-runbook), and their
+launch-template versions, are not pruned by any ci-burst command. Their snapshot
+storage is billed and untracked, so tracked cost does not bound it (see
+[Cost tracking and the allowance](#cost-tracking-and-the-allowance)). The
+automated retention (`retain`, `retain_min_age_seconds`) covers only images that
+the pipeline built, which carry the `ci-burst:image-build` tag.
+
+To clean them up by hand, use this rule:
+
+1. Keep every template version that the deployment file pins:
+   `aws.launch_template_version`, and each zone candidate's
+   `launch_template_version`. Keep the previously pinned version too.
+2. Delete the other template versions that reference a hand-built image, with
+   `aws ec2 delete-launch-template-versions`. Do not delete a candidate version
+   that the image pipeline added (its image carries `ci-burst:image-build`): the
+   pipeline owns it, and a pending promotion may still need it. AWS refuses to
+   delete the template's default version, so make a kept version the default
+   first.
+3. Keep every image that a remaining version references.
+4. Deregister the other hand-built images, then delete their snapshots.
+
+A bootstrap-only version, which changes only the user data, uses the same image
+as its source version. Check the image of every kept version before you
+deregister an image.
+
 ### Image reason codes
 
 Where the code appears depends on how the command ended:

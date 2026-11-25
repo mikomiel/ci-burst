@@ -1051,6 +1051,30 @@ class RefreshTests(CliCase):
         self.assertEqual(self.pin_in_file(), 5)
         self.assertEqual(len(self.sessions), built + 1, "only the refresh built a client")
 
+    def test_refresh_rolls_a_hot_journal_back_and_leaves_the_pending_row_and_the_deployment_file_alone(self):
+        # The recovery that the refusal names first. It changes neither the pin nor the account, so the row of a
+        # crashed promotion stays pending for the command that resolves it. The helpers are imported here because
+        # test_image_promote imports this module.
+        from test_image_promote import EditTests
+
+        self.add_pending(old_sha="0" * 64, new_sha=self.file_sha())
+        rows = self.journal_rows()
+        EditTests.leave_a_hot_journal(self)
+        deployment = self.config_path.read_bytes()
+        code, payload = self.invoke("image", "status")
+        refusal = payload.get("error", {})
+        self.assertEqual((code, refusal.get("reason")), (2, "IMAGE_STATE_RECOVERY_NEEDED"), payload)
+        self.assertIn("image status --refresh", refusal.get("detail", ""))
+        code, payload = self.invoke("image", "status", "--refresh")
+        self.assertEqual((code, payload.get("decision")), (0, "refreshed"), payload)
+        self.assertIsNone(EditTests.hot_files(self)[1], "the journal is gone")
+        tables = {row["name"] for row in self.table("sqlite_master")}
+        self.assertNotIn("spill", tables, "the interrupted transaction is rolled back, not committed")
+        after = self.journal_rows()
+        self.assertEqual([row["status"] for row in after], ["pending"])
+        self.assertEqual(after, rows)
+        self.assertEqual(self.config_path.read_bytes(), deployment)
+
 
 # -- 6.7: the previous pin's image state is recorded ---------------------------------------
 

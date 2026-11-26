@@ -72,6 +72,7 @@ from .export import (
     _job_process_value,
     _match,
     _number,
+    _open_for_reading,
     _refuse_constant,
     _refuse_repeated_member,
     _spot_interruption_value,
@@ -165,17 +166,6 @@ def read_launch_evidence(path, now, recorded):
         return _read(path, now, recorded)
     except Exception:  # noqa: BLE001 - an optional brake never fails the pass
         return LaunchEvidence(UNREADABLE)
-
-
-def _open_for_reading(path, flags):
-    """Open ``path`` without blocking and without following a link.
-
-    A plain read-only open of a FIFO that has no writer blocks forever, and
-    ``apply`` reads the record while it holds the ledger writer lock. ``export``
-    replaces the record by a rename of a regular file, so a link at the path is
-    not its output.
-    """
-    return os.open(path, flags | os.O_NONBLOCK | os.O_NOFOLLOW)
 
 
 def _read_to_bound(descriptor):

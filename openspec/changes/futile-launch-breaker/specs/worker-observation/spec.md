@@ -33,13 +33,11 @@ change to the brake's reader.
 - **THEN** the record is not rewritten
 - **AND** its modification time ages, so the brake sees it as `stale` after 600 seconds
 
-#### Scenario: A run that cannot write its textfile leaves the record alone
-- **WHEN** a run cannot replace the metrics textfile, so the command exits 1
-- **THEN** the command puts back the record that it saved before the textfile: the same bytes under the same modification time, or no file when there was none
+#### Scenario: A run that cannot write its textfile keeps the record that it saved
+- **WHEN** a run saved the record and then cannot replace the metrics textfile, so the command exits 1
+- **THEN** the record stays as the run saved it, under the modification time of the record that the run read, or under the epoch when it read none
 - **AND** the modification time ages, so the brake sees it as `stale` after 600 seconds
-- **AND** the next run rediscovers the owned instances and reads again the consoles that it selects within its per-run read budget (`MAX_CONSOLE_READS`, 16, live workers first), so a marker that it still finds on one of them is emitted again under the same identity
-- **AND** a console that the run defers past that budget (`console_read_deferred`) is not read in that run, so the run emits nothing for it
-- **AND** an instance that left the provider's inventory, or a marker that scrolled out of the console, is not emitted again
+- **AND** the run published its events before it saved the record, so the next run does not emit them again
 
 #### Scenario: A run that cannot write the record does not replace the textfile
 - **WHEN** a run cannot replace the record, so the command exits 1
@@ -52,11 +50,22 @@ change to the brake's reader.
 - **THEN** the record already holds the totals of that textfile, under the modification time that it had before the run, so the brake sees it as `stale` after 600 seconds
 - **AND** a later run writes totals that are not lower, even when a worker has left the provider's inventory in between
 
-#### Scenario: A record that is not put back stays ahead of the textfile
-- **WHEN** a run saved the record and then cannot replace the metrics textfile, and the record is not put back, because the put-back fails or because the run could not read the record that it replaced, or an interrupt ends the run before it replaced the textfile
-- **THEN** the textfile is the previous one, and the record holds the totals of that run under a modification time that is not newer than the one that it had before, so the brake sees it as `stale` after 600 seconds
-- **AND** the run does not remove the record that it could not read, because the textfile may carry its totals
+#### Scenario: A run that read its record and cannot write its textfile cannot lower a counter
+- **WHEN** a run read the record, saved it, and then cannot replace the metrics textfile, or an interrupt ends the run before it replaced the textfile
+- **THEN** the textfile is the previous one, and the record holds the totals of that run under the modification time that the run read, so the brake sees it as `stale` after 600 seconds
 - **AND** a later run writes totals that are not lower, so no counter falls
+
+#### Scenario: A record that cannot be read restarts the counters
+- **WHEN** a record exists and the run cannot read it: a read fails, even for a moment, or the path holds a link or a FIFO
+- **THEN** the command treats it as a record that does not decode: it notes `state_rebuilt`, starts from an empty record and saves a regular file in its place
+- **AND** the emitted history and the cumulative counters start again, as when the record is deleted, so the textfile of an earlier run can hold higher totals until a run replaces it
+- **AND** the run saves the new record under the epoch, so a run that then cannot write its textfile leaves no fresh heartbeat
+- **AND** the record carries neither the records nor the modification time of a link's target
+
+#### Scenario: Runs that share a record take turns
+- **WHEN** a run starts while another run that uses the same record is in progress, such as a manual run while the timer's run is in progress
+- **THEN** the run waits on an exclusive lock on `<record>.lock` beside the record before it reads the record or the event file
+- **AND** it reads the record only after the other run has made its last write, so it never saves totals derived from an older snapshot or writes over a newer record
 
 #### Scenario: The unit cannot publish the textfile
 - **WHEN** a run completes and writes the record, and the shipped unit then cannot publish the textfile into the collector's directory

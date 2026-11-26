@@ -114,14 +114,20 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   row must not stop a pass. Do not catch `MemoryError`.
 - [x] 1.14 In `export`, save the record before the textfile, so that no textfile
   carries a total that the record lacks, and advance the record's modification
-  time last. Save the record under the modification time that it had (the epoch
-  when there was none), put it back when the textfile cannot be replaced (the
-  same bytes under the same times, or no file when there was none, for an
-  `Exception` only), and let a put-back that fails, or an interrupt, leave the
-  record ahead of the textfile. Do not put the record back once the textfile is
-  replaced. Do not remove a record that the run could not read before it
-  replaced it: leave it as saved, under the epoch. `load_state` draws the same
-  line between a file that is absent and one that does not read.
+  time last. Save the record under the modification time of the record that the
+  run read (the epoch when it read none: no file, or one that it could not read).
+  When the textfile cannot be replaced, leave the record as saved: do not put it
+  back. The run published its events before it saved the record, so the next run
+  does not emit them again.
+- [x] 1.15 In `export`, read the record once per run, through the launch evidence
+  reader's opener (`_open_for_reading`, now in `export`), without blocking and
+  without following a link. Parse the state and take the times for the save from
+  that one read. Treat a link, a FIFO, another entry that is not a regular file
+  and a read that fails as a record that does not decode: note `state_rebuilt`
+  and restart the counters. Serialize runs that share a record with an
+  exclusive, blocking `flock` on `<record>.lock`, a file of its own that is never
+  deleted, taken before the clock, the record and the event file are read and
+  held until the last write.
 
 ## 2. Gate
 
@@ -213,10 +219,10 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   records and notes `console_read_deferred` for the rest.
 - [x] 3.4 Exporter tests show that a successful run with nothing new still
   rewrites the record and advances its modification time, that a refused run
-  leaves it unrewritten, that a run that cannot write its textfile puts it back
-  as it was and that the next run emits again, under the same identities, the
-  markers it still finds, and that a deleted record is rebuilt with the rebuilding
-  run's time.
+  leaves it unrewritten, that a run that cannot write its textfile keeps the
+  record that it saved under its old modification time and that the next run
+  does not emit the failed run's events again, and that a deleted record is
+  rebuilt with the rebuilding run's time.
 - [x] 3.5 Controller tests add one class beside `ClaimGraceTests` in
   `tests/test_controller.py`. They cover the hold with its single reason and its
   `launch_evidence`; no template read and no price read on a hold, checked
@@ -277,11 +283,18 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   the record's total, for the three totals and for console reads, and no series
   falls over a sequence of runs in which a worker leaves the provider's
   inventory. The sequences are a record that cannot be saved, a run that stops
-  after the textfile, a put-back that fails, an interrupt, and a record that
-  cannot be read before it is replaced, with the textfile blocked. Before the
-  textfile is replaced the record holds the new totals under its old
+  after the textfile, a run that cannot write its textfile, and an interrupt.
+  Before the textfile is replaced the record holds the new totals under its old
   modification time, and the time advances after it. A first run that cannot
-  write its textfile leaves no record.
+  write its textfile leaves a record under the epoch, which the reader reads as
+  `stale`.
+- [x] 3.13 Shared-record tests in `tests/test_export.py`. A run waits while the
+  lock is held and starts from the record that the holder saved. A record whose
+  first read fails notes `state_rebuilt` and restarts the counters, and after a
+  failed textfile write it carries the epoch, not a fresh heartbeat. A link at the
+  record path to a fresh record of three futile workers is replaced by a regular
+  file that carries neither the target's records nor its modification time, and
+  the reader reports no hold after a failed textfile write.
 
 ## 4. Documentation
 
@@ -298,10 +311,10 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   zero-bound reasons in "Fleet size and fan-out", extend the "recovery path" line
   in "Claim grace" with the gate, correct the sentence in "Worker evidence" that
   says deleting the dedupe record never changes a decision, add that `export`
-  saves the dedupe record before the textfile and puts it back when the textfile
-  cannot be replaced, that the repeats of a run that failed count against the
-  event file bound, that a run which cannot save the record exits 1 before it
-  replaces the textfile and before the unit publishes it, so the collector's
+  saves the dedupe record before the textfile and keeps it when the textfile
+  cannot be replaced, that a record that cannot be read restarts the counters,
+  that runs which share a record are serialized, that a run which cannot save
+  the record exits 1 before it replaces the textfile and before the unit publishes it, so the collector's
   last-run time does not advance, that no textfile carries a total that the
   record lacks, in direct mode as well as in the shipped unit, and that a unit
   which fails at publication keeps the record fresh, and note in "Launch

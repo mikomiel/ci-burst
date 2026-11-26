@@ -1,9 +1,12 @@
 import io
 import contextlib
 import dataclasses
+import fcntl
 import json
 import os
+import stat
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -1834,6 +1837,30 @@ class LaunchEvidenceContractTests(ExportCase):
         self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 3})
         self.assertTrue(evidence.holds)
 
+    def test_a_link_at_the_record_path_is_no_evidence_after_a_failed_run(self):
+        # The reader refuses a link at the record path. The exporter must not
+        # turn one into a regular file that carries the target's records or its
+        # modification time, even when the run then fails at its textfile.
+        wall = time.time()
+        target = self.root / "elsewhere" / "observed.json"
+        write_observed(target, [futile_record(wall - 60, index=index) for index in (1, 2, 3)], mtime=wall)
+        recorded = ledger_holding(target)
+        self.assertTrue(read_launch_evidence(target, wall, recorded).holds)
+        before = (target.read_bytes(), os.stat(target).st_mtime_ns)
+        self.state_file.parent.mkdir(parents=True)
+        self.state_file.symlink_to(target)
+        self.metrics.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.run_export(self.build([], {}), now=wall)
+        self.assertTrue(stat.S_ISREG(os.lstat(self.state_file).st_mode))
+        self.assertEqual(self.records(), {})
+        self.assertEqual(os.stat(self.state_file).st_mtime_ns, 0)
+        evidence = read_launch_evidence(self.state_file, time.time(), recorded)
+        self.assertEqual(evidence.state, "stale")
+        self.assertFalse(evidence.holds)
+        # The target of the link is not written.
+        self.assertEqual((target.read_bytes(), os.stat(target).st_mtime_ns), before)
+
     def test_the_reader_accepts_every_marker_the_exporter_writes(self):
         # A reader that is stricter than the writer would switch the gate off
         # without any test that refuses a record noticing it.
@@ -2396,8 +2423,8 @@ class RecordCadenceTests(ExportCase):
         """Write a record, age it, and return a run that cannot write its textfile.
 
         A directory where the textfile belongs cannot be replaced by a file. The
-        second worker is new evidence, so a record that the run wrote would
-        differ from the one on disk.
+        second worker is new evidence, so the record that the run saves differs
+        from the one on disk.
         """
         self.run_export(self.build(self.owned(), consoles))
         old = time.time() - 3600
@@ -2410,35 +2437,61 @@ class RecordCadenceTests(ExportCase):
         ]
         return old, self.build(owned, consoles)
 
-    def test_a_run_that_cannot_write_its_textfile_leaves_the_record_alone(self):
+    def test_a_run_that_cannot_write_its_textfile_does_not_refresh_the_record(self):
         # The record's modification time is the launch evidence heartbeat, and
-        # a run that fails must not refresh it.
+        # a run that fails must not refresh it. The record stays as the run saved
+        # it, under the time that it had.
         old, exporter = self.fail_the_textfile({"i-0123456789abcdef0": CLEAN_BOOT})
-        before = self.state_file.read_bytes()
         with self.assertRaises(OSError):
             self.run_export(exporter, now=NOW + 60)
-        self.assertEqual(self.state_file.read_bytes(), before)
+        self.assertIn("i-0123456789abcdef1", json.loads(self.state_file.read_text())["instances"])
         self.assertEqual(os.stat(self.state_file).st_mtime, old)
-        # The failed replacement leaves no temporary file behind.
+        # The failed replacement leaves no temporary file behind. The lock file
+        # stays, because it is never deleted.
         self.assertEqual(os.listdir(self.metrics.parent), [self.metrics.name])
-        self.assertEqual(sorted(os.listdir(self.state_file.parent)), ["observed.json", "worker-events.ndjson"])
+        self.assertEqual(
+            sorted(os.listdir(self.state_file.parent)),
+            ["observed.json", "observed.json.lock", "worker-events.ndjson"],
+        )
 
-    def test_the_events_of_a_run_that_failed_repeat_under_the_same_identities(self):
-        # The record is the last file a run writes, so a run that fails earlier
-        # has already published its events. Delivery stays at least once: the
-        # next run re-emits the markers it still finds, and the identity lets a
-        # consumer drop the repeat.
+    def test_the_events_of_a_run_that_failed_are_not_emitted_again(self):
+        # A run publishes its events before it saves the record, and a run that
+        # cannot write its textfile keeps the record that it saved, so the next
+        # run does not emit those markers again.
         old, exporter = self.fail_the_textfile({"i-0123456789abcdef0": CLEAN_BOOT})
         with self.assertRaises(OSError):
             self.run_export(exporter, now=NOW + 60)
         published = [event["id"] for event in self.events_read()]
         self.assertTrue(any(key.startswith("i-0123456789abcdef1:") for key in published))
         self.metrics.rmdir()
-        self.run_export(exporter, now=NOW + 120)
+        result = self.run_export(exporter, now=NOW + 120)
+        self.assertEqual(result["events_emitted"], 0)
+        self.assertEqual([event["id"] for event in self.events_read()], published)
+        self.assertGreater(os.stat(self.state_file).st_mtime, old)
+
+    def test_the_events_of_a_run_that_could_not_save_its_record_repeat_under_the_same_identities(self):
+        # A run publishes its events before it saves the record, so a run that
+        # cannot save it has published events that no record holds. Delivery stays
+        # at least once: the next run emits again the markers that it still finds,
+        # under the same identities, and a consumer can drop the repeat.
+        consoles = {"i-0123456789abcdef0": CLEAN_BOOT, "i-0123456789abcdef1": CLEAN_BOOT}
+        self.run_export(self.build(self.owned(), consoles))
+        owned = self.owned() + [instance("i-0123456789abcdef1", state="terminated", operation=operation_hex(2))]
+        real_replace = os.replace
+
+        def fail_the_record(source, target, *arguments, **options):
+            if Path(target) == self.state_file:
+                raise OSError("injected")
+            return real_replace(source, target, *arguments, **options)
+
+        with mock.patch("os.replace", fail_the_record), self.assertRaises(OSError):
+            self.run_export(self.build(owned, consoles), now=NOW + 60)
+        published = [event["id"] for event in self.events_read()]
+        self.assertTrue(any(key.startswith("i-0123456789abcdef1:") for key in published))
+        self.run_export(self.build(owned, consoles), now=NOW + 120)
         repeated = [event["id"] for event in self.events_read()]
         self.assertEqual(set(repeated), set(published))
         self.assertGreater(len(repeated), len(published))
-        self.assertGreater(os.stat(self.state_file).st_mtime, old)
 
     def test_a_deleted_record_is_rebuilt_with_the_rebuilding_run_time(self):
         consoles = {"i-0123456789abcdef0": CLEAN_BOOT}
@@ -2456,7 +2509,8 @@ class PublishedCounterTests(ExportCase):
 
     A collector that read a counter must not read a lower one in a later run, so
     a run saves its totals before it publishes them, whatever a write does. The
-    record keeps the modification time that it had until the run is over.
+    record keeps the modification time that it had until the run is over. A record
+    that a run cannot read restarts the counters, as a deleted one does.
     """
 
     #: Each counter of the textfile, with the place in the record that holds its total.
@@ -2569,23 +2623,22 @@ class PublishedCounterTests(ExportCase):
         self.note()
         self.assert_never_fell()
 
-    def test_a_put_back_that_fails_leaves_the_record_ahead_under_its_old_time(self):
+    def test_a_run_that_cannot_write_its_textfile_keeps_the_record_under_its_old_time(self):
         self.first_run()
         old = self.age_the_record()
         saves = []
 
-        def fail_both(path):
+        def fail_the_textfile(path):
             if path == self.metrics:
                 raise OSError("injected textfile")
             if path == self.state_file:
                 saves.append(path)
-                if len(saves) > 1:
-                    raise OSError("injected put back")
 
-        with self.intercepting(fail_both), self.assertRaises(OSError) as raised:
+        with self.intercepting(fail_the_textfile), self.assertRaises(OSError) as raised:
             self.run_export(self.exporter(later=True), now=NOW + 60)
-        # The textfile is what failed, and the failed put-back does not hide it.
         self.assertEqual(str(raised.exception), "injected textfile")
+        # The record is saved once and is not written again after the failure.
+        self.assertEqual(saves, [self.state_file])
         self.assertEqual(os.stat(self.state_file).st_mtime, old)
         self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 2)
         self.note()
@@ -2610,36 +2663,81 @@ class PublishedCounterTests(ExportCase):
         self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 2)
         self.note()
 
-    def test_a_record_that_cannot_be_read_is_not_removed_when_the_textfile_fails(self):
-        # The run cannot read the record that it replaces, so it cannot put it
-        # back. It must not remove it either: the textfile still carries the
-        # totals that the record held, and a later run would start below them.
+    def test_a_run_waits_for_the_run_that_holds_the_record(self):
+        # Two runs that share a record are serialized from the first read of the
+        # record to its last write. The test holds the lock as the other run
+        # would, and saves a newer record meanwhile: the waiting run starts from
+        # that record, so it never saves totals from an older snapshot.
+        self.first_run()
+        before = (self.state_file.read_bytes(), os.stat(self.state_file).st_mtime_ns)
+        exporter = self.exporter(later=True)
+        outcome = []
+
+        def waiting_run():
+            try:
+                outcome.append(self.run_export(exporter, now=NOW + 60))
+            except BaseException as error:  # noqa: BLE001 - reported to the test thread
+                outcome.append(error)
+
+        thread = threading.Thread(target=waiting_run, daemon=True)
+        lock = os.open(f"{self.state_file}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            thread.start()
+            thread.join(timeout=0.5)
+            self.assertTrue(thread.is_alive(), "the run did not wait for the lock")
+            self.assertEqual((self.state_file.read_bytes(), os.stat(self.state_file).st_mtime_ns), before)
+            newer = json.loads(before[0])
+            newer["totals"]["launches"] = 7
+            self.state_file.write_text(json.dumps(newer))
+        finally:
+            os.close(lock)
+            if thread.is_alive():
+                thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertIsInstance(outcome[0], dict)
+        self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 8)
+        self.assertEqual(self.published()["ci_burst_worker_launches_total"], 8)
+
+    def test_a_record_that_cannot_be_read_restarts_the_counters(self):
+        # An intact record that the run cannot read is replaced, as a deleted or
+        # damaged one is, and its totals restart. A run that then cannot write
+        # its textfile leaves the new record under the epoch, so it carries no
+        # fresh heartbeat. The first open of the record fails, and any later one
+        # would succeed, as for a record that is unreadable for a moment.
         self.run_export(self.exporter(later=True))
-        self.note()
-        old = self.age_the_record()
-        reads = []
+        self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 2)
+        os.utime(self.state_file)
+        real_open = io.open
+        failed = []
 
-        def unreadable(*arguments, **options):
-            reads.append(arguments)
-            raise OSError("injected read")
+        def open_failing_once(file, *arguments, **options):
+            if not failed and isinstance(file, (str, os.PathLike)) and os.fspath(file) == str(self.state_file):
+                failed.append(file)
+                raise PermissionError(13, "injected read", str(file))
+            return real_open(file, *arguments, **options)
 
-        def fail_the_textfile(path):
-            if path == self.metrics:
-                raise OSError("injected textfile")
+        def run_with_the_first_read_failing(now):
+            failed.clear()
+            with mock.patch("builtins.open", open_failing_once), mock.patch("io.open", open_failing_once):
+                return self.run_export(self.exporter(later=False), now=now)
 
-        with self.intercepting(fail_the_textfile), mock.patch("os.fstat", unreadable):
-            with self.assertRaises(OSError) as raised:
-                self.run_export(self.exporter(later=True), now=NOW + 60)
-        # The textfile is what failed, and nothing else in the run reads through that call.
-        self.assertEqual(str(raised.exception), "injected textfile")
-        self.assertEqual(len(reads), 1)
-        self.assertTrue(self.state_file.exists())
-        self.assertLessEqual(os.stat(self.state_file).st_mtime, old)
-        self.note()
-        # The later worker leaves the provider's inventory before the next run.
-        self.run_export(self.exporter(later=False), now=NOW + 120)
-        self.note()
-        self.assert_never_fell()
+        self.metrics.unlink()
+        self.metrics.mkdir()
+        with self.assertRaises(IsADirectoryError):
+            run_with_the_first_read_failing(NOW + 60)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 1)
+        self.assertEqual(os.stat(self.state_file).st_mtime_ns, 0)
+        evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
+        self.assertEqual(evidence.state, "stale")
+
+        self.metrics.rmdir()
+        result = run_with_the_first_read_failing(NOW + 120)
+        self.assertEqual(len(failed), 1)
+        self.assertIn("state_rebuilt", result["notes"])
+        self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 1)
+        self.assertEqual(self.published()["ci_burst_worker_launches_total"], 1)
 
     def test_the_record_holds_the_totals_before_the_textfile_and_ages_until_the_run_ends(self):
         self.first_run()
@@ -2657,12 +2755,20 @@ class PublishedCounterTests(ExportCase):
         self.assertGreater(os.stat(self.state_file).st_mtime, old)
         self.note()
 
-    def test_a_first_run_that_cannot_write_its_textfile_leaves_no_record(self):
+    def test_a_first_run_that_cannot_write_its_textfile_leaves_a_stale_record(self):
+        # With no record to read, the run saves its record under the epoch, so the
+        # failed run leaves no fresh heartbeat.
         self.metrics.mkdir(parents=True)
         with self.assertRaises(OSError):
             self.run_export(self.exporter(later=False))
-        self.assertFalse(self.state_file.exists())
-        self.assertEqual(os.listdir(self.state_file.parent), [self.events.name])
+        self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 1)
+        self.assertEqual(os.stat(self.state_file).st_mtime_ns, 0)
+        evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
+        self.assertEqual(evidence.state, "stale")
+        self.assertEqual(
+            sorted(os.listdir(self.state_file.parent)),
+            sorted([self.events.name, "observed.json", "observed.json.lock"]),
+        )
 
 
 class ConsoleReadTests(unittest.TestCase):

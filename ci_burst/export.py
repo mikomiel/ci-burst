@@ -24,23 +24,25 @@ Delivery is at least once. The event line carries a stable ``id`` that is a
 function of the instance and the marker, so a consumer can deduplicate the
 repeat that follows a crash between publishing an event and persisting the
 dedupe record; the alternative — persisting first — would lose a failure event
-instead of repeating it. A run that cannot write the metrics textfile puts the
-record back as it was, so the next run reads the current consoles of the
-instances that the provider still lists, at most ``MAX_CONSOLE_READS`` of them in
-one run, and emits again, under the same identities, the markers it still finds
-on those consoles.
+instead of repeating it.
+
+Runs that share a record take turns. A run holds an exclusive lock on a file
+beside the record, ``<record>.lock``, from before its first read of the record
+or the event file until its last write, so a manual run waits for the timer's
+run and the other way round, and no run saves totals from an older snapshot
+(``_record_lock``).
 
 The counter contract sets the order of the last writes (``_publish``). The
 cumulative counters are saved in the record, and a collector must never read a
 total that a later run lowers, so a run saves the record before it replaces the
-metrics textfile. The textfile never carries a total that the record on disk
-lacks, whether it is the copy that the shipped unit publishes after the command
-exits 0 or the file that a collector reads from ``--metrics-file`` itself, and
-whether a write fails or the process stops. Counters fall only when the record is
-lost or damaged: deleted, or replaced by ``load_state`` because it cannot use it.
-A put-back that fails, an interrupt, and a record that the run could not read
-before it replaced it leave the record ahead of the textfile, which a counter
-survives.
+metrics textfile. A textfile that a run writes never carries a total that the
+record on disk lacks, whether it is the copy that the shipped unit publishes after
+the command exits 0 or the file that a collector reads from ``--metrics-file``
+itself, and whether a write fails or the process stops. Counters fall only when
+the record is lost, damaged or unreadable: deleted, or replaced by
+``load_state`` because it cannot read or use it. The counters then start again,
+and until a run replaces the textfile, the textfile of an earlier run can hold
+more than the record.
 
 The dedupe record is derived observation, not decision state. Deleting it loses
 the emitted history and the cumulative counters. It influences admission in one
@@ -48,16 +50,19 @@ way only: ``apply`` and ``plan`` read it as a read-only brake that can withhold 
 launch after repeated futile launches (``launch_evidence``). The brake reads the
 file's modification time as a heartbeat, so every successful run advances it,
 even when nothing changed, and does it last, after the textfile is replaced. The
-record is saved under the time that it already had, so a run that fails does not
-advance the modification time and the record ages. The record never authorizes a
-launch and never influences termination.
+record is saved under the time of the file that the run read, or under the epoch
+when it read none, so a run that fails does not advance the modification time
+and the record ages. The record never authorizes a launch and never influences
+termination.
 """
 
 import contextlib
+import fcntl
 import json
 import math
 import os
 import re
+import stat
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -390,6 +395,45 @@ def _refuse_repeated_member(pairs):
     return members
 
 
+#: ``_read_record``'s content for a record that exists and cannot be read.
+UNREADABLE_RECORD = object()
+
+
+def _open_for_reading(path, flags):
+    """Open ``path`` without blocking and without following a link.
+
+    Both readers of the record open it through this function: ``load_state`` and
+    the launch evidence reader. A plain read-only open of a FIFO that has no
+    writer blocks forever, and ``apply`` reads the record while it holds the ledger
+    writer lock. ``export`` replaces the record by a rename of a regular file, so a
+    link at the path is not its output.
+    """
+    return os.open(path, flags | os.O_NONBLOCK | os.O_NOFOLLOW)
+
+
+def _read_record(path):
+    """Read the record at ``path`` once and return ``(content, times)``.
+
+    ``content`` is the bytes of a regular file, ``None`` when there is no file, or
+    ``UNREADABLE_RECORD`` when the path holds a link, a FIFO, a directory or
+    another entry that is not a regular file, or when the read fails. ``times`` is
+    the access and modification time, in nanoseconds, of the file that was read,
+    and ``(0, 0)`` when none was: a run saves its record under these times
+    (``_publish``), so it never gives the record a time that it did not read from
+    the record itself.
+    """
+    try:
+        with open(path, "rb", opener=_open_for_reading) as stream:
+            status = os.fstat(stream.fileno())
+            if not stat.S_ISREG(status.st_mode):
+                return UNREADABLE_RECORD, (0, 0)
+            return stream.read(), (status.st_atime_ns, status.st_mtime_ns)
+    except FileNotFoundError:
+        return None, (0, 0)
+    except OSError:
+        return UNREADABLE_RECORD, (0, 0)
+
+
 def load_state(path, *, now=None):
     """Return ``(state, note)``; an unusable record is replaced, not repaired.
 
@@ -431,13 +475,26 @@ def load_state(path, *, now=None):
     dropped record, and the evidence that a live worker's record held from earlier
     reads is lost with it: the record shows what the console shows now. Without
     ``now`` no record is judged against a clock.
+
+    The file is read once, as ``_read_record`` reads it. An entry that exists and
+    cannot be read is replaced as well, and the note is ``state_rebuilt``: a link,
+    a FIFO, or a file whose read fails, even for a moment. The emitted history and
+    the cumulative counters start again, as for a deleted file. A directory at the
+    path reads the same way, and the run then fails when it saves the record.
     """
+    return _state_from(_read_record(path)[0], now)
+
+
+def _state_from(content, now):
+    """``load_state`` for the content that ``_read_record`` returned."""
     empty = {"version": STATE_VERSION, "console_reads": 0, "totals": _empty_totals(), "instances": {}}
-    try:
-        raw = Path(path).read_bytes().decode("utf-8")
-    except FileNotFoundError:
+    if content is None:
         return empty, None
-    except (OSError, UnicodeDecodeError):
+    if content is UNREADABLE_RECORD:
+        return empty, "state_rebuilt"
+    try:
+        raw = content.decode("utf-8")
+    except UnicodeDecodeError:
         return empty, "state_rebuilt"
     try:
         payload = json.loads(
@@ -784,6 +841,12 @@ class Exporter:
         self._ledger = ledger
 
     def run(self, *, events_file, metrics_file, state_file, now=None):
+        # The lock comes before the clock: a run that waited would otherwise
+        # judge the records of the run before it against an older clock.
+        with _record_lock(state_file):
+            return self._run(events_file, metrics_file, state_file, now)
+
+    def _run(self, events_file, metrics_file, state_file, now):
         started = self.clock()
         current = self.clock() if now is None else now
         summary = RunSummary(deployment=self.config.deployment)
@@ -802,7 +865,10 @@ class Exporter:
         if len(live) > limit:
             summary.notes.append("above_configured_limit")
 
-        state, note = load_state(state_file, now=current)
+        # The record is read once. The state and the times that the record is
+        # saved under come from the same read.
+        content, times = _read_record(state_file)
+        state, note = _state_from(content, current)
         if note is not None:
             summary.notes.append(note)
         prune_state(state, current)
@@ -872,7 +938,7 @@ class Exporter:
         summary.duration = self.clock() - started
         # The record is saved before the textfile and its modification time
         # advances after it: ``_publish`` has the order and the reason for it.
-        _publish(state_file, record_text, metrics_file, render_metrics(summary, current, state["console_reads"]))
+        _publish(state_file, record_text, times, metrics_file, render_metrics(summary, current, state["console_reads"]))
         result = summary.as_dict()
         result["decision"] = "reported"
         return result
@@ -1205,61 +1271,44 @@ def _write_atomic(path, content, *, times=None):
         raise
 
 
-def _read_record_file(path):
-    """The record at ``path`` as ``(bytes, access time, modification time)``, the times in nanoseconds.
+@contextlib.contextmanager
+def _record_lock(state_file):
+    """Hold an exclusive lock for the record at ``state_file`` while the block runs.
 
-    ``None`` is the answer for a file that is absent. ``()`` is the answer for a
-    file that exists and cannot be read. ``load_state`` draws the same line: an
-    absent record is no record, and an unreadable one is replaced.
+    Runs that share a record are serialized: a second run waits until the first
+    releases the lock. The lock is on a file of its own, ``<record>.lock``,
+    created when it is absent and never deleted. A lock on the record itself would
+    exclude nothing, because ``_write_atomic`` renames a new file over it. The
+    launch evidence reader takes no lock.
     """
+    path = Path(f"{state_file}.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
-        with open(path, "rb") as stream:
-            status = os.fstat(stream.fileno())
-            return stream.read(), status.st_atime_ns, status.st_mtime_ns
-    except FileNotFoundError:
-        return None
-    except OSError:
-        return ()
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
-def _publish(state_file, record_text, metrics_file, metrics_text):
+def _publish(state_file, record_text, times, metrics_file, metrics_text):
     """Save the record, replace the metrics textfile, then advance the record's time.
 
     The cumulative counters live in the record and the textfile publishes them.
     A collector must never read a total that a later run lowers, so the record is
     saved first: the textfile never carries a total that the record on disk
     lacks, whether a write fails or the process stops. The record is saved under
-    the modification time that it had, or under the epoch when there was none,
-    because that time is the launch evidence heartbeat: a run that fails must not
-    advance it, and the reader takes a file with that time for ``stale``. It is
-    advanced last, after the textfile is replaced.
+    ``times``, the times of the record that the run read, or the epoch when it read
+    none, because the modification time is the launch evidence heartbeat: a run
+    that fails must not advance it, and the reader takes a file with the epoch for
+    ``stale``. It is advanced last, after the textfile is replaced.
 
-    A run that cannot replace the textfile puts back the record that it replaced,
-    the same bytes under the same times, or no file when there was none, so the
-    failed run leaves the record as it found it. The put-back is for an
-    ``Exception`` only. An interrupt leaves the record ahead of the textfile,
-    which is the safe direction for a counter, and so does a put-back that fails:
-    the original error is still the one that propagates. The put-back must never
-    run once the textfile is replaced, because it would then save less than the
-    textfile publishes.
-
-    A record that exists and could not be read before the run replaced it is
-    neither put back nor removed. There is nothing to restore, and removing it
-    would drop totals that the textfile may already carry. It stays as the run
-    saved it, under the epoch like a first record, so the failed run does not
-    leave it fresh.
+    A run that cannot replace the textfile leaves the record as it saved it, under
+    those times. Its events were published before the record was saved, so the
+    next run does not emit them again.
     """
-    previous = _read_record_file(state_file)
-    _write_atomic(state_file, record_text, times=previous[1:] if previous else (0, 0))
-    try:
-        _write_atomic(metrics_file, metrics_text)
-    except Exception:
-        with contextlib.suppress(OSError):
-            if previous is None:
-                Path(state_file).unlink(missing_ok=True)
-            elif previous:
-                _write_atomic(state_file, previous[0], times=previous[1:])
-        raise
+    _write_atomic(state_file, record_text, times=times)
+    _write_atomic(metrics_file, metrics_text)
     os.utime(state_file)
 
 

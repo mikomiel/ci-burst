@@ -205,7 +205,11 @@ python -m ci_burst export --config deployment.toml \
 ```
 
 The two optional paths default to `<ledger directory>/export/`, as
-`worker-events.ndjson` and `observed.json`.
+`worker-events.ndjson` and `observed.json`. Concurrent runs that share a record
+are serialized: a run holds an exclusive lock on `<record>.lock` beside the
+record, from before it reads the record or the event file until its last write,
+so a manual run waits for the timer's run and the other way round. The lock file
+is never deleted.
 
 ### The event stream
 
@@ -283,18 +287,10 @@ rewrite is also what makes rotation and the size bound possible.
 
 Delivery is at least once. `id` is derived from the instance and the marker, so
 a repeat after a crash between publishing an event and saving the dedupe record
-carries the same identity and a consumer can drop it. `export` saves the dedupe
-record before it replaces the textfile and puts the record back if the textfile
-cannot be replaced, so a run that cannot write the textfile leaves the record as
-it was. The next run rediscovers the owned instances and reads
-again the consoles that it selects within its per-run read budget
-(`MAX_CONSOLE_READS`, 16, live workers first), so a marker that it still finds on
-one of them is emitted again under the same identity. A console that the run
-defers past the budget (`console_read_deferred`) is not read in that run, so the
-run emits nothing for it. An instance that left the provider's inventory, or a
-marker that scrolled out of the console, is not emitted again.
-The repeats count against the event file bound, so a long textfile outage can
-push older lines out of the file. The dedupe record keeps what was
+carries the same identity and a consumer can drop it. `export` publishes the
+events, then saves the dedupe record before it replaces the textfile. A run that
+cannot write the textfile keeps the record that it saved, so the next run does
+not emit those events again. The dedupe record keeps what was
 already emitted and is pruned after seven days; deleting it loses the history and
 the cumulative counters. It can change a decision in one way only: `apply` and
 `plan` read the record as a brake after repeated futile launches (§ Futile launch
@@ -309,8 +305,13 @@ they do not fall when an instance ages out of the provider's record window or
 when a record is pruned. `export` saves the record, which holds the totals,
 before it replaces the textfile, so a textfile never carries a total that the
 record lacks, and that holds for a collector that reads `--metrics-file` itself
-as well as for the shipped unit. Only a lost or damaged dedupe record (deleted,
-or replaced by `export` because it cannot load it) restarts a counter.
+as well as for the shipped unit. Only a lost, damaged or unreadable dedupe
+record (deleted, or replaced by `export` because it cannot read or load it)
+restarts a counter. `export` reads the record once per run, without blocking and
+without following a link, and treats a read that fails, even for a moment, a
+link or a FIFO as a damaged record, which it replaces.
+After such a reset the textfile of an earlier run can hold higher totals until a
+run replaces it.
 `ci_burst_worker_unregistered_total` counts workers
 that ended without ever showing the registration marker; evidence observed once
 is never un-learned by a later empty console. `ci_burst_spend_micros`, `ci_burst_committed_micros`,
@@ -323,9 +324,9 @@ the collector. `export` saves the dedupe record, then replaces the textfile at
 `--metrics-file`, then advances the record's modification time, which is the
 heartbeat that `apply` reads (§ Futile launch hold). A run that cannot save the
 record exits 1 before it replaces the textfile. A run that cannot replace the
-textfile puts the record back as it was, bytes and modification time, and exits
-1. Either way the record is not refreshed, so it ages, and the failed unit shows
-it. In the shipped unit,
+textfile keeps the record that it saved, under the modification time of the
+record that it read, or the epoch when it read none, and exits 1. Either way the
+record is not refreshed, so it ages, and the failed unit shows it. In the shipped unit,
 `--metrics-file` is in the state directory and `ExecStartPost` publishes the
 textfile into the collector's directory. systemd runs `ExecStartPost` only after
 `export` exits 0, so a failed run publishes nothing: the collector's timestamp
@@ -334,13 +335,13 @@ record's modification time, and the collector's timestamp does not advance
 either. Where `--metrics-file` names the collector's own file (direct mode, as in
 the commands above), the collector reads each textfile as soon as `export`
 replaces it, and a textfile that it has read never carries a total that a later
-run lowers: the record already holds it. A run that stops after it replaced the
-textfile, whose put-back fails, or that could not read the record it replaced,
-leaves the record level with the textfile or ahead of it, under its old
-modification time (the epoch when the run could not read the record), and a later
-run writes totals that are not lower, even when an instance has left the
-provider's inventory in between. A record that the run could not read is not
-removed, because the textfile may carry its totals.
+run lowers: the record already holds it. A run that read its record and then
+stops after it replaced the textfile, or cannot replace it, leaves the record
+level with the textfile or ahead of it, under the modification time that it read,
+and a later run writes totals that are not lower, even when an instance has left
+the provider's inventory in between. A run that could not read its record
+restarts the counters, as for a deleted record (see above), and saves the new
+record under the epoch.
 
 ### Bounds
 
@@ -1837,8 +1838,10 @@ record had, and advances that time as its last step, after the event file (when
 the run has events to add or the file exists) and the textfile, so only a run
 that completed those writes refreshes it. A refused run, or a run that fails
 before it gets there (the textfile cannot be written, for example), lets it age:
-a run that cannot replace the textfile puts the record back as it was. The
-heartbeat does not cover publication. The shipped unit publishes the textfile
+a run that cannot replace the textfile keeps the record that it saved under the
+modification time of the record that it read, or the epoch when it read none.
+Until that time is 600 seconds old, a hold can rest on the evidence that the
+failed run read. The heartbeat does not cover publication. The shipped unit publishes the textfile
 into the collector's directory afterwards, from `ExecStartPost`, and a failure
 there leaves the record fresh: a hold still rests on the record, because the
 evidence in it was read, while the collector's copy of the textfile is not

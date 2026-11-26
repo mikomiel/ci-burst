@@ -241,6 +241,19 @@ class ConfigTests(unittest.TestCase):
             load(path)
         self.assertIn("quoted decimal string", raised.exception.detail)
 
+    def test_refuses_a_max_spot_price_above_the_stored_price_bound(self):
+        # Admission freezes the cap as MaxPrice; one micro above the bound would be a request resume refuses.
+        for price, accepted in (("1000000", True), ("1000000.000001", False)):
+            with self.subTest(price=price):
+                path = write_config(self.root)
+                path.write_text(path.read_text().replace('max_spot_price = "0.0400"', f'max_spot_price = "{price}"'))
+                if accepted:
+                    self.assertEqual(load(path).aws.max_spot_price, 10**12)
+                else:
+                    with self.assertRaises(ConfigRefusal) as raised:
+                        load(path)
+                    self.assertIn("aws.max_spot_price", raised.exception.detail)
+
     def test_refuses_mutable_template_version(self):
         path = write_config(self.root, config={"aws": {"launch_template_version": "$Latest"}})
         with self.assertRaises(ConfigRefusal):

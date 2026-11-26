@@ -20,8 +20,9 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .cost import MAX_STORED_PRICE_MICROS
 from .errors import ConfigRefusal
-from .money import parse_money
+from .money import format_money, parse_money
 
 #: Contracts whose response shapes this source validates. A contract is a
 #: declared interface, not proof of live semantics: see ``qualification``.
@@ -822,6 +823,11 @@ def loads(text, path):
     profile = aws_table.get("profile")
     if profile is not None and (not isinstance(profile, str) or not profile):
         _fail("aws.profile", "must be a non-empty string when set")
+    max_spot_price = _money(aws_table, "max_spot_price", "aws")
+    # Admission freezes this cap as the request's MaxPrice, and a stored price above the bound is no usable price, so
+    # a larger cap would write a request that its own resume refuses as damaged.
+    if max_spot_price > MAX_STORED_PRICE_MICROS:
+        _fail("aws.max_spot_price", f"must be at most {format_money(MAX_STORED_PRICE_MICROS)}")
     aws = AwsConfig(
         region=region,
         zones=zones,
@@ -830,7 +836,7 @@ def loads(text, path):
             aws_table, "launch_template_name", "aws", pattern=_TEMPLATE_NAME, pattern_name="a launch template name"
         ),
         launch_template_version=launch_template_version,
-        max_spot_price=_money(aws_table, "max_spot_price", "aws"),
+        max_spot_price=max_spot_price,
         max_lifetime_seconds=_integer(aws_table, "max_lifetime_seconds", "aws", minimum=60, maximum=86_400),
         price_max_age_seconds=_integer(
             aws_table, "price_max_age_seconds", "aws", minimum=60, maximum=86_400, required=False

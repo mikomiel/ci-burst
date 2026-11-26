@@ -213,9 +213,11 @@ at a time, its publication step included. A `ci-burst export` command run
 outside the unit names its own `--state-file`, `--events-file` and
 `--metrics-file` and does not write the unit's collector file. Any other sharing
 is unsupported, and the guarantees of this section do not hold for it. `export`
-refuses with `EXPORT_PATHS_CONFLICT` (exit 2), before it writes anything, two
-outputs that name one file and an output on an entry that the ledger, the
-configuration or `[image].state_directory` uses. Other paths are the operator's.
+creates no directory but `export` in an existing ledger directory. Before any
+write it exits 2 on a missing output directory (`EXPORT_DIRECTORY_MISSING`), on
+two outputs on one file, and on an output on an entry that the lookup of the
+ledger, the configuration or `[image].state_directory`, enabled or not, reads
+(`EXPORT_PATHS_CONFLICT`). Other paths are the operator's.
 
 Each run reads the event file without blocking and without following a link.
 Only a missing event file is an empty stream; a run that cannot read an existing

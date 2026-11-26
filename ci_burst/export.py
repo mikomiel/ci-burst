@@ -1309,94 +1309,94 @@ def _write_atomic(path, content, *, times=None):
 _MAX_LINK_HOPS = 40
 
 
-def _walk(path, option=None):
-    """The directory entry that ``path`` names, and the entries of the linked directories on its way.
+def _trace(path):
+    """Each entry (directory device, inode, name) that a lookup of ``path`` reads, as the kernel reads them.
 
-    An entry is a directory's device and inode, the names below it and the final
-    name. Components that exist are taken as the kernel takes them, so ``..`` and
-    a linked directory lead to the directory that they reach. From the first one
-    that does not exist the names are taken lexically: the run creates that
-    directory, and a directory that it creates is no link, so ``missing/..``
-    names the directory above ``missing``. Two spellings of one entry give one
-    value. For an output (``option``), a component that exists and is not a
-    directory, such as a link to a missing directory, is refused: the run could
-    reach it through another output's directory. Nothing is created.
+    Every link met at any depth is followed relative to its directory, up to
+    ``_MAX_LINK_HOPS``. Each item says whether the names that continue the
+    entry's name count too: true at the end of the path, for a link there (the
+    ledger names its lock after the name it was given) and for the entry where
+    the lookup stops, existing or not. Also returns the directory it ends at.
     """
-    path = Path.cwd() / path
-    directory, below, links = Path(path.anchor), [], []
-    for name in path.parts[1:-1]:
-        candidate = directory / name
-        if below:
-            if name == "..":
-                below.pop()
-            else:
-                below.append(name)
-        elif name == ".." or os.path.isdir(candidate):
-            if name != ".." and os.path.islink(candidate):
-                status = os.stat(directory)
-                links.append((status.st_dev, status.st_ino, (), name))
-            directory = candidate
-        elif option is not None and os.path.lexists(candidate):
-            raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{option} passes {candidate}, which is not a directory")
-        else:
-            below.append(name)
-    status = os.stat(directory)
-    return (status.st_dev, status.st_ino, tuple(below), path.name), links
-
-
-def _link_chain(path):
-    """``path`` and each link that a lookup of it passes, hop by hop, relative to the link's directory."""
-    chain = [Path.cwd() / path]
-    while len(chain) <= _MAX_LINK_HOPS:
-        try:
-            target = os.readlink(chain[-1])
-        except OSError:
-            break
-        chain.append(chain[-1].parent / target)
-    return chain
-
-
-def refuse_conflicting_outputs(outputs, *, files, directories):
-    """Refuse, before any write, an output that would replace another output or a protected entry.
-
-    ``outputs`` maps an option to a path, ``files`` and ``directories`` map a
-    description to a path or ``None``. Two outputs must name two entries. For a
-    protected file, each link of its chain and the file at its end are protected,
-    and so is every entry beside one of them whose name continues that name with
-    ``.`` or ``-``: the ledger's writer lock, journal and migration copies, and
-    the lock, temporary file and backups of ``image promote``. Every entry of a
-    protected directory is protected. Entries are compared by identity, not by
-    string (``_walk``), and a linked directory on the way to a protected path is
-    protected too. Paths that the configuration does not name are the
-    operator's.
-    """
-    seen = {}
-    for option, path in outputs.items():
-        entry, _ = _walk(path, option)
-        if entry in seen:
-            raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{option} names the same file as {seen[entry]}")
-        seen[entry] = option
-
-    def refuse_links(links, description):
-        for link in links:
-            if link in seen:
-                raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{seen[link]} names a link on the way to {description}")
-
-    for description, path in files.items():
-        for hop in () if path is None else _link_chain(path):
-            (*where, name), links = _walk(hop)
-            refuse_links(links, description)
-            for (*place, other), option in seen.items():
-                if place == where and (other == name or other.startswith((name + ".", name + "-"))):
-                    raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{option} names {description} or a file beside it")
-    for description, path in directories.items():
-        if path is None:
+    remaining = list((Path.cwd() / path).parts)
+    directory, items, hops = Path(remaining.pop(0)), [], 0
+    while remaining:
+        name = remaining.pop(0)
+        if name == "..":
+            directory = directory.parent
             continue
-        entry, links = _walk(Path(path) / "entry")
-        refuse_links(links, description)
-        for other, option in seen.items():
-            if other[:3] == entry[:3]:
-                raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{option} names a file in {description}")
+        status = os.stat(directory)
+        entry, candidate = (status.st_dev, status.st_ino, name), directory / name
+        if os.path.islink(candidate):
+            items.append((entry, not remaining))
+            hops += 1
+            if hops > _MAX_LINK_HOPS:
+                return items, None
+            target = Path(os.readlink(candidate))
+            if target.is_absolute():
+                directory = Path(target.anchor)
+            remaining[:0] = target.parts[1:] if target.is_absolute() else target.parts
+        elif remaining and os.path.isdir(candidate):
+            directory = candidate
+        else:
+            items.append((entry, True))
+            return items, candidate if os.path.isdir(candidate) else None
+    return items, directory
+
+
+def refuse_conflicting_outputs(outputs, *, export_directory, files, directories):
+    """Refuse, before any write, outputs that could replace each other or a protected entry.
+
+    Each output's directory must exist, except ``export_directory``, which the
+    caller creates in the existing ledger directory when this returns it. An
+    output replaces only its own entry, and ``os.replace`` of a file cannot
+    replace a directory. Every entry that the lookup of a protected path reads
+    (``_trace``) is protected, with the names that continue a final entry's name
+    with ``.`` or ``-`` (the ledger's lock, journal and copies; the lock,
+    temporary file and backups of ``image promote``) and every entry of a
+    protected directory. Other paths are the operator's.
+    """
+    claimed, create, missing = {}, None, []
+
+    def claim(entry, what):
+        if entry in claimed:
+            raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{what} names the same entry as {claimed[entry]}")
+        claimed[entry] = what
+
+    for option, path in outputs.items():
+        path = Path.cwd() / path
+        try:
+            status = os.stat(path.parent)
+        except (FileNotFoundError, NotADirectoryError):
+            status = None
+        if status is not None and stat.S_ISDIR(status.st_mode):
+            claim((status.st_dev, status.st_ino, path.name), option)
+        elif status is None and path.parent == export_directory and not os.path.isdir(export_directory.parent):
+            missing.append(f"the ledger directory {export_directory.parent} of {option} is missing")
+        elif status is None and path.parent == export_directory and not os.path.lexists(export_directory):
+            if create is None:
+                ledger = os.stat(export_directory.parent)
+                claim((ledger.st_dev, ledger.st_ino, export_directory.name), "the export directory")
+                create = export_directory
+            claim((None, None, path.name), option)
+        else:
+            missing.append(f"the directory of {option} is missing; export creates only {export_directory}")
+    protected = []
+    for description, path in (files | directories).items():
+        items, final = ((), None) if path is None else _trace(path)
+        protected += [(entry, family, description) for entry, family in items]
+        if final is not None and description in directories:
+            status = os.stat(final)
+            protected.append(((status.st_dev, status.st_ino, None), False, description))
+    for (device, inode, name), family, description in protected:
+        for (other_device, other_inode, other), what in claimed.items():
+            if (other_device, other_inode) == (device, inode) and (
+                name is None or other == name or family and other.startswith((name + ".", name + "-"))
+            ):
+                raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{what} names an entry that {description} uses")
+    if missing:
+        raise ConfigRefusal("EXPORT_DIRECTORY_MISSING", missing[0])
+    return create
 
 
 @contextlib.contextmanager
@@ -1407,9 +1407,11 @@ def _directory_locks(*paths):
     The locks are a guard that makes an accidental second run wait until the
     first releases them; they attach no guarantee. The lock is on the directory
     and not on a file, so a run creates no file for it and no output path can
-    replace it. The directories are created first and opened, and each is locked
-    once, in the order of its device and inode numbers, so two runs that reach
-    one directory under different paths never wait for each other in a circle.
+    replace it. A missing directory is created here only for a direct caller:
+    the command line has refused any but the export directory and created that
+    one. Each directory is locked once, in the order of its device and inode
+    numbers, so two runs that reach one directory under different paths never
+    wait for each other in a circle.
     The launch evidence reader takes no lock.
     """
     opened = {}

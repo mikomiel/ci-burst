@@ -144,9 +144,10 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   committed. A terminal row keeps the tolerance.
 - [x] 1.19 State once in `docs/operations.md`, in the `design.md` shared-files
   row and in the worker-observation spec that a set of export files has one
-  writer, the shipped unit. In the CLI, refuse with `EXPORT_PATHS_CONFLICT`
-  (exit 2), before any write, two outputs that name one directory entry or an
-  output on an entry that the ledger, the configuration or the image state uses.
+  writer, the shipped unit. In the CLI, create no directory but `export` in an
+  existing ledger directory (`EXPORT_DIRECTORY_MISSING`), and refuse two outputs
+  on one entry or one on an entry that the lookup of a protected path reads
+  (`EXPORT_PATHS_CONFLICT`).
 
 ## 2. Gate
 
@@ -309,11 +310,11 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   `stale`.
 - [x] 3.13 Lock mechanism tests in `tests/test_export.py`: a run waits while its
   directory is held, creates no lock file, and an output at the former lock path
-  cannot replace the lock. Exit 2, nothing written or created: two outputs on one
-  entry (any spelling, `missing/..`, a link to a missing directory); an output on
-  a link, file, sidecar or directory link of the ledger's or configuration's path,
-  or in the image state directory. A read that fails after its open fails the run
-  (event file) or notes `state_rebuilt` (record). A record whose
+  cannot replace the lock. Exit 2, nothing written or created: an output under a
+  missing directory but the export directory; two outputs on one entry; an output
+  on an entry that the lookup of the ledger (relative or not), the configuration
+  or the image state directory (enabled or not) reads. A read that fails after its
+  open fails the run (event file) or notes `state_rebuilt` (record). A record whose
   first read fails notes `state_rebuilt` and restarts the counters, and after a
   failed textfile write it carries the epoch, not a fresh heartbeat. A link at the
   record path to a fresh record of three futile workers is replaced by a regular

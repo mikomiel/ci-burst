@@ -3092,6 +3092,8 @@ class ExportCliTests(unittest.TestCase):
         from ci_burst.cli import main
 
         if config is None:
+            # A deployed ledger directory exists; export creates only its "export" directory.
+            (self.root / "state").mkdir(exist_ok=True)
             config = write_config(self.root, config={"state": {"database": str(self.root / "state" / "state.sqlite3")}})
         database = load(config).state.database
         ran = []
@@ -3205,6 +3207,85 @@ class ExportCliTests(unittest.TestCase):
             with self.subTest(name):
                 code, ran, output, _, _ = self.run_cli(config=config, metrics_file=self.root / "db" / name)
                 self.assertEqual((code, ran), (2, []), output)
+
+    def assert_refused(self, *, config=None, **paths):
+        """Exit 2, the exporter not run, and no entry added under the temporary root."""
+        before = sorted(str(path) for path in self.root.rglob("*"))
+        code, ran, output, _, _ = self.run_cli(config=config, **paths)
+        self.assertEqual((code, ran), (2, []), output)
+        after = sorted(str(path) for path in self.root.rglob("*"))
+        self.assertEqual(after, before)
+
+    def test_an_output_under_a_missing_directory_other_than_the_export_directory_is_refused(self):
+        self.run_cli(metrics_file=self.root / "unused.prom")
+        self.assert_refused(metrics_file=self.root / "elsewhere" / "ci-burst.prom")
+
+    def test_an_output_cannot_make_a_directory_of_the_ledger_lock(self):
+        self.run_cli(metrics_file=self.root / "unused.prom")
+        self.assert_refused(metrics_file=self.root / "state" / "state.sqlite3.lock" / "ci-burst.prom")
+
+    def test_the_link_that_a_relative_database_names_is_protected(self):
+        (self.root / "db").mkdir()
+        (self.root / "db" / "current.sqlite").symlink_to("live.sqlite")
+        config = write_config(self.root, config={"state": {"database": "db/current.sqlite"}})
+        self.assert_refused(config=config, metrics_file=self.root / "db" / "current.sqlite")
+        self.assertTrue((self.root / "db" / "current.sqlite").is_symlink())
+
+    def test_a_directory_link_inside_a_directory_links_target_is_protected(self):
+        # current -> active -> releases/v1: the lookup of current/deployment.toml
+        # reads both links.
+        (self.root / "releases" / "v1").mkdir(parents=True)
+        write_config(self.root / "releases" / "v1")
+        (self.root / "active").symlink_to(Path("releases") / "v1")
+        (self.root / "current").symlink_to("active")
+        self.assert_refused(config=self.root / "current" / "deployment.toml", metrics_file=self.root / "active")
+        self.assertTrue((self.root / "active").is_symlink())
+
+    def test_a_middle_link_of_a_chain_inside_a_linked_directory_is_protected(self):
+        # deployment.toml -> sub/mid.toml, sub -> a/b, a -> x: the hop through
+        # sub reads the link a inside sub's target.
+        (self.root / "x" / "b").mkdir(parents=True)
+        (self.root / "a").symlink_to("x")
+        (self.root / "sub").symlink_to(Path("a") / "b")
+        (self.root / "releases").mkdir()
+        release = write_config(self.root / "releases")
+        (self.root / "x" / "b" / "mid.toml").symlink_to(release)
+        (self.root / "deployment.toml").symlink_to(Path("sub") / "mid.toml")
+        self.assert_refused(config=self.root / "deployment.toml", metrics_file=self.root / "a")
+        self.assertTrue((self.root / "a").is_symlink())
+
+    def test_the_state_directory_of_a_disabled_image_table_is_protected(self):
+        directory = self.root / "image-state"
+        directory.mkdir()
+        (directory / "image-state.sqlite").write_bytes(b"retained")
+        (self.root / "state").mkdir()
+        config = write_config(self.root, config={"state": {"database": str(self.root / "state" / "state.sqlite3")}})
+        config.write_text(config.read_text() + f'\n[image]\nenabled = false\nstate_directory = "{directory}"\n')
+        self.assert_refused(config=config, metrics_file=directory / "image-state.sqlite")
+        self.assertEqual((directory / "image-state.sqlite").read_bytes(), b"retained")
+
+    def test_an_image_state_directory_reached_through_dot_dot_is_protected(self):
+        (self.root / "real" / "sub").mkdir(parents=True)
+        (self.root / "real" / "image-state.sqlite").write_bytes(b"retained")
+        (self.root / "image-state").symlink_to(Path("real") / "sub" / "..")
+        (self.root / "state").mkdir()
+        config = write_config(self.root, config={"state": {"database": str(self.root / "state" / "state.sqlite3")}})
+        config.write_text(config.read_text() + f'\n[image]\nenabled = false\nstate_directory = "{self.root / "image-state"}"\n')
+        self.assert_refused(config=config, metrics_file=self.root / "real" / "image-state.sqlite")
+
+    def test_a_missing_ledger_directory_is_refused_and_named(self):
+        # export creates the export directory only inside an existing ledger directory.
+        config = write_config(self.root, config={"state": {"database": str(self.root / "ledger" / "state.sqlite3")}})
+        self.assert_refused(config=config, metrics_file=self.root / "ci-burst.prom")
+        _, _, output, _, _ = self.run_cli(config=config, metrics_file=self.root / "ci-burst.prom")
+        self.assertIn("EXPORT_DIRECTORY_MISSING", output)
+        self.assertIn("the ledger directory", output)
+
+    def test_the_default_paths_create_only_the_export_directory(self):
+        code, ran, output, database, _ = self.run_cli(metrics_file=self.root / "state" / "export" / "ci-burst.prom")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(ran), 1)
+        self.assertTrue((database.parent / "export").is_dir())
 
     def test_an_output_in_the_image_state_directory_is_refused(self):
         from test_image_pipeline import DEPLOYMENT, render_toml

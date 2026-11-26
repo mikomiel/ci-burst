@@ -10,9 +10,9 @@ A deployment MUST give each set of export files (the record, the event file, the
 - **WHEN** an operator wants an export of the unit's set of export files
 - **THEN** they run `systemctl start ci-burst-export.service`, and systemd does not start a second instance while one runs
 
-#### Scenario: Outputs that name one file are refused
-- **WHEN** two outputs of the command name one file by any spelling, or an output names a link or the file on the way to the ledger database or the configuration file, an entry beside one of those whose name continues it with `.` or `-`, or an entry in the image state directory
-- **THEN** the command refuses with `EXPORT_PATHS_CONFLICT` and exits 2 before it writes or creates anything; it checks no other path
+#### Scenario: Outputs that could replace a protected entry are refused
+- **WHEN** an output's directory is missing and is not `export` in an existing ledger directory, two outputs name one file, or an output names an entry that the lookup of the ledger database, the configuration file or the image state directory (enabled or not) reads: each link at any depth, the final entry and the names that continue it with `.` or `-`, or any entry of the image state directory
+- **THEN** the command refuses (`EXPORT_DIRECTORY_MISSING` or `EXPORT_PATHS_CONFLICT`) and exits 2 before it writes or creates anything; it checks no other path
 
 ## MODIFIED Requirements
 

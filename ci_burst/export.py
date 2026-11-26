@@ -26,11 +26,13 @@ repeat that follows a crash between publishing an event and persisting the
 dedupe record; the alternative — persisting first — would lose a failure event
 instead of repeating it.
 
-Runs that share a record take turns. A run holds an exclusive lock on a file
-beside the record, ``<record>.lock``, from before its first read of the record
-or the event file until its last write, so a manual run waits for the timer's
-run and the other way round, and no run saves totals from an older snapshot
-(``_record_lock``).
+Runs that share a file take turns. A run holds an exclusive lock on the
+directory of the record, of the event file and of the metrics textfile, from
+before its first read of the clock, the record or the event file until its last
+write. Runs that share any of these files, or only a directory, are serialized,
+so a manual run waits for the timer's run and the other way round, and no run
+saves totals from an older snapshot or replaces lines that another run added.
+The lock leaves no file behind (``_directory_locks``).
 
 The counter contract sets the order of the last writes (``_publish``). The
 cumulative counters are saved in the record, and a collector must never read a
@@ -841,9 +843,9 @@ class Exporter:
         self._ledger = ledger
 
     def run(self, *, events_file, metrics_file, state_file, now=None):
-        # The lock comes before the clock: a run that waited would otherwise
+        # The locks come before the clock: a run that waited would otherwise
         # judge the records of the run before it against an older clock.
-        with _record_lock(state_file):
+        with _directory_locks(state_file, events_file, metrics_file):
             return self._run(events_file, metrics_file, state_file, now)
 
     def _run(self, events_file, metrics_file, state_file, now):
@@ -1272,23 +1274,38 @@ def _write_atomic(path, content, *, times=None):
 
 
 @contextlib.contextmanager
-def _record_lock(state_file):
-    """Hold an exclusive lock for the record at ``state_file`` while the block runs.
+def _directory_locks(*paths):
+    """Hold an exclusive lock on the directory of each of ``paths`` while the block runs.
 
-    Runs that share a record are serialized: a second run waits until the first
-    releases the lock. The lock is on a file of its own, ``<record>.lock``,
-    created when it is absent and never deleted. A lock on the record itself would
-    exclude nothing, because ``_write_atomic`` renames a new file over it. The
-    launch evidence reader takes no lock.
+    A run reads or replaces the record, the event file and the metrics textfile,
+    so runs that share any of them, or only a directory, take turns: a second run
+    waits until the first releases its locks. The lock is on the directory and not
+    on a file, so a run creates no file for it, any user who can read the
+    directory can take it, and no output path can replace it. Runs whose files
+    are in other directories run in parallel. The directories are created first
+    and opened, and each is locked once, in the order of its device and inode
+    numbers. Two runs that reach one directory under different paths, as a host
+    and a container can, still lock in the same order, so they never wait for
+    each other in a circle. The launch evidence reader takes no lock.
     """
-    path = Path(f"{state_file}.lock")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    opened = {}
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        for path in paths:
+            directory = Path(path).parent
+            directory.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            status = os.fstat(descriptor)
+            identity = (status.st_dev, status.st_ino)
+            if identity in opened:
+                os.close(descriptor)
+            else:
+                opened[identity] = descriptor
+        for identity in sorted(opened):
+            fcntl.flock(opened[identity], fcntl.LOCK_EX)
         yield
     finally:
-        os.close(descriptor)
+        for descriptor in opened.values():
+            os.close(descriptor)
 
 
 def _publish(state_file, record_text, times, metrics_file, metrics_text):

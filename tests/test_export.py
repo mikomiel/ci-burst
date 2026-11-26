@@ -247,7 +247,82 @@ class ParseConsoleTests(unittest.TestCase):
         self.assertFalse(facts.registered)
 
 
+class BackgroundRun:
+    """One export run in a thread, with a handshake at its lock and after it.
+
+    ``at_lock`` is set when the run calls ``flock``, and ``past_lock`` when it
+    makes its first provider call, which comes after its locks. A paused run then
+    waits for ``resume`` while it holds them. Use it inside
+    ``ExportCase.watching_locks``, which sets ``at_lock``.
+    """
+
+    def __init__(self, case, exporter, *, pause=False, now=NOW, **paths):
+        self.at_lock = threading.Event()
+        self.past_lock = threading.Event()
+        self.resume = threading.Event()
+        if not pause:
+            self.resume.set()
+        self.outcome = []
+
+        def provider_call():
+            self.past_lock.set()
+            self.resume.wait(10)
+
+        exporter.aws.on_owned_instances = provider_call
+        paths = {"events_file": case.events, "metrics_file": case.metrics, "state_file": case.state_file} | paths
+
+        def target():
+            case.runs[threading.get_ident()] = self
+            try:
+                self.outcome.append(exporter.run(now=now, **paths))
+            except BaseException as error:  # noqa: BLE001 - reported to the test thread
+                self.outcome.append(error)
+
+        self.thread = threading.Thread(target=target, daemon=True)
+        case.addCleanup(self.finish)
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def waits(self):
+        """True when the run reached its lock and did not get past it."""
+        return self.at_lock.wait(5) and not self.past_lock.wait(0.2)
+
+    def finish(self):
+        """Let the run go on, wait for it and return its result."""
+        self.resume.set()
+        if self.thread.is_alive():
+            self.thread.join(10)
+        return self.outcome[0] if self.outcome else None
+
+
 class ExportCase(unittest.TestCase):
+    @contextlib.contextmanager
+    def watching_locks(self):
+        """Set ``at_lock`` of a ``BackgroundRun`` when its thread calls ``flock``."""
+        self.runs = {}
+        real_flock = fcntl.flock
+
+        def flock(descriptor, operation):
+            run = self.runs.get(threading.get_ident())
+            if run is not None:
+                run.at_lock.set()
+            return real_flock(descriptor, operation)
+
+        with mock.patch("fcntl.flock", flock):
+            yield
+
+    @contextlib.contextmanager
+    def holding(self, directory):
+        """Hold the lock of ``directory`` as another run would."""
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
+
     def setUp(self):
         self._directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._directory.cleanup)
@@ -2446,13 +2521,9 @@ class RecordCadenceTests(ExportCase):
             self.run_export(exporter, now=NOW + 60)
         self.assertIn("i-0123456789abcdef1", json.loads(self.state_file.read_text())["instances"])
         self.assertEqual(os.stat(self.state_file).st_mtime, old)
-        # The failed replacement leaves no temporary file behind. The lock file
-        # stays, because it is never deleted.
+        # The failed replacement leaves no temporary file behind.
         self.assertEqual(os.listdir(self.metrics.parent), [self.metrics.name])
-        self.assertEqual(
-            sorted(os.listdir(self.state_file.parent)),
-            ["observed.json", "observed.json.lock", "worker-events.ndjson"],
-        )
+        self.assertEqual(sorted(os.listdir(self.state_file.parent)), ["observed.json", "worker-events.ndjson"])
 
     def test_the_events_of_a_run_that_failed_are_not_emitted_again(self):
         # A run publishes its events before it saves the record, and a run that
@@ -2665,39 +2736,94 @@ class PublishedCounterTests(ExportCase):
 
     def test_a_run_waits_for_the_run_that_holds_the_record(self):
         # Two runs that share a record are serialized from the first read of the
-        # record to its last write. The test holds the lock as the other run
-        # would, and saves a newer record meanwhile: the waiting run starts from
-        # that record, so it never saves totals from an older snapshot.
+        # record to its last write. The test holds the record's directory as the
+        # other run would, and saves a newer record meanwhile: the waiting run
+        # starts from that record, so it never saves totals from an older snapshot.
         self.first_run()
         before = (self.state_file.read_bytes(), os.stat(self.state_file).st_mtime_ns)
-        exporter = self.exporter(later=True)
-        outcome = []
-
-        def waiting_run():
-            try:
-                outcome.append(self.run_export(exporter, now=NOW + 60))
-            except BaseException as error:  # noqa: BLE001 - reported to the test thread
-                outcome.append(error)
-
-        thread = threading.Thread(target=waiting_run, daemon=True)
-        lock = os.open(f"{self.state_file}.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            thread.start()
-            thread.join(timeout=0.5)
-            self.assertTrue(thread.is_alive(), "the run did not wait for the lock")
-            self.assertEqual((self.state_file.read_bytes(), os.stat(self.state_file).st_mtime_ns), before)
-            newer = json.loads(before[0])
-            newer["totals"]["launches"] = 7
-            self.state_file.write_text(json.dumps(newer))
-        finally:
-            os.close(lock)
-            if thread.is_alive():
-                thread.join(timeout=10)
-        self.assertFalse(thread.is_alive())
-        self.assertIsInstance(outcome[0], dict)
+        with self.watching_locks():
+            with self.holding(self.state_file.parent):
+                run = BackgroundRun(self, self.exporter(later=True), now=NOW + 60).start()
+                self.assertTrue(run.waits(), "the run did not wait for the lock")
+                self.assertEqual((self.state_file.read_bytes(), os.stat(self.state_file).st_mtime_ns), before)
+                newer = json.loads(before[0])
+                newer["totals"]["launches"] = 7
+                self.state_file.write_text(json.dumps(newer))
+            self.assertIsInstance(run.finish(), dict)
         self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 8)
         self.assertEqual(self.published()["ci_burst_worker_launches_total"], 8)
+
+    def test_runs_with_their_own_records_wait_for_each_other_on_a_shared_event_file(self):
+        # A manual run can name its own record and keep the default event file.
+        # The two runs read and replace one event file, so they take turns, and
+        # neither replacement drops the lines of the other run.
+        first = self.build([instance(self.WORKER, state="terminated", operation=operation_hex(1))], {self.WORKER: CLEAN_BOOT})
+        second = self.build([instance(self.LATER, state="terminated", operation=operation_hex(2))], {self.LATER: CLEAN_BOOT})
+        manual = self.root / "manual"
+        with self.watching_locks():
+            holder = BackgroundRun(self, first, pause=True).start()
+            self.assertTrue(holder.past_lock.wait(5))
+            waiter = BackgroundRun(
+                self,
+                second,
+                state_file=manual / "observed.json",
+                metrics_file=manual / "textfile" / "ci-burst.prom",
+            ).start()
+            self.assertTrue(waiter.waits(), "the run with its own record did not wait for the shared event file")
+            self.assertIsInstance(holder.finish(), dict)
+            self.assertIsInstance(waiter.finish(), dict)
+        instances = {event["instance"] for event in self.events_read()}
+        self.assertEqual(instances, {self.WORKER, self.LATER})
+
+    def test_runs_in_separate_directories_run_in_parallel(self):
+        other = self.root / "other"
+        with self.watching_locks():
+            holder = BackgroundRun(self, self.exporter(later=False), pause=True).start()
+            self.assertTrue(holder.past_lock.wait(5))
+            parallel = BackgroundRun(
+                self,
+                self.exporter(later=False),
+                state_file=other / "export" / "observed.json",
+                events_file=other / "export" / "worker-events.ndjson",
+                metrics_file=other / "textfile" / "ci-burst.prom",
+            ).start()
+            # The other run finished while the first one still holds its directories.
+            self.assertIsInstance(parallel.finish(), dict)
+            self.assertTrue(holder.thread.is_alive())
+            self.assertIsInstance(holder.finish(), dict)
+
+    def test_a_run_leaves_no_file_besides_its_outputs(self):
+        # The lock is on directories, so a run creates no lock file that a later
+        # run as another user could fail to open. An entry left at the former lock
+        # path, which the run cannot open for writing, does not stop it.
+        self.state_file.parent.mkdir(parents=True)
+        leftover = self.state_file.parent / "observed.json.lock"
+        leftover.mkdir()
+        self.run_export(self.exporter(later=False))
+        self.assertEqual(
+            sorted(os.listdir(self.state_file.parent)),
+            ["observed.json", "observed.json.lock", "worker-events.ndjson"],
+        )
+        self.assertEqual(os.listdir(leftover), [])
+        self.assertEqual(os.listdir(self.metrics.parent), [self.metrics.name])
+
+    def test_an_output_at_the_former_lock_path_cannot_let_two_runs_overlap(self):
+        # A run whose textfile is named like a lock file replaces that file. Two
+        # runs that both need the record's directory still take turns: one that
+        # waited while the file was replaced and one that starts afterwards.
+        self.first_run()
+        renamed = self.state_file.parent / "observed.json.lock"
+        with self.watching_locks():
+            replacing = BackgroundRun(self, self.exporter(later=False), pause=True, metrics_file=renamed).start()
+            self.assertTrue(replacing.past_lock.wait(5))
+            waiting = BackgroundRun(self, self.exporter(later=True), pause=True, now=NOW + 60).start()
+            self.assertTrue(waiting.waits())
+            self.assertIsInstance(replacing.finish(), dict)
+            self.assertTrue(waiting.past_lock.wait(5))
+            later = BackgroundRun(self, self.exporter(later=True), now=NOW + 120).start()
+            self.assertTrue(later.waits(), "a run started after the replacement did not wait")
+            self.assertIsInstance(waiting.finish(), dict)
+            self.assertIsInstance(later.finish(), dict)
 
     def test_a_record_that_cannot_be_read_restarts_the_counters(self):
         # An intact record that the run cannot read is replaced, as a deleted or
@@ -2765,10 +2891,7 @@ class PublishedCounterTests(ExportCase):
         self.assertEqual(os.stat(self.state_file).st_mtime_ns, 0)
         evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
         self.assertEqual(evidence.state, "stale")
-        self.assertEqual(
-            sorted(os.listdir(self.state_file.parent)),
-            sorted([self.events.name, "observed.json", "observed.json.lock"]),
-        )
+        self.assertEqual(sorted(os.listdir(self.state_file.parent)), sorted([self.events.name, "observed.json"]))
 
 
 class ConsoleReadTests(unittest.TestCase):

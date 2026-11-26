@@ -124,10 +124,11 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   without following a link. Parse the state and take the times for the save from
   that one read. Treat a link, a FIFO, another entry that is not a regular file
   and a read that fails as a record that does not decode: note `state_rebuilt`
-  and restart the counters. Serialize runs that share a record with an
-  exclusive, blocking `flock` on `<record>.lock`, a file of its own that is never
-  deleted, taken before the clock, the record and the event file are read and
-  held until the last write.
+  and restart the counters. Serialize runs that share the record, the event file
+  or the metrics textfile, or only a directory of one, with an exclusive,
+  blocking `flock` on the directory of each of the three files (each directory
+  once, in the order of its device and inode numbers), taken before the clock, the record and the event
+  file are read and held until the last write. Create no lock file.
 
 ## 2. Gate
 
@@ -288,8 +289,13 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   modification time, and the time advances after it. A first run that cannot
   write its textfile leaves a record under the epoch, which the reader reads as
   `stale`.
-- [x] 3.13 Shared-record tests in `tests/test_export.py`. A run waits while the
-  lock is held and starts from the record that the holder saved. A record whose
+- [x] 3.13 Shared-file tests in `tests/test_export.py`. A run waits while another
+  holds the record's directory and starts from the record that the holder saved.
+  Two runs with their own records in other directories that share one event file
+  take turns, and the event file keeps the lines of both. A run creates no file
+  besides its outputs, and an entry at the former lock path does not stop it. A
+  run whose textfile is named like the former lock file cannot let two later
+  runs overlap. A record whose
   first read fails notes `state_rebuilt` and restarts the counters, and after a
   failed textfile write it carries the epoch, not a fresh heartbeat. A link at the
   record path to a fresh record of three futile workers is replaced by a regular
@@ -313,7 +319,7 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   says deleting the dedupe record never changes a decision, add that `export`
   saves the dedupe record before the textfile and keeps it when the textfile
   cannot be replaced, that a record that cannot be read restarts the counters,
-  that runs which share a record are serialized, that a run which cannot save
+  that runs which share a file or a directory are serialized, that a run which cannot save
   the record exits 1 before it replaces the textfile and before the unit publishes it, so the collector's
   last-run time does not advance, that no textfile carries a total that the
   record lacks, in direct mode as well as in the shipped unit, and that a unit

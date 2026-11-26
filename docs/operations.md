@@ -205,11 +205,16 @@ python -m ci_burst export --config deployment.toml \
 ```
 
 The two optional paths default to `<ledger directory>/export/`, as
-`worker-events.ndjson` and `observed.json`. Concurrent runs that share a record
-are serialized: a run holds an exclusive lock on `<record>.lock` beside the
-record, from before it reads the record or the event file until its last write,
-so a manual run waits for the timer's run and the other way round. The lock file
-is never deleted.
+`worker-events.ndjson` and `observed.json`. Concurrent runs take turns when
+they share the record, the event file or the metrics textfile, or only a
+directory of one: a run holds an exclusive lock on the directory of each of the
+three files, from before it reads the clock, the record or the event file until
+its last write, so a manual run waits for the timer's run and the other way
+round. The lock is on the directories, so any user who can read a directory can
+take it and no file is left behind. Such a user can also hold the lock and
+delay a run; the shipped unit's `TimeoutStartSec` then stops it, the record is
+not refreshed, and the hold fails open once the record is stale. Runs whose
+files are all in other directories run in parallel.
 
 ### The event stream
 

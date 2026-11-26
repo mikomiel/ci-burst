@@ -63,9 +63,14 @@ change to the brake's reader.
 - **AND** the record carries neither the records nor the modification time of a link's target
 
 #### Scenario: Runs that share a record take turns
-- **WHEN** a run starts while another run that uses the same record is in progress, such as a manual run while the timer's run is in progress
-- **THEN** the run waits on an exclusive lock on `<record>.lock` beside the record before it reads the record or the event file
-- **AND** it reads the record only after the other run has made its last write, so it never saves totals derived from an older snapshot or writes over a newer record
+- **WHEN** a run starts while another run is in progress that uses the same record, event file or metrics textfile, or only a directory of one, such as a manual run with its own `--state-file` while the timer's run is in progress
+- **THEN** the run waits on an exclusive lock on the directory of each of those files before it reads the clock, the record or the event file
+- **AND** it reads those files only after the other run has made its last write, so it never saves totals derived from an older snapshot, writes over a newer record or drops event lines that the other run added
+- **AND** the lock leaves no file behind, so any user who can read the directory can take it and no output path can replace it
+
+#### Scenario: Runs in separate directories run in parallel
+- **WHEN** two runs use a record, an event file and a metrics textfile in directories that the other run does not use
+- **THEN** neither run waits for the other
 
 #### Scenario: The unit cannot publish the textfile
 - **WHEN** a run completes and writes the record, and the shipped unit then cannot publish the textfile into the collector's directory

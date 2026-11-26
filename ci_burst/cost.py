@@ -21,39 +21,35 @@ import json
 import math
 from dataclasses import dataclass
 
-from .money import MICROS_PER_UNIT, hourly_cost_micros
+from .money import MICROS_PER_UNIT, format_money, hourly_cost_micros
 
 #: EC2 bills an instance for at least one minute even when it exits sooner.
 MINIMUM_BILLABLE_SECONDS = 60
 TERMINAL_STATES = ("terminal", "failed")
-#: ``format_money`` writes six fractional digits; a stored price may carry fewer.
-PRICE_FRACTION_DIGITS = 6
+#: A stored hourly price above one million units is no usable price, so no stored text can push the cost arithmetic
+#: or what the export renders past the interpreter's digit limit.
+MAX_STORED_PRICE_MICROS = 10**12
 
 
 def _stored_price_micros(value):
-    """Exact micros of one stored price, or zero when it is not a price admission writes.
+    """Exact micros of one stored price, or zero when it is not the text admission writes.
 
-    Admission writes ``MaxPrice`` as a string of ASCII digits with a fraction of
-    six digits (``format_money``). Any other value, a JSON number or a longer
-    fraction included, is no usable price. A malformed stored request must never
-    raise while cost is reported, so it contributes nothing and the other bounds apply.
+    Admission writes ``MaxPrice`` with ``format_money``, so a usable price is a
+    string that ``format_money`` writes back unchanged, up to ``MAX_STORED_PRICE_MICROS``.
+    Any other value, a JSON number, leading zeros, another fraction length, a
+    digit outside ASCII or a larger price included, is no usable price. A malformed stored request must never raise
+    while cost is reported, so it contributes nothing and the other bounds apply.
     """
     if not isinstance(value, str):
         return 0
-    whole, dot, fraction = value.partition(".")
-    if not _ascii_digits(whole) or (dot and not _ascii_digits(fraction)) or len(fraction) > PRICE_FRACTION_DIGITS:
-        return 0
+    whole, _, fraction = value.partition(".")
     try:
-        micros = int(whole) * MICROS_PER_UNIT + int(fraction.ljust(PRICE_FRACTION_DIGITS, "0"))
+        micros = int(whole) * MICROS_PER_UNIT + int(fraction)
+        canonical = 0 < micros <= MAX_STORED_PRICE_MICROS and format_money(micros) == value
     except ValueError:
-        # ``int`` refuses a digit string past the interpreter's length limit.
+        # ``int`` and ``str`` refuse a number past the interpreter's digit limit.
         return 0
-    return micros if micros > 0 else 0
-
-
-def _ascii_digits(text):
-    """Whether ``text`` is one or more ASCII digits: ``isdigit`` alone also accepts "²" and other scripts' digits."""
-    return text.isascii() and text.isdigit()
+    return micros if canonical else 0
 
 
 def request_damaged(operation):

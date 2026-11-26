@@ -1501,7 +1501,9 @@ its stored settled cost. That stored mark makes the row's reservation the
 commitment floor. So does a non-terminal row whose stored request is damaged:
 its text no longer hashes to the stored `request_sha256`, or it has no usable
 `MaxPrice` (missing, null or malformed). The controller writes a price into
-every request and stores the hash of the exact text. A damaged price is no
+every request and stores the hash of the exact text. The hash detects a stored
+text that disagrees with its stored hash; a row whose text and hash were rewritten
+together is outside what it detects. A damaged price is no
 longer the ceiling that admission committed, and a lowered `max_spot_price` and
 the accepted price would price the remaining life below it. A terminal row needs
 no ceiling for its remaining life and keeps no such floor.

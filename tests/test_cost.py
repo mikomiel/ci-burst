@@ -2,8 +2,9 @@ import hashlib
 import json
 import unittest
 
-from ci_burst.cost import MINIMUM_BILLABLE_SECONDS, CostModel, _frozen_max_price_micros
+from ci_burst.cost import MAX_STORED_PRICE_MICROS, MINIMUM_BILLABLE_SECONDS, CostModel, _frozen_max_price_micros
 from ci_burst.ledger import Operation
+from ci_burst.money import format_money
 
 FROZEN_REQUEST = json.dumps(
     {
@@ -407,11 +408,32 @@ class AdmittedBasisTests(unittest.TestCase):
         self.assertEqual(self.original_model().reservation_floor_micros(ended), 0)
 
     def test_a_price_admission_would_not_write_is_no_price(self):
-        for price in ("²", "0.²", "0.010000²", "٣", "9" * 5000, "0.01" + "0" * 5000, "0.0400001", " 0.040000", 0.04, 1):
+        for price in (
+            "²", "0.²", "0.010000²", "٣.000000", "9" * 5000, "0.01" + "0" * 5000, "0.0400001", " 0.040000",
+            "00.040000", "0.04", "1", "+0.040000", "0_0.040000", 0.04, 1,
+        ):
             with self.subTest(price=repr(price)[:14]):
                 request = json.dumps({"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": price}}})
                 self.assertEqual(_frozen_max_price_micros(request), 0)
         self.assertEqual(_frozen_max_price_micros(FROZEN_REQUEST), 40_000)
+        for micros, expected in ((MAX_STORED_PRICE_MICROS, MAX_STORED_PRICE_MICROS), (MAX_STORED_PRICE_MICROS + 1, 0)):
+            request = json.dumps({"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": format_money(micros)}}})
+            self.assertEqual(_frozen_max_price_micros(request), expected)
+
+    def test_a_noncanonical_price_under_its_own_hash_keeps_the_reservation(self):
+        # Admission writes "0.010000"; the same price with a leading zero is not a request it froze.
+        request = FROZEN_REQUEST.replace('"0.040000"', '"00.010000"')
+        self.assertNotEqual(request, FROZEN_REQUEST)
+        self.assertEqual(self.original_model().reservation_floor_micros(self.admitted(request_json=request)), 590_000)
+
+    def test_an_oversized_price_does_not_price_the_ceiling(self):
+        # A price past any real one, even under its own hash, must not reach the arithmetic or the export.
+        huge = FROZEN_REQUEST.replace('"0.040000"', '"' + "9" * 4300 + '.000000"')
+        damaged = self.admitted(request_json=huge)
+        model = self.original_model()
+        intact_bounds = self.admitted(request_json=None)
+        self.assertEqual(model.price_ceiling_micros(damaged), model.price_ceiling_micros(intact_bounds))
+        self.assertEqual(model.settlement_price_micros(damaged), model.settlement_price_micros(intact_bounds))
 
     def test_a_malformed_frozen_request_never_raises(self):
         model = CostModel(

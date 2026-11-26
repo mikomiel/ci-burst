@@ -111,6 +111,7 @@ Before requesting a launch, the controller MUST durably record operation identit
 - **AND** no `RunInstances` request is sent for that intent
 - **AND** the operation keeps its state, stored request, client token and reservation
 - **AND** no replacement launch is admitted while the intent remains unresolved
+- **AND** a stored request rewritten together with its stored hash is outside what this check detects
 
 #### Scenario: Durable state cannot commit
 - **WHEN** the state transaction fails or another writer owns the deployment

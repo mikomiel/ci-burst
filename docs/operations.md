@@ -1498,12 +1498,13 @@ window for the same reason.
 The schema-3 upgrade marks every non-terminal row whose admitted inputs it
 backfilled with `admitted_inputs_backfilled = 1`; a terminal row keeps `0` and
 its stored settled cost. That stored mark makes the row's reservation the
-commitment floor. So does a non-terminal row whose frozen request has no usable
-`MaxPrice`: the request does not decode, or the price is missing, null or
-malformed. The controller writes a price into every request, so such a row is
-damaged. Without the price, a lowered `max_spot_price` and the accepted price
-would price the remaining life below the ceiling that admission committed. A
-terminal row needs no ceiling for its remaining life and keeps no such floor.
+commitment floor. So does a non-terminal row whose stored request is damaged:
+its text no longer hashes to the stored `request_sha256`, or it has no usable
+`MaxPrice` (missing, null or malformed). The controller writes a price into
+every request and stores the hash of the exact text. A damaged price is no
+longer the ceiling that admission committed, and a lowered `max_spot_price` and
+the accepted price would price the remaining life below it. A terminal row needs
+no ceiling for its remaining life and keeps no such floor.
 The floor is not inferred from a whole-life estimate, because
 such an estimate includes the current configured ceiling: raising
 `max_spot_price` could then reach the reservation, switch the floor off and
@@ -2059,11 +2060,11 @@ owned inventory does not prove that its request was never sent
 intent).
 
 A fifth refusal protects the stored request. Before `apply` sends an intent
-again, it hashes the stored request as admission did and compares the result
-with the `request_sha256` stored with it. It also requires a usable `MaxPrice`,
-the price ceiling that admission wrote into every request. `apply` refuses an
-intent whose request does not decode, hashes to another value, or has no usable
-`MaxPrice` with `unresolved_intent_request_damaged`, and sends nothing. The row,
+again, it hashes the stored request text and compares the result with the
+`request_sha256` stored with it. It also requires a usable `MaxPrice`, the price
+ceiling that admission wrote into every request. `apply` refuses an intent whose
+request hashes to another value or has no usable `MaxPrice` with
+`unresolved_intent_request_damaged`, and sends nothing for that intent. The row,
 its request, its client token and its reservation stay as they are, and the
 intent blocks admission while it remains unresolved. Reconciliation settles it
 when the provider shows its instance. Otherwise no command repairs it: keep

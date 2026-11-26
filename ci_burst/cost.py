@@ -16,6 +16,7 @@ billed duration is floored at it, and the forward commitment prices only the
 lifetime beyond the billed duration.
 """
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -48,7 +49,7 @@ def _stored_price_micros(value):
     if not isinstance(value, str):
         return 0
     whole, dot, fraction = value.strip().partition(".")
-    if not whole.isdigit() or (dot and (not fraction or not fraction.isdigit())):
+    if not _ascii_digits(whole) or (dot and not _ascii_digits(fraction)):
         return 0
     try:
         micros = int(whole) * MICROS_PER_UNIT
@@ -57,9 +58,33 @@ def _stored_price_micros(value):
             if fraction[PRICE_FRACTION_DIGITS:].strip("0"):
                 micros += 1
     except ValueError:
-        # ``isdigit`` also accepts "²", and ``int`` refuses a digit string past the interpreter's length limit.
+        # ``int`` refuses a digit string past the interpreter's length limit.
         return 0
     return micros if micros > 0 else 0
+
+
+def _ascii_digits(text):
+    """Whether ``text`` is one or more ASCII digits: ``isdigit`` alone also accepts "²" and other scripts' digits."""
+    return text.isascii() and text.isdigit()
+
+
+def request_damaged(operation):
+    """Whether an operation's stored launch request is not the one admission froze.
+
+    Admission stores the request as canonical JSON with the sha256 of that text,
+    and writes a ``MaxPrice`` into every request. A stored request whose text no
+    longer hashes to the stored ``request_sha256``, or that carries no usable
+    ``MaxPrice``, is damaged: a resume must not send it, and its price must not
+    lower the ceiling admission committed.
+    """
+    text = operation.request_json
+    if not isinstance(text, str):
+        return True
+    try:
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    except UnicodeError:
+        return True
+    return digest != operation.request_sha256 or not _frozen_max_price_micros(text)
 
 
 #: ``_decoded_request``'s answer for a frozen request that does not decode.
@@ -173,19 +198,15 @@ class CostModel:
         and its commitment may fall below the reservation as its minutes are
         accepted under the ceiling.
 
-        A non-terminal row whose frozen request has no usable ``MaxPrice`` keeps
-        the same floor: the request does not decode, or decodes with the price
-        missing, null or malformed. The controller writes a price into every
-        request, so such a row is damaged. The price is the ceiling admission
-        committed, and without it the configured maximum, which may since have
-        been lowered, and the accepted price would price the remaining life below
-        that ceiling. A terminal row needs no ceiling for the remaining life, so
-        a request without a usable ``MaxPrice`` gives it no floor.
+        A non-terminal row whose stored request is damaged (``request_damaged``:
+        it no longer hashes to its stored hash, or has no usable ``MaxPrice``)
+        keeps the same floor. Its price is no longer the ceiling admission
+        committed, and the configured maximum, which may since have been
+        lowered, and the accepted price would price the remaining life below that
+        ceiling. A terminal row needs no ceiling for the remaining life, so a
+        damaged request gives it no floor.
         """
-        damaged = (
-            operation.state not in TERMINAL_STATES
-            and not _frozen_max_price_micros(operation.request_json)
-        )
+        damaged = operation.state not in TERMINAL_STATES and request_damaged(operation)
         if not (operation.admitted_inputs_backfilled or damaged):
             return 0
         return operation.reservation_micros or 0

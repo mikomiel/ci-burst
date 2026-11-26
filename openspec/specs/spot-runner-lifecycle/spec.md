@@ -108,7 +108,7 @@ Before requesting a launch, the controller MUST durably record operation identit
 #### Scenario: Stored request no longer matches its record
 - **WHEN** the `resume` phase of `apply` reaches an intent that has no confirmed instance after reconciliation, whose stored request has no usable `MaxPrice` or does not hash to the `request_sha256` stored with it, and that passes the client-token window, elapsed-lifetime, lifetime-mismatch and age checks
 - **THEN** `apply` refuses with `unresolved_intent_request_damaged`
-- **AND** no `RunInstances` request is sent
+- **AND** no `RunInstances` request is sent for that intent
 - **AND** the operation keeps its state, stored request, client token and reservation
 - **AND** no replacement launch is admitted while the intent remains unresolved
 

@@ -1,7 +1,8 @@
+import hashlib
 import json
 import unittest
 
-from ci_burst.cost import MINIMUM_BILLABLE_SECONDS, CostModel
+from ci_burst.cost import MINIMUM_BILLABLE_SECONDS, CostModel, _frozen_max_price_micros
 from ci_burst.ledger import Operation
 
 FROZEN_REQUEST = json.dumps(
@@ -21,7 +22,12 @@ LIFETIME = 3600
 BUFFER = 50_000
 
 
+def sha(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def operation(**overrides):
+    """An operation row; its ``request_sha256`` is the hash of its request text, as admission stores it."""
     values = {
         "id": "op",
         "client_token": "ci-burst-op",
@@ -34,13 +40,15 @@ def operation(**overrides):
         "region": "eu-central-1",
         "account": "111122223333",
         "request_json": "{}",
-        "request_sha256": "0" * 64,
         "instance_id": "i-1",
         "detail": "",
         "price_micros": 100_000,
         "launch_time": 1_000_000.0,
     }
     values.update(overrides)
+    if "request_sha256" not in values:
+        text = values["request_json"]
+        values["request_sha256"] = sha(text) if isinstance(text, str) else "0" * 64
     return Operation(**values)
 
 
@@ -387,6 +395,23 @@ class AdmittedBasisTests(unittest.TestCase):
         self.assertEqual(raised.committed_micros(backfilled, now), 590_000)
         self.assertGreaterEqual(far.committed_micros(backfilled, now), 590_000)
         self.assertEqual(raised.reservation_floor_micros(backfilled), 590_000)
+
+    def test_a_live_row_whose_request_no_longer_matches_its_hash_keeps_its_reservation(self):
+        # A valid but lower MaxPrice written without its hash must not price the remaining life below the ceiling.
+        lowered = FROZEN_REQUEST.replace('"0.040000"', '"0.010000"')
+        self.assertNotEqual(lowered, FROZEN_REQUEST)
+        stale = self.admitted(request_json=lowered, request_sha256=sha(FROZEN_REQUEST))
+        self.assertEqual(self.original_model().reservation_floor_micros(stale), 590_000)
+        self.assertEqual(self.original_model().reservation_floor_micros(self.admitted(request_json=lowered)), 0)
+        ended = self.admitted(request_json=lowered, request_sha256=sha(FROZEN_REQUEST), state="terminal")
+        self.assertEqual(self.original_model().reservation_floor_micros(ended), 0)
+
+    def test_a_price_with_a_digit_outside_ascii_is_no_price(self):
+        for price in ("²", "0.²", "0.010000²", "٣", "9" * 5000):
+            with self.subTest(price=price[:12]):
+                request = json.dumps({"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": price}}})
+                self.assertEqual(_frozen_max_price_micros(request), 0)
+        self.assertEqual(_frozen_max_price_micros(FROZEN_REQUEST), 40_000)
 
     def test_a_malformed_frozen_request_never_raises(self):
         model = CostModel(

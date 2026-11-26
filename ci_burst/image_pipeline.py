@@ -2157,12 +2157,16 @@ class _Pass:
             found = self.aws.instances([build.builder_id], deadline=self.deadline)
             if any(item.instance_id == build.builder_id and item.state in BUILDER_STATES for item in found):
                 self.aws.terminate([build.builder_id], deadline=None)
-        if build.source_template is None or build.source_pin is None:
+        if build.source_template is None or build.source_region is None or build.source_pin is None:
             # The token of the version is the build's, so every request under it names the template and the pin
-            # recorded here. A pin that moved later leaves the candidate refused at promotion (``PIN_MOVED``).
+            # recorded here, and the row records the Region that the first one goes to. A template, Region or pin
+            # that changed later leaves the candidate refused at promotion (``PIN_MOVED``).
             settings = self.p._config.aws
             build = self.s.advance_build(
-                build.id, source_template=settings.launch_template_name, source_pin=settings.launch_template_version
+                build.id,
+                source_template=settings.launch_template_name,
+                source_region=settings.region,
+                source_pin=settings.launch_template_version,
             )
         try:
             outcome = create_candidate_version(

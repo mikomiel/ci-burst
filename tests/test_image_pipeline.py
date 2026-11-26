@@ -4463,7 +4463,10 @@ class FailureTests(PipelineCase):
         self.assertEqual(retry["SourceVersion"], str(PIN))
         build = self.only_build()
         # The candidate records the pin it was made from: promotion refuses it while the file pins another one.
-        self.assertEqual((build.template_version, build.source_template, build.source_pin), (5, WORKER, PIN))
+        self.assertEqual(
+            (build.template_version, build.source_template, build.source_region, build.source_pin),
+            (5, WORKER, REGION, PIN),
+        )
         self.assertEqual(self.world.next_version, 6)
 
     def test_a_version_that_cannot_be_created_before_the_deadline_fails_the_build(self):

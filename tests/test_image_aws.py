@@ -2166,6 +2166,22 @@ class PresignTests(Base):
                 self.assertEqual(urls, signed)
                 self.assertEqual(len(self.requests("generate_presigned_url")), len(signed))
 
+    def test_a_session_that_ages_during_the_owner_lookup_signs_no_url(self):
+        # The session outlives the URL when the call starts, and the lookup of the bucket's owner takes the margin.
+        for lookup_seconds, signed in ((60, [SENTINEL_URL]), (61, [])):
+            with self.subTest(lookup_seconds=lookup_seconds):
+                self.clock.now = NOW
+                self.calls.clear()
+                sts = SlowSts(self.calls, self.clock, lookup_seconds)
+                aws = self.image_aws(expiry=NOW + 1860, account=None, clients={"s3": self.s3, "sts": sts})
+                try:
+                    urls = [aws.presign_get(BUCKET, self.KEY, 1800, deadline=None)]
+                except ProviderRefusal as refusal:
+                    self.assertEqual(refusal.reason, "IMAGE_CREDENTIAL_SHORT")
+                    urls = []
+                self.assertEqual(urls, signed)
+                self.assertEqual(len(self.requests("generate_presigned_url")), len(signed))
+
     def test_an_expired_session_reports_no_negative_life(self):
         with self.assertRaises(ProviderRefusal) as raised:
             self.image_aws(expiry=NOW - 10).presign_get(BUCKET, self.KEY, 300, deadline=None)
@@ -2175,12 +2191,12 @@ class PresignTests(Base):
         session = FakeSession(self.calls, self.ec2, self.s3, credentials=FakeCredentials(None))
         aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock)
         with self.assertRaises(ProviderRefusal) as raised:
-            aws.presign_get(BUCKET, self.KEY, 300, deadline=None)
+            aws.presign_get(BUCKET, self.KEY, 300, owner=ACCOUNT, deadline=None)
         self.assertEqual(raised.exception.reason, "IMAGE_CREDENTIAL_SHORT")
         session.credentials = None
         aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock)
         with self.assertRaises(ProviderRefusal):
-            aws.presign_get(BUCKET, self.KEY, 300, deadline=None)
+            aws.presign_get(BUCKET, self.KEY, 300, owner=ACCOUNT, deadline=None)
         self.assertEqual(self.requests("generate_presigned_url"), [])
 
     def test_a_passed_cutoff_resolves_no_credentials(self):
@@ -2233,7 +2249,7 @@ class PresignTests(Base):
         session = FakeSession(self.calls, self.ec2, self.s3, credentials=short)
         aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock)
         with self.assertRaises(ProviderRefusal) as raised:
-            aws.presign_get(BUCKET, self.KEY, 1800, deadline=None)
+            aws.presign_get(BUCKET, self.KEY, 1800, owner=ACCOUNT, deadline=None)
         self.assertEqual(raised.exception.reason, "IMAGE_CREDENTIAL_SHORT")
 
     def test_expiry_may_be_a_callable(self):
@@ -2299,7 +2315,7 @@ class PresignTests(Base):
                 aws, credentials = adapter(error)
                 calls = {
                     "credential_expiry": lambda aws=aws: aws.credential_expiry(deadline=None),
-                    "presign_get": lambda aws=aws: aws.presign_get(BUCKET, self.KEY, 1800, deadline=None),
+                    "presign_get": lambda aws=aws: aws.presign_get(BUCKET, self.KEY, 1800, owner=ACCOUNT, deadline=None),
                 }
                 for name, call in calls.items():
                     with self.subTest(label=label, call=name):
@@ -2509,7 +2525,7 @@ class NoSecretTests(Base):
                 )
                 with self.subTest(label=label, error=type(error).__name__):
                     with mock.patch.dict(sys.modules, patched), Capture() as capture:
-                        capture.run(lambda aws=aws: aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800, deadline=None))
+                        capture.run(lambda aws=aws: aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800, owner=ACCOUNT, deadline=None))
                     # Six surfaces mean a provider refusal came out, not the SDK's own error.
                     self.assertEqual(len(capture.rendered), 6)
                     self.assertEqual(capture.outcomes, ["AWS_UNCERTAIN"])

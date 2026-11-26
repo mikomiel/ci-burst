@@ -22,8 +22,9 @@ from .config import _image_basis_paths
 from .errors import ConfigRefusal, StateRefusal
 
 #: Schema 2 added ``archive_bucket``, ``archive_owner``, ``archive_deleted_at``, ``archive_delete_tried_at``,
-#: ``archive_delete_seq``, ``basis_file_hashes`` and ``source_template`` to ``image_builds``. A file at schema 1
-#: is refused, not migrated: no deployment held one when schema 2 was made, so a pre-release file is removed by hand.
+#: ``archive_delete_seq``, ``basis_file_hashes``, ``source_template`` and ``source_region`` to ``image_builds``. A file
+#: at schema 1 is refused, not migrated: no deployment held one when schema 2 was made, so a pre-release file is
+#: removed by hand.
 SCHEMA_VERSION = 2
 STATE_FILE = "image-state.sqlite"
 #: A process that stopped inside a commit left a hot rollback journal, which only a writable connection rolls back.
@@ -78,6 +79,7 @@ _SCHEMA_SQL = f"""
         drift_result TEXT,
         verified_at REAL,
         source_template TEXT,
+        source_region TEXT,
         source_pin INTEGER,
         basis_file_hashes TEXT
     );
@@ -138,6 +140,7 @@ _BUILD_UPDATABLE = (
     "drift_result",
     "verified_at",
     "source_template",
+    "source_region",
     "source_pin",
 )
 _CONTROL_UPDATABLE = ("consecutive_failures", "cooldown_until", "blocked", "last_check_at")
@@ -183,9 +186,11 @@ class Build:
     template_version_exists: int | None = None
     drift_result: str | None = None
     verified_at: float | None = None
-    #: The worker template and the pin that the candidate version is made from, written before the first request
-    #: that creates it: a retry sends the same request under the same token, whatever the configuration says by then.
+    #: The worker template, the Region and the pin that the candidate version is made from, written before the first
+    #: request that creates it: a retry sends the same template and pin under the same token, whatever the
+    #: configuration says by then. ``promote`` refuses a candidate that lacks one of the three.
     source_template: str | None = None
+    source_region: str | None = None
     source_pin: int | None = None
     #: The JSON object ``path -> sha256 of the file's content`` of the basis files read when the row was inserted,
     #: keys sorted. ``build_file_hashes`` reads it. ``None`` when the column holds nothing that is text, or text that

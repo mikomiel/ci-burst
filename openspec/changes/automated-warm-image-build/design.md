@@ -246,7 +246,7 @@ The build state lives in `<state dir>/image-state.sqlite`, with its own lock and
 
 Tables:
 
-- `image_builds`: id, deployment, client_token, basis_digest, source_sha, `basis_file_hashes` (the hash of each basis file that gave the digest), archive_bucket, `archive_owner`, archive_key, archive_sha256, `archive_deleted_at`, `archive_delete_tried_at`, `archive_delete_seq`, builder_id, image_id, template_version, state, reason_code, created_at, updated_at, deadline_at, and the verification record (gate seen, drift result, `verified_at`, `source_template`, `source_pin`).
+- `image_builds`: id, deployment, client_token, basis_digest, source_sha, `basis_file_hashes` (the hash of each basis file that gave the digest), archive_bucket, `archive_owner`, archive_key, archive_sha256, `archive_deleted_at`, `archive_delete_tried_at`, `archive_delete_seq`, builder_id, image_id, template_version, state, reason_code, created_at, updated_at, deadline_at, and the verification record (gate seen, drift result, `verified_at`, `source_template`, `source_region`, `source_pin`).
 - `pin_log`: one row per observed pin: pin version, image id, observed_at.
 - `promotion_journal`: one row per promotion or rollback: previous pin, new pin, previous and new file sha256, candidate id, kind (`promotion` or `rollback`), backup file name, the sha256 of that backup, the pin that the backup contains, status (`pending`, `complete` or `aborted`) and timestamps.
 - `control`: one row with the consecutive failure count (a refused start is not a failure and never moves it), the failure cooldown end, the `blocked` flag and the last check time.
@@ -292,7 +292,7 @@ With `--write` it refuses unless the candidate is verified:
 - the full `LaunchTemplateData` differs from the pin that the version was derived from only in `ImageId`;
 - the offline gate was configured and passed (or `allow_no_gate` was set and the record says so);
 - `verified_at` is within `promote_max_age_seconds` (default 172800);
-- the pin and the launch template name in the TOML now equal the record's `source_pin` and `source_template`, so the diff basis is still true;
+- the pin, the launch template name and `aws.region` in the TOML now equal the record's `source_pin`, `source_template` and `source_region`, so the diff basis is still true, and the record has all three;
 - no `[[aws.availability_zones]]` entry carries its own `launch_template_version` (see open question 3).
 
 It then edits only the `launch_template_version` key of the `[aws]` table:

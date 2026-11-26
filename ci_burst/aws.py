@@ -1362,14 +1362,17 @@ class ImageAws:
     def presign_get(self, bucket, key, expires_seconds, *, deadline, owner=None):
         """Presign a GET for one object, only if the session outlives the URL.
 
-        ``check_credential_life`` decides that. A ``deadline`` is read before the lookup of the credential, which can
-        ask STS, and again right before signing, as ``_check_deadline`` says. The ``owner`` (see ``_bound_owner``) is
-        signed as the bucket's expected owner: the SDK signs it as the ``x-amz-expected-bucket-owner`` header, so the
-        GET must send that header with that value. The URL is returned and never logged, stored or placed in an error.
+        ``check_credential_life`` decides that, right before signing: the signature dies with the credentials, and the
+        lookup of the owner (which can ask STS) and the build of the client take time first. A ``deadline`` is read
+        before both, again before the lookup of the credential, which can ask STS, and again right before signing, as
+        ``_check_deadline`` says. The ``owner`` (see ``_bound_owner``) is signed as the bucket's expected owner: the
+        SDK signs it as the ``x-amz-expected-bucket-owner`` header, so the GET must send that header with that value.
+        The URL is returned and never logged, stored or placed in an error.
         """
-        self.check_credential_life(expires_seconds, deadline=deadline)
+        self._check_deadline(deadline, "presign")
         owner = self._bound_owner(owner, deadline=deadline, detail="presign")
         client = self._client("s3")
+        self.check_credential_life(expires_seconds, deadline=deadline)
         self._check_deadline(deadline, "presign")
         try:
             return client.generate_presigned_url(

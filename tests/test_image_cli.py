@@ -38,6 +38,7 @@ from test_image_pipeline import (
     NOW,
     PIN,
     READY,
+    REGION,
     SCRIPT,
     WAITING,
     WORKER,
@@ -213,7 +214,7 @@ class CliCase(PipelineCase):
         """A verified candidate row and the version and image it names in the account.
 
         The version is a copy of ``source_pin`` with the new image, so it is clean unless ``drift``
-        changes a field of its data.
+        changes a field of its data. The row records the worker template, the Region and the pin, as a pass does.
         """
         image_id = ami(image_number)
         data = copy.deepcopy(self.world.versions[(WORKER, source_pin)]["LaunchTemplateData"])
@@ -232,6 +233,8 @@ class CliCase(PipelineCase):
             template_version_exists=1,
             drift_result="clean",
             verified_at=NOW - age + 60,
+            source_template=WORKER,
+            source_region=REGION,
             source_pin=source_pin,
             script_sha256="c" * 64,
         )

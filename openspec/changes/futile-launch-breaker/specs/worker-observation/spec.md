@@ -1,5 +1,19 @@
 # Spec Delta
 
+## ADDED Requirements
+
+### Requirement: One writer per set of export files
+
+A deployment MUST give each set of export files (the record, the event file, the metrics textfile and the collector file the unit publishes it to) one writer: the shipped unit `ci-burst-export.service`, which systemd runs as one instance at a time. A command run outside the unit MUST name its own record, event file and textfile and MUST NOT write the unit's collector file. The command MUST refuse with `EXPORT_PATHS_CONFLICT` two outputs naming one file, or one naming the ledger or configuration.
+
+#### Scenario: A manual export of the unit's files
+- **WHEN** an operator wants an export of the unit's set of export files
+- **THEN** they run `systemctl start ci-burst-export.service`, and systemd does not start a second instance while one runs
+
+#### Scenario: Outputs that name one file are refused
+- **WHEN** two outputs of the command name one file, by any spelling, or an output names the ledger or the configuration file
+- **THEN** the command refuses with `EXPORT_PATHS_CONFLICT` and exits 2 before it writes any file
+
 ## MODIFIED Requirements
 
 ### Requirement: Rebuildable dedupe state
@@ -17,7 +31,8 @@ That time marks the command's own work, which ends with it. It does not mark
 the publication of the metrics textfile into the collector's directory, which the
 unit that runs the command does afterwards. A change to the
 record's version or to a field that the brake reads MUST ship with the matching
-change to the brake's reader.
+change to the brake's reader. These obligations hold for a set of export files
+that has one writer (requirement "One writer per set of export files").
 
 #### Scenario: The same console is read twice
 - **WHEN** the command runs twice over the same console content
@@ -62,22 +77,11 @@ change to the brake's reader.
 - **AND** the run saves the new record under the epoch, so a run that then cannot write its textfile leaves no fresh heartbeat
 - **AND** the record carries neither the records nor the modification time of a link's target
 
-#### Scenario: Runs that share an export file take turns
-- **WHEN** a run starts while another run is in progress that shares an export file with it, and the two runs keep the sharing contract: runs that share any export file (the record, the event file, the metrics textfile or the collector file it is published to) share all of them, the same deployment name, the same publication mode (the shipped unit's staged copy, or direct `--metrics-file` into the collector, never both for one collector file), and the same user, and the parent directories stay the same directories while a run is active
-- **THEN** the run waits on an exclusive lock on the directory of each of its files before it reads the clock, the record or the event file
-- **AND** it reads those files only after the other run has made its last write, so it never saves totals derived from an older snapshot, writes over a newer record or drops event lines that the other run added, and no counter falls
-- **AND** the lock leaves no file behind, so no output path can replace it
-- **AND** runs that share no file are independent, and any other combination is unsupported: the guarantees of this requirement do not hold for it
-
 #### Scenario: An event file that cannot be read fails the run
 - **WHEN** the event file exists and the run cannot read it, or the path holds a link, a FIFO or a directory, whether or not the run has new events
 - **THEN** the command exits 1 before it replaces the event file, the record or the textfile
-- **AND** it opens the path without blocking, so a FIFO with no writer cannot stop it while it holds its locks
+- **AND** it opens the path without blocking, so a FIFO with no writer cannot stop it
 - **AND** only a missing event file is an empty stream
-
-#### Scenario: Runs in separate directories run in parallel
-- **WHEN** two runs use a record, an event file and a metrics textfile in directories that the other run does not use
-- **THEN** neither run waits for the other
 
 #### Scenario: The unit cannot publish the textfile
 - **WHEN** a run completes and writes the record, and the shipped unit then cannot publish the textfile into the collector's directory

@@ -2661,6 +2661,54 @@ class RecordCadenceTests(ExportCase):
         self.assertEqual(self.outputs(), before)
         self.assertEqual((self.events.read_bytes(), os.stat(self.events).st_mtime_ns), events)
 
+    @contextlib.contextmanager
+    def failing_read_after_open(self, target):
+        """Open ``target`` as the code asks, then make its read raise ``FileNotFoundError``."""
+        real_open = io.open
+
+        class FailingRead:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exception):
+                self.stream.close()
+
+            def fileno(self):
+                return self.stream.fileno()
+
+            def read(self, *arguments):
+                raise FileNotFoundError(2, "injected read", str(target))
+
+        def opening(file, *arguments, **options):
+            stream = real_open(file, *arguments, **options)
+            if isinstance(file, (str, os.PathLike)) and os.fspath(file) == str(target):
+                return FailingRead(stream)
+            return stream
+
+        with mock.patch("builtins.open", opening), mock.patch("io.open", opening):
+            yield
+
+    def test_an_event_file_whose_read_fails_after_its_open_fails_the_run(self):
+        # The open found the file, so a later error is not a missing stream.
+        self.run_export(self.build(self.owned(), {"i-0123456789abcdef0": CLEAN_BOOT}))
+        before = self.outputs()
+        events = (self.events.read_bytes(), os.stat(self.events).st_mtime_ns)
+        with self.failing_read_after_open(self.events), self.assertRaises(FileNotFoundError):
+            self.run_export(self.build(self.owned(), {}), now=NOW + 60)
+        self.assertEqual(self.outputs(), before)
+        self.assertEqual((self.events.read_bytes(), os.stat(self.events).st_mtime_ns), events)
+
+    def test_a_record_whose_read_fails_after_its_open_is_rebuilt(self):
+        # The open found the record, so a later error is an unreadable record,
+        # which restarts the counters with a note, and not an absent one.
+        self.run_export(self.build(self.owned(), {"i-0123456789abcdef0": CLEAN_BOOT}))
+        with self.failing_read_after_open(self.state_file):
+            result = self.run_export(self.build(self.owned(), {}), now=NOW + 60)
+        self.assertIn("state_rebuilt", result["notes"])
+
     def test_a_deleted_record_is_rebuilt_with_the_rebuilding_run_time(self):
         consoles = {"i-0123456789abcdef0": CLEAN_BOOT}
         self.run_export(self.build(self.owned(), consoles))
@@ -2831,11 +2879,14 @@ class PublishedCounterTests(ExportCase):
         self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 2)
         self.note()
 
-    def test_a_run_waits_for_the_run_that_holds_the_record(self):
-        # Two runs that share a record are serialized from the first read of the
-        # record to its last write. The test holds the record's directory as the
-        # other run would, and saves a newer record meanwhile: the waiting run
-        # starts from that record, so it never saves totals from an older snapshot.
+    # -- the directory locks ------------------------------------------------
+    # The locks are a guard that makes an accidental second run wait. These tests
+    # show the mechanism only: a set of export files has one writer, and the
+    # locks attach no guarantee to any other sharing.
+
+    def test_lock_mechanism_a_run_waits_while_its_directory_is_held(self):
+        # The test holds the record's directory and saves a newer record
+        # meanwhile: the run waits, then starts from that record.
         self.first_run()
         before = (self.state_file.read_bytes(), os.stat(self.state_file).st_mtime_ns)
         with self.watching_locks():
@@ -2850,49 +2901,9 @@ class PublishedCounterTests(ExportCase):
         self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 8)
         self.assertEqual(self.published()["ci_burst_worker_launches_total"], 8)
 
-    def test_runs_with_their_own_records_wait_for_each_other_on_a_shared_event_file(self):
-        # A manual run can name its own record and keep the default event file.
-        # The two runs read and replace one event file, so they take turns, and
-        # neither replacement drops the lines of the other run.
-        first = self.build([instance(self.WORKER, state="terminated", operation=operation_hex(1))], {self.WORKER: CLEAN_BOOT})
-        second = self.build([instance(self.LATER, state="terminated", operation=operation_hex(2))], {self.LATER: CLEAN_BOOT})
-        manual = self.root / "manual"
-        with self.watching_locks():
-            holder = BackgroundRun(self, first, pause=True).start()
-            self.assertTrue(holder.past_lock.wait(5))
-            waiter = BackgroundRun(
-                self,
-                second,
-                state_file=manual / "observed.json",
-                metrics_file=manual / "textfile" / "ci-burst.prom",
-            ).start()
-            self.assertTrue(waiter.waits(), "the run with its own record did not wait for the shared event file")
-            self.assertIsInstance(holder.finish(), dict)
-            self.assertIsInstance(waiter.finish(), dict)
-        instances = {event["instance"] for event in self.events_read()}
-        self.assertEqual(instances, {self.WORKER, self.LATER})
-
-    def test_runs_in_separate_directories_run_in_parallel(self):
-        other = self.root / "other"
-        with self.watching_locks():
-            holder = BackgroundRun(self, self.exporter(later=False), pause=True).start()
-            self.assertTrue(holder.past_lock.wait(5))
-            parallel = BackgroundRun(
-                self,
-                self.exporter(later=False),
-                state_file=other / "export" / "observed.json",
-                events_file=other / "export" / "worker-events.ndjson",
-                metrics_file=other / "textfile" / "ci-burst.prom",
-            ).start()
-            # The other run finished while the first one still holds its directories.
-            self.assertIsInstance(parallel.finish(), dict)
-            self.assertTrue(holder.thread.is_alive())
-            self.assertIsInstance(holder.finish(), dict)
-
-    def test_a_run_leaves_no_file_besides_its_outputs(self):
-        # The lock is on directories, so a run creates no lock file that a later
-        # run as another user could fail to open. An entry left at the former lock
-        # path, which the run cannot open for writing, does not stop it.
+    def test_lock_mechanism_leaves_no_lock_file(self):
+        # The lock is on directories, so a run creates no file besides its
+        # outputs. An entry left at the former lock path does not stop it.
         self.state_file.parent.mkdir(parents=True)
         leftover = self.state_file.parent / "observed.json.lock"
         leftover.mkdir()
@@ -2904,10 +2915,10 @@ class PublishedCounterTests(ExportCase):
         self.assertEqual(os.listdir(leftover), [])
         self.assertEqual(os.listdir(self.metrics.parent), [self.metrics.name])
 
-    def test_an_output_at_the_former_lock_path_cannot_let_two_runs_overlap(self):
-        # A run whose textfile is named like a lock file replaces that file. Two
-        # runs that both need the record's directory still take turns: one that
-        # waited while the file was replaced and one that starts afterwards.
+    def test_lock_mechanism_an_output_at_the_former_lock_path_cannot_replace_the_lock(self):
+        # A run whose textfile is named like the former lock file replaces that
+        # file. The lock is on the directory, so a run that waited while the file
+        # was replaced and one that starts afterwards still wait.
         self.first_run()
         renamed = self.state_file.parent / "observed.json.lock"
         with self.watching_locks():
@@ -3071,6 +3082,55 @@ class ExportCliTests(unittest.TestCase):
             )
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(buffer.getvalue())["decision"], "reported")
+
+    def run_cli(self, **paths):
+        """Run ``export`` with a stub exporter; return the exit code and whether it ran."""
+        from ci_burst.cli import main
+
+        database = self.root / "state" / "state.sqlite3"
+        config = write_config(self.root, config={"state": {"database": str(database)}})
+        ran = []
+        stub = type(
+            "StubExporter",
+            (),
+            {"__init__": lambda self, config: None, "run": lambda self, **kwargs: ran.append(kwargs) or {"decision": "reported"}},
+        )
+        argv = ["export", "--config", str(config)]
+        for option, value in paths.items():
+            argv += [f"--{option.replace('_', '-')}", str(value)]
+        with mock.patch("ci_burst.cli.Exporter", stub), redirect_stdout(io.StringIO()) as buffer:
+            code = main(argv)
+        return code, ran, buffer.getvalue(), database, config
+
+    def test_two_outputs_that_name_one_entry_are_refused(self):
+        record = self.root / "state" / "export" / "observed.json"
+        record.parent.mkdir(parents=True)
+        alias = self.root / "alias"
+        alias.symlink_to(record.parent)
+        for name, metrics in (("same spelling", record), ("another spelling", alias / "observed.json")):
+            with self.subTest(name):
+                code, ran, output, _, _ = self.run_cli(metrics_file=metrics, state_file=record)
+                self.assertEqual(code, 2, output)
+                self.assertEqual(ran, [])
+                self.assertEqual(os.listdir(record.parent), [])
+
+    def test_a_refusal_creates_no_directory(self):
+        record = self.root / "missing" / "export" / "observed.json"
+        code, ran, output, _, _ = self.run_cli(metrics_file=record, state_file=record)
+        self.assertEqual(code, 2, output)
+        self.assertEqual(ran, [])
+        self.assertFalse((self.root / "missing").exists())
+
+    def test_an_output_that_names_the_ledger_or_the_configuration_is_refused(self):
+        for name in ("ledger", "configuration"):
+            with self.subTest(name):
+                _, _, _, database, config = self.run_cli(metrics_file=self.root / "unused.prom")
+                target = database if name == "ledger" else config
+                before = target.read_bytes() if target.exists() else None
+                code, ran, output, _, _ = self.run_cli(metrics_file=target)
+                self.assertEqual(code, 2, output)
+                self.assertEqual(ran, [])
+                self.assertEqual(target.read_bytes() if target.exists() else None, before)
 
     def test_the_exporter_builds_a_live_adapter_when_none_is_injected(self):
         config = load(write_config(self.root))

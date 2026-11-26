@@ -24,7 +24,7 @@ from .aws import ImageAws
 from .config import load
 from .controller import Controller
 from .errors import ImageRefusal, ProviderRefusal, Refusal
-from .export import Exporter, default_record_path
+from .export import Exporter, default_record_path, refuse_conflicting_outputs
 from .forgejo import ForgejoSource
 from .image_pipeline import ImagePipeline, write_event
 from .image_state import ImageState
@@ -143,6 +143,10 @@ def _export(config, arguments):
     record = default_record_path(config.state.database)
     events_file = arguments.events_file or str(record.parent / "worker-events.ndjson")
     state_file = arguments.state_file or str(record)
+    refuse_conflicting_outputs(
+        {"--state-file": state_file, "--events-file": events_file, "--metrics-file": arguments.metrics_file},
+        {"the ledger database": config.state.database, "the configuration file": arguments.config},
+    )
     return Exporter(config).run(
         events_file=events_file,
         metrics_file=arguments.metrics_file,

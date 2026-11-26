@@ -176,8 +176,7 @@ standard-library tests run without the SDK, a token or a cloud account.
 python -m ci_burst plan   --config deployment.toml   # observation only
 python -m ci_burst apply  --config deployment.toml   # may launch the configured fleet
 python -m ci_burst status --config deployment.toml   # evidence, no mutation
-python -m ci_burst export --config deployment.toml \
-                          --metrics-file /var/lib/prometheus/node-exporter/ci-burst.prom
+python -m ci_burst export --config deployment.toml --metrics-file PATH
 python -m ci_burst reap   --config deployment.toml   # expired resources, no launch
 python -m ci_burst reap   --config deployment.toml --apply
 ```
@@ -199,33 +198,29 @@ console of the instances this deployment owns and turns the shipped first-boot
 markers into two artefacts:
 
 ```sh
-python -m ci_burst export --config deployment.toml \
-  --metrics-file /var/lib/prometheus/node-exporter/ci-burst.prom \
+python -m ci_burst export --config deployment.toml --metrics-file PATH \
   [--events-file PATH] [--state-file PATH]
 ```
 
 The two optional paths default to `<ledger directory>/export/`, as
 `worker-events.ndjson` and `observed.json`.
 
-**Sharing contract.** Runs that share any export file (the record, the event
-file, the metrics textfile or the collector file it is published to) share all
-of them, the same deployment name, the same publication mode (the shipped
-unit's staged copy, or direct `--metrics-file` into the collector, never both
-for one collector file), and the same user; the parent directories stay the
-same directories while a run is active. Runs that share no file are
-independent. Any other combination is unsupported, and the guarantees below do
-not hold for it.
+**One writer.** A set of export files (the record, the event file, the metrics
+textfile and the collector file that the unit publishes it to) has one writer:
+the shipped unit `ci-burst-export.service`. For a manual export of that set, run
+`systemctl start ci-burst-export.service`; systemd runs one instance of the unit
+at a time, its publication step included. A `ci-burst export` command run
+outside the unit names its own `--state-file`, `--events-file` and
+`--metrics-file` (with the unit's configuration, the defaults are the unit's
+files) and does not write the unit's collector file. Any other sharing
+is unsupported, and the guarantees of this section do not hold for it. `export`
+refuses with `EXPORT_PATHS_CONFLICT` (exit 2), before it writes anything, when
+two of its outputs name one file or one names the ledger or the configuration.
 
-Runs take turns: a run holds an exclusive lock on the directory of each of its
-three files, from before it reads the clock, the record or the event file until
-its last write, so a manual run waits for the timer's run and the other way
-round. The lock is on the directories and leaves no file behind. A user who can
-read a directory can hold its lock and delay a run; the shipped unit's
-`TimeoutStartSec` then stops it, the record is not refreshed, and the hold fails
-open once the record is stale. A run reads the event file on every run, without
-blocking and without following a link. Only a missing event file is an empty
-stream; a run that cannot read an existing one, or finds a link, a FIFO or a
-directory there, exits 1 before it replaces any file.
+Each run reads the event file without blocking and without following a link.
+Only a missing event file is an empty stream; a run that cannot read an existing
+one, or finds a link, a FIFO or a directory there, exits 1 before it replaces
+any file.
 
 ### The event stream
 
@@ -321,8 +316,7 @@ they do not fall when an instance ages out of the provider's record window or
 when a record is pruned. `export` saves the record, which holds the totals,
 before it replaces the textfile, so a textfile never carries a total that the
 record lacks, and that holds for a collector that reads `--metrics-file` itself
-as well as for the shipped unit, for runs that keep the sharing contract (§ Worker
-evidence). Only a lost, damaged or unreadable dedupe
+as well as for the shipped unit. Only a lost, damaged or unreadable dedupe
 record (deleted, or replaced by `export` because it cannot read or load it)
 restarts a counter. `export` reads the record once per run, without blocking and
 without following a link, and treats a read that fails, even for a moment, a
@@ -1903,8 +1897,7 @@ Known residual cases:
   tag. The controller launches one instance for each operation, so two such
   records need a tag that the controller did not write.
 - Records carry no deployment name, so the hold takes the deployment from the
-  ledger row of the operation, so a rename does not mix their evidence. Two
-  deployments do not share export files (§ Worker evidence, sharing contract). A row with no readable
+  ledger row of the operation, and a rename does not mix their evidence. A row with no readable
   deployment tag is unbound and counts for every name; the controller never
   writes such a row. The hold does not compare the region or the account of a
   row, so a worker that ended under another region or credential route of the

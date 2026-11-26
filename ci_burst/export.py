@@ -26,14 +26,10 @@ repeat that follows a crash between publishing an event and persisting the
 dedupe record; the alternative — persisting first — would lose a failure event
 instead of repeating it.
 
-Runs that share an export file keep the sharing contract in
-``docs/operations.md`` ("Sharing contract"), and the guarantees below hold for
-those runs only. They take turns: a run holds an exclusive lock on the
-directory of the record, of the event file and of the metrics textfile, from
-before its first read of the clock, the record or the event file until its last
-write, so a manual run waits for the timer's run and the other way round, and no
-run saves totals from an older snapshot or replaces lines that another run
-added. The lock leaves no file behind (``_directory_locks``).
+A set of export files has one writer (``docs/operations.md``, "One writer"),
+and the guarantees below hold for that writer only. The directory locks
+(``_directory_locks``) are a guard that makes an accidental second run wait;
+they attach no guarantee.
 
 The counter contract sets the order of the last writes (``_publish``). The
 cumulative counters are saved in the record, and a collector must never read a
@@ -74,7 +70,7 @@ from pathlib import Path
 from .aws import Aws
 from .config import INSTANCE_TYPE_PATTERN, MAX_INSTANCE_TYPE_LENGTH
 from .cost import CostModel
-from .errors import ProviderRefusal
+from .errors import ConfigRefusal, ProviderRefusal
 from .ledger import NONTERMINAL, TERMINAL, Ledger, current_window
 
 #: One run reads at most this many consoles. The budget is spent on records that
@@ -423,16 +419,21 @@ def _read_record(path):
     the access and modification time, in nanoseconds, of the file that was read,
     and ``(0, 0)`` when none was: a run saves its record under these times
     (``_publish``), so it never gives the record a time that it did not read from
-    the record itself.
+    the record itself. Only an open that finds no file is ``None``: an error
+    after the open, ``FileNotFoundError`` included, is a read that failed.
     """
     try:
-        with open(path, "rb", opener=_open_for_reading) as stream:
+        stream = open(path, "rb", opener=_open_for_reading)
+    except FileNotFoundError:
+        return None, (0, 0)
+    except OSError:
+        return UNREADABLE_RECORD, (0, 0)
+    try:
+        with stream:
             status = os.fstat(stream.fileno())
             if not stat.S_ISREG(status.st_mode):
                 return UNREADABLE_RECORD, (0, 0)
             return stream.read(), (status.st_atime_ns, status.st_mtime_ns)
-    except FileNotFoundError:
-        return None, (0, 0)
     except OSError:
         return UNREADABLE_RECORD, (0, 0)
 
@@ -1226,17 +1227,18 @@ def _read_event_file(path):
 
     The file is opened as the record is (``_open_for_reading``): without blocking,
     so a FIFO with no writer cannot stop a run that holds its locks, and without
-    following a link. Only ``FileNotFoundError`` is an absent file. A link, a
-    directory, a FIFO, another entry that is not a regular file and any other
-    error raise ``OSError``.
+    following a link. Only an open that raises ``FileNotFoundError`` is an
+    absent file. A link, a directory, a FIFO, another entry that is not a regular
+    file and any other error, an error after the open included, raise ``OSError``.
     """
     try:
-        with open(path, "rb", opener=_open_for_reading) as stream:
-            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                raise OSError(f"the event path is not a regular file: {path}")
-            return stream.read()
+        stream = open(path, "rb", opener=_open_for_reading)
     except FileNotFoundError:
         return None
+    with stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError(f"the event path is not a regular file: {path}")
+        return stream.read()
 
 
 def _append_events(path, events, deployment):
@@ -1303,20 +1305,61 @@ def _write_atomic(path, content, *, times=None):
         raise
 
 
+def _entry(path):
+    """The directory entry that ``path`` names, compared by identity and not by string.
+
+    The value is the device and inode of the nearest directory above ``path``
+    that exists, and the names below it. Two spellings of one entry, through
+    ``..`` or a linked directory, give one value. Nothing is created.
+    """
+    path = Path.cwd() / path
+    names = [path.name]
+    directory = path.parent
+    while True:
+        try:
+            status = os.stat(directory)
+        except (FileNotFoundError, NotADirectoryError):
+            names.insert(0, directory.name)
+            directory = directory.parent
+            continue
+        return status.st_dev, status.st_ino, tuple(names)
+
+
+def refuse_conflicting_outputs(outputs, protected):
+    """Refuse outputs that name one directory entry, or an entry in ``protected``.
+
+    ``outputs`` and ``protected`` map an option or a description to a path. A run
+    replaces each output, so two outputs on one entry would overwrite each other,
+    and an output on the ledger or the configuration would destroy it. The check
+    compares entries, not strings, and runs before any file is opened for writing.
+    A protected path is compared as named and as resolved, because the ledger and
+    the configuration are read through a link while an output replaces the link.
+    """
+    seen = {}
+    for option, path in outputs.items():
+        entry = _entry(path)
+        if entry in seen:
+            raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{option} names the same file as {seen[entry]}")
+        seen[entry] = option
+    for description, path in protected.items():
+        for candidate in {str(path), os.path.realpath(path)}:
+            entry = _entry(candidate)
+            if entry in seen:
+                raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{seen[entry]} names {description}")
+
+
 @contextlib.contextmanager
 def _directory_locks(*paths):
     """Hold an exclusive lock on the directory of each of ``paths`` while the block runs.
 
-    A run reads or replaces the record, the event file and the metrics textfile,
-    so runs that share them take turns: a second run waits until the first
-    releases its locks. The sharing contract in ``docs/operations.md`` says which
-    runs may share them. The lock is on the directory and not on a file, so a run
-    creates no file for it and no output path can replace it. Runs whose files
-    are in other directories run in parallel. The directories are created first
-    and opened, and each is locked once, in the order of its device and inode
-    numbers. Two runs that reach one directory under different paths, as a host
-    and a container can, still lock in the same order, so they never wait for
-    each other in a circle. The launch evidence reader takes no lock.
+    A set of export files has one writer (``docs/operations.md``, "One writer").
+    The locks are a guard that makes an accidental second run wait until the
+    first releases them; they attach no guarantee. The lock is on the directory
+    and not on a file, so a run creates no file for it and no output path can
+    replace it. The directories are created first and opened, and each is locked
+    once, in the order of its device and inode numbers, so two runs that reach
+    one directory under different paths never wait for each other in a circle.
+    The launch evidence reader takes no lock.
     """
     opened = {}
     try:

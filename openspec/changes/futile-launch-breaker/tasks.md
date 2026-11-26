@@ -113,8 +113,7 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   (`RecursionError`). Every pass reads every row, terminal ones too, so one such
   row must not stop a pass. Do not catch `MemoryError`.
 - [x] 1.14 In `export`, save the record before the textfile, so that no textfile
-  carries a total that the record lacks for runs that keep the sharing contract
-  of `docs/operations.md`, and advance the record's modification
+  carries a total that the record lacks, and advance the record's modification
   time last. Save the record under the modification time of the record that the
   run read (the epoch when it read none: no file, or one that it could not read).
   When the textfile cannot be replaced, leave the record as saved: do not put it
@@ -125,11 +124,11 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   without following a link. Parse the state and take the times for the save from
   that one read. Treat a link, a FIFO, another entry that is not a regular file
   and a read that fails as a record that does not decode: note `state_rebuilt`
-  and restart the counters. Serialize runs that share export files under the
-  sharing contract with an exclusive, blocking `flock` on the directory of each
-  of the three files (each directory once, in the order of its device and inode
-  numbers), taken before the clock, the record and the event file are read and
-  held until the last write. Create no lock file.
+  and restart the counters. As a guard with no guarantee, take a blocking
+  `flock` on the directory of each of the three files (each once, in the order
+  of its device and inode numbers) before the clock and the reads, and hold it
+  until the last write. Create no lock file. Only an open that finds no file is
+  an absent record or event file; an error after the open is a failed read.
 - [x] 1.16 In `_append_events`, read the event file on every run, with or without
   new events, through `_open_for_reading` and an `fstat` regular-file check.
   Treat only a missing file as an empty stream. Let a link, a FIFO, a directory
@@ -143,9 +142,11 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   backfilled row: without its `MaxPrice`, a lowered configured maximum and the
   accepted price would price the remaining life below the ceiling that admission
   committed. A terminal row keeps the tolerance.
-- [x] 1.19 State the sharing contract once in `docs/operations.md`, in the
-  `design.md` shared-files row and in the worker-observation spec, and point to
-  it from every other statement of a concurrency or counter guarantee.
+- [x] 1.19 State once in `docs/operations.md`, in the `design.md` shared-files
+  row and in the worker-observation spec that a set of export files has one
+  writer, the shipped unit. In the CLI, refuse with `EXPORT_PATHS_CONFLICT`
+  (exit 2), before any write, two outputs that name one directory entry or an
+  output that names the ledger or the configuration.
 
 ## 2. Gate
 
@@ -306,13 +307,12 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   modification time, and the time advances after it. A first run that cannot
   write its textfile leaves a record under the epoch, which the reader reads as
   `stale`.
-- [x] 3.13 Shared-file tests in `tests/test_export.py`. A run waits while another
-  holds the record's directory and starts from the record that the holder saved.
-  Two runs with their own records in other directories that share one event file
-  take turns, and the event file keeps the lines of both. A run creates no file
-  besides its outputs, and an entry at the former lock path does not stop it. A
-  run whose textfile is named like the former lock file cannot let two later
-  runs overlap. A record whose
+- [x] 3.13 Lock mechanism tests in `tests/test_export.py`: a run waits while its
+  directory is held, creates no lock file, and an output at the former lock path
+  cannot replace the lock. Outputs that name one entry, under the same or another
+  spelling, or the ledger or the configuration, are refused with exit 2 and
+  nothing written. An event file or record whose read fails after its open fails
+  the run or notes `state_rebuilt`. A record whose
   first read fails notes `state_rebuilt` and restarts the counters, and after a
   failed textfile write it carries the epoch, not a fresh heartbeat. A link at the
   record path to a fresh record of three futile workers is replaced by a regular
@@ -346,11 +346,10 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   says deleting the dedupe record never changes a decision, add that `export`
   saves the dedupe record before the textfile and keeps it when the textfile
   cannot be replaced, that a record that cannot be read restarts the counters,
-  the sharing contract and that runs which keep it are serialized, that a run which cannot save
+  that a set of export files has one writer, that a run which cannot save
   the record exits 1 before it replaces the textfile and before the unit publishes it, so the collector's
   last-run time does not advance, that no textfile carries a total that the
-  record lacks, in direct mode as well as in the shipped unit, for runs that keep
-  the sharing contract, and that a unit
+  record lacks, in direct mode as well as in the shipped unit, and that a unit
   which fails at publication keeps the record fresh, and note in "Launch
   decision and
   capacity fallback" that a hold comes before the template read.

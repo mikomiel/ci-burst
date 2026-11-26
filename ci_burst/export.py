@@ -660,6 +660,11 @@ def _spot_interruption_value(value):
     return None
 
 
+def _lacks_registration_key(record):
+    """Return True when ``record`` lacks a key that shows whether its worker registered."""
+    return any(key not in record for key in ("registered", "steps", "job_process", "spot_interruption"))
+
+
 def _registration_evidence_is_damaged(record):
     """Return True when what a record shows of registration cannot be kept.
 
@@ -678,7 +683,11 @@ def _registration_evidence_is_damaged(record):
     an older version does for a key that the version did not write yet. The record
     of a worker that has not ended may lack a key. While the provider lists the
     instance, the run reads its console again within its budget, and the console
-    fills the key. Until then the reader counts no such worker.
+    fills the key. The loader drops the exit marker of that record as well
+    (``_sanitize_record``): the provider may list the worker as ended before that
+    read, and a marker kept beside a key that the record lost would count as a
+    futile launch that no read observed. Until a read supplies both, the reader
+    counts no such worker.
 
     A value that the loader keeps with the evidence it carries is not damaged: a
     Spot notice whose registration identifier it normalises, and a ``steps`` list
@@ -689,9 +698,8 @@ def _registration_evidence_is_damaged(record):
     repaired record cannot count as a futile launch.
     """
     state = record.get("state")
-    if isinstance(state, str) and state in CONSOLE_FINAL_STATES:
-        if any(field not in record for field in ("registered", "steps", "job_process", "spot_interruption")):
-            return True
+    if isinstance(state, str) and state in CONSOLE_FINAL_STATES and _lacks_registration_key(record):
+        return True
     for field, stored in (
         ("job_process", _job_process_value),
         ("spot_interruption", _spot_interruption_value),
@@ -731,6 +739,12 @@ def _sanitize_record(record):
         changed = True
     exit_code = record.get("exit_code")
     if exit_code is not None and (type(exit_code) is not int or not 0 <= exit_code <= 255):
+        exit_code = None
+        changed = True
+    if exit_code is not None and _lacks_registration_key(record):
+        # Only the record of a worker that has not ended is kept without a key. Once the
+        # provider lists the worker as ended, this marker beside the lost key would count
+        # it as futile, so the record is no evidence until a read supplies both.
         exit_code = None
         changed = True
     job_process = _job_process_value(record.get("job_process"))
@@ -1248,25 +1262,30 @@ def _append_events(path, events, deployment):
     a collector that reopens it by path sees a complete file, and the rewrite is
     what makes rotation and the size bound possible. The file is a bounded
     publication, not an unbounded WAL. Returns the number of historical lines
-    dropped because they no longer match the schema.
+    dropped because they no longer match the schema or are not UTF-8.
 
     The file is read on every run (``_read_event_file``). Only a missing file is
     an empty stream, and a run with no new event then writes no file. Any other
     failure to read the file fails the run here, before it replaces a file: a
     file that this run cannot read would otherwise be replaced by the lines of
-    this run alone. A file that is read but is not UTF-8 is damaged content, and
-    its lines are dropped.
+    this run alone. A line that is read but is not UTF-8 is damaged content: it
+    is dropped and counted, and the lines around it are kept.
     """
     path = Path(path)
     content = _read_event_file(path)
     if content is None and not events:
         return 0
     lines = "".join(json.dumps(event, sort_keys=True) + "\n" for event in events)
-    try:
-        existing = (content or b"").decode("utf-8")
-    except UnicodeDecodeError:
-        existing = ""
-    existing, dropped = _retained_events(existing, deployment)
+    # No multi-byte character holds the newline byte, so the split cuts none, and a
+    # line that does not decode costs only itself.
+    decoded, undecodable = [], 0
+    for raw in (content or b"").split(b"\n"):
+        try:
+            decoded.append(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            undecodable += 1
+    existing, dropped = _retained_events("\n".join(decoded), deployment)
+    dropped += undecodable
     combined = existing + lines
     encoded = combined.encode("utf-8")
     if len(encoded) > MAX_EVENTS_BYTES:

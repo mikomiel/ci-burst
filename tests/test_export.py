@@ -1549,6 +1549,32 @@ class ExporterTests(ExportCase):
         self.assertNotIn("SYNTHETIC-CONSOLE-SECRET-123", body)
         self.assertIn("i-0123456789abcdef1:step:register", body)
 
+    def test_a_historical_line_that_is_not_utf8_costs_only_that_line(self):
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        base = {
+            "ts": "2026-11-11T00:00:00Z",
+            "deployment": "test-deployment",
+            "zone": "eu-central-1a",
+            "operation": None,
+            "event": "step",
+            "step": "register",
+        }
+        lines = [
+            json.dumps(dict(base, id=f"i-0123456789abcdef{index}:step:register", instance=f"i-0123456789abcdef{index}")).encode()
+            for index in (1, 2, 3)
+        ]
+        # The middle line is a valid event with one byte that UTF-8 never uses.
+        lines[1] = lines[1].replace(b"register", b"reg\xffister")
+        self.events.write_bytes(b"\n".join(lines) + b"\n")
+
+        result = self.run_export(self.build([], {}))
+
+        self.assertIn("events_pruned", result["notes"])
+        self.assertEqual(
+            [event["id"] for event in self.events_read()],
+            ["i-0123456789abcdef1:step:register", "i-0123456789abcdef3:step:register"],
+        )
+
 
     def test_historical_event_values_are_validated_per_field(self):
         secret = "SYNTHETIC-CONSOLE-SECRET-123"
@@ -2344,6 +2370,28 @@ class LaunchEvidenceContractTests(ExportCase):
                 result = self.run_export(self.build([self.owned(first, 1, state="running")], {first: console}))
                 self.assertEqual(result["console_reads"], 1)
                 self.assertEqual(self.records()[first][field], shown[field])
+
+    def test_a_record_that_lacks_a_registration_field_is_not_futile_on_an_inherited_exit_marker(self):
+        # The loader keeps the record of a worker that has not ended, and the field
+        # that it lacks may have shown that the worker registered. The exit marker is
+        # the other half of a futile verdict. The provider now lists the worker as
+        # ended and its console reads empty, so a kept marker would pair with the
+        # missing field into a futile launch that no read observed. The loader drops
+        # the marker, so the record carries no evidence until a read supplies both.
+        first = self.WORKER_IDS[0]
+        now = time.time()
+        for field in self.REGISTRATION_FIELDS:
+            with self.subTest(field=field):
+                record = futile_record(now - 60, index=1, state="shutting-down", exit_code=1)
+                del record[field]
+                self.write_workers([record], mtime=now)
+
+                result = self.run_export(self.build([self.owned(first, 1)], {first: ""}), now=now)
+
+                self.assertEqual(result["console_reads"], 1)
+                self.assertEqual(self.records()[first]["state"], "terminated")
+                evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
+                self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 0, "futile": 0})
 
     def test_a_record_that_lacks_a_field_the_reader_requires_is_never_loaded_as_futile(self):
         # The fields come from the reader, so a field that it starts to require is

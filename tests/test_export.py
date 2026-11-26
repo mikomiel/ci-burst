@@ -1,4 +1,5 @@
 import io
+import contextlib
 import dataclasses
 import json
 import os
@@ -2448,6 +2449,220 @@ class RecordCadenceTests(ExportCase):
         record = json.loads(self.state_file.read_text())["instances"]["i-0123456789abcdef0"]
         self.assertEqual(record["seen"], NOW + 500)
         self.assertEqual(record["first_seen"], NOW + 500)
+
+
+class PublishedCounterTests(ExportCase):
+    """The textfile never carries a total that the record on disk lacks.
+
+    A collector that read a counter must not read a lower one in a later run, so
+    a run saves its totals before it publishes them, whatever a write does. The
+    record keeps the modification time that it had until the run is over.
+    """
+
+    #: Each counter of the textfile, with the place in the record that holds its total.
+    COUNTERS = (
+        ("ci_burst_worker_launches_total", lambda record: record["totals"]["launches"]),
+        ("ci_burst_worker_registered_total", lambda record: record["totals"]["registered"]),
+        ("ci_burst_worker_unregistered_total", lambda record: record["totals"]["unregistered"]),
+        ("ci_burst_export_console_reads_total", lambda record: record["console_reads"]),
+    )
+    WORKER = "i-0123456789abcdef0"
+    LATER = "i-0123456789abcdef1"
+
+    def setUp(self):
+        super().setUp()
+        #: What the textfile held after each run, in order.
+        self.history = []
+
+    def exporter(self, *, later):
+        """An exporter over the first worker, and over the later one while ``later`` is true."""
+        owned = [instance(self.WORKER, state="terminated", operation=operation_hex(1))]
+        if later:
+            owned.append(instance(self.LATER, state="terminated", operation=operation_hex(2)))
+        return self.build(owned, {self.WORKER: CLEAN_BOOT, self.LATER: CLEAN_BOOT})
+
+    def published(self):
+        """The value of each counter in the textfile on disk."""
+        names = dict(self.COUNTERS)
+        values = {}
+        for line in self.metrics.read_text().splitlines():
+            name = line.split("{", 1)[0]
+            if name in names:
+                values[name] = int(line.rsplit(" ", 1)[1])
+        return values
+
+    def saved(self):
+        """The same counters in the record on disk."""
+        record = json.loads(self.state_file.read_text())
+        return {name: read(record) for name, read in self.COUNTERS}
+
+    def note(self):
+        """Hold the textfile's counters within the record's, and keep them to compare with later runs."""
+        published, saved = self.published(), self.saved()
+        for name, value in published.items():
+            self.assertLessEqual(value, saved[name], name)
+        self.history.append(published)
+
+    def assert_never_fell(self):
+        for name, _ in self.COUNTERS:
+            series = [snapshot[name] for snapshot in self.history]
+            self.assertEqual(series, sorted(series), name)
+
+    def first_run(self):
+        self.run_export(self.exporter(later=False))
+        self.note()
+
+    def age_the_record(self):
+        old = time.time() - 3600
+        os.utime(self.state_file, (old, old))
+        return old
+
+    @contextlib.contextmanager
+    def intercepting(self, hook):
+        """Call ``hook(path)`` before every ``os.replace`` onto a path and every ``os.utime`` of one.
+
+        The hook may raise to fail that call. Every other call goes through.
+        """
+        real_replace, real_utime = os.replace, os.utime
+
+        def replace(source, target, *arguments, **options):
+            hook(Path(target))
+            return real_replace(source, target, *arguments, **options)
+
+        def utime(path, *arguments, **options):
+            hook(Path(path))
+            return real_utime(path, *arguments, **options)
+
+        with mock.patch("os.replace", replace), mock.patch("os.utime", utime):
+            yield
+
+    def test_a_record_that_cannot_be_saved_leaves_the_textfile_alone(self):
+        self.first_run()
+
+        def fail_at_the_record(path):
+            if path == self.state_file:
+                raise OSError("injected")
+
+        with self.intercepting(fail_at_the_record), self.assertRaises(OSError):
+            self.run_export(self.exporter(later=True), now=NOW + 60)
+        self.note()
+        # The later worker leaves the provider's inventory before the next run.
+        self.run_export(self.exporter(later=False), now=NOW + 120)
+        self.note()
+        self.assert_never_fell()
+
+    def test_a_run_that_stops_after_publishing_cannot_lower_a_later_counter(self):
+        self.first_run()
+        replaced = []
+
+        def fail_after_the_textfile(path):
+            if path == self.metrics:
+                replaced.append(path)
+            elif replaced and path == self.state_file:
+                raise OSError("injected")
+
+        with self.intercepting(fail_after_the_textfile), self.assertRaises(OSError):
+            self.run_export(self.exporter(later=True), now=NOW + 60)
+        self.assertEqual(len(replaced), 1)
+        self.note()
+        self.run_export(self.exporter(later=False), now=NOW + 120)
+        self.note()
+        self.assert_never_fell()
+
+    def test_a_put_back_that_fails_leaves_the_record_ahead_under_its_old_time(self):
+        self.first_run()
+        old = self.age_the_record()
+        saves = []
+
+        def fail_both(path):
+            if path == self.metrics:
+                raise OSError("injected textfile")
+            if path == self.state_file:
+                saves.append(path)
+                if len(saves) > 1:
+                    raise OSError("injected put back")
+
+        with self.intercepting(fail_both), self.assertRaises(OSError) as raised:
+            self.run_export(self.exporter(later=True), now=NOW + 60)
+        # The textfile is what failed, and the failed put-back does not hide it.
+        self.assertEqual(str(raised.exception), "injected textfile")
+        self.assertEqual(os.stat(self.state_file).st_mtime, old)
+        self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 2)
+        self.note()
+        self.run_export(self.exporter(later=False), now=NOW + 120)
+        self.note()
+        self.assert_never_fell()
+
+    def test_an_interrupt_leaves_the_record_ahead_under_its_old_time(self):
+        class Interrupted(BaseException):
+            pass
+
+        self.first_run()
+        old = self.age_the_record()
+
+        def interrupt_the_textfile(path):
+            if path == self.metrics:
+                raise Interrupted()
+
+        with self.intercepting(interrupt_the_textfile), self.assertRaises(Interrupted):
+            self.run_export(self.exporter(later=True), now=NOW + 60)
+        self.assertEqual(os.stat(self.state_file).st_mtime, old)
+        self.assertEqual(self.saved()["ci_burst_worker_launches_total"], 2)
+        self.note()
+
+    def test_a_record_that_cannot_be_read_is_not_removed_when_the_textfile_fails(self):
+        # The run cannot read the record that it replaces, so it cannot put it
+        # back. It must not remove it either: the textfile still carries the
+        # totals that the record held, and a later run would start below them.
+        self.run_export(self.exporter(later=True))
+        self.note()
+        old = self.age_the_record()
+        reads = []
+
+        def unreadable(*arguments, **options):
+            reads.append(arguments)
+            raise OSError("injected read")
+
+        def fail_the_textfile(path):
+            if path == self.metrics:
+                raise OSError("injected textfile")
+
+        with self.intercepting(fail_the_textfile), mock.patch("os.fstat", unreadable):
+            with self.assertRaises(OSError) as raised:
+                self.run_export(self.exporter(later=True), now=NOW + 60)
+        # The textfile is what failed, and nothing else in the run reads through that call.
+        self.assertEqual(str(raised.exception), "injected textfile")
+        self.assertEqual(len(reads), 1)
+        self.assertTrue(self.state_file.exists())
+        self.assertLessEqual(os.stat(self.state_file).st_mtime, old)
+        self.note()
+        # The later worker leaves the provider's inventory before the next run.
+        self.run_export(self.exporter(later=False), now=NOW + 120)
+        self.note()
+        self.assert_never_fell()
+
+    def test_the_record_holds_the_totals_before_the_textfile_and_ages_until_the_run_ends(self):
+        self.first_run()
+        old = self.age_the_record()
+        before_the_textfile = []
+
+        def look_at_the_record(path):
+            if path == self.metrics:
+                launches = self.saved()["ci_burst_worker_launches_total"]
+                before_the_textfile.append((launches, os.stat(self.state_file).st_mtime))
+
+        with self.intercepting(look_at_the_record):
+            self.run_export(self.exporter(later=True), now=NOW + 60)
+        self.assertEqual(before_the_textfile, [(2, old)])
+        self.assertGreater(os.stat(self.state_file).st_mtime, old)
+        self.note()
+
+    def test_a_first_run_that_cannot_write_its_textfile_leaves_no_record(self):
+        self.metrics.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.run_export(self.exporter(later=False))
+        self.assertFalse(self.state_file.exists())
+        self.assertEqual(os.listdir(self.state_file.parent), [self.events.name])
 
 
 class ConsoleReadTests(unittest.TestCase):

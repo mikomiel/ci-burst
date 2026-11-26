@@ -8,12 +8,14 @@ The command MUST persist what it has already emitted, MUST prune those
 per-instance records after a fixed retention, and MUST treat the record as
 derived observation. The record MUST NOT influence admission, launch or
 termination, except through the one read-only brake that the bounded-operation
-capability defines, which only withholds launches. The command MUST rewrite the
-record at the end of every successful run, even when nothing changed, because the
-file's modification time is that brake's freshness signal. That time marks the
-command's own writes, which end with the record. It does not mark the publication
-of the metrics textfile into the collector's directory, which the unit that runs
-the command does afterwards. A change to the
+capability defines, which only withholds launches. The command MUST save the
+record before it replaces the metrics textfile, so that the textfile carries no
+total that the record lacks. It MUST advance the record's modification time as
+the last step of every successful run, even when nothing changed, because that
+time is that brake's freshness signal, and a run that fails MUST NOT advance it.
+That time marks the command's own work, which ends with it. It does not mark
+the publication of the metrics textfile into the collector's directory, which the
+unit that runs the command does afterwards. A change to the
 record's version or to a field that the brake reads MUST ship with the matching
 change to the brake's reader.
 
@@ -33,23 +35,28 @@ change to the brake's reader.
 
 #### Scenario: A run that cannot write its textfile leaves the record alone
 - **WHEN** a run cannot replace the metrics textfile, so the command exits 1
-- **THEN** the record is not rewritten, because the command writes the record after the event file and the textfile
-- **AND** its modification time ages, so the brake sees it as `stale` after 600 seconds
+- **THEN** the command puts back the record that it saved before the textfile: the same bytes under the same modification time, or no file when there was none
+- **AND** the modification time ages, so the brake sees it as `stale` after 600 seconds
 - **AND** the next run rediscovers the owned instances and reads again the consoles that it selects within its per-run read budget (`MAX_CONSOLE_READS`, 16, live workers first), so a marker that it still finds on one of them is emitted again under the same identity
 - **AND** a console that the run defers past that budget (`console_read_deferred`) is not read in that run, so the run emits nothing for it
 - **AND** an instance that left the provider's inventory, or a marker that scrolled out of the console, is not emitted again
 
-#### Scenario: A run that cannot write the record does not reach publication
-- **WHEN** a run replaces the metrics textfile and cannot replace the record, so the command exits 1
-- **THEN** the record is not rewritten and its modification time ages, so the brake sees it as `stale` after 600 seconds
-- **AND** the shipped unit does not publish the textfile into the collector's directory, because that step follows only a successful command
-- **AND** the collector's last-run timestamp does not advance either
+#### Scenario: A run that cannot write the record does not replace the textfile
+- **WHEN** a run cannot replace the record, so the command exits 1
+- **THEN** the command has not replaced the metrics textfile, so no collector reads a total that the record lacks, whether it reads the `--metrics-file` that the command writes itself or the copy that the shipped unit publishes
+- **AND** the record keeps its modification time and ages, so the brake sees it as `stale` after 600 seconds
+- **AND** the shipped unit does not publish the textfile into the collector's directory, because that step follows only a successful command, so the collector's last-run timestamp does not advance either
 
-#### Scenario: A collector reads the textfile of a run that failed at the record
-- **WHEN** the collector reads the `--metrics-file` that the command writes itself, and a run replaces that textfile and cannot replace the record
-- **THEN** the collector has read counters that no record saved, and a later run can write lower values
-- **AND** a consumer of that file treats a fall as a counter reset, so that use is for manual and diagnostic runs
-- **AND** the counters in the textfiles that the shipped unit publishes do not fall in this way, because the unit publishes only after a successful command
+#### Scenario: A run that stops after it replaced the textfile cannot lower a counter
+- **WHEN** a run replaces the metrics textfile and then cannot advance the record's modification time, or stops before it does
+- **THEN** the record already holds the totals of that textfile, under the modification time that it had before the run, so the brake sees it as `stale` after 600 seconds
+- **AND** a later run writes totals that are not lower, even when a worker has left the provider's inventory in between
+
+#### Scenario: A record that is not put back stays ahead of the textfile
+- **WHEN** a run saved the record and then cannot replace the metrics textfile, and the record is not put back, because the put-back fails or because the run could not read the record that it replaced, or an interrupt ends the run before it replaced the textfile
+- **THEN** the textfile is the previous one, and the record holds the totals of that run under a modification time that is not newer than the one that it had before, so the brake sees it as `stale` after 600 seconds
+- **AND** the run does not remove the record that it could not read, because the textfile may carry its totals
+- **AND** a later run writes totals that are not lower, so no counter falls
 
 #### Scenario: The unit cannot publish the textfile
 - **WHEN** a run completes and writes the record, and the shipped unit then cannot publish the textfile into the collector's directory

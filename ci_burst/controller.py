@@ -120,11 +120,15 @@ def _frozen_deployment(operation):
     The frozen request is the immutable record, so a deployment rename is
     detected without another ledger column. ``None`` means the row carries no
     readable deployment tag: ``_request`` never writes one, so the row is
-    unbound rather than evidence of another deployment.
+    unbound rather than evidence of another deployment. A request that does not
+    decode is unbound as well: ``ValueError`` covers text that is not JSON and
+    bytes that are not UTF-8, ``TypeError`` a value that is not text, and
+    ``RecursionError`` text nested past the decoder's limit. Every pass reads
+    every row, terminal ones too, so one such row must not stop a pass.
     """
     try:
         tags = operation.request()["TagSpecifications"][0]["Tags"]
-    except (KeyError, IndexError, TypeError, ValueError):
+    except (KeyError, IndexError, TypeError, ValueError, RecursionError):
         return None
     if not isinstance(tags, list):
         return None

@@ -67,7 +67,7 @@ def _frozen_max_price_micros(request_json):
     try:
         request = json.loads(request_json)
         value = request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"]
-    except (TypeError, ValueError, KeyError, IndexError):
+    except (TypeError, ValueError, KeyError, IndexError, RecursionError):
         return 0
     return _stored_price_micros(value)
 

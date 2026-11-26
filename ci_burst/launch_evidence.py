@@ -85,8 +85,8 @@ FUTILE_LAUNCH_COUNT = 3
 FUTILE_LAUNCH_WINDOW_SECONDS = 3600
 
 #: The record is evidence while its modification time is at most this many
-#: seconds before the controller clock. ``export`` rewrites it last on every
-#: successful run, so its modification time is a heartbeat.
+#: seconds before the controller clock. ``export`` advances its modification
+#: time last on every successful run, so that time is a heartbeat.
 EVIDENCE_MAX_AGE_SECONDS = 600
 
 #: The reader accepts a record of at most this many bytes. ``export`` bounds the

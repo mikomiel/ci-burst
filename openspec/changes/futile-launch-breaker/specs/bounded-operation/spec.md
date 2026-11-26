@@ -93,6 +93,11 @@ The controller MUST classify a worker only from a record that shows the instance
 - **WHEN** the ledger holds the operation of a record in a row whose frozen request names no readable deployment
 - **THEN** the record is evidence, as it is for a row that names this deployment
 
+#### Scenario: A row whose request does not decode does not stop a pass
+- **WHEN** the ledger holds an old terminal row whose frozen request does not decode, because the text is not JSON or its nesting passes the decoder's limit, and no record exists
+- **THEN** `plan` and `apply` read that row as one that names no readable deployment, and decide as they do without it
+- **AND** neither command exits with an unexpected error
+
 #### Scenario: A rename does not carry the hold over
 - **WHEN** a drained ledger and the record of its workers are kept through a change of the deployment name, and the three newest workers of the old name ended without registering
 - **THEN** `plan` does not hold admission under the new name, and `apply` launches as it does for any new deployment

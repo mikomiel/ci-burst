@@ -107,6 +107,21 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   caught up. The record of a listed instance is read again, within
   `MAX_CONSOLE_READS`, and dated by that read. An instance that the provider no
   longer lists leaves no evidence.
+- [x] 1.13 In `_frozen_deployment`, treat a frozen request that does not decode
+  as unbound, whatever the reason: text that is not JSON, bytes that are not
+  UTF-8, a value that is not text, and text nested past the decoder's limit
+  (`RecursionError`). Every pass reads every row, terminal ones too, so one such
+  row must not stop a pass. Do not catch `MemoryError`.
+- [x] 1.14 In `export`, save the record before the textfile, so that no textfile
+  carries a total that the record lacks, and advance the record's modification
+  time last. Save the record under the modification time that it had (the epoch
+  when there was none), put it back when the textfile cannot be replaced (the
+  same bytes under the same times, or no file when there was none, for an
+  `Exception` only), and let a put-back that fails, or an interrupt, leave the
+  record ahead of the textfile. Do not put the record back once the textfile is
+  replaced. Do not remove a record that the run could not read before it
+  replaced it: leave it as saved, under the epoch. `load_state` draws the same
+  line between a file that is absent and one that does not read.
 
 ## 2. Gate
 
@@ -122,7 +137,8 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   `_decide`, so it reports the same hold.
 - [x] 2.5 Correct the `ci_burst/export.py` module docstring, which says the
   record never influences admission, so that it names the one read-only brake and
-  the duty to write the record last, on every successful run.
+  the duty to advance the record's modification time last, on every successful
+  run.
 - [x] 2.6 Give `_decide` the ledger operations of this deployment and pass them
   to the reader (see 1.11). `plan` reads them beside its state block, before its
   queue call. `apply` reads them at the end of `_reconcile`, in the same
@@ -197,8 +213,8 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   records and notes `console_read_deferred` for the rest.
 - [x] 3.4 Exporter tests show that a successful run with nothing new still
   rewrites the record and advances its modification time, that a refused run
-  leaves it unrewritten, that a run that cannot write its textfile leaves it
-  unrewritten and that the next run emits again, under the same identities, the
+  leaves it unrewritten, that a run that cannot write its textfile puts it back
+  as it was and that the next run emits again, under the same identities, the
   markers it still finds, and that a deleted record is rebuilt with the rebuilding
   run's time.
 - [x] 3.5 Controller tests add one class beside `ClaimGraceTests` in
@@ -252,6 +268,20 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   dropped record of a listed instance is read again and dated by that read. In
   `tests/test_controller.py`, the same two cases run from the exporter to the
   next `apply`.
+- [x] 3.11 Decoder tests in `tests/test_controller.py`. A request nested past the
+  decoder's limit, a value that is not text and bytes that are not UTF-8 are
+  unbound. An old terminal row of that kind, with no record, does not stop
+  `plan` or `apply`: both decide as they do without the row.
+- [x] 3.12 Counter tests in `tests/test_export.py`, in `PublishedCounterTests`.
+  After every run, including one that fails, no counter in the textfile is above
+  the record's total, for the three totals and for console reads, and no series
+  falls over a sequence of runs in which a worker leaves the provider's
+  inventory. The sequences are a record that cannot be saved, a run that stops
+  after the textfile, a put-back that fails, an interrupt, and a record that
+  cannot be read before it is replaced, with the textfile blocked. Before the
+  textfile is replaced the record holds the new totals under its old
+  modification time, and the time advances after it. A first run that cannot
+  write its textfile leaves no record.
 
 ## 4. Documentation
 
@@ -261,19 +291,21 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   from the design, the two levers and why deleting the record does not resume,
   that `status` does not report the gate, that `export` creates the record
   owner-only, so a `plan` run as another user reads `unreadable`, that `export`
-  writes the record last so a failed run lets it age, and that a worker with
-  registration evidence and no exit marker is counted as registered.
+  advances the record's modification time last so a failed run lets it age, and
+  that a worker with registration evidence and no exit marker is counted as
+  registered.
 - [x] 4.2 In `docs/operations.md`, add `recent_launches_futile` to the list of
   zero-bound reasons in "Fleet size and fan-out", extend the "recovery path" line
   in "Claim grace" with the gate, correct the sentence in "Worker evidence" that
   says deleting the dedupe record never changes a decision, add that `export`
-  saves the dedupe record after the textfile, that the repeats of a run that
-  failed count against the event file bound, that a run which fails at the record
-  exits 1 before the unit publishes the textfile, so the collector's last-run
-  time does not advance, that the counters keep their guarantee in the textfiles
-  that the shipped unit publishes and not in direct mode, where a later run can
-  lower a counter and a consumer treats a fall as a reset, and that a unit which
-  fails at publication keeps the record fresh, and note in "Launch decision and
+  saves the dedupe record before the textfile and puts it back when the textfile
+  cannot be replaced, that the repeats of a run that failed count against the
+  event file bound, that a run which cannot save the record exits 1 before it
+  replaces the textfile and before the unit publishes it, so the collector's
+  last-run time does not advance, that no textfile carries a total that the
+  record lacks, in direct mode as well as in the shipped unit, and that a unit
+  which fails at publication keeps the record fresh, and note in "Launch
+  decision and
   capacity fallback" that a hold comes before the template read.
 - [x] 4.3 In `docs/deployment.md` and `docs/container.md`, replace the wording
   that the observation unit is "independent of admission": it is optional and

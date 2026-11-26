@@ -27,7 +27,7 @@ Nothing in `_decide` looks at how earlier workers ended.
 
 | Term | Meaning |
 |---|---|
-| Record | `observed.json` in the `export` directory beside the ledger, at `<dirname(state.database)>/export/observed.json`. `export` writes it last, on every successful run. |
+| Record | `observed.json` in the `export` directory beside the ledger, at `<dirname(state.database)>/export/observed.json`. `export` saves it before the textfile and advances its modification time last, on every successful run. |
 | Ended | The record's provider state is `terminated` or `stopped`. These are the two states after which `export` reads the console no more, so the record is finished and its `seen` time no longer changes. |
 | Registration evidence | The record shows the registration step, a step that the shipped first-boot script prints only after registration, a one-job process outcome or a Spot interruption notice. |
 | Recorded | The record has an operation identifier of the shape that this deployment generates, and the ledger holds that operation for this deployment. A row is of this deployment unless its frozen request names another one. When the ledger names an instance for the operation, the record is filed under that instance. |
@@ -60,10 +60,11 @@ Everything that authorizes a launch still comes from the queue, the ledger, the
 provider and the price read.
 
 The delta modifies the existing requirement instead of adding a second rule
-beside it, so the two cannot disagree. It also binds `export`: it must write
-the record last, on every successful run, because the gate reads the file's
-modification time as a heartbeat, and a change to the record's version or to a
-field the gate reads must change the reader in the same change.
+beside it, so the two cannot disagree. It also binds `export`: it must save the
+record before it replaces the textfile, and advance the record's modification
+time last, on every successful run, because the gate reads that time as a
+heartbeat, and a change to the record's version or to a field the gate reads
+must change the reader in the same change.
 
 ## Relation to the open `bounded-idle-workers` change
 
@@ -180,7 +181,7 @@ no operation, so the gate counts no worker and stays open.
 | What orders and ages a record? | `seen`. | It stops changing when the record finishes, because `export` never reads a finished record again. Every loaded record has one, because `export` drops a record without a usable `seen`. `first_seen` can be null, and the ledger's creation time needs a join that a record without an operation cannot make. |
 | Is a window edge inside? | Yes. An age of at most 3600 seconds is inside. | One rule for both edges. |
 | What does a tie do? | The considered set takes every worker equal to the third. | The verdict never depends on opaque instance identifiers, and a tie that hides a registered worker opens the gate. |
-| How is freshness judged? | By the file's modification time, at most 600 seconds old. | Version 2 of the record has no generation time. `export` replaces the file as its last write, after the event file (when the run has events to add or the file exists) and the textfile, on every successful run, so the time is a heartbeat of the command's own writes, and a refused, failed or stopped run lets it age. The heartbeat does not cover the publication of the textfile into the collector's directory, which the unit does afterwards (see "Failure behaviour"). The reader takes the time from the open descriptor, so a replacement by `export` cannot pair one file's time with another file's content. |
+| How is freshness judged? | By the file's modification time, at most 600 seconds old. | Version 2 of the record has no generation time. `export` saves the file before the textfile, under the modification time that it had, and advances that time as its last step, after the event file (when the run has events to add or the file exists) and the textfile, on every successful run, so the time is a heartbeat of the command's own work, and a refused, failed or stopped run lets it age. The heartbeat does not cover the publication of the textfile into the collector's directory, which the unit does afterwards (see "Failure behaviour"). The reader takes the time from the open descriptor, so a replacement by `export` cannot pair one file's time with another file's content. |
 | What is a time after the controller clock? | The file is `stale`. A record with such a `seen` makes the file `malformed`. `export` drops such a record when it loads its own, against the clock of its run. | An age that cannot be established is not evidence. A clock that was set back leaves a finished record dated ahead, and `export` never reads a finished record again, so without the drop every file that it wrote would stay `malformed` until the clock caught up. |
 
 A rebuilt record is stamped with the time of the run that rebuilds it. `export`
@@ -268,9 +269,10 @@ spend or access.
 | A record's provider state is null, or text outside the known six | That record has not ended. The file stays usable. `export` writes `unknown` for a state it cannot label, turns it into null when it next loads the record, and keeps that null until the record is pruned. It replaces a bad `operation` or `exit_code` by null in the same way and keeps the record, because the reader reads null there as no evidence for that record. A registration value is the exception: see the row for a value that `export` cannot keep. |
 | The file's owner-only mode denies a reader that runs as another user | `unreadable`. `export` creates the file through a temporary file, which is owner-only. |
 | `export` refused its last run, or its unit stopped | The file ages and reads as `stale` after 600 seconds. |
-| `export` cannot write its textfile | The record is written after the textfile, so it is not refreshed and reads as `stale` after 600 seconds. The run had published its events before the failure, and no record of the run was saved, so the next run rediscovers the owned instances and reads again the consoles that it selects within its per-run read budget (`MAX_CONSOLE_READS`, 16, live workers first). A marker that it still finds on one of them is emitted again under the same identity. A console that the run defers past the budget (`console_read_deferred`) is not read in that run, so the run emits nothing for it. An instance that left the provider's inventory, or a marker that scrolled out of the console, is not emitted again. The repeats count against the event file bound, so a long outage can push older lines out of the file. |
-| `export` writes its textfile and cannot write the record | The record is not refreshed and reads as `stale` after 600 seconds, and the hold fails open. The command exits 1, so the failed unit is the signal. The shipped unit publishes the textfile into the collector's directory only after a successful command, so it does not publish here: the collector's copy is not replaced and its last-run timestamp does not advance either. Only where `--metrics-file` names the collector's own file (direct mode) does the new timestamp reach the collector, and with it the counters, which hold totals that no record saved: the next run starts from the older totals and can write lower values, for example when an instance has left the provider's inventory in between. The guarantee that the counters do not fall therefore holds for the shipped unit, which publishes only after a successful run, and not for direct mode. Direct mode is for manual and diagnostic runs, and a consumer of a directly written file must treat a fall as a counter reset: `rate` and `increase` do, and a window that holds the fall reads high by about the value before it. |
-| The shipped unit cannot publish the textfile after a successful run | `export` has already written the record, so it stays `fresh`, and a hold still rests on it, because the evidence in it was read. The collector's copy of the textfile is not replaced, so its last-run timestamp does not advance, and the failed unit is the signal. |
+| `export` cannot write its textfile | The run saved the record before the textfile and puts it back, the same bytes under the same modification time, or no file when there was none, so the record is not refreshed and reads as `stale` after 600 seconds. The run had published its events before the failure, and the put-back leaves no record of the run, so the next run rediscovers the owned instances and reads again the consoles that it selects within its per-run read budget (`MAX_CONSOLE_READS`, 16, live workers first). A marker that it still finds on one of them is emitted again under the same identity. A console that the run defers past the budget (`console_read_deferred`) is not read in that run, so the run emits nothing for it. An instance that left the provider's inventory, or a marker that scrolled out of the console, is not emitted again. The repeats count against the event file bound, so a long outage can push older lines out of the file. A put-back that fails, an interrupt, or a record that the run could not read before it replaced it leaves the record as the run saved it: the run cannot restore what it could not read, and it does not remove it. The modification time is not newer than it was: it is the old time, or the epoch when the run could not read the record. The record is not refreshed and reads as `stale` after 600 seconds, and until then the brake can read the content of a run that did not finish. That evidence was read, as in the case of a unit that cannot publish. The next run starts from the totals of the record, so no counter falls and the markers that it holds are not emitted again. |
+| `export` cannot save the record | The run stops before it replaces the textfile, so the collector's copy and its last-run timestamp stay as they were, whether the collector reads the copy that the shipped unit publishes or the `--metrics-file` that `export` writes itself, and no textfile carries a total that the record lacks. The record keeps its modification time and reads as `stale` after 600 seconds, and the hold fails open. The command exits 1, so the failed unit is the signal. The shipped unit publishes the textfile into the collector's directory only after a successful command, so it does not publish here either. |
+| `export` replaces the textfile and cannot advance the record's modification time, or is stopped before it does | The record holds the totals of that textfile, under the modification time that it had, so it reads as `stale` after 600 seconds and the hold fails open. The command exits 1 when it can. The next run starts from those totals, so no counter falls, even when a worker has left the provider's inventory in between. |
+| The shipped unit cannot publish the textfile after a successful run | `export` has already saved the record and advanced its modification time, so it stays `fresh`, and a hold still rests on it, because the evidence in it was read. The collector's copy of the textfile is not replaced, so its last-run timestamp does not advance, and the failed unit is the signal. |
 | `export` writes to another path with `--state-file` | The default path reads as `missing` or `stale`. The reader never searches. |
 | A failure the reader did not foresee | `unreadable`. The reader never raises, because a pass must not fail for an optional brake. |
 | Two passes read while `export` replaces the file | Each pass sees one whole file. `export` replaces it atomically. |
@@ -335,21 +337,36 @@ which `plan` does not.
   clock that the exporter's own retention uses.
 - A cool-down that `apply` persists. Declined: it adds durable state for what the
   window already derives from existing evidence.
-- Write the record before the textfile, as `export` first did. Declined: a run
-  that fails at its own textfile write would still refresh the heartbeat and keep
-  a hold fresh while the command fails. The order guards the command's own
-  writes and not the publication that follows them: a unit that fails at
-  publication still leaves a fresh record, and the hold rests on it because its
-  evidence was read. The order taken costs a repeat: while the textfile cannot be
-  written, each run reads again the consoles that it selects within its read
-  budget (`MAX_CONSOLE_READS`) and emits again, under the same identities, the
-  markers it still finds there, which at-least-once delivery allows. A console
-  that a run defers past the budget is not read in that run. The repeats
-  count against the event file bound, so a long outage can
-  push older lines out of the file, and a failure of the last write alone leaves
-  a textfile that is newer than the record. The shipped unit never publishes that
-  textfile. Where a collector reads it directly, its counters can fall, so the
-  contract names that use as manual and diagnostic (see "Failure behaviour").
+- Write the record before the textfile and leave it there, as `export` first
+  did. Declined: a run that fails at its own textfile write would still refresh
+  the heartbeat and keep a hold fresh while the command fails, and the next run
+  would not repeat the markers that the failed run published. The order taken
+  saves the record before the textfile, under the modification time that it had,
+  puts it back when the textfile cannot be replaced, and advances the time last.
+  The put-back costs a repeat: while the textfile cannot be written, each run
+  reads again the consoles that it selects within its read budget
+  (`MAX_CONSOLE_READS`) and emits again, under the same identities, the markers
+  it still finds there, which at-least-once delivery allows. A console that a
+  run defers past the budget is not read in that run. The repeats count against
+  the event file bound, so a long outage can push older lines out of the file.
+- Write the textfile first and the record last, as an earlier revision of this
+  change did. Declined: a run that cannot save the record has already replaced
+  the textfile with totals that no record holds, and a later run lowers them
+  when a worker has left the provider's inventory in between, which breaks the
+  contract that counters do not fall. The shipped unit hid that by publishing
+  only after a successful command. A collector that reads `--metrics-file`
+  itself did not have that protection.
+- Save the record and replace the textfile as one step, or stage both files and
+  rename them in turn. Declined: two files cannot change together, and whichever
+  rename comes second can fail or be cut off. The order taken puts that cut on
+  the side that a counter survives: the record ahead of the textfile.
+- Keep the totals in a file of their own. Declined: it adds a second durable
+  file with its own schema, loader and damage rules, for a duty that the order
+  of two writes meets.
+- Put the record back on any exception, an interrupt included. Declined: an
+  interrupt that lands after the textfile was replaced would then save less than
+  the textfile publishes. The put-back is for an `Exception` only, and an
+  interrupt leaves the record ahead.
 
 ## Rollback
 

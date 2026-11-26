@@ -1615,6 +1615,37 @@ class IntentScopeTests(ControllerCase):
         self.assertEqual(ledger.operation(old).request_json, retained.request_json)
         self.assertEqual(ledger.operation(old).request_sha256, retained.request_sha256)
 
+    def test_a_history_row_nested_past_the_json_limit_does_not_stop_a_pass(self):
+        # Every pass reads each row of the ledger, terminal ones too, to see whether
+        # its frozen request names another deployment. A request that the decoder
+        # cannot take is unbound, like any other that does not decode.
+        old = self.seed(
+            state="terminal",
+            operation_id="nested-op",
+            instance_id=None,
+            reservation=0,
+            age=10 * self.config.budget.window_seconds,
+        )
+        nested = "[" * 100_000 + "]" * 100_000
+        connection = sqlite3.connect(self.config.state.database)
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE operations SET request_json = ? WHERE id = ?", (nested, old))
+        connection.commit()
+        with self.assertRaises(RecursionError):
+            self.reopened().operation(old).request()
+        self.assertFalse((self.config.state.database.parent / "export" / "observed.json").exists())
+        no_record = {"state": "missing", "considered": 0, "futile": 0}
+
+        planned = self.build(observation=observation_demand()).plan()
+        self.assertEqual(planned["decision"], "would_launch")
+        self.assertEqual(planned["launch_evidence"], no_record)
+
+        result = self.build(observation=observation_demand()).apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_evidence"], no_record)
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertEqual(self.reopened().operation(old).request_json, nested)
+
 
 class FrozenDeploymentTests(unittest.TestCase):
     """``_frozen_deployment`` reads only a well-formed deployment tag."""
@@ -1660,6 +1691,16 @@ class FrozenDeploymentTests(unittest.TestCase):
 
     def test_invalid_request_json_is_unbound(self):
         self.assertIsNone(_frozen_deployment(self.operation("not json")))
+
+    def test_a_request_nested_past_the_json_limit_is_unbound(self):
+        nested = "[" * 100_000 + "]" * 100_000
+        self.assertIsNone(_frozen_deployment(self.operation(nested)))
+
+    def test_a_request_that_is_not_text_is_unbound(self):
+        self.assertIsNone(_frozen_deployment(self.operation(42)))
+
+    def test_a_request_that_is_not_utf8_is_unbound(self):
+        self.assertIsNone(_frozen_deployment(self.operation(b"\x80\x81")))
 
 
 class FleetTests(ControllerCase):

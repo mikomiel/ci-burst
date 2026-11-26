@@ -29,7 +29,9 @@ The allowance still bounds spend, but every launch in the window can be wasted
   block admission, and the decision reports which state it found.
 - The worker-observation requirement that the record never influences admission
   is narrowed to allow this one read-only use. It now also binds `export` to
-  write the record last, on every successful run, and to drop a record that is
+  save the record before it replaces the textfile, so that the textfile never
+  carries a total that the record lacks, to advance the record's modification
+  time last, on every successful run, and to drop a record that is
   dated after the clock of its run when it loads the record, so that one date set
   ahead by a clock that was corrected cannot keep every new file `malformed`.
 - Every decision that reaches the gate reports `launch_evidence`.

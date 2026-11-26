@@ -85,6 +85,16 @@ class AccrualTests(unittest.TestCase):
         self.assertEqual(model().accrued_micros(late, 1_000_600.0), 16_667)
 
 
+    def test_a_request_nested_past_the_json_limit_contributes_no_ceiling(self):
+        # Every pass prices the rows of the budget window, terminal ones too. A
+        # frozen request that the decoder cannot take contributes nothing, like
+        # any other that does not parse, and must not stop the pass.
+        nested = "[" * 100_000 + "]" * 100_000
+        self.assertEqual(
+            model().price_ceiling_micros(operation(request_json=nested)),
+            model().price_ceiling_micros(operation()),
+        )
+
 class CommitmentTests(unittest.TestCase):
     def test_remaining_life_is_priced_at_the_cap(self):
         # 3_000 seconds left at the configured maximum of 0.20 per hour.

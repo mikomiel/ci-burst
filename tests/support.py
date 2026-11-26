@@ -317,12 +317,12 @@ def write_observed(path, records=(), *, mtime, payload=None, raw=None):
 
 
 def ledger_holding(path):
-    """Return the ledger snapshot that records every operation the record at ``path`` names.
+    """Return the ledger operations that cover every operation the record at ``path`` names.
 
     A reader test is about the record and not about the ledger, so it gives the
     reader a ledger that holds each record's operation with no instance
     identifier. A path that holds no record that parses, such as a missing file, a
-    directory or a pipe, gives an empty snapshot, which the reader never looks at
+    directory or a pipe, gives no operations, which the reader never looks at
     because it refuses the file first.
     """
     try:

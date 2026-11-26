@@ -51,7 +51,7 @@ The controller MUST refuse a launch with the reason `recent_launches_futile` whe
 - **AND** no operator action was taken
 
 ### Requirement: Only ended workers with an operation are classified
-The controller MUST classify a worker only from a record that shows the instance has ended, meaning a provider state of `terminated` or `stopped`, and that carries an operation identifier of the shape this deployment generates. The ledger state that the same pass read MUST hold that operation, under the same instance when it names one. Any other record is no evidence and MUST NOT be counted.
+The controller MUST classify a worker only from a record that shows the instance has ended, meaning a provider state of `terminated` or `stopped`, and that carries an operation identifier of the shape this deployment generates. The ledger MUST hold that operation, under the same instance when it names one, in a row that does not name another deployment. Any other record is no evidence and MUST NOT be counted.
 
 #### Scenario: The instance has not ended
 - **WHEN** a record shows the provider state `pending`, `running`, `shutting-down` or `stopping`, whatever else it shows
@@ -83,6 +83,24 @@ The controller MUST classify a worker only from a record that shows the instance
 #### Scenario: The ledger names no instance
 - **WHEN** the ledger holds the operation of a record and names no instance for it
 - **THEN** the record is evidence under any instance identifier
+
+#### Scenario: The ledger row belongs to another deployment
+- **WHEN** three ended records show the exit marker and no registration evidence, and the ledger holds their operations in rows whose frozen request names another deployment
+- **THEN** the records are no evidence and the gate is open
+- **AND** the evidence reports `considered` 0 and `futile` 0
+
+#### Scenario: A row that names no deployment still counts
+- **WHEN** the ledger holds the operation of a record in a row whose frozen request names no readable deployment
+- **THEN** the record is evidence, as it is for a row that names this deployment
+
+#### Scenario: A rename does not carry the hold over
+- **WHEN** a drained ledger and the record of its workers are kept through a change of the deployment name, and the three newest workers of the old name ended without registering
+- **THEN** `plan` does not hold admission under the new name, and `apply` launches as it does for any new deployment
+- **AND** the old rows stay in the ledger
+
+#### Scenario: The same ledger and record hold under the old name
+- **WHEN** the ledger and the record of the previous scenario are read again with the old deployment name
+- **THEN** the gate holds
 
 #### Scenario: A worker that the ledger does not hold takes no place among the newest three
 - **WHEN** the three newest ended workers are not in the ledger, and the three next older workers are futile and in the ledger
@@ -150,7 +168,7 @@ The controller MUST treat a missing, unreadable, stale or malformed record as no
 - **THEN** the next pass reports `fresh` and evaluates the gate normally
 
 ### Requirement: The evidence is read from one file without side effects
-The controller MUST read the evidence only from `observed.json` in the `export` directory beside the ledger. It MUST NOT write, repair or delete that file. It MUST NOT make a provider or queue call, and MUST NOT read the ledger again, to read it or to count its workers. It MUST NOT block on the path and MUST read only a regular file that is not a link. The evidence state MUST be exactly one of `missing`, `unreadable`, `stale`, `malformed` or `fresh`, tested in that order.
+The controller MUST read the evidence only from `observed.json` in the `export` directory beside the ledger. It MUST NOT write, repair or delete that file. It MUST NOT make a provider or queue call to read it or to count its workers. The evidence read MUST NOT call the ledger. It MUST NOT block on the path and MUST read only a regular file that is not a link. The evidence state MUST be exactly one of `missing`, `unreadable`, `stale`, `malformed` or `fresh`, tested in that order.
 
 #### Scenario: The record cannot be read
 - **WHEN** the file exists and cannot be opened or read
@@ -190,6 +208,7 @@ The controller MUST read the evidence only from `observed.json` in the `export` 
 - **WHEN** the file's modification time is fresh and one record has a field that the gate reads with the wrong type, or a `seen` that is not a finite number or is after the controller clock
 - **THEN** the evidence state is `malformed` for the whole file
 - **AND** no record from that file is used
+- **AND** `export` drops a record with a `seen` after the clock of its run when it loads its own, so a file that it writes holds none
 
 #### Scenario: An instance key that `export` rejects
 - **WHEN** the file's modification time is fresh and one key of `instances` is not an instance identifier of the shape that `export` accepts
@@ -210,10 +229,10 @@ The controller MUST read the evidence only from `observed.json` in the `export` 
 - **WHEN** `plan` or `apply` runs
 - **THEN** the bytes and the modification time of the record are unchanged
 
-#### Scenario: The gate uses the ledger state that its pass read
+#### Scenario: The gate counts against the ledger operations of this deployment
 - **WHEN** `plan` or `apply` decides on a record that holds futile workers
-- **THEN** the workers are counted against the ledger state that the same pass already read
-- **AND** the gate makes no provider call, no queue call and no ledger read of its own
+- **THEN** the workers are counted against the operations of this deployment that the same pass reads from its open ledger
+- **AND** the gate makes no provider call and no queue call, and the evidence read makes no ledger call
 
 ### Requirement: The evidence read is bounded and decided from the open file
 The controller MUST take the type, the modification time and the size of the record from the open file and decide before it reads any content. It MUST read the open file itself, not through a buffered stream, and fetch at most 16 MiB plus one byte from it, and MUST treat a file above 16 MiB as `malformed`. It MUST refuse the JSON constants `NaN`, `Infinity` and `-Infinity`, and a JSON object that names a member twice, when it decodes the file, so a file that holds one is `malformed`.

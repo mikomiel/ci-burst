@@ -99,6 +99,33 @@ change to the brake's reader.
 - **THEN** the run reads at most `MAX_CONSOLE_READS` consoles and notes `console_read_deferred`
 - **AND** a record that waits for a later run is absent from the file that this run writes
 
+#### Scenario: A record dated after the clock of the run is dropped
+- **WHEN** the command loads a record whose `seen` is after the clock of its run, whether the worker has ended or not
+- **THEN** it drops that record only and notes `state_rebuilt`
+- **AND** a record whose `seen` equals the clock stays, as the brake's reader keeps it
+
+#### Scenario: A finished record dated ahead cannot keep the file malformed
+- **WHEN** a clock that was set back leaves the record of a finished worker dated after the clock of the run, beside the records of three futile workers, so that the brake's reader calls the file `malformed`
+- **THEN** after one successful run the brake's reader calls the file `fresh` and finds the hold that the three futile workers give
+- **AND** the run gave the dropped record no new time
+
+#### Scenario: A record dated ahead is read again while the provider lists the instance
+- **WHEN** the record of a listed instance is dropped because it is dated after the clock of the run
+- **THEN** the run reads that console again within its per-run read budget and dates the new record by that read
+- **AND** the record shows what the console shows now, and not what the dropped record showed
+
+#### Scenario: A record dated ahead of an unlisted instance is no evidence
+- **WHEN** the record of an instance is dropped because it is dated after the clock of the run, and the provider no longer lists the instance
+- **THEN** the run writes no record for it
+- **AND** the brake's reader has no evidence about that worker
+
+#### Scenario: A dropped record dated ahead costs only its own history
+- **WHEN** the command drops a record because it is dated after the clock of its run
+- **THEN** the cumulative counters count that worker again, and the run emits its markers again under their stable identities
+- **AND** a worker that still runs loses what earlier reads of its console found, because its record shows what the console shows now
+- **AND** a clock set back by more than the age of the newest records drops every record dated ahead in the same run, the records of live workers included
+- **AND** the command keeps every other record
+
 #### Scenario: A dropped record costs only its own history
 - **WHEN** the command drops a record because its registration evidence cannot be kept
 - **THEN** the cumulative counters count that worker again, and the run emits its markers again under their stable identities

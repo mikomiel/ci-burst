@@ -2781,6 +2781,22 @@ class FutileLaunchTests(ControllerCase):
                 )
                 self.recorded.append(operation)
 
+    def record_under(self, deployment, records):
+        """Record the operation of each record as an ended one that ``deployment`` launched.
+
+        The frozen request carries the deployment tag, as ``apply`` writes it. The
+        rows of ``record_in_ledger`` carry none.
+        """
+        request = {
+            "TagSpecifications": [
+                {"ResourceType": "instance", "Tags": [{"Key": DEPLOYMENT_TAG, "Value": deployment}]}
+            ]
+        }
+        for record in records:
+            operation = record["operation"]
+            self.seed(state="terminal", operation_id=operation, instance_id=None, reservation=0, request=request)
+            self.recorded.append(operation)
+
     def three_futile(self, newest_age=60):
         return [futile_record(self.clock.now - newest_age - 60 * index, index=index) for index in range(3)]
 
@@ -3095,8 +3111,66 @@ class FutileLaunchTests(ControllerCase):
                 )
                 self.assertEqual(result["decision"], "refused" if considered == 3 else "would_launch")
 
+    # -- the deployment that a ledger row belongs to ---------------------------------------
+    def test_a_renamed_deployment_does_not_inherit_the_hold_of_its_predecessor(self):
+        # docs/deployment.md, "Change the deployment name": the rows of the old name
+        # stay in the ledger as history, and ``export`` keeps the records of their
+        # workers until retention drops them. Those workers are no evidence for the
+        # deployment that replaced the old one.
+        records = self.three_futile()
+        self.write_records(records, ledger=False)
+        self.record_under("test-deployment", records)
+        control = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(control["decision"], "refused")
+        self.assertEqual(control["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 3})
+        renamed = self.fleet(deployment="different-deployment")
+
+        planned = self.build(observation=observation_demand(1), config=renamed).plan()
+        applied = self.build(observation=observation_demand(1), config=renamed).apply()
+
+        for result, decision in ((planned, "would_launch"), (applied, "launched")):
+            with self.subTest(command=result["command"]):
+                self.assertEqual(result["decision"], decision)
+                self.assertNotIn("recent_launches_futile", result["reasons"])
+                self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 0, "futile": 0})
+        # The old rows stay as history, and the pass added its own row.
+        self.assertEqual(len(self.reopened().operations()), len(records) + 1)
+
+    def test_only_a_row_that_names_another_deployment_is_left_out(self):
+        # Each row is judged by the deployment in its frozen request, as the scope
+        # check judges it. A row that names none is not evidence of another
+        # deployment, so its worker still counts after a rename.
+        current, other = "test-deployment", "old-deployment"
+        cases = (
+            ("every row names the deployment", current, [current] * 3, 3),
+            ("one row names another deployment", current, [current, current, other], 2),
+            ("every row names another deployment", "different-deployment", [current] * 3, 0),
+            ("no row names a deployment and the name changed", "different-deployment", [None] * 3, 3),
+        )
+        for name, deployment, rows, considered in cases:
+            with self.subTest(name):
+                self.setUp()
+                records = self.three_futile()
+                self.write_records(records, ledger=False)
+                for record, row in zip(records, rows):
+                    if row is None:
+                        self.record_in_ledger([record])
+                    else:
+                        self.record_under(row, [record])
+                config = self.fleet(deployment=deployment)
+
+                result = self.build(observation=observation_demand(1), config=config).plan()
+
+                self.assertEqual(
+                    result["launch_evidence"], {"state": "fresh", "considered": considered, "futile": considered}
+                )
+                self.assertEqual(result["decision"], "refused" if considered == 3 else "would_launch")
+
     # -- the record that export writes, read by the next pass ------------------------------
     WORKERS = tuple(f"i-0123456789abcde{index:02x}" for index in range(3))
+
+    #: The fourth record that ``write_observed`` files, after the three of ``WORKERS``.
+    AHEAD_WORKER = "i-0123456789abcde03"
 
     #: The console of a worker that registered and ran one job, and of one that
     #: never registered, as the shipped first-boot script prints them.
@@ -3251,6 +3325,57 @@ class FutileLaunchTests(ControllerCase):
         result = self.build(observation=observation_demand(1), config=self.config).apply()
         self.assert_held(result)
         self.assert_no_launch_work()
+
+    # -- a record dated after the clock of the run ---------------------------------------
+    def ahead_of_the_clock(self, make_ahead):
+        """Write the records of three workers that never registered and of a fourth, dated ahead.
+
+        ``make_ahead`` builds the fourth record, which is finished and dated an hour
+        after the clock, as a backward clock correction leaves one. The reader
+        refuses a file that holds it. Return the provider's listing of the four.
+        """
+        now = self.clock.now
+        self.config = self.fleet()
+        records = [futile_record(now - 60 - 60 * index, index=index + 1) for index in range(3)]
+        records.append(make_ahead(now + 3600, index=9))
+        self.write_records(records, mtime=now - 30)
+        return [
+            instance(worker, state="terminated", operation=record["operation"], zone="eu-central-1a")
+            for worker, record in zip((*self.WORKERS, self.AHEAD_WORKER), records)
+        ]
+
+    def test_a_finished_record_dated_ahead_of_the_clock_cannot_switch_the_hold_off(self):
+        # The reader refuses the whole file for the record, and a run never reads a
+        # finished record again, so the file stayed refused until the clock caught
+        # up. The run drops the record, and the provider no longer lists its worker.
+        # That worker registered: a run that kept the record under a fresh time would
+        # make it the newest of four and lift the hold that the other three give.
+        listed = self.ahead_of_the_clock(registered_record)
+        planned = self.build(observation=observation_demand(1), config=self.config).plan()
+        self.assertEqual(planned["launch_evidence"], {"state": "malformed", "considered": 0, "futile": 0})
+
+        run, _ = self.export_run(listed[:3], {})
+
+        result = self.build(observation=observation_demand(1), config=self.config).apply()
+        self.assert_held(result)
+        self.assert_no_launch_work()
+        self.assertEqual(sorted(self.exported_records()), sorted(self.WORKERS))
+        self.assertIn("state_rebuilt", run["notes"])
+
+    def test_a_record_dated_ahead_of_the_clock_is_read_again_and_counts_by_its_console(self):
+        # The provider still lists the worker, so the run reads its console, and the
+        # file carries that read under the time of the run. The console shows that
+        # the worker registered, which the stored record did not.
+        listed = self.ahead_of_the_clock(futile_record)
+
+        run, aws = self.export_run(listed, {self.AHEAD_WORKER: self.REGISTERED_CONSOLE})
+
+        self.assertEqual([call[1] for call in aws.calls if call[0] == "console_output"], [[self.AHEAD_WORKER]])
+        self.assertEqual(self.exported_records()[self.AHEAD_WORKER]["seen"], self.clock.now)
+        result = self.build(observation=observation_demand(1), config=self.config).apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 2})
+        self.assertIn("state_rebuilt", run["notes"])
 
 
 class BudgetHeadroomTests(ControllerCase):

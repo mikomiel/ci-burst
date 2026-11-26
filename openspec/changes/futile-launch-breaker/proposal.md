@@ -19,8 +19,9 @@ The allowance still bounds spend, but every launch in the window can be wasted
 - The evidence is the record that `export` already writes beside the ledger.
   The controller reads it and never writes it. A worker counts as futile only
   when its record shows that the instance ended, shows the bootstrap's exit
-  marker, and shows no sign of registration, and when the ledger that the same
-  pass already read holds the worker's operation.
+  marker, and shows no sign of registration, and when the ledger holds the
+  worker's operation for this deployment. A rename therefore starts without the
+  hold of the old name.
 - The gate sits in `_decide`, after the earlier wait reasons and before the
   launch template is read. It is a refusal like `budget_allowance_exhausted`,
   and the command exits 2 as it does for any refusal.
@@ -28,7 +29,9 @@ The allowance still bounds spend, but every launch in the window can be wasted
   block admission, and the decision reports which state it found.
 - The worker-observation requirement that the record never influences admission
   is narrowed to allow this one read-only use. It now also binds `export` to
-  write the record last, on every successful run.
+  write the record last, on every successful run, and to drop a record that is
+  dated after the clock of its run when it loads the record, so that one date set
+  ahead by a clock that was corrected cannot keep every new file `malformed`.
 - Every decision that reaches the gate reports `launch_evidence`.
 - The operator, deployment and container guides describe the gate, its limits
   and its one blunt lever.

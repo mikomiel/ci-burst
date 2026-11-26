@@ -387,7 +387,7 @@ def _refuse_repeated_member(pairs):
     return members
 
 
-def load_state(path):
+def load_state(path, *, now=None):
     """Return ``(state, note)``; an unusable record is replaced, not repaired.
 
     Nested types are validated here rather than at first use: a record that
@@ -416,6 +416,18 @@ def load_state(path):
     no longer lists leaves no evidence. The cost is that of any dropped record:
     the cumulative totals count the worker again, and the run emits its markers
     again under their stable identities.
+
+    One record is dropped, and the note is ``state_rebuilt``, when it is dated
+    after ``now``, the clock of the run. The reader refuses a whole file for one
+    record dated after its own clock, and a worker that ended is not read again,
+    so a record that an earlier clock stamped ahead would keep every new file
+    ``malformed`` until the clock caught up. Without the record, the run reads the
+    console again while the provider lists the instance and stamps only what it
+    read, and an instance that it no longer lists leaves no evidence. The run
+    never gives an observation a time it did not make. The cost is that of any
+    dropped record, and the evidence that a live worker's record held from earlier
+    reads is lost with it: the record shows what the console shows now. Without
+    ``now`` no record is judged against a clock.
     """
     empty = {"version": STATE_VERSION, "console_reads": 0, "totals": _empty_totals(), "instances": {}}
     try:
@@ -453,6 +465,11 @@ def load_state(path):
         # A record without a usable timestamp can never age out, so retention
         # would keep it forever. Drop it rather than leak it.
         if record_value["seen"] is None:
+            rebuilt = True
+            continue
+        # The reader's own comparison (``seen > now``): a record that it would
+        # refuse is not carried into a file that it would then refuse whole.
+        if now is not None and record_value["seen"] > now:
             rebuilt = True
             continue
         if changed:
@@ -782,7 +799,7 @@ class Exporter:
         if len(live) > limit:
             summary.notes.append("above_configured_limit")
 
-        state, note = load_state(state_file)
+        state, note = load_state(state_file, now=current)
         if note is not None:
             summary.notes.append(note)
         prune_state(state, current)

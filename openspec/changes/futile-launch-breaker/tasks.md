@@ -14,10 +14,10 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   lists the steps the shipped first-boot script prints only after the register
   step. Do not copy the step names into a second list.
 - [x] 1.3 Add `ci_burst/launch_evidence.py` with one function that takes the
-  record path, the controller clock reading and the ledger operations of the pass
-  (see 1.9) and returns the evidence state, the considered count and the futile
-  count. It imports the record version, the final provider states, the operation
-  pattern and the constant from 1.2 from `ci_burst/export.py`.
+  record path, the controller clock reading and the ledger operations of this
+  deployment (see 1.9) and returns the evidence state, the considered count and
+  the futile count. It imports the record version, the final provider states, the
+  operation pattern and the constant from 1.2 from `ci_burst/export.py`.
 - [x] 1.4 Open the file once, without blocking and without following a link,
   take the type, the modification time and the size from the open descriptor, and
   decide before it reads any content. Read the file only when it is a regular
@@ -47,12 +47,13 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   that `export` stores: the reader and `export` share one rule for each, so the
   reader accepts no empty list and no other shape that `export` cannot write. A
   record that fails, or whose `seen` is after the clock, makes the whole file
-  `malformed`. A record whose provider state is null, or text outside the known
-  six, is valid and has not ended.
+  `malformed`; `export` drops such a record when it loads its own (see 1.12). A
+  record whose provider state is null, or text outside the known six, is valid
+  and has not ended.
 - [x] 1.7 Classify each record as registered, futile or no evidence, order by
   `seen`, keep the window edge inside, and build the considered set with the tie
-  rule from the spec. Skip a record that the ledger does not hold (see 1.9)
-  before the newest three are chosen.
+  rule from the spec. Skip a record that the ledger does not hold for this
+  deployment (see 1.9) before the newest three are chosen.
 - [x] 1.8 Decode the record in `load_state` in `ci_burst/export.py` with the same
   two hooks. A file that holds a refused constant or a repeated member takes the
   branch of a file that does not decode: the loader drops it whole, notes
@@ -63,15 +64,15 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   the file with a fresh heartbeat. The same reasoning applies to a repaired
   registration value and to a default for an absent registration key (see
   1.10).
-- [x] 1.9 Count a worker only when the ledger holds its operation. The reader
-  takes the operations of the pass as a required argument: a mapping from each
-  operation identifier that the ledger holds to the instance identifier that it
-  holds for it, or to null while it holds none. A record counts when its operation
-  is in the mapping and the mapped instance is null or the instance that the
-  record is filed under. The reader makes no ledger call of its own. `export`
-  persists any well-shaped operation tag, and reconciliation ignores a terminated
-  instance that no ledger operation names, so the tag alone does not show a launch
-  that the ledger holds.
+- [x] 1.9 Count a worker only when the ledger holds its operation for this
+  deployment. The reader takes the operations as a required argument: a mapping
+  from each operation identifier that the ledger holds for this deployment to the
+  instance identifier that it holds for it, or to null while it holds none. A
+  record counts when its operation is in the mapping and the mapped instance is
+  null or the instance that the record is filed under. The reader makes no ledger
+  call of its own. `export` persists any well-shaped operation tag, and
+  reconciliation ignores a terminated instance that no ledger operation names, so
+  the tag alone does not show a launch that the ledger holds.
 - [x] 1.10 In `load_state`, drop the record of an instance when a stored value
   that bears on registration is present and cannot be kept: a `job_process` or
   `spot_interruption` that `export` does not write, a `steps` list with an element
@@ -89,6 +90,23 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   observed. The dropped record is read again while the provider lists the
   instance, within `MAX_CONSOLE_READS`, and leaves no evidence when the provider
   does not.
+- [x] 1.11 In the controller, build the mapping of 1.9 from the operation rows of
+  the ledger, and leave out a row whose frozen request names another deployment.
+  Use the rule of the scope check (`_deployment_changed`): the deployment is the
+  `ci-burst:deployment` tag of the frozen request, and a row with no readable tag
+  is unbound and stays in. Add no ledger column and no record field. A rename
+  leaves the old rows behind as history (the drain-and-retain rule of the
+  lifecycle capability), and their workers are no evidence for the new name.
+- [x] 1.12 In `load_state`, take the clock of the run as the keyword argument
+  `now`, and drop a record whose `seen` is after it, whether its worker has ended
+  or not, with the note `state_rebuilt`. A record dated at the clock stays, as the
+  reader keeps it. `Exporter.run` passes its own clock, and a call without `now`
+  judges no record against a clock. Do not clamp the date and do not keep the
+  record: the reader refuses a whole file for such a record, and a worker that has
+  ended is not read again, so the file would stay `malformed` until the clock
+  caught up. The record of a listed instance is read again, within
+  `MAX_CONSOLE_READS`, and dated by that read. An instance that the provider no
+  longer lists leaves no evidence.
 
 ## 2. Gate
 
@@ -105,10 +123,11 @@ instance identifiers and 32-character hexadecimal operation identifiers.
 - [x] 2.5 Correct the `ci_burst/export.py` module docstring, which says the
   record never influences admission, so that it names the one read-only brake and
   the duty to write the record last, on every successful run.
-- [x] 2.6 Give `_decide` the ledger operations of the pass and pass them to the
-  reader. `plan` takes them from the state block that it already reads. `apply`
-  takes them from the state that `_reconcile` reads at its end, in the same
-  transaction, so the gate adds no provider call and no ledger read.
+- [x] 2.6 Give `_decide` the ledger operations of this deployment and pass them
+  to the reader (see 1.11). `plan` reads them beside its state block, before its
+  queue call. `apply` reads them at the end of `_reconcile`, in the same
+  transaction. The gate adds no provider call and no schema change, and one more
+  read of the operation rows on the ledger connection that the pass has open.
 
 ## 3. Tests
 
@@ -218,6 +237,21 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   provider no longer lists leaves no evidence, that a dropped record whose console
   shows no registration counts, and, as the control, that three futile workers
   that nothing damaged still hold after an export run.
+- [x] 3.9 Rename tests in `tests/test_controller.py`. Keep the old rows and the
+  old record through a change of the deployment name. `plan` and `apply` do not
+  hold under the new name, `apply` launches, and the old rows stay in the ledger.
+  As the control, the same ledger and record still hold under the old name. A
+  further test fixes the rule on the row: the gate counts rows whose frozen
+  request names this deployment, leaves out a row that names another, counts every
+  row that names none, and counts none when every row names another deployment.
+- [x] 3.10 Clock tests. In `tests/test_export.py`, `load_state` drops a record
+  dated after the clock, whether its worker has ended or not, keeps a record dated
+  at the clock, and judges no record without a clock. After one run, a finished
+  record dated ahead no longer makes the file `malformed`, the three futile
+  workers beside it hold, and the run gave the dropped record no new time. A
+  dropped record of a listed instance is read again and dated by that read. In
+  `tests/test_controller.py`, the same two cases run from the exporter to the
+  next `apply`.
 
 ## 4. Documentation
 
@@ -247,9 +281,17 @@ instance identifiers and 32-character hexadecimal operation identifiers.
 - [x] 4.4 In `docs/operations.md`, state in "Worker evidence" that `export` drops
   the record of an instance when a stored registration value cannot be kept, why,
   what the run does next, what it costs and which values it keeps. State in the
-  hold section that a worker counts only when the ledger of the same pass holds
-  its operation, that the hold reads no ledger of its own, and add the two
-  residual cases that follow from these rules.
+  hold section that a worker counts only when the ledger holds its operation for
+  this deployment, how the pass reads the rows (see 2.6), and that a row that
+  names another deployment is left out, and add the two residual cases that follow
+  from these rules.
+- [x] 4.5 In `docs/operations.md`, state in "Worker evidence" that `export` drops
+  a record dated after the clock of its run, why (the reader refuses the whole
+  file for it, and a worker that has ended is not read again), what the run does
+  next and what it costs. State in the hold section that a rename does not carry
+  the hold over and that the rule compares the deployment of the row and not its
+  region or account. Correct the residual cases: a rename no longer mixes the
+  records, and a dropped record includes one dropped for its date.
 
 ## 5. Verification
 

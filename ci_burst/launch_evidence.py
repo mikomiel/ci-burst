@@ -12,14 +12,16 @@ The reader opens one regular file read-only, without blocking and without
 following a link. It never writes, repairs, locks or deletes it, makes no
 provider, queue or ledger call, and never raises.
 
-A worker counts only when the ledger records it. The caller passes the
-operations that its pass has already read from the ledger, as a mapping from the
+A worker counts only when the ledger records it for this deployment. The caller
+passes the operations that its pass reads from the ledger, as a mapping from the
 operation identifier to the instance identifier that the ledger holds for it, or
-``None`` while it holds none. A record whose operation is not in the mapping, or
-whose operation the ledger ties to another instance, is no evidence. ``export``
-writes the operation tag of any owned instance that the provider lists, and
-reconciliation ignores a terminated instance that no ledger operation names, so
-the tag alone does not show a launch of this deployment.
+``None`` while it holds none, and it leaves out each row whose frozen request
+names another deployment: a rename leaves such rows behind as history, and their
+workers are no evidence for the new name. A record whose operation is not in the
+mapping, or whose operation the ledger ties to another instance, is no evidence.
+``export`` writes the operation tag of any owned instance that the provider
+lists, and reconciliation ignores a terminated instance that no ledger operation
+names, so the tag alone does not show a launch of this deployment.
 
 The reader decides from the open descriptor before it reads a byte: a file that
 is not a regular one is ``unreadable``, a file outside the freshness bound is
@@ -46,6 +48,11 @@ that the record of an ended worker lacks (``_registration_evidence_is_damaged``)
 The run reads the worker's console again while the provider lists the instance, and
 leaves no record when it does not: ``export`` never writes back, under a fresh
 heartbeat, a repaired record that shows no registration.
+A record dated after the controller clock drops the whole file as well, so
+``export`` drops such a record when it loads its own, against the clock of its
+run (``load_state``). The file that a run writes then holds no record that this
+reader refuses for its date, and a clock that ran backwards cannot keep it
+``malformed``.
 The fields it reads, the record version and the rules that decide a shape are
 imported from ``export``; a contract test in ``tests/test_export.py`` fails when
 the two drift apart.
@@ -141,11 +148,12 @@ class LaunchEvidence:
 def read_launch_evidence(path, now, recorded):
     """Return the launch evidence in the record at ``path`` against the clock ``now``.
 
-    ``recorded`` maps each operation identifier that the ledger holds to its
-    instance identifier, or to ``None`` while the ledger holds none. A worker
-    counts only when its operation is in it, under the instance that the record
-    names when the ledger names one. The argument is required, so that a caller
-    cannot count workers that no operation of this deployment launched.
+    ``recorded`` maps each operation identifier that the ledger holds for this
+    deployment to its instance identifier, or to ``None`` while the ledger holds
+    none. A worker counts only when its operation is in it, under the instance
+    that the record names when the ledger names one. The argument is required, so
+    that a caller cannot count workers that no operation of this deployment
+    launched.
 
     The states are tested in the order ``missing``, ``unreadable``, ``stale``,
     ``malformed``. A file above ``MAX_RECORD_BYTES`` is ``malformed``, and it is
@@ -263,6 +271,9 @@ def _record_is_valid(record, now):
         return False
     # The exporter's own timestamp rule: a finite number that is not a boolean.
     seen = _number(record["seen"])
+    # A record dated after the clock is not the output of a run that kept to it.
+    # ``export`` applies the same comparison when it loads its record, so it never
+    # carries such a record into a file that this reader would refuse whole.
     if seen is None or seen > now:
         return False
     for key in ("state", "operation"):

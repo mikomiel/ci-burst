@@ -2130,12 +2130,12 @@ class LaunchEvidenceContractTests(ExportCase):
         ("registered", "true"),
     )
 
-    def write_workers(self, records, *, ids=None):
+    def write_workers(self, records, *, ids=None, mtime=NOW):
         """Write a record of ended workers, filed under ``ids`` (``WORKER_IDS``) by position."""
         ids = self.WORKER_IDS if ids is None else ids
         write_observed(
             self.state_file,
-            mtime=NOW,
+            mtime=mtime,
             payload={
                 "version": STATE_VERSION,
                 "console_reads": len(records),
@@ -2280,6 +2280,86 @@ class LaunchEvidenceContractTests(ExportCase):
         self.assertEqual(sorted(self.records()), sorted(ids[:MAX_CONSOLE_READS]))
         for record in self.records().values():
             self.assertEqual(classify(record), REGISTERED)
+
+    # -- a record dated after the clock of the run ---------------------------------------
+    AHEAD_ID = "i-0123456789abcdea9"
+
+    def three_futile_workers(self, now):
+        """The records of three ended workers that never registered, the newest 60 seconds old."""
+        return [futile_record(now - 60 - 60 * index, index=index + 1) for index in range(3)]
+
+    def listed_workers(self):
+        """The provider's listing of the three workers of ``three_futile_workers``."""
+        return [self.owned(instance_id, index + 1) for index, instance_id in enumerate(self.WORKER_IDS)]
+
+    def test_the_loader_drops_a_record_dated_after_the_clock_of_the_run(self):
+        # The reader's comparison is ``seen > now``: a record dated at the clock is
+        # kept and one dated after it is dropped, whether its worker ended or not.
+        # Without a clock no record is judged against one.
+        self.write_workers(
+            [
+                futile_record(NOW, index=1),
+                futile_record(NOW + 1, index=2),
+                futile_record(NOW + 60, index=3, state="running", exit_code=None),
+            ]
+        )
+
+        state, note = load_state(self.state_file, now=NOW)
+
+        self.assertEqual(note, "state_rebuilt")
+        self.assertEqual(sorted(state["instances"]), sorted(self.WORKER_IDS[:1]))
+        state, note = load_state(self.state_file)
+        self.assertIsNone(note)
+        self.assertEqual(sorted(state["instances"]), sorted(self.WORKER_IDS))
+
+    def test_a_finished_record_dated_ahead_of_the_clock_cannot_keep_the_file_malformed(self):
+        # A backward clock correction leaves a finished record dated ahead of the
+        # clock. The reader refuses the whole file for it, and a run never reads a
+        # finished record again, so every new file would be refused until the clock
+        # caught up. The run drops the record. The provider no longer lists the
+        # worker, so it leaves no evidence. It registered: a run that kept the
+        # record under a fresh time would make it the newest of four and lift the
+        # hold that the other three give.
+        now = time.time()
+        records = [*self.three_futile_workers(now), registered_record(now + 3600, index=9)]
+        self.write_workers(records, ids=[*self.WORKER_IDS, self.AHEAD_ID], mtime=now)
+        before = read_launch_evidence(self.state_file, now, ledger_holding(self.state_file))
+        self.assertEqual(before.state, "malformed")
+        exporter = self.build(self.listed_workers(), {})
+
+        result = self.run_export(exporter, now=now)
+
+        evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
+        self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 3})
+        self.assertTrue(evidence.holds)
+        self.assertEqual(sorted(self.records()), sorted(self.WORKER_IDS))
+        self.assertEqual(self.console_read_calls(exporter), [])
+        self.assertIn("state_rebuilt", result["notes"])
+
+    def test_a_record_dated_ahead_of_the_clock_is_read_again_while_the_provider_lists_it(self):
+        # The stored record says that the worker never registered and the console
+        # shows that it did. The run reads that console and no other, and writes
+        # what the console shows, under the time of that read. The three records
+        # that are not dated ahead are kept without a read.
+        now = time.time()
+        records = [*self.three_futile_workers(now), futile_record(now + 3600, index=9)]
+        self.write_workers(records, ids=[*self.WORKER_IDS, self.AHEAD_ID], mtime=now)
+        exporter = self.build([*self.listed_workers(), self.owned(self.AHEAD_ID, 9)], {self.AHEAD_ID: CLEAN_BOOT})
+
+        result = self.run_export(exporter, now=now)
+
+        self.assertEqual(self.console_read_calls(exporter), [[self.AHEAD_ID]])
+        self.assertEqual(sorted(self.records()), sorted([*self.WORKER_IDS, self.AHEAD_ID]))
+        ahead = self.records()[self.AHEAD_ID]
+        self.assertEqual(ahead["seen"], now)
+        self.assertTrue(ahead["registered"])
+        self.assertEqual(classify(ahead), REGISTERED)
+        # The cost of a dropped record: the totals count the worker again.
+        self.assertEqual(json.loads(self.state_file.read_text())["totals"]["launches"], len(records) + 1)
+        evidence = read_launch_evidence(self.state_file, time.time(), ledger_holding(self.state_file))
+        self.assertEqual(evidence.as_dict(), {"state": "fresh", "considered": 3, "futile": 2})
+        self.assertFalse(evidence.holds)
+        self.assertIn("state_rebuilt", result["notes"])
 
 
 class RecordCadenceTests(ExportCase):

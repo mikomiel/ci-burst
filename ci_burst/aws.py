@@ -721,17 +721,21 @@ def _quiet_sdk_loggers():
         credentials.addFilter(_WithoutTraceback())
 
 
-def _session_expiry(session):
+def _session_expiry(session, check):
     """Epoch expiry of the session's credentials, or ``None`` when unknown.
 
     Assumed-role credentials resolve lazily and carry no expiry until the first
     refresh, so they are resolved first. The resolved secret is discarded here.
+    ``check`` reads the cutoff right before the discovery and before the refresh,
+    since the build of the session and the discovery take time.
     """
+    check()
     credentials = session.get_credentials()
     if credentials is None:
         return None
     freeze = getattr(credentials, "get_frozen_credentials", None)
     if callable(freeze):
+        check()
         freeze()
     expiry = getattr(credentials, "_expiry_time", None)
     return _timestamp(expiry)
@@ -1335,7 +1339,7 @@ class ImageAws:
         if self._expiry is not None:
             return self._expiry() if callable(self._expiry) else self._expiry
         with _sdk_failures():
-            return _session_expiry(self._session())
+            return _session_expiry(self._session(), lambda: self._check_deadline(deadline, "credential lookup"))
 
     def check_credential_life(self, expires_seconds, *, deadline):
         """Refuse with ``IMAGE_CREDENTIAL_SHORT`` unless the session outlives a URL of ``expires_seconds``.

@@ -823,7 +823,8 @@ blocks the state again, so a recovered build has one attempt.
 
 A build that works ends as a candidate: an image tagged for this deployment, and a
 new version of the worker launch template (`aws.launch_template_name`) that copies
-the version the TOML pins now and changes `ImageId` only. The pass reads both
+the version the TOML pinned when the pass first asked for it and changes `ImageId`
+only. The row records that template and pin, so a retry sends the same request. The pass reads both
 versions back and compares the whole `LaunchTemplateData`. A difference in any
 field but `ImageId` ends the build `failed` with `TEMPLATE_DRIFT`; the event names
 the fields and never a value. The new version is inert. It is not the default

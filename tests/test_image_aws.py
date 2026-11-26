@@ -2195,6 +2195,33 @@ class PresignTests(Base):
         self.assertEqual(credentials.resolved, 0)
         self.assertEqual(self.requests("generate_presigned_url"), [])
 
+    def test_a_session_build_or_a_discovery_that_ends_at_the_cutoff_starts_no_refresh(self):
+        # The session's build or the discovery of its credentials takes the time left: nothing after it starts.
+        for slow, discovered in (("session", 0), ("discovery", 1)):
+            with self.subTest(slow=slow):
+                self.clock.now = NOW
+                credentials = FakeCredentials(datetime.fromtimestamp(NOW + 3600, timezone.utc))
+                session = FakeSession(self.calls, self.ec2, self.s3, credentials=credentials)
+                discover = session.get_credentials
+
+                def get_credentials(slow=slow, discover=discover):
+                    if slow == "discovery":
+                        self.clock.advance(5)
+                    return discover()
+
+                session.get_credentials = mock.Mock(side_effect=get_credentials)
+
+                def build_session(profile, slow=slow, session=session):
+                    if slow == "session":
+                        self.clock.advance(5)
+                    return session
+
+                aws = ImageAws(REGION, PROFILE, session_factory=build_session, clock=self.clock)
+                with self.assertRaises(DeadlineRefusal):
+                    aws.credential_expiry(deadline=NOW + 5)
+                self.assertEqual(session.get_credentials.call_count, discovered)
+                self.assertEqual(credentials.resolved, 0)
+
     def test_session_credentials_are_resolved_before_their_expiry_is_read(self):
         expiry = datetime.fromtimestamp(NOW + 3600, timezone.utc)
         credentials = FakeCredentials(expiry)
@@ -2295,6 +2322,9 @@ class Capture:
         self.out = io.StringIO()
         self.err = io.StringIO()
         self.rendered = []
+        #: What each call ended in: a refusal's reason, or the class of another error. A test checks that the call
+        #: reached the failure it is about, not an earlier one with no secret to leak.
+        self.outcomes = []
 
     def __enter__(self):
         capture = self
@@ -2325,6 +2355,7 @@ class Capture:
         try:
             return call()
         except Refusal as refusal:
+            self.outcomes.append(refusal.reason)
             self.rendered.extend(
                 [
                     str(refusal),
@@ -2336,6 +2367,7 @@ class Capture:
                 ]
             )
         except Exception as error:  # noqa: BLE001 - the rendering is what is measured
+            self.outcomes.append(type(error).__name__)
             self.rendered.extend([str(error), repr(error), "".join(traceback.format_exception(error))])
         return None
 
@@ -2390,7 +2422,8 @@ class NoSecretTests(Base):
                 with self.subTest(label=label, method=method):
                     with mock.patch.dict(sys.modules, patched), Capture() as capture:
                         capture.run(calls[method])
-                    self.assertTrue(capture.rendered)
+                    # The leaky provider error was reached: with the SDK it is a definite refusal, without it unknown.
+                    self.assertEqual(capture.outcomes, ["AWS_REFUSED" if label == "sdk" else "AWS_UNCERTAIN"])
                     self.assert_clean(capture.surfaces(), f"{label} {method}")
 
     def test_upload_failures_keep_stream_and_provider_text_out_of_every_rendering(self):
@@ -2401,26 +2434,43 @@ class NoSecretTests(Base):
         def overrun():
             yield b"x" * 200
 
+        failed = "IMAGE_ARCHIVE_UPLOAD_FAILED"
         scenarios = {
-            "stream": (lambda: leaking_stream(), {}),
-            "part": (lambda: [b"x" * 35], {"fail_part": 2}),
-            "complete": (lambda: [b"x" * 15], {"errors": {"complete_multipart_upload": ProviderError("InternalError")}}),
-            "abort": (lambda: [b"x" * 35], {"fail_part": 1, "errors": {"abort_multipart_upload": ProviderError("InternalError")}}),
-            "overrun": (overrun, {}),
+            "stream": (lambda: leaking_stream(), {}, failed),
+            "part": (lambda: [b"x" * 35], {"fail_part": 2}, failed),
+            "complete": (
+                lambda: [b"x" * 15],
+                {"errors": {"complete_multipart_upload": ProviderError("InternalError")}},
+                failed,
+            ),
+            "abort": (
+                lambda: [b"x" * 35],
+                {"fail_part": 1, "errors": {"abort_multipart_upload": ProviderError("InternalError")}},
+                failed,
+            ),
+            "overrun": (overrun, {}, "IMAGE_ARCHIVE_TOO_LARGE"),
         }
-        for name, (stream, settings) in scenarios.items():
+        for name, (stream, settings, reason) in scenarios.items():
             with self.subTest(name=name):
                 fresh = FakeS3(self.calls)
                 for attribute, value in settings.items():
                     setattr(fresh, attribute, value)
-                aws = ImageAws(REGION, PROFILE, clients={"ec2": self.ec2, "s3": fresh}, clock=self.clock, expiry=NOW + 3600)
+                # The account is given, so the upload opens without an owner lookup and reaches the failure.
+                aws = ImageAws(
+                    REGION,
+                    PROFILE,
+                    clients={"ec2": self.ec2, "s3": fresh},
+                    clock=self.clock,
+                    expiry=NOW + 3600,
+                    account=ACCOUNT,
+                )
                 with Capture() as capture:
                     capture.run(
                         lambda: aws.put_archive(
                             BUCKET, PREFIX + "x.tar.gz", stream(), max_bytes=100, part_bytes=10, deadline=None
                         )
                     )
-                self.assertTrue(capture.rendered)
+                self.assertEqual(capture.outcomes, [reason])
                 self.assert_clean(capture.surfaces(), name)
 
     def test_presign_errors_and_refusals_do_not_carry_the_url(self):
@@ -2431,6 +2481,9 @@ class NoSecretTests(Base):
                 lambda: self.image_aws(expiry=NOW + 10).presign_get(BUCKET, PREFIX + "x.tar.gz", 1800, deadline=None)
             )
         self.assertEqual(len(capture.rendered), 12)
+        # The signing call failed, then the short session refused before any signing.
+        self.assertEqual(capture.outcomes, ["AWS_UNCERTAIN", "IMAGE_CREDENTIAL_SHORT"])
+        self.assertEqual(len(self.requests("generate_presigned_url")), 1)
         self.assert_clean(capture.surfaces(), "presign")
 
     def test_a_credential_failure_keeps_the_provider_text_out_of_every_rendering(self):
@@ -2459,6 +2512,7 @@ class NoSecretTests(Base):
                         capture.run(lambda aws=aws: aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800, deadline=None))
                     # Six surfaces mean a provider refusal came out, not the SDK's own error.
                     self.assertEqual(len(capture.rendered), 6)
+                    self.assertEqual(capture.outcomes, ["AWS_UNCERTAIN"])
                     self.assert_clean(capture.surfaces(), f"{label} {type(error).__name__}")
 
     def test_a_whole_successful_pass_logs_and_prints_nothing_secret_and_summaries_omit_it(self):
@@ -2496,11 +2550,12 @@ class NoSecretTests(Base):
         aws = self.image_aws()
         with Capture() as capture:
             capture.run(
-                        lambda: aws.put_archive(
-                            BUCKET, PREFIX + "x.tar.gz", stream(), max_bytes=100, part_bytes=10, deadline=None
-                        )
-                    )
+                lambda: aws.put_archive(
+                    BUCKET, PREFIX + "x.tar.gz", stream(), max_bytes=100, part_bytes=10, deadline=None
+                )
+            )
         self.assertEqual(len(capture.rendered), 6)
+        self.assertEqual(capture.outcomes, ["IMAGE_SOURCE_FORBIDDEN"])
         self.assert_clean(capture.surfaces(), "source refusal")
 
     def test_the_adapter_does_not_log_at_all(self):
@@ -3359,7 +3414,7 @@ class RealSdkCredentialFailureTests(RealSdkCase):
         aws._session().events.register("before-send.sts.AssumeRole", self.deny)
         key = PREFIX + "x.tar.gz"
         calls = {
-            "credential_expiry": aws.credential_expiry,
+            "credential_expiry": lambda: aws.credential_expiry(deadline=None),
             "presign_get": lambda: aws.presign_get(BUCKET, key, 1800, deadline=None),
             "builders": lambda: aws.builders(DEPLOYMENT, deadline=None),
             "image": lambda: aws.image("ami-0123456789abcdef0", deadline=None),

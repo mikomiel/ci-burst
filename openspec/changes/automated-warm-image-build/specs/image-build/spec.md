@@ -1004,7 +1004,7 @@ Each build MUST be bounded by `build_deadline_seconds`, the builder's lifetime t
 - **THEN** the output names the two ways to clear it
 
 ### Requirement: A launch-template version is created inert and drift-checked
-After the image is `available`, the command MUST create a new launch-template version from the configured pin as `SourceVersion` (never `$Latest` or the default), changing only `ImageId`, with a client token from the state file. It MUST then read back both versions and compare their full `LaunchTemplateData`. Any difference other than `ImageId` MUST yield `TEMPLATE_DRIFT`, mark the version unusable and prevent promotion.
+After the image is `available`, the command MUST create a new launch-template version from the template and pin recorded on the row before its first request, the pin as `SourceVersion` (never `$Latest` or the default), changing only `ImageId`, with a client token from the state file. It MUST then read back both versions and compare their full `LaunchTemplateData`. Any difference other than `ImageId` MUST yield `TEMPLATE_DRIFT`, mark the version unusable and prevent promotion.
 
 #### Scenario: Only the image differs
 - **WHEN** the new version equals the pin's version except for `ImageId`

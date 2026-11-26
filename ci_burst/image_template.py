@@ -31,9 +31,10 @@ def create_candidate_version(
 ):
     """Create the candidate's launch-template version and compare it with the pin.
 
-    ``aws`` is an ``ImageAws``. ``source_pin`` is the numeric version the
-    deployment's configuration pins now (never ``$Latest`` or the default; the
-    adapter refuses anything but a positive integer, before any request).
+    ``aws`` is an ``ImageAws``. ``source_pin`` is the numeric version that the
+    build row recorded from the configuration before the first request (never
+    ``$Latest`` or the default; the adapter refuses anything but a positive
+    integer, before any request).
     ``image_id`` is the new image. ``build_id`` and the first 12 characters of
     ``basis_digest`` go into the version description, and ``client_token`` is
     the build's token from the state file.

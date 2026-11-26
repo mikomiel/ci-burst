@@ -389,7 +389,11 @@ class WorldEc2:
                 ClientToken=ClientToken,
             ),
         )
+        request = (LaunchTemplateName, SourceVersion, LaunchTemplateData, VersionDescription)
         if ClientToken in self.w.version_tokens:
+            # EC2 answers a token that comes back with another request with this error, and creates nothing.
+            if self.w.version_requests[ClientToken] != request:
+                raise ProviderError("IdempotentParameterMismatch")
             return {"LaunchTemplateVersion": {"VersionNumber": self.w.version_tokens[ClientToken]}}
         source = self.w.versions[(LaunchTemplateName, int(SourceVersion))]
         data = copy.deepcopy(source["LaunchTemplateData"])
@@ -399,6 +403,7 @@ class WorldEc2:
         self.w.next_version += 1
         self.w.set_version(LaunchTemplateName, number, data, description=VersionDescription)
         self.w.version_tokens[ClientToken] = number
+        self.w.version_requests[ClientToken] = copy.deepcopy(request)
         return {"LaunchTemplateVersion": {"VersionNumber": number}}
 
 
@@ -524,6 +529,7 @@ class World:
         self.templates = {}
         self.versions = {}
         self.version_tokens = {}
+        self.version_requests = {}
         self.version_drift = {}
         self.omit_versions_once = set()
         self.groups = {}
@@ -4431,6 +4437,34 @@ class FailureTests(PipelineCase):
         self.assertEqual({attempt["ClientToken"] for attempt in attempts}, {f"{build.client_token}-v"})
         self.assertEqual(self.world.next_version, 6)
         self.assertEqual(len([key for key in self.world.versions if key[0] == WORKER]), 2)
+
+    def test_a_retry_after_the_pin_moved_sends_the_request_that_its_token_was_first_used_with(self):
+        # The version is created and the pass deadline cuts its read-back. The operator then moves the pin.
+        self.world.console_plan = [(30.0, READY)]
+        self.world.set_version(WORKER, 4, copy.deepcopy(self.world.versions[(WORKER, PIN)]["LaunchTemplateData"]))
+
+        def run_out_of_time(arguments):
+            del self.world.hooks["create_launch_template_version"]
+            self.clock.advance(PASS_DEADLINE_SECONDS)
+
+        self.world.hooks["create_launch_template_version"] = run_out_of_time
+        result = self.apply()
+        self.assertEqual(result["decision"], "imaging")
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        pinned = f"launch_template_version = {PIN}\n"
+        text = self.config_path.read_text(encoding="utf-8")
+        self.assertEqual(text.count(pinned), 1)
+        self.config_path.write_text(text.replace(pinned, "launch_template_version = 4\n"), encoding="utf-8")
+        self.restart()
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate")
+        first, retry = self.world.arguments("create_launch_template_version")
+        self.assertEqual(retry, first)
+        self.assertEqual(retry["SourceVersion"], str(PIN))
+        build = self.only_build()
+        # The candidate records the pin it was made from: promotion refuses it while the file pins another one.
+        self.assertEqual((build.template_version, build.source_template, build.source_pin), (5, WORKER, PIN))
+        self.assertEqual(self.world.next_version, 6)
 
     def test_a_version_that_cannot_be_created_before_the_deadline_fails_the_build(self):
         self.world.console_plan = [(30.0, READY)]

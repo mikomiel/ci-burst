@@ -58,16 +58,36 @@ def _stored_price_micros(value):
     return micros if micros > 0 else 0
 
 
+#: ``_decoded_request``'s answer for a frozen request that does not decode.
+UNDECODABLE = object()
+
+
+def _decoded_request(request_json):
+    """The frozen request, or ``UNDECODABLE``.
+
+    ``ValueError`` covers text that is not JSON and bytes that are not UTF-8,
+    ``TypeError`` a value that is not text, and ``RecursionError`` text nested
+    past the decoder's limit. None of them may stop a pass that prices the rows
+    of the window, terminal ones too.
+    """
+    try:
+        return json.loads(request_json)
+    except (TypeError, ValueError, RecursionError):
+        return UNDECODABLE
+
+
 def _frozen_max_price_micros(request_json):
     """The ``MaxPrice`` frozen in an operation's request, or zero.
 
     The ceiling admission committed is already stored in the request the
-    provider received; a schema-3 row does not need a second column for it.
+    provider received; a schema-3 row does not need a second column for it. A
+    request that does not decode gives zero here, and an operation that still
+    needs its ceiling keeps its reservation instead (``reservation_floor_micros``).
     """
+    request = _decoded_request(request_json)
     try:
-        request = json.loads(request_json)
         value = request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"]
-    except (TypeError, ValueError, KeyError, IndexError, RecursionError):
+    except (TypeError, KeyError, IndexError):
         return 0
     return _stored_price_micros(value)
 
@@ -147,8 +167,19 @@ class CostModel:
         Every normally admitted row carries a zero flag and therefore no floor,
         and its commitment may fall below the reservation as its minutes are
         accepted under the ceiling.
+
+        A non-terminal row whose frozen request does not decode keeps the same
+        floor. Its ``MaxPrice`` is the ceiling admission committed, and without it
+        the configured maximum, which may since have been lowered, and the
+        accepted price would price the remaining life below that ceiling. A
+        terminal row needs no ceiling for the remaining life, so its request may
+        stay undecodable without a floor.
         """
-        if not operation.admitted_inputs_backfilled:
+        damaged = (
+            operation.state not in TERMINAL_STATES
+            and _decoded_request(operation.request_json) is UNDECODABLE
+        )
+        if not (operation.admitted_inputs_backfilled or damaged):
             return 0
         return operation.reservation_micros or 0
 

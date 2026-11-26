@@ -3991,6 +3991,43 @@ class CostTrackingTests(ControllerCase):
         self.assertEqual(result["decision"], "refused")
         self.assertIn("budget_allowance_exhausted", result["reasons"])
 
+    def test_an_active_row_whose_frozen_request_does_not_decode_keeps_its_reservation(self):
+        # The frozen request holds the ceiling that admission committed. When it
+        # does not decode, the lowered configuration and the accepted quote both
+        # price the remaining life below that ceiling, so the reservation that
+        # admission stored is the floor, as for a backfilled row.
+        def config(**aws):
+            path = write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 2},
+                    "aws": {"max_lifetime_seconds": 3600} | aws,
+                    "budget": {"allowance": "0.59", "incidental_per_hour": "0.05", "non_compute_allowance": "0.5"},
+                },
+            )
+            return load(path)
+
+        first = self.build(observation=observation_demand(1), config=config(max_spot_price="0.0400")).apply()
+        self.assertEqual(first["decision"], "launched")
+        self.assertEqual(first["budget"]["per_launch_reservation"], "0.590000")
+        operation_id = first["operation"]
+        self.assertEqual(self.reopened().operation(operation_id).price_micros, 20_000)
+        nested = "[" * 100_000 + "]" * 100_000
+        connection = sqlite3.connect(self.config.state.database)
+        with connection:
+            connection.execute("UPDATE operations SET request_json = ? WHERE id = ?", (nested, operation_id))
+        connection.close()
+        self.clock.advance(600)
+        lowered = self.build(
+            observation=observation_demand(1),
+            config=config(max_spot_price="0.0100"),
+            aws=FakeAws(spot_quote=quote(price_micros=10_000, clock=self.clock)),
+        )
+        result = lowered.apply()
+        self.assertEqual(result["budget"]["committed"], "0.590000")
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("budget_allowance_exhausted", result["reasons"])
+
     def test_a_lowered_configuration_does_not_reprice_an_admitted_operation(self):
         config = load(
             write_config(

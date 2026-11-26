@@ -113,7 +113,8 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   (`RecursionError`). Every pass reads every row, terminal ones too, so one such
   row must not stop a pass. Do not catch `MemoryError`.
 - [x] 1.14 In `export`, save the record before the textfile, so that no textfile
-  carries a total that the record lacks, and advance the record's modification
+  carries a total that the record lacks for runs that keep the sharing contract
+  of `docs/operations.md`, and advance the record's modification
   time last. Save the record under the modification time of the record that the
   run read (the epoch when it read none: no file, or one that it could not read).
   When the textfile cannot be replaced, leave the record as saved: do not put it
@@ -124,17 +125,27 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   without following a link. Parse the state and take the times for the save from
   that one read. Treat a link, a FIFO, another entry that is not a regular file
   and a read that fails as a record that does not decode: note `state_rebuilt`
-  and restart the counters. Serialize runs that share the record, the event file
-  or the metrics textfile, or only a directory of one, with an exclusive,
-  blocking `flock` on the directory of each of the three files (each directory
-  once, in the order of its device and inode numbers), taken before the clock, the record and the event
-  file are read and held until the last write. Create no lock file.
-- [x] 1.16 In `_append_events`, treat only a missing event file as an empty
-  stream. Let any other error that reading an existing file raises fail the run
-  before it replaces the event file, the record or the textfile.
+  and restart the counters. Serialize runs that share export files under the
+  sharing contract with an exclusive, blocking `flock` on the directory of each
+  of the three files (each directory once, in the order of its device and inode
+  numbers), taken before the clock, the record and the event file are read and
+  held until the last write. Create no lock file.
+- [x] 1.16 In `_append_events`, read the event file on every run, with or without
+  new events, through `_open_for_reading` and an `fstat` regular-file check.
+  Treat only a missing file as an empty stream. Let a link, a FIFO, a directory
+  and any other error fail the run before it replaces the event file, the record
+  or the textfile.
 - [x] 1.17 In the reader, read the controller clock after the `fstat` of the open
   descriptor and before the content, and judge the age, the record dates and the
   window against that one reading. The controller passes its clock, not a time.
+- [x] 1.18 In `CostModel.reservation_floor_micros`, keep the stored reservation as
+  the floor of a non-terminal row whose frozen request does not decode, as for a
+  backfilled row: without its `MaxPrice`, a lowered configured maximum and the
+  accepted price would price the remaining life below the ceiling that admission
+  committed. A terminal row keeps the tolerance.
+- [x] 1.19 State the sharing contract once in `docs/operations.md`, in the
+  `design.md` shared-files row and in the worker-observation spec, and point to
+  it from every other statement of a concurrency or counter guarantee.
 
 ## 2. Gate
 
@@ -311,6 +322,12 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   file fails before it replaces the event file, the record or the textfile. In
   `tests/test_controller.py`, a heartbeat that `export` refreshes between the gate
   call and the reader's `fstat` still reads `fresh`, and the hold stays.
+- [x] 3.15 In `tests/test_export.py`, a run with no new events fails without
+  waiting when a FIFO is at the event path, and fails when the event file's
+  status and content cannot be read; neither replaces the record or the
+  textfile. In `tests/test_controller.py`, an active row whose frozen request is
+  nested past the decoder's limit keeps its reservation under a lowered
+  configured maximum, and admission refuses another worker.
 
 ## 4. Documentation
 
@@ -329,10 +346,11 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   says deleting the dedupe record never changes a decision, add that `export`
   saves the dedupe record before the textfile and keeps it when the textfile
   cannot be replaced, that a record that cannot be read restarts the counters,
-  that runs which share a file or a directory are serialized, that a run which cannot save
+  the sharing contract and that runs which keep it are serialized, that a run which cannot save
   the record exits 1 before it replaces the textfile and before the unit publishes it, so the collector's
   last-run time does not advance, that no textfile carries a total that the
-  record lacks, in direct mode as well as in the shipped unit, and that a unit
+  record lacks, in direct mode as well as in the shipped unit, for runs that keep
+  the sharing contract, and that a unit
   which fails at publication keeps the record fresh, and note in "Launch
   decision and
   capacity fallback" that a hold comes before the template read.

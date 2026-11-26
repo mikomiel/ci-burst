@@ -205,20 +205,27 @@ python -m ci_burst export --config deployment.toml \
 ```
 
 The two optional paths default to `<ledger directory>/export/`, as
-`worker-events.ndjson` and `observed.json`. Concurrent runs take turns when
-they share the record, the event file or the metrics textfile, or only a
-directory of one: a run holds an exclusive lock on the directory of each of the
+`worker-events.ndjson` and `observed.json`.
+
+**Sharing contract.** Runs that share any export file (the record, the event
+file, the metrics textfile or the collector file it is published to) share all
+of them, the same deployment name, the same publication mode (the shipped
+unit's staged copy, or direct `--metrics-file` into the collector, never both
+for one collector file), and the same user; the parent directories stay the
+same directories while a run is active. Runs that share no file are
+independent. Any other combination is unsupported, and the guarantees below do
+not hold for it.
+
+Runs take turns: a run holds an exclusive lock on the directory of each of its
 three files, from before it reads the clock, the record or the event file until
 its last write, so a manual run waits for the timer's run and the other way
-round. The lock is on the directories, so any user who can read a directory can
-take it and no file is left behind. Such a user can also hold the lock and
-delay a run; the shipped unit's `TimeoutStartSec` then stops it, the record is
-not refreshed, and the hold fails open once the record is stale. Runs whose
-files are all in other directories run in parallel. Runs take turns only while
-each parent directory stays the same directory during a run: do not rename,
-replace or re-point a link of one while an export runs. Runs that share an event
-file must run as a user that can read it, in practice the same UID: a run that
-cannot read an existing event file exits 1 before it replaces any file.
+round. The lock is on the directories and leaves no file behind. A user who can
+read a directory can hold its lock and delay a run; the shipped unit's
+`TimeoutStartSec` then stops it, the record is not refreshed, and the hold fails
+open once the record is stale. A run reads the event file on every run, without
+blocking and without following a link. Only a missing event file is an empty
+stream; a run that cannot read an existing one, or finds a link, a FIFO or a
+directory there, exits 1 before it replaces any file.
 
 ### The event stream
 
@@ -314,9 +321,8 @@ they do not fall when an instance ages out of the provider's record window or
 when a record is pruned. `export` saves the record, which holds the totals,
 before it replaces the textfile, so a textfile never carries a total that the
 record lacks, and that holds for a collector that reads `--metrics-file` itself
-as well as for the shipped unit. Counters are guaranteed not to fall only across
-runs that use the same record, so runs that write the same textfile must use the
-same `--state-file`. Only a lost, damaged or unreadable dedupe
+as well as for the shipped unit, for runs that keep the sharing contract (§ Worker
+evidence). Only a lost, damaged or unreadable dedupe
 record (deleted, or replaced by `export` because it cannot read or load it)
 restarts a counter. `export` reads the record once per run, without blocking and
 without following a link, and treats a read that fails, even for a moment, a
@@ -346,10 +352,10 @@ record's modification time, and the collector's timestamp does not advance
 either. Where `--metrics-file` names the collector's own file (direct mode, as in
 the commands above), the collector reads each textfile as soon as `export`
 replaces it, and a textfile that it has read never carries a total that a later
-run with the same record lowers: the record already holds it. A run that read its record and then
+run lowers: the record already holds it. A run that read its record and then
 stops after it replaced the textfile, or cannot replace it, leaves the record
 level with the textfile or ahead of it, under the modification time that it read,
-and a later run with the same record writes totals that are not lower, even when an instance has left
+and a later run writes totals that are not lower, even when an instance has left
 the provider's inventory in between. A run that could not read its record
 restarts the counters, as for a deleted record (see above), and saves the new
 record under the epoch.
@@ -1500,8 +1506,12 @@ window for the same reason.
 
 The schema-3 upgrade marks every non-terminal row whose admitted inputs it
 backfilled with `admitted_inputs_backfilled = 1`; a terminal row keeps `0` and
-its stored settled cost. Only that stored mark makes the row's reservation the
-commitment floor. The floor is not inferred from a whole-life estimate, because
+its stored settled cost. That stored mark makes the row's reservation the
+commitment floor. So does a non-terminal row whose frozen request does not
+decode: without its `MaxPrice`, a lowered `max_spot_price` and the accepted price
+would price the remaining life below the ceiling that admission committed. A
+terminal row needs no ceiling for its remaining life and keeps no such floor.
+The floor is not inferred from a whole-life estimate, because
 such an estimate includes the current configured ceiling: raising
 `max_spot_price` could then reach the reservation, switch the floor off and
 release allowance admission had committed. A row admitted normally carries a
@@ -1893,8 +1903,8 @@ Known residual cases:
   tag. The controller launches one instance for each operation, so two such
   records need a tag that the controller did not write.
 - Records carry no deployment name, so the hold takes the deployment from the
-  ledger row of the operation. A rename, or a state directory that two
-  deployments share, does not mix their evidence. A row with no readable
+  ledger row of the operation, so a rename does not mix their evidence. Two
+  deployments do not share export files (§ Worker evidence, sharing contract). A row with no readable
   deployment tag is unbound and counts for every name; the controller never
   writes such a row. The hold does not compare the region or the account of a
   row, so a worker that ended under another region or credential route of the

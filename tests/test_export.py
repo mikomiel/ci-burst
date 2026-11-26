@@ -2586,6 +2586,81 @@ class RecordCadenceTests(ExportCase):
                 self.run_export(self.build(owned, consoles), now=NOW + 60)
         self.assertEqual([(path.read_bytes(), os.stat(path).st_mtime_ns) for path in files], before)
 
+    def outputs(self):
+        """The bytes and the modification time of the record and the textfile."""
+        return [(path.read_bytes(), os.stat(path).st_mtime_ns) for path in (self.state_file, self.metrics)]
+
+    def test_a_fifo_at_the_event_path_fails_a_run_with_no_new_events_without_waiting(self):
+        # The worker is finished after the first run, so the second run has no
+        # new event. It still reads the event file, without blocking: a FIFO with
+        # no writer would otherwise stop the run while it holds its locks.
+        self.run_export(self.build(self.owned(), {"i-0123456789abcdef0": CLEAN_BOOT}))
+        before = self.outputs()
+        self.events.unlink()
+        os.mkfifo(self.events)
+
+        def release_a_blocked_reader():
+            try:
+                os.close(os.open(self.events, os.O_WRONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+
+        self.addCleanup(release_a_blocked_reader)
+        outcome = []
+
+        def run():
+            try:
+                outcome.append(self.run_export(self.build(self.owned(), {}), now=NOW + 60))
+            except BaseException as error:  # noqa: BLE001 - reported to the test thread
+                outcome.append(error)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "the run blocked on the FIFO")
+        self.assertIsInstance(outcome[0], OSError)
+        self.assertEqual(self.outputs(), before)
+        self.assertTrue(stat.S_ISFIFO(os.lstat(self.events).st_mode))
+
+    def test_a_run_with_no_new_events_fails_when_the_event_file_cannot_be_read(self):
+        # The event file exists, and neither its status nor its content can be
+        # read, as for a run without access to it. The run must not take that for
+        # a missing stream and go on: it fails before it replaces a file.
+        self.run_export(self.build(self.owned(), {"i-0123456789abcdef0": CLEAN_BOOT}))
+        before = self.outputs()
+        events = (self.events.read_bytes(), os.stat(self.events).st_mtime_ns)
+        target = str(self.events)
+        real_stat, real_os_open, real_open = os.stat, os.open, io.open
+
+        def refused(path):
+            return isinstance(path, (str, os.PathLike)) and os.fspath(path) == target
+
+        def stat_refusing(path, *arguments, **options):
+            if refused(path):
+                raise PermissionError(13, "injected stat", target)
+            return real_stat(path, *arguments, **options)
+
+        def os_open_refusing(path, *arguments, **options):
+            if refused(path):
+                raise PermissionError(13, "injected open", target)
+            return real_os_open(path, *arguments, **options)
+
+        def open_refusing(file, *arguments, **options):
+            if refused(file):
+                raise PermissionError(13, "injected open", target)
+            return real_open(file, *arguments, **options)
+
+        with (
+            mock.patch("os.stat", stat_refusing),
+            mock.patch("os.open", os_open_refusing),
+            mock.patch("builtins.open", open_refusing),
+            mock.patch("io.open", open_refusing),
+            self.assertRaises(PermissionError),
+        ):
+            self.run_export(self.build(self.owned(), {}), now=NOW + 60)
+        self.assertEqual(self.outputs(), before)
+        self.assertEqual((self.events.read_bytes(), os.stat(self.events).st_mtime_ns), events)
+
     def test_a_deleted_record_is_rebuilt_with_the_rebuilding_run_time(self):
         consoles = {"i-0123456789abcdef0": CLEAN_BOOT}
         self.run_export(self.build(self.owned(), consoles))

@@ -26,21 +26,19 @@ repeat that follows a crash between publishing an event and persisting the
 dedupe record; the alternative — persisting first — would lose a failure event
 instead of repeating it.
 
-Runs that share a file take turns. A run holds an exclusive lock on the
+Runs that share an export file keep the sharing contract in
+``docs/operations.md`` ("Sharing contract"), and the guarantees below hold for
+those runs only. They take turns: a run holds an exclusive lock on the
 directory of the record, of the event file and of the metrics textfile, from
 before its first read of the clock, the record or the event file until its last
-write. Runs that share any of these files, or only a directory, are serialized,
-so a manual run waits for the timer's run and the other way round, and no run
-saves totals from an older snapshot or replaces lines that another run added.
-The lock leaves no file behind (``_directory_locks``). This holds while each of
-those directories stays the same directory during a run.
+write, so a manual run waits for the timer's run and the other way round, and no
+run saves totals from an older snapshot or replaces lines that another run
+added. The lock leaves no file behind (``_directory_locks``).
 
 The counter contract sets the order of the last writes (``_publish``). The
 cumulative counters are saved in the record, and a collector must never read a
-total that a later run with the same record lowers, so a run saves the record
-before it replaces the metrics textfile. Runs that write one textfile must use
-one record: the counters of two records are unrelated. A textfile that a run
-writes never carries a total that the record on disk lacks, whether it is the
+total that a later run lowers, so a run saves the record before it replaces the
+metrics textfile. A textfile that a run writes never carries a total that the record on disk lacks, whether it is the
 copy that the shipped unit publishes after the command exits 0 or the file that
 a collector reads from ``--metrics-file`` itself, and whether a write fails or
 the process stops. Counters fall only when
@@ -931,10 +929,11 @@ class Exporter:
         summary.totals = dict(state["totals"])
         self._read_ledger(summary, current)
 
-        if events or Path(events_file).exists():
-            dropped = _append_events(events_file, events, self.config.deployment)
-            if dropped:
-                summary.notes.append("events_pruned")
+        # Read on every run, with or without new events: an event file that
+        # exists and cannot be read fails the run before it replaces a file.
+        dropped = _append_events(events_file, events, self.config.deployment)
+        if dropped:
+            summary.notes.append("events_pruned")
         summary.new_events = len(events)
 
         state["console_reads"] = min(state.get("console_reads", 0) + summary.console_reads, MAX_COUNTER)
@@ -1222,6 +1221,24 @@ def _retained_events(existing, deployment):
     return "".join(line + "\n" for line in kept), dropped
 
 
+def _read_event_file(path):
+    """Return the bytes of the event file at ``path``, or ``None`` when there is none.
+
+    The file is opened as the record is (``_open_for_reading``): without blocking,
+    so a FIFO with no writer cannot stop a run that holds its locks, and without
+    following a link. Only ``FileNotFoundError`` is an absent file. A link, a
+    directory, a FIFO, another entry that is not a regular file and any other
+    error raise ``OSError``.
+    """
+    try:
+        with open(path, "rb", opener=_open_for_reading) as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise OSError(f"the event path is not a regular file: {path}")
+            return stream.read()
+    except FileNotFoundError:
+        return None
+
+
 def _append_events(path, events, deployment):
     """Publish new event lines, rotating the file when it outgrows its bound.
 
@@ -1231,17 +1248,21 @@ def _append_events(path, events, deployment):
     publication, not an unbounded WAL. Returns the number of historical lines
     dropped because they no longer match the schema.
 
-    Only a missing file is an empty stream. Any other error that reading an
-    existing file raises fails the run here, before it replaces a file: a file
-    that this run cannot read, such as one that another user owns, would
-    otherwise be replaced by the lines of this run alone. A file that is read but
-    is not UTF-8 is damaged content, and its lines are dropped.
+    The file is read on every run (``_read_event_file``). Only a missing file is
+    an empty stream, and a run with no new event then writes no file. Any other
+    failure to read the file fails the run here, before it replaces a file: a
+    file that this run cannot read would otherwise be replaced by the lines of
+    this run alone. A file that is read but is not UTF-8 is damaged content, and
+    its lines are dropped.
     """
     path = Path(path)
+    content = _read_event_file(path)
+    if content is None and not events:
+        return 0
     lines = "".join(json.dumps(event, sort_keys=True) + "\n" for event in events)
     try:
-        existing = path.read_bytes().decode("utf-8")
-    except (FileNotFoundError, UnicodeDecodeError):
+        existing = (content or b"").decode("utf-8")
+    except UnicodeDecodeError:
         existing = ""
     existing, dropped = _retained_events(existing, deployment)
     combined = existing + lines
@@ -1287,18 +1308,15 @@ def _directory_locks(*paths):
     """Hold an exclusive lock on the directory of each of ``paths`` while the block runs.
 
     A run reads or replaces the record, the event file and the metrics textfile,
-    so runs that share any of them, or only a directory, take turns: a second run
-    waits until the first releases its locks. The lock is on the directory and not
-    on a file, so a run creates no file for it, any user who can read the
-    directory can take it, and no output path can replace it. Runs whose files
+    so runs that share them take turns: a second run waits until the first
+    releases its locks. The sharing contract in ``docs/operations.md`` says which
+    runs may share them. The lock is on the directory and not on a file, so a run
+    creates no file for it and no output path can replace it. Runs whose files
     are in other directories run in parallel. The directories are created first
     and opened, and each is locked once, in the order of its device and inode
     numbers. Two runs that reach one directory under different paths, as a host
     and a container can, still lock in the same order, so they never wait for
-    each other in a circle. The lock is held on the directories that the run
-    opened here, and the files are named by path, so runs take turns only while
-    each directory stays the same directory during a run. The launch evidence
-    reader takes no lock.
+    each other in a circle. The launch evidence reader takes no lock.
     """
     opened = {}
     try:

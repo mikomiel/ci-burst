@@ -48,12 +48,12 @@ change to the brake's reader.
 #### Scenario: A run that stops after it replaced the textfile cannot lower a counter
 - **WHEN** a run replaces the metrics textfile and then cannot advance the record's modification time, or stops before it does
 - **THEN** the record already holds the totals of that textfile, under the modification time that it had before the run, so the brake sees it as `stale` after 600 seconds
-- **AND** a later run with the same record writes totals that are not lower, even when a worker has left the provider's inventory in between
+- **AND** a later run writes totals that are not lower, even when a worker has left the provider's inventory in between
 
 #### Scenario: A run that read its record and cannot write its textfile cannot lower a counter
 - **WHEN** a run read the record, saved it, and then cannot replace the metrics textfile, or an interrupt ends the run before it replaced the textfile
 - **THEN** the textfile is the previous one, and the record holds the totals of that run under the modification time that the run read, so the brake sees it as `stale` after 600 seconds
-- **AND** a later run with the same record writes totals that are not lower, so no counter falls
+- **AND** a later run writes totals that are not lower, so no counter falls
 
 #### Scenario: A record that cannot be read restarts the counters
 - **WHEN** a record exists and the run cannot read it: a read fails, even for a moment, or the path holds a link or a FIFO
@@ -62,21 +62,18 @@ change to the brake's reader.
 - **AND** the run saves the new record under the epoch, so a run that then cannot write its textfile leaves no fresh heartbeat
 - **AND** the record carries neither the records nor the modification time of a link's target
 
-#### Scenario: Runs that share a record take turns
-- **WHEN** a run starts while another run is in progress that uses the same record, event file or metrics textfile, or only a directory of one, such as a manual run with its own `--state-file` while the timer's run is in progress
-- **THEN** the run waits on an exclusive lock on the directory of each of those files before it reads the clock, the record or the event file
-- **AND** it reads those files only after the other run has made its last write, so it never saves totals derived from an older snapshot, writes over a newer record or drops event lines that the other run added
-- **AND** the lock leaves no file behind, so any user who can read the directory can take it and no output path can replace it
-- **AND** this holds while each parent directory stays the same directory during a run, which no operator renames, replaces or re-points while an export runs
+#### Scenario: Runs that share an export file take turns
+- **WHEN** a run starts while another run is in progress that shares an export file with it, and the two runs keep the sharing contract: runs that share any export file (the record, the event file, the metrics textfile or the collector file it is published to) share all of them, the same deployment name, the same publication mode (the shipped unit's staged copy, or direct `--metrics-file` into the collector, never both for one collector file), and the same user, and the parent directories stay the same directories while a run is active
+- **THEN** the run waits on an exclusive lock on the directory of each of its files before it reads the clock, the record or the event file
+- **AND** it reads those files only after the other run has made its last write, so it never saves totals derived from an older snapshot, writes over a newer record or drops event lines that the other run added, and no counter falls
+- **AND** the lock leaves no file behind, so no output path can replace it
+- **AND** runs that share no file are independent, and any other combination is unsupported: the guarantees of this requirement do not hold for it
 
 #### Scenario: An event file that cannot be read fails the run
-- **WHEN** the event file exists and the run cannot read it, such as one that another user owns
+- **WHEN** the event file exists and the run cannot read it, or the path holds a link, a FIFO or a directory, whether or not the run has new events
 - **THEN** the command exits 1 before it replaces the event file, the record or the textfile
-- **AND** only a missing event file is an empty stream, so runs that share an event file run as a user that can read it, in practice the same UID
-
-#### Scenario: Runs that write one textfile with different records
-- **WHEN** two runs write the same metrics textfile with different records
-- **THEN** a later run can publish lower totals than an earlier one, so runs that write one textfile use the same record, and the guarantee that a counter does not fall holds only across runs that use the same record
+- **AND** it opens the path without blocking, so a FIFO with no writer cannot stop it while it holds its locks
+- **AND** only a missing event file is an empty stream
 
 #### Scenario: Runs in separate directories run in parallel
 - **WHEN** two runs use a record, an event file and a metrics textfile in directories that the other run does not use

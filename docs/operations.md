@@ -712,17 +712,22 @@ Two refusals belong to the start itself and count no failure:
 `IMAGE_CREDENTIAL_SHORT` (the role session would not outlive the archive URL, or its expiry is unknown, see
 [deployment.md](deployment.md#image-build-role-and-source-identity-optional)) and
 `IMAGE_BUILD_ALREADY_ACTIVE`. A pass checks both before it writes the build row
-and again just before the launch. The launch reads both deadlines before it checks the
-credential, and again after its last read, right before the provider call, so a deadline
-decides before the credential does: a build that is out of time when the launch begins
-ends with `CONSOLE_BLIND` instead, because the build deadline decides first, and a pass
-that is at or after its own deadline launches nothing and leaves the row `building` for
-the next pass to stage again, even when a slow upload has left the role session too short
-for the archive URL. The checks before the upload follow the same rule, because the read
-of the build template that comes before them takes time too: a stage done again reads both
-deadlines after that read and before the credential check, the build deadline first, and a
-new start reads the pass deadline there (no row exists yet, so the pass ends with
-`pass_deadline_exceeded` instead of answering `refused`). A wrong input is raised, not answered, and
+and again just before the launch. One rule applies in a new start, in a stage done again
+and in the launch: a deadline decides before the outcome of any call that takes time.
+These calls are the read of the build template, the lookup of the credential, the upload,
+the presign and the listing of the builders. When one of them has returned, with a result
+or with a refusal, the pass reads both deadlines again before it acts on the outcome:
+before it writes the row, before it uploads, before it launches and before a refusal
+ends the row. The build deadline decides first, and a build that is out of time ends with
+`CONSOLE_BLIND` instead, a counted failure. A pass that is at or after its own deadline
+launches nothing. A build that has a row stays `building` for the next pass to stage
+again. A new start has no row yet: it writes none, and the pass ends with
+`pass_deadline_exceeded` instead of answering `refused`. So `IMAGE_CREDENTIAL_SHORT` ends
+a row only when neither deadline has passed, even when a slow call has left the role
+session too short for the archive URL. One outcome is not read this way: a listing that
+shows a builder is refused with `IMAGE_BUILD_ALREADY_ACTIVE` whenever it returns. The order
+of that refusal and a deadline is tracked in
+[#232](https://github.com/mikomiel/ci-burst/issues/232). A wrong input is raised, not answered, and
 nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge on the branch or
 basis reads (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
 or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
@@ -732,8 +737,9 @@ opt-out, and an unsafe template verdict end its row and are answered `refused`
 (below). The recheck of the digest reads no basis file of the forge, so a slow
 or unavailable forge cannot hold the stage. Once those rechecks pass, the stage runs the same staging and launch checks as a first stage:
 a start refusal such as `IMAGE_CREDENTIAL_SHORT` ends the row `refused` without a
-failure, unless a deadline has passed first (below), and a definite refusal of the
-archive request ends it as a failed build, counted, with exit `1`. A pass that
+failure, and a definite refusal of the archive request ends it as a failed build,
+counted, with exit `1`. Both hold only when neither deadline has passed when the
+refused call returns: a deadline decides first (below). A pass that
 finds a build in flight, or an archive deletion that a finished build still owes,
 runs and settles it even without a gate; a launch that pass would then make is
 refused with `IMAGE_GATE_REQUIRED`, answered `refused`, and counts no failure.
@@ -765,17 +771,19 @@ the row with `IMAGE_GATE_REQUIRED`; an unsafe build template then ends it with
 `IMAGE_BUILD_TEMPLATE_UNSAFE`. Each is answered `refused`, counts no failure, writes
 no `image_build_failed` event and tries to delete the row's archive. A pass past
 the build deadline that reaches its deadline check ends the row instead. The build
-deadline decides before the pass deadline, wherever the pass deadline cuts the stage:
-in a read of the checks before the upload, in the stream of the upload, at its
-completion, or in the launch, before the archive URL is presigned or in the last listing
-of the builders before the provider call. The stage reads the clock after the template
-read and before the credential check, and the launch reads it before it presigns,
-so a stage that a deadline cut never ends with `IMAGE_CREDENTIAL_SHORT`, however short the
-session has become. When the cut falls
+deadline decides before the pass deadline, wherever a deadline cuts the stage:
+in a read before the upload (the template, the credential, the listing of the builders),
+in the stream of the upload, when the upload has returned, when the archive URL has been
+presigned, or when the last listing of the builders has returned, before the provider call.
+The stage reads both deadlines when each of these calls has returned, as the rule above says,
+so the answer of a call that a deadline cut does not end the stage: not a short session
+(`IMAGE_CREDENTIAL_SHORT`), not an unsafe template verdict, not a refused bucket and not a
+listing that the provider refused. When the cut falls
 at or after the build deadline, the pass ends the build `failed` with `CONSOLE_BLIND` in
-that pass and tries to delete the archive, and a build that is out of time when the launch
-begins asks for no presign and no listing. When only the pass deadline has passed, the row
-stays and the next pass stages it again. `lifetime_seconds` and `snapshot_seconds` are not in the digest: a
+that pass and tries to delete the archive, and a build that is out of time when a call
+returns asks for no later call: no upload, no presign, no listing and no launch. When only
+the pass deadline has passed, the row stays and the next pass stages it again.
+`lifetime_seconds` and `snapshot_seconds` are not in the digest: a
 stage that launches renders them from the file as it reads it then.
 
 A build that has no verdict by `build_deadline_seconds` ends `failed` in a pass that
@@ -1275,9 +1283,11 @@ records the attempt.
 The sweep has a bound of its own, in time. It runs in reconcile, before the work of the pass, so it
 takes a fixed early share of the pass: no stray delete starts once the pass is 30 seconds old
 (`STRAY_SWEEP_SECONDS`). Two clocks measure that age, and the first to reach it stops the sweep:
-the AWS client reads the wall clock right before each request, and the pass reads elapsed time on a
-monotonic clock before each delete, so a wall clock that is stepped back (a time correction, a host
-that resumed) cannot stretch the bound. A backlog of slow or refused deletes, or a listing that
+the wall clock, and elapsed time on a monotonic clock. The pass reads the monotonic clock before
+each delete, as an early stop. The AWS client evaluates both clocks, after it has built its S3 client
+and right before the request, because time passes between that check and the request. A wall clock
+that is stepped back (a time correction, a host that resumed) cannot stretch the bound, because the
+monotonic clock still reaches it. A backlog of slow or refused deletes, or a listing that
 returns after that time, starts no delete after it. The sweep stops, the pass notes
 `archive:sweep_deferred`, and a later pass sweeps the strays that it left. Elapsed time measures this
 bound only: the pass deadline, the build deadline and the cutoff of the owed deletions are times on
@@ -1372,13 +1382,13 @@ passing plan does not rule these out.
 | `WARM_FAILED` | the builder printed a failure marker: the script failed, for example in the archive fetch, a warm command or the gate. Read the cause in the framed tail of the event or the console |
 | `IMAGE_MARKER_DIGEST_MISMATCH` | the builder reports another archive digest than the staged one |
 | `MARKER_TIMEOUT` | no ready marker by the build deadline, or the marker was first read at or after it while the builder was still running |
-| `CONSOLE_BLIND` | the console returned no text by the deadline, the provider refused the console read in a pass at or after the deadline (`notes` holds `console_read:<reason>`), or the launch fell at or after it. A stage that the pass deadline cuts at or after the build deadline ends this way too, in that pass: in a read of the checks before the upload, in the stream of the upload, at its completion, in the launch before the archive URL is presigned (a short session does not end it `IMAGE_CREDENTIAL_SHORT` first) or in the last listing of the builders. A build that is out of time when the launch begins asks for no presign and no listing. A console read refused before the deadline makes the pass raise, and the next pass reads again |
+| `CONSOLE_BLIND` | the console returned no text by the deadline, the provider refused the console read in a pass at or after the deadline (`notes` holds `console_read:<reason>`), or the launch fell at or after it. A stage in which a call returns at or after the build deadline ends this way too, in that pass, whichever call it is (the read of the template, the lookup of the credential, the listing of the builders when it shows none, the upload, the presign), and whether the call answered or refused: a short session, an unsafe template, a refused bucket or a listing that the provider refused does not end the row first. A build that is out of time when a call returns asks for no later call, so no upload, no presign and no launch follows. A console read refused before the deadline makes the pass raise, and the next pass reads again |
 | `IMAGE_BUILDER_GONE` | a pass did not see the builder as active, or no builder was recorded, while the build had no recorded image. It is not proof that the builder ended. A later applying pass asks the provider to terminate a tagged builder that it lists and that is not the active build's, and does not check the result: verify the final state yourself. Find the instance by the failed row's `builder_id` or its `ci-burst:build-id` tag, not by the deployment tags alone, which also match a newer builder ([Leaked builders and the backstop](#leaked-builders-and-the-backstop)). An image may still exist; the deletion rule handles it as the image of a failed build |
 | `IMAGE_NOT_AVAILABLE` | the image failed, or was not `available` by the deadline |
 | `TEMPLATE_DRIFT` | the candidate version differs from the pin in a field other than `ImageId`, or does not carry the build's image; `drift_fields` names them |
 | `FORGEJO_ARCHIVE_TOO_LARGE` | the forge stream of the archive passed `max_archive_bytes` while it was staged. A passing `image plan` does not rule it out, because the plan reads only the first chunk |
 | `IMAGE_ARCHIVE_TOO_LARGE`, `IMAGE_ARCHIVE_UPLOAD_FAILED` | the upload counted more than `max_archive_bytes`, or the upload failed |
-| `IMAGE_STAGING_BUCKET_DENIED` | S3 answered `AccessDenied` to the upload of a first stage. A stage done again ends as a refusal instead (second table) |
+| `IMAGE_STAGING_BUCKET_DENIED` | S3 answered `AccessDenied` to the upload of a first stage. A stage done again ends as a refusal instead (second table). An answer that arrives at or after the pass deadline is not counted: the deadline decides, the row stays `building`, and the next pass stages it again |
 | `IMAGE_STAGING_BUCKET_MISSING` | S3 answered `NoSuchBucket` to the upload of a first stage: the configured bucket went away after the sweep at the start of the pass listed it. A stage done again ends as a refusal instead (second table) |
 | `IMAGE_USERDATA_TOO_LARGE` | the user data, rendered with the real presigned URL, is 16384 bytes or more. `image plan` sizes it with a synthetic URL, so a plan can pass where the run fails |
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the archive request |
@@ -1408,10 +1418,10 @@ and the codes of `promote` in [Promote reason codes](#promote-reason-codes).
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the image token while the branch or a basis file was read, or, in `image plan`, the first chunk of the archive. The same answer to the archive request of a staging run ends the build `failed` (first table) |
 | `IMAGE_BRANCH_UNPROTECTED` | the configured branch is not protected on the forge |
 | `IMAGE_BASIS_PATH_MISSING` | the forge answered `404` for a `basis_paths` file, or the path escapes the repository, at the branch head that a decision reads |
-| `IMAGE_BUILD_TEMPLATE_UNSAFE` | the build launch template or its version is missing or fails a safety check; the detail names the properties, never a value. On a stage done again the row ends `failed`, uncounted, and the pass answers `refused`. A read of the template that the provider refuses, such as a version that EC2 reports as not found, is the provider's own refusal instead: it is raised (exit `1`), and on a stage done again it leaves the row for the next pass |
+| `IMAGE_BUILD_TEMPLATE_UNSAFE` | the build launch template or its version is missing or fails a safety check; the detail names the properties, never a value. On a stage done again the row ends `failed`, uncounted, and the pass answers `refused`, when neither deadline has passed as the read returns (a deadline decides first, see `CONSOLE_BLIND`). A read of the template that the provider refuses, such as a version that EC2 reports as not found, is the provider's own refusal instead: it is raised (exit `1`), and on a stage done again it leaves the row for the next pass, when neither deadline has passed as the read returns. A read that returns at or after a deadline is decided by the deadline, whatever it showed or refused: a new start ends with `pass_deadline_exceeded`, a stage done again ends `CONSOLE_BLIND` at or after the build deadline, and its row stays `building` at or after the pass deadline only |
 | `IMAGE_USERDATA_TOO_LARGE` | in `image plan`: the user data, rendered with a synthetic URL, is 16384 bytes or more. In an applying run it ends the build `failed` instead (first table) |
-| `IMAGE_STAGING_BUCKET_DENIED` | S3 answered `AccessDenied` to a staging call. Every one names the account of the image role as the bucket's owner, so the bucket now belongs to another account (a released name that was reassigned), or the role may not use it. The refused call wrote and deleted nothing, and no call is made without the owner. A stage done again at the bucket that its row recorded ends the row `failed` with this code, counts no failure and answers `refused`; the next pass stages under the configured bucket. As the row ends, the pass makes one delete of its archive, and the answer to that delete decides whether a deletion is owed. When S3 refuses it too (a bucket of another account, or a role that lost `s3:DeleteObject` as well), the pass notes `archive:delete_failed` and the row stays owed. That attempt does not add to `owed_archive_delete_failed`; only the retries of later passes count there. When the delete succeeds, the row records `archive_deleted_at`, the pass notes no `archive:delete_failed` and nothing is owed. It succeeds for a role that may no longer put at the old prefix but may still delete there, for example after a rotation that removed `s3:PutObject` and kept `s3:DeleteObject`. A first stage ends the build as a failure (first table), and a refused listing of the sweep refuses the pass |
-| `IMAGE_STAGING_BUCKET_MISSING` | S3 answered `NoSuchBucket` to the upload of a stage done again: the bucket that the row recorded does not exist, for example because it was removed after the earlier stage. The row ends `failed` with this code, counts no failure and the pass answers `refused`; the next pass stages under the configured bucket. The row keeps its archive fields. As the row ends, the pass makes one delete of its archive, and the answer to that delete decides whether a deletion is owed. When S3 refuses it, as it does while the bucket stays missing, the pass notes `archive:delete_failed` and the row stays owed and is not marked deleted. That attempt does not add to `owed_archive_delete_failed`, because the owed deletions at the end of the pass skip a row that the pass already attempted; the retries of later passes count there. When the delete succeeds, which needs a bucket of that name again, the row records `archive_deleted_at` and nothing is owed. A first stage ends the build as a failure (first table). The sweep lists the configured bucket first, and a listing of a missing bucket refuses the pass with the provider's own reason |
+| `IMAGE_STAGING_BUCKET_DENIED` | S3 answered `AccessDenied` to a staging call. Every one names the account of the image role as the bucket's owner, so the bucket now belongs to another account (a released name that was reassigned), or the role may not use it. The refused call wrote and deleted nothing, and no call is made without the owner. A stage done again at the bucket that its row recorded ends the row `failed` with this code, counts no failure and answers `refused`, when neither deadline has passed as the answer returns (a deadline decides first, see `CONSOLE_BLIND`); the next pass stages under the configured bucket. As the row ends, the pass makes one delete of its archive, and the answer to that delete decides whether a deletion is owed. When S3 refuses it too (a bucket of another account, or a role that lost `s3:DeleteObject` as well), the pass notes `archive:delete_failed` and the row stays owed. That attempt does not add to `owed_archive_delete_failed`; only the retries of later passes count there. When the delete succeeds, the row records `archive_deleted_at`, the pass notes no `archive:delete_failed` and nothing is owed. It succeeds for a role that may no longer put at the old prefix but may still delete there, for example after a rotation that removed `s3:PutObject` and kept `s3:DeleteObject`. A first stage ends the build as a failure (first table), and a refused listing of the sweep refuses the pass |
+| `IMAGE_STAGING_BUCKET_MISSING` | S3 answered `NoSuchBucket` to the upload of a stage done again: the bucket that the row recorded does not exist, for example because it was removed after the earlier stage. The row ends `failed` with this code, counts no failure and the pass answers `refused`, when neither deadline has passed as the answer returns (a deadline decides first, see `CONSOLE_BLIND`); the next pass stages under the configured bucket. The row keeps its archive fields. As the row ends, the pass makes one delete of its archive, and the answer to that delete decides whether a deletion is owed. When S3 refuses it, as it does while the bucket stays missing, the pass notes `archive:delete_failed` and the row stays owed and is not marked deleted. That attempt does not add to `owed_archive_delete_failed`, because the owed deletions at the end of the pass skip a row that the pass already attempted; the retries of later passes count there. When the delete succeeds, which needs a bucket of that name again, the row records `archive_deleted_at` and nothing is owed. A first stage ends the build as a failure (first table). The sweep lists the configured bucket first, and a listing of a missing bucket refuses the pass with the provider's own reason |
 | `IMAGE_STAGING_OWNER_CHANGED` | a stage done again found that the account that owned the row's bucket when the archive was first staged (`archive_owner`) is not the account of this pass's role, or that the row records none. No S3 call is made. The row ends `failed` with this code, counts no failure and the pass answers `refused`; its delete is owed and counts as failed (see [Leaked builders and the backstop](#leaked-builders-and-the-backstop)). The next pass stages under the configured bucket |
 | `IMAGE_SCRIPT_MISSING` | the container image does not hold the shipped warm script |
 | `pass_deadline_exceeded` | the 240-second budget of a pass ran out. It is raised in `image plan` and before a decision. Elsewhere it is a `notes` entry, alone (the row waits for the next pass) or after the name of a lookup that the pass then goes without (such as `image_lookup:` or `base_image:`), or the `refused` code of the `retention` or `deletion` part |

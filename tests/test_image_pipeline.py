@@ -766,6 +766,31 @@ class LazyClientAws(ImageAws):
         )
 
 
+class SlowLookupAws(WorldAws):
+    """The real adapter on the world's clients, whose lookups of the credential's expiry can take time.
+
+    ``WorldAws`` hands the adapter a fixed expiry, so no lookup of it ever waits. A session that assumes a role does
+    wait: its credentials are resolved, and refreshed, when they are first read. ``stalls`` maps the number of a lookup
+    in the pass (1 is the first) to the seconds of the clock that it takes. The answer is the expiry that the adapter
+    began with, so the credential has less life left after a stall. ``began`` holds the clock reading at which each
+    stalled lookup began, and ``lookups`` counts the lookups.
+    """
+
+    def __init__(self, world, stalls):
+        super().__init__(world)
+        self.stalls = stalls
+        self.lookups = 0
+        self.began = []
+
+    def credential_expiry(self):
+        self.lookups += 1
+        seconds = self.stalls.get(self.lookups, 0)
+        if seconds:
+            self.began.append(self.world.clock())
+            self.world.clock.advance(seconds)
+        return super().credential_expiry()
+
+
 class FakeSource:
     """The Forgejo reader: one protected branch, a few basis files and one archive."""
 
@@ -3658,6 +3683,467 @@ class FailureTests(PipelineCase):
         self.assert_refused(result, "IMAGE_CREDENTIAL_SHORT")
         self.assertEqual(self.builds(), [])
 
+    # -- a deadline decides before the outcome of any slow call --------------------------------------------------------
+    # One rule runs through the start, the restage and the launch: when a call that can take time returns, both
+    # deadlines are read again before the pipeline acts on what the call produced (a row, an upload, a presign, a
+    # refusal), the build deadline first. The sections above show it for the upload, for the template read and for the
+    # last listing of the launch. These show it for the builder listing of the start checks (its result and its
+    # refusal), for the lookup of the credential (in the start checks and in the presign), and for the refusals that an
+    # upload and a template read produce. A listing that shows a builder is the one outcome that stays as it was:
+    # ``IMAGE_BUILD_ALREADY_ACTIVE`` whenever it returns.
+
+    def a_start_listing_that_takes(self, seconds, mark, *, refused=False):
+        """Make the builder listing of the start checks take ``seconds`` of the clock, once.
+
+        Returns the times it began at.
+
+        Reconcile lists the builders first and the launch lists them again: the listing of the start checks is the first
+        one after the read of the build template in the pass that began at call ``mark``. With ``refused`` the provider
+        throttles it when the time has passed (``AWS_UNCERTAIN``).
+        """
+        began = []
+
+        def slow(arguments):
+            if "describe_security_groups" in self.world.names(mark) and not began:
+                began.append(self.clock())
+                self.clock.advance(seconds)
+                if refused:
+                    self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)
+
+        self.world.hooks["describe_instances"] = slow
+        return began
+
+    def a_launch_listing_that_takes(self, seconds, *, refused):
+        """Make the builder listing that the launch runs after it presigned the URL take ``seconds``, once.
+
+        With ``refused`` the provider throttles it when the time has passed (``AWS_UNCERTAIN``). Returns the times it
+        began at.
+        """
+        began = []
+
+        def slow(arguments):
+            if self.world.arguments("generate_presigned_url") and not began:
+                began.append(self.clock())
+                self.clock.advance(seconds)
+                if refused:
+                    self.world.fail("describe_instances", ProviderError("RequestLimitExceeded"), times=1)
+
+        self.world.hooks["describe_instances"] = slow
+        return began
+
+    def credential_lookups_that_take(self, stalls):
+        """From now on a pass is handed an adapter whose lookups of the credential's expiry take time.
+
+        The adapter is ``SlowLookupAws``.
+
+        ``stalls`` maps the number of a lookup in the pass to its seconds, and a test can change it for a later pass.
+        The session has 1850 seconds of life when the pass starts: enough for the URL (it lives 1800) until a lookup has
+        taken 51 seconds or more. The start checks make the first lookup of a pass and the presign makes the second.
+        Returns the adapters that the passes were handed.
+        """
+        self.world.credential_life = 1850.0
+        adapters = []
+
+        def factory():
+            adapter = SlowLookupAws(self.world, stalls)
+            self.sessions.append(adapter)
+            adapters.append(adapter)
+            return adapter
+
+        self.aws_factory = factory
+        self.restart()
+        return adapters
+
+    def test_a_start_listing_that_returns_empty_after_the_pass_deadline_inserts_no_row(self):
+        # No row exists yet, and the listing is the last call before the insert: the pass ends on its deadline instead.
+        began = self.a_start_listing_that_takes(PASS_DEADLINE_SECONDS + 60, 0)
+        started_at = self.clock()
+        self.refused(self.apply, "pass_deadline_exceeded")
+        # The premise: the listing began inside the pass deadline and ended after it.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        # Nothing was written or started: no row, no upload and no builder.
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
+    def test_a_start_listing_that_returns_empty_inside_the_pass_deadline_still_inserts_the_row(self):
+        # The control of the test above: the same listing, quicker, starts the build.
+        began = self.a_start_listing_that_takes(PASS_DEADLINE_SECONDS - 60, 0)
+        started_at = self.clock()
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertEqual(len(self.builds()), 1)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    def test_a_start_listing_that_returns_empty_after_the_build_deadline_stages_nothing_and_ends_the_build_blind(self):
+        # A resumed stage: the late return of the listing is the last call before the upload. The build deadline has
+        # passed, so no upload starts (the pass deadline has not: the adapter would send it).
+        first = self.resumed_stage_with_100_seconds_left()
+        mark = len(self.world.calls)
+        began = self.a_start_listing_that_takes(150, mark)
+        started_at = self.clock()
+        result = self.apply()
+        # The premise: the listing began before the build deadline and ended after it, inside the pass deadline.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], first.deadline_at)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+
+    def test_a_start_listing_that_returns_empty_after_the_build_deadline_lets_no_bucket_refusal_win(self):
+        # The upload that the late return would have started is refused by S3 (the bucket is another account's now).
+        # The build was out of time before the upload began, so the refusal that the upload would have produced is not
+        # the answer: the build fails ``CONSOLE_BLIND`` and counts, and no refused start ends the row.
+        first = self.resumed_stage_with_100_seconds_left()
+        self.world.fail("create_multipart_upload", ProviderError("AccessDenied"))
+        mark = len(self.world.calls)
+        began = self.a_start_listing_that_takes(150, mark)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+
+    def test_a_start_listing_that_returns_empty_after_both_deadlines_ends_a_resumed_stage_blind(self):
+        # The control for the order: both deadlines have passed, and the build deadline decides.
+        first = self.resumed_stage_with_100_seconds_left()
+        mark = len(self.world.calls)
+        began = self.a_start_listing_that_takes(PASS_DEADLINE_SECONDS + 60, mark)
+        started_at = self.clock()
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assertGreaterEqual(self.clock(), max(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+
+    def test_a_start_listing_that_returns_empty_after_only_the_pass_deadline_leaves_a_resumed_stage_for_the_next_pass(self):
+        # The control of the tests above for a build deadline that is far off: the pass deadline alone leaves the row.
+        first = self.unstaged_build()
+        mark = len(self.world.calls)
+        began = self.a_start_listing_that_takes(PASS_DEADLINE_SECONDS + 60, mark)
+        started_at = self.clock()
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assert_unstaged(build)
+        self.assertLess(self.clock(), build.deadline_at)
+        names = self.world.names(mark)
+        self.assertNotIn("create_multipart_upload", names)
+        self.assertNotIn("delete_object", names)
+
+    def test_a_start_listing_that_is_refused_after_the_pass_deadline_ends_a_new_start_on_the_deadline(self):
+        # The refusal of a late listing is no more the answer than its result is: no row exists, so the deadline
+        # decides.
+        began = self.a_start_listing_that_takes(PASS_DEADLINE_SECONDS + 60, 0, refused=True)
+        started_at = self.clock()
+        self.refused(self.apply, "pass_deadline_exceeded")
+        # The premise: the listing began inside the pass deadline, and the provider refused it after the deadline.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
+    def test_a_start_listing_that_is_refused_inside_the_pass_deadline_still_raises_the_refusal(self):
+        # The control of the test above: the same refusal, quicker, is the answer of the pass.
+        began = self.a_start_listing_that_takes(10, 0, refused=True)
+        self.refused(self.apply, "AWS_UNCERTAIN")
+        self.assertEqual(len(began), 1)
+        self.assertEqual(self.builds(), [])
+
+    def test_a_start_listing_that_is_refused_after_the_build_deadline_ends_a_resumed_stage_blind(self):
+        # The build deadline decides before the refusal of the provider does: the row ends ``CONSOLE_BLIND`` and counts.
+        first = self.resumed_stage_with_100_seconds_left()
+        mark = len(self.world.calls)
+        began = self.a_start_listing_that_takes(150, mark, refused=True)
+        started_at = self.clock()
+        result = self.apply()
+        # The premise: the listing began before the build deadline, and the provider refused it after it.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], first.deadline_at)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+
+    def test_a_start_listing_that_is_refused_after_only_the_pass_deadline_leaves_a_resumed_stage_for_the_next_pass(self):
+        # The control of the test above for a build deadline that is far off: the pass deadline alone leaves the row,
+        # and the refusal of the provider is not acted on (it would have failed the build and counted).
+        first = self.unstaged_build()
+        mark = len(self.world.calls)
+        began = self.a_start_listing_that_takes(PASS_DEADLINE_SECONDS + 60, mark, refused=True)
+        started_at = self.clock()
+        result = self.apply()
+        # The premise: the listing began inside the pass deadline, and the provider refused it after the deadline.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assert_unstaged(build)
+        self.assertLess(self.clock(), build.deadline_at)
+        names = self.world.names(mark)
+        self.assertNotIn("create_multipart_upload", names)
+        self.assertNotIn("delete_object", names)
+
+    def test_a_launch_listing_that_is_refused_after_the_pass_deadline_leaves_the_row_for_the_next_pass(self):
+        # The pass deadline alone cut the stage: the refusal is not acted on, and the row waits with its archive.
+        first = self.unstaged_build()
+        began = self.a_launch_listing_that_takes(PASS_DEADLINE_SECONDS + 60, refused=True)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the last listing began inside the pass deadline, and the provider refused it after the deadline.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assert_unstaged(build)
+        self.assertLess(self.clock(), build.deadline_at)
+        self.assertNotIn("delete_object", self.world.names(mark))
+        self.assertEqual(list(self.world.objects), [build.archive_key])
+        self.assertIsNone(build.archive_deleted_at)
+
+    def test_a_launch_listing_that_is_refused_after_the_build_deadline_ends_the_build_blind(self):
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_launch_listing_that_takes(150, refused=True)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the last listing began before the build deadline, and the provider refused it after it.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], first.deadline_at)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+
+    def test_a_launch_listing_that_is_refused_inside_both_deadlines_still_fails_the_build_with_its_code(self):
+        # The control of the two tests above: the same refusal, quicker, ends the build with the code of the provider.
+        first = self.unstaged_build()
+        began = self.a_launch_listing_that_takes(10, refused=True)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        build = self.assert_failed(result, "AWS_UNCERTAIN")
+        self.assertEqual(build.id, first.id)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
+    def test_a_credential_lookup_that_ends_after_the_pass_deadline_ends_a_new_start_on_the_deadline(self):
+        # No row exists, so the refusal that the late lookup produces could only change the answer: the deadline
+        # decides.
+        adapters = self.credential_lookups_that_take({1: PASS_DEADLINE_SECONDS + 60})
+        started_at = self.clock()
+        self.refused(self.apply, "pass_deadline_exceeded")
+        # The premise: the lookup began inside the pass deadline and ended after it.
+        (began,) = adapters[-1].began
+        self.assertLess(began, started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        # Nothing was written or started.
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.urls, [])
+
+    def test_a_credential_lookup_that_ends_inside_the_pass_deadline_still_refuses_a_new_start_on_a_short_session(self):
+        # The control of the test above: the same lookup, quicker, leaves the credential to decide.
+        adapters = self.credential_lookups_that_take({1: 100})
+        started_at = self.clock()
+        result = self.apply()
+        self.assertEqual(len(adapters[-1].began), 1)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_refused(result, "IMAGE_CREDENTIAL_SHORT")
+        self.assertEqual(self.builds(), [])
+
+    def test_a_credential_lookup_that_ends_after_the_pass_deadline_leaves_a_resumed_stage_for_the_next_pass(self):
+        # The pass deadline alone cut the stage, so the row waits. The refusal of the credential, which would end it, is
+        # not acted on.
+        first = self.unstaged_build()
+        stalls = {1: PASS_DEADLINE_SECONDS + 60}
+        adapters = self.credential_lookups_that_take(stalls)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the lookup began inside the pass deadline and ended after it.
+        (began,) = adapters[-1].began
+        self.assertLess(began, started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assert_unstaged(build)
+        self.assertLess(self.clock(), build.deadline_at)
+        # Nothing ended the row: no delete of its archive, no second upload and no URL.
+        names = self.world.names(mark)
+        self.assertNotIn("create_multipart_upload", names)
+        self.assertNotIn("delete_object", names)
+        self.assertIsNone(build.archive_deleted_at)
+        self.assertEqual(self.world.urls, [])
+        # The next pass has a long session and a quick lookup: it stages the archive again and launches.
+        stalls.clear()
+        self.world.credential_life = float(HOUR)
+        result = self.apply()
+        self.assertEqual(result["decision"], "building", result)
+        launched = self.only_build()
+        self.assertEqual(launched.id, first.id)
+        self.assertIsNotNone(launched.builder_id)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_a_credential_lookup_that_ends_after_the_build_deadline_ends_a_resumed_stage_blind(self):
+        # The build deadline decides before the credential does: the row ends ``CONSOLE_BLIND`` and counts. It is not a
+        # refused start.
+        first = self.resumed_stage_with_100_seconds_left()
+        adapters = self.credential_lookups_that_take({1: 150})
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the lookup began before the build deadline and ended after it, inside the pass deadline.
+        (began,) = adapters[-1].began
+        self.assertLess(began, first.deadline_at)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+
+    def test_a_credential_lookup_that_ends_after_both_deadlines_ends_a_resumed_stage_blind(self):
+        # The build deadline decides before the pass deadline, and both decide before the credential.
+        first = self.resumed_stage_with_100_seconds_left()
+        adapters = self.credential_lookups_that_take({1: PASS_DEADLINE_SECONDS + 60})
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        (began,) = adapters[-1].began
+        self.assertLess(began, min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assertGreaterEqual(self.clock(), max(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+
+    def test_a_credential_lookup_that_ends_inside_both_deadlines_still_ends_a_resumed_stage_on_a_short_session(self):
+        # The control of the tests above: the same lookup, quicker, leaves the credential to decide.
+        first = self.unstaged_build()
+        adapters = self.credential_lookups_that_take({1: 100})
+        started_at = self.clock()
+        result = self.apply()
+        self.assertEqual(len(adapters[-1].began), 1)
+        self.assertLess(self.clock(), min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assert_refused(result, "IMAGE_CREDENTIAL_SHORT")
+        build = self.only_build()
+        self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "IMAGE_CREDENTIAL_SHORT"))
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
+    def test_a_presign_whose_credential_lookup_ends_after_the_pass_deadline_leaves_the_row_and_keeps_the_archive(self):
+        # A new start: the lookup of the start checks is quick, the upload completes, and the lookup of the presign is
+        # the slow one. The pass deadline alone cut the stage, so the row waits for the next pass.
+        adapters = self.credential_lookups_that_take({2: PASS_DEADLINE_SECONDS + 60})
+        started_at = self.clock()
+        result = self.apply()
+        # The premise: the second lookup of the pass began inside the pass deadline and ended after it.
+        self.assertEqual(adapters[-1].lookups, 2)
+        (began,) = adapters[-1].began
+        self.assertLess(began, started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assert_unstaged(build)
+        self.assertLess(self.clock(), build.deadline_at)
+        # The archive that the stage stored is still there for the next pass, and no URL was made.
+        self.assertEqual(list(self.world.objects), [build.archive_key])
+        self.assertNotIn("delete_object", self.world.names())
+        self.assertIsNone(build.archive_deleted_at)
+        self.assertEqual(self.world.urls, [])
+
+    def test_a_presign_whose_credential_lookup_ends_after_the_build_deadline_ends_the_build_blind(self):
+        first = self.resumed_stage_with_100_seconds_left()
+        adapters = self.credential_lookups_that_take({2: 150})
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the lookup of the presign began before the build deadline and ended after it.
+        self.assertEqual(adapters[-1].lookups, 2)
+        (began,) = adapters[-1].began
+        self.assertLess(began, first.deadline_at)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+        self.assertEqual(self.world.urls, [])
+
+    def test_a_presign_whose_credential_lookup_ends_inside_both_deadlines_still_refuses_the_start(self):
+        # The control of the two tests above: the same lookup, quicker, leaves the credential to decide.
+        adapters = self.credential_lookups_that_take({2: 100})
+        started_at = self.clock()
+        result = self.apply()
+        self.assertEqual(adapters[-1].lookups, 2)
+        self.assertEqual(len(adapters[-1].began), 1)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_refused(result, "IMAGE_CREDENTIAL_SHORT")
+        build = self.only_build()
+        self.assertEqual((build.state, build.reason_code), ("failed", "IMAGE_CREDENTIAL_SHORT"))
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.world.urls, [])
+
+    def test_a_refused_upload_that_returns_after_the_build_deadline_ends_the_build_blind_not_as_a_refused_start(self):
+        # S3 refuses the upload of a resumed stage (the bucket is another account's now), and the refusal returns after
+        # the build deadline: the build was out of time when the answer came. It fails ``CONSOLE_BLIND`` and counts.
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_call_that_takes("create_multipart_upload", 150)
+        self.world.fail("create_multipart_upload", ProviderError("AccessDenied"))
+        started_at = self.clock()
+        result = self.apply()
+        # The premise: the upload began before the build deadline, and its refusal returned after it.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], first.deadline_at)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        build = self.assert_failed(result, "CONSOLE_BLIND")
+        self.assertEqual(build.id, first.id)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.objects, {})
+        self.assertEqual(self.control().consecutive_failures, 1)
+
+    def test_an_unsafe_template_found_after_the_build_deadline_ends_a_resumed_stage_blind_not_as_a_refused_start(self):
+        # The last read of the template check returns after the build deadline, and the template is unsafe: the build
+        # was out of time when the answer came. It fails ``CONSOLE_BLIND`` and counts.
+        first = self.resumed_stage_with_100_seconds_left()
+        self.world.add_group(BUILD_GROUP, "example-build-group", ingress=1)
+        began = self.a_call_that_takes("describe_security_groups", 150)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the read began before the build deadline and ended after it, inside the pass deadline.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], first.deadline_at)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+
+    def test_an_unsafe_template_found_after_the_pass_deadline_ends_a_new_start_on_the_deadline(self):
+        # No row exists, so the refusal that the late read produces could only change the answer: the deadline decides.
+        # The control is ``test_an_unsafe_group_stops_a_pass_before_anything_is_staged``: the same group, read in time.
+        self.world.add_group(BUILD_GROUP, "example-build-group", ingress=1)
+        began = self.a_call_that_takes("describe_security_groups", PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        self.refused(self.apply, "pass_deadline_exceeded")
+        # The premise: the read began inside the pass deadline and ended after it.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        # Nothing was written or started.
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
     def test_a_forge_that_fails_during_the_stage_fails_the_build_by_its_code_alone(self):
         self.source.fail_after_first = ObservationRefusal("FORGEJO_UNAVAILABLE", "token=" + TOKEN)
         result = self.apply()
@@ -5223,6 +5709,101 @@ class OwedArchiveBoundTests(PipelineCase):
         self.a_listing_that_takes(STRAY_SWEEP_SECONDS)
         result = self.apply()
         self.assertEqual(monotonic(), 1000.0)
+        self.assertEqual(self.world.arguments("delete_object"), [])
+        self.assertEqual(len(self.remaining_strays()), 3)
+        self.assertIn("archive:sweep_deferred", result["notes"])
+
+    # -- both cutoffs are read again right before the request ----------------------------------------------------------
+    # The pipeline reads elapsed time before it calls the adapter, and the adapter reads the clocks once more right
+    # before it sends the request: time can pass in between (the lookup of the account, the build of the S3 client). The
+    # adapter therefore evaluates both cutoffs there, the wall clock against the deadline that it is given and elapsed
+    # time on the pipeline's monotonic clock against the bound. The tests above cover the pipeline's own check.
+
+    @contextmanager
+    def a_delete_that_finds_time_gone_when_it_is_called(self, monotonic, seconds, *, only_the_first=True):
+        """Make ``seconds`` of elapsed time pass between the pipeline's check and the adapter's, for a stray delete.
+
+        The adapter is called after the pipeline's check has passed, so the time passes on entry to the call. The wall
+        clock steps back by as much, so it shows none of it. Yields the readings ``((wall, elapsed), (wall, elapsed))``
+        before and after each such step.
+        """
+        real = ImageAws.delete_object
+        readings = []
+
+        def late(adapter, bucket, key, **keywords):
+            if "/stray-" in key and not (only_the_first and readings):
+                before = (self.clock(), monotonic())
+                monotonic.advance(seconds)
+                self.clock.advance(-seconds)
+                readings.append((before, (self.clock(), monotonic())))
+            return real(adapter, bucket, key, **keywords)
+
+        with mock.patch.object(ImageAws, "delete_object", late):
+            yield readings
+
+    def test_a_stray_delete_is_not_sent_when_elapsed_time_reaches_the_bound_after_the_pipeline_check_on_a_wall_clock_that_stepped_back(self):
+        self.strays(3)
+        monotonic = Clock(1000.0)
+        self.a_pipeline_with_a_monotonic_clock(monotonic)
+        started_at, started_on = self.clock(), monotonic()
+        with self.a_delete_that_finds_time_gone_when_it_is_called(monotonic, STRAY_SWEEP_SECONDS) as readings:
+            result = self.apply()
+        # The premise: the adapter was called once, after the pipeline's check had passed (elapsed time was inside the
+        # bound), and it found the wall clock behind its deadline and elapsed time at the bound.
+        ((before, after),) = readings
+        self.assertLess(before[1] - started_on, STRAY_SWEEP_SECONDS)
+        self.assertLess(after[0], started_at + STRAY_SWEEP_SECONDS)
+        self.assertGreaterEqual(after[1] - started_on, STRAY_SWEEP_SECONDS)
+        # So the adapter sent no delete, and the sweep ended without a failure.
+        self.assertEqual(self.world.arguments("delete_object"), [])
+        self.assertEqual(len(self.remaining_strays()), 3)
+        self.assertEqual(result["reconcile"]["archives_deleted"], 0)
+        self.assertEqual(result["reconcile"]["failures"], [])
+        self.assertIn("archive:sweep_deferred", result["notes"])
+        # The pass went on with its own work.
+        self.assertEqual(result["decision"], "building", result)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    def test_a_stray_delete_is_sent_when_elapsed_time_is_just_inside_the_bound_after_the_pipeline_check(self):
+        # The control of the test above: one second less of elapsed time, so the test above can tell a check at the
+        # adapter from an adapter that never sends. The sweep then runs to its end.
+        self.strays(3)
+        monotonic = Clock(1000.0)
+        self.a_pipeline_with_a_monotonic_clock(monotonic)
+        started_at, started_on = self.clock(), monotonic()
+        with self.a_delete_that_finds_time_gone_when_it_is_called(monotonic, STRAY_SWEEP_SECONDS - 1) as readings:
+            result = self.apply()
+        ((before, after),) = readings
+        self.assertLess(after[0], started_at + STRAY_SWEEP_SECONDS)
+        self.assertLess(after[1] - started_on, STRAY_SWEEP_SECONDS)
+        self.assertEqual(len(self.world.arguments("delete_object")), 3)
+        self.assertEqual(self.remaining_strays(), [])
+        self.assertEqual(result["reconcile"]["archives_deleted"], 3)
+        self.assertNotIn("archive:sweep_deferred", result["notes"])
+
+    def test_a_stray_delete_is_not_sent_after_the_pipeline_check_when_the_wall_clock_alone_reaches_the_deadline(self):
+        # The other clock: elapsed time shows none of the time (the monotonic clock is not moved), the wall clock jumps
+        # to the deadline, and the adapter refuses for it as before.
+        self.strays(3)
+        monotonic = Clock(1000.0)
+        self.a_pipeline_with_a_monotonic_clock(monotonic)
+        started_at, started_on = self.clock(), monotonic()
+        real = ImageAws.delete_object
+        jumped = []
+
+        def late(adapter, bucket, key, **keywords):
+            if not jumped:
+                jumped.append((self.clock(), monotonic()))
+                self.clock.advance(STRAY_SWEEP_SECONDS)
+            return real(adapter, bucket, key, **keywords)
+
+        with mock.patch.object(ImageAws, "delete_object", late):
+            result = self.apply()
+        # The premise: the wall clock reached its deadline between the checks, and elapsed time had not moved.
+        ((wall, elapsed),) = jumped
+        self.assertLess(wall, started_at + STRAY_SWEEP_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + STRAY_SWEEP_SECONDS)
+        self.assertEqual(monotonic() - started_on, 0)
         self.assertEqual(self.world.arguments("delete_object"), [])
         self.assertEqual(len(self.remaining_strays()), 3)
         self.assertIn("archive:sweep_deferred", result["notes"])

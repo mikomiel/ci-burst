@@ -257,13 +257,13 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 - **WHEN** a pass makes an S3 call against a staging bucket: the upload, its abort, a delete or a listing
 - **THEN** the call names the account of the image identity as the expected bucket owner, read once per pass from `GetCallerIdentity`, and no call goes out without it
 - **AND** the row records that account as `archive_owner` with the bucket and the key, and a stage done again and every delete of the archive name the recorded owner
-- **AND** an `AccessDenied` answer sends nothing more and gives `IMAGE_STAGING_BUCKET_DENIED`: a stage done again ends its row as a refused start with no failure counted, a first stage fails the build, and a refused delete counts as failed and stays owed
+- **AND** an `AccessDenied` answer sends nothing more and gives `IMAGE_STAGING_BUCKET_DENIED`: when neither deadline has passed as it returns, a stage done again ends its row as a refused start with no failure counted and a first stage fails the build; a refused delete counts as failed and stays owed
 
 #### Scenario: The bucket does not exist
 - **WHEN** S3 answers `NoSuchBucket` to the upload of an archive, for instance because the bucket that a row recorded was removed
 - **THEN** the upload ends with `IMAGE_STAGING_BUCKET_MISSING`
-- **AND** a stage done again ends its row as a refused start with no failure counted, keeps the archive fields of the row and marks it deleted only when the delete of its archive succeeds
-- **AND** a first stage fails the build, and an owed deletion at that bucket counts as failed and stays owed
+- **AND** when neither deadline has passed as the answer returns, a stage done again ends its row as a refused start with no failure counted, keeps the archive fields of the row and marks it deleted only when the delete of its archive succeeds
+- **AND** when neither deadline has passed as the answer returns, a first stage fails the build; an owed deletion at that bucket counts as failed and stays owed
 
 #### Scenario: The build ends
 - **WHEN** a build whose row records an archive key reaches `candidate` or `failed`
@@ -397,7 +397,7 @@ At most one builder MUST exist for a deployment. A unique index keyed on the dep
 - **THEN** the AWS precheck refuses the launch
 
 ### Requirement: A refused start is not a failed build
-A refused start MUST NOT count as a failed build. The refusal itself MUST add no failure, start no cooldown and set no `blocked`, and a clearing that the trigger decision already made MUST stay. A refusal before the build row exists MUST write no row and no archive. A refusal once the row exists MUST end the row as `failed` with the refusal code and MUST try to delete its archive. Such a row MUST still count toward `max_builds_per_day` and `min_build_interval_seconds`.
+A refused start MUST NOT count as a failed build. The refusal MUST add no failure, start no cooldown and set no `blocked`, and a clearing that the trigger decision already made MUST stay. A refusal before the build row exists MUST write no row and no archive. A refusal once the row exists, with neither deadline passed, MUST end the row as `failed` with the refusal code and MUST try to delete its archive. Such a row MUST still count toward `max_builds_per_day` and `min_build_interval_seconds`.
 
 #### Scenario: A check refuses before the row exists
 - **WHEN** the session has less life than `presign_seconds`, or a builder of the deployment exists, before the build row is written
@@ -409,7 +409,7 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **THEN** the pass ends with `pass_deadline_exceeded`, not `refused`, and writes no build row and no archive
 
 #### Scenario: The template precheck refuses
-- **WHEN** the template precheck refuses a start
+- **WHEN** the template precheck refuses a start, and the read that refused it returns before the pass deadline
 - **THEN** the pass ends with that refusal, writes no build row and no archive and counts no failure
 
 #### Scenario: A clearing comes before the refusal
@@ -418,7 +418,7 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **AND** the refusal adds no failure and starts no cooldown
 
 #### Scenario: The session runs short during the upload
-- **WHEN** the build row exists and the session has less life than `presign_seconds` once the archive is staged, and neither deadline has passed when the launch begins
+- **WHEN** the build row exists and the session has less life than `presign_seconds` once the archive is staged, and neither deadline has passed when the presign refuses
 - **THEN** the row ends `failed` with `IMAGE_CREDENTIAL_SHORT`, the pass tries to delete its archive and no builder is launched
 - **AND** the pass answers `refused` and counts no failure
 
@@ -448,13 +448,78 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **AND** the pass answers `refused`, counts no failure and leaves that builder to the next pass's reconcile
 
 #### Scenario: A resumed stage is refused
-- **WHEN** a pass stages again a build that has no builder and no staged archive, and the check before the upload refuses
+- **WHEN** a pass stages again a build that has no builder and no staged archive, the check before the upload refuses, and neither deadline has passed when the check returns
 - **THEN** the row ends `failed` with the refusal code and the pass tries to delete any archive that the row names
 - **AND** no new upload is made and no failure is counted
 
 #### Scenario: A refused row counts toward the limits
 - **WHEN** a build row has ended by a refusal
 - **THEN** it counts toward `max_builds_per_day` and `min_build_interval_seconds` like any other row
+
+### Requirement: A deadline decides before the outcome of a call that takes time
+A deadline MUST decide before the outcome of any call that takes time. In a new start, a stage done again and the launch, the pass MUST read both deadlines again when the read of the template, the lookup of the credential, the upload, the presign or the listing of the builders returns, with a result or a refusal, before it inserts a row, uploads, launches or ends a row on a refusal. The build deadline MUST decide first. This requirement does not decide a listing that shows a builder.
+
+#### Scenario: A late listing of a new start writes no row
+- **WHEN** the listing of the builders in the start checks of a new start shows no builder and returns at or after the pass deadline
+- **THEN** the pass ends with `pass_deadline_exceeded`, not `refused`, and writes no build row and no archive
+- **AND** no upload starts and no failure is counted
+
+#### Scenario: A late refusal of the listing in a new start
+- **WHEN** the provider refuses the listing of the builders in the start checks of a new start, and the refusal returns at or after the pass deadline
+- **THEN** the pass ends with `pass_deadline_exceeded`, not with the code of the provider, and writes no build row and no archive
+- **AND** no upload starts and no failure is counted
+
+#### Scenario: A late lookup of the credential in a new start
+- **WHEN** the lookup of the credential in the start checks of a new start returns at or after the pass deadline, whether it answers or refuses with `IMAGE_CREDENTIAL_SHORT`
+- **THEN** the pass ends with `pass_deadline_exceeded`, not `refused`, and writes no build row and no archive
+
+#### Scenario: The checks of a new start return before the pass deadline
+- **WHEN** the lookup of the credential and the listing of the builders in the start checks of a new start return before the pass deadline
+- **THEN** the checks answer as they find: the build row is written, the start is refused with `IMAGE_CREDENTIAL_SHORT`, or the pass ends with the refusal that the provider gave to the listing
+
+#### Scenario: A late listing before the upload of a resumed stage, the pass deadline only
+- **WHEN** a pass stages again a build, and the listing of the builders in the start checks returns at or after the pass deadline and before the build deadline, whether it shows no builder or the provider refuses it
+- **THEN** no upload starts and the row stays `building` with no builder and no `archive_sha256`
+- **AND** the pass counts no failure, and the next pass stages the build again
+
+#### Scenario: A late listing before the upload of a resumed stage, the build deadline
+- **WHEN** a pass stages again a build, and the listing of the builders in the start checks returns at or after the build deadline, whether it shows no builder or the provider refuses it, and whether or not the pass deadline has passed
+- **THEN** no upload starts and the row ends `failed` with `CONSOLE_BLIND`, whatever S3 would answer to the upload
+- **AND** the pass counts the failure and tries to delete the archive that the row names
+
+#### Scenario: A late lookup of the credential in a resumed stage
+- **WHEN** a pass stages again a build, and the lookup of the credential returns, with a session that has less life than `presign_seconds`, at or after a deadline
+- **THEN** at or after the build deadline the row ends `failed` with `CONSOLE_BLIND` and the pass counts the failure
+- **AND** at or after the pass deadline only, the row stays `building`, the pass counts no failure and deletes no archive
+- **AND** no upload starts and no builder is launched
+
+#### Scenario: A late presign
+- **WHEN** the lookup of the credential in the presign of the launch returns at or after a deadline, whether it answers or refuses with `IMAGE_CREDENTIAL_SHORT`
+- **THEN** no builder is launched and the listing of the builders is not asked for
+- **AND** at or after the build deadline the row ends `failed` with `CONSOLE_BLIND`
+- **AND** at or after the pass deadline only, the row stays `building` with no `archive_sha256`, and its archive is kept
+
+#### Scenario: A late refusal of the upload
+- **WHEN** the upload of a stage done again ends with a refusal that S3 gave for the bucket, at or after the build deadline
+- **THEN** the row ends `failed` with `CONSOLE_BLIND`, not with the code of the bucket, and the pass counts the failure
+
+#### Scenario: A late unsafe template in a new start
+- **WHEN** the read of the build template of a new start shows an unsafe template at or after the pass deadline
+- **THEN** the pass ends with `pass_deadline_exceeded`, not with `IMAGE_BUILD_TEMPLATE_UNSAFE`, and writes no build row and no archive
+
+#### Scenario: A late unsafe template in a resumed stage
+- **WHEN** the read of the build template of a stage done again shows an unsafe template at or after the build deadline
+- **THEN** the row ends `failed` with `CONSOLE_BLIND`, not with `IMAGE_BUILD_TEMPLATE_UNSAFE`, and the pass counts the failure
+
+#### Scenario: A late refusal of the last listing before the launch
+- **WHEN** the provider refuses the last listing of the builders before the launch call, and the refusal returns at or after a deadline
+- **THEN** no builder is launched
+- **AND** at or after the build deadline the row ends `failed` with `CONSOLE_BLIND`, not with the code of the provider, and the pass counts the failure
+- **AND** at or after the pass deadline only, the row stays `building` with no `archive_sha256`, its archive is kept and the pass counts no failure
+
+#### Scenario: The last listing before the launch is refused inside both deadlines
+- **WHEN** the provider refuses the last listing of the builders before the launch call, and the refusal returns before both deadlines
+- **THEN** no builder is launched and the row ends `failed` with the code of the provider
 
 ### Requirement: A stage done again launches only under the inputs of its row
 The row MUST record the hash of each basis file when it is inserted. A pass that stages a build again MUST recompute the digest from those hashes, the warm and gate commands, `strip_components` and the script, and MUST read no basis file. A different digest, or a different set of `basis_paths`, MUST end the row `failed` with `IMAGE_INPUTS_CHANGED` as a refused start: no builder, the archive deleted, no failure counted. A row without valid hashes MUST raise `IMAGE_STATE_UNREADABLE`.
@@ -654,18 +719,18 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **AND** the failure path ends the builder
 
 #### Scenario: A resumed stage outlasts the deadline
-- **WHEN** the build deadline passes during the upload of a resumed stage, or during the reads between the upload and the launch call
+- **WHEN** the build deadline passes during the upload of a resumed stage, or during the calls between the upload and the launch call (the presign and the listing of the builders unless it shows a builder)
 - **THEN** no builder is launched and the build fails with `CONSOLE_BLIND`
 - **AND** the pass tries to delete the archive that the row names
 
 #### Scenario: A resumed stage outlasts both deadlines
-- **WHEN** a read in the checks before the upload of a resumed stage, a wait in the stream of the upload, the completion of the upload, or the last listing of the builders before the launch call when it shows no builder, ends at or after the build deadline and at or after the pass deadline
+- **WHEN** a call of a resumed stage ends at or after the build deadline and at or after the pass deadline: a read in the checks before the upload (the template, the credential, the listing of the builders unless it shows a builder), a wait in the stream of the upload, the completion of the upload, the presign, or the last listing of the builders before the launch call unless it shows a builder
 - **THEN** no builder is launched and the build fails with `CONSOLE_BLIND` in that pass, and the row is not left for the next pass to stage again
 - **AND** the pass tries to delete the archive that the row names
-- **AND** a build that is out of time when the launch begins asks for no presign and no listing
+- **AND** a build that is out of time when a call returns asks for no later call: no upload, no presign and no listing
 
 #### Scenario: A resumed stage outlasts only the pass deadline
-- **WHEN** a read in the checks before the upload of a resumed stage, a wait in the stream of the upload, the completion of the upload, or the last listing of the builders before the launch call when it shows no builder, ends at or after the pass deadline and before the build deadline
+- **WHEN** a call of a resumed stage ends at or after the pass deadline and before the build deadline: a read in the checks before the upload (the template, the credential, the listing of the builders unless it shows a builder), a wait in the stream of the upload, the completion of the upload, the presign, or the last listing of the builders before the launch call unless it shows a builder
 - **THEN** no builder is launched and the row stays `building` with no builder and no `archive_sha256`
 - **AND** the next pass stages again and no failure is counted
 
@@ -841,7 +906,7 @@ Every pass MUST reconcile before any transition; its first call MUST end the bui
 - **AND** the pass result reports that run as `retention`
 
 ### Requirement: The sweep of stray archives has a bound of its own
-The sweep of stray archives runs in reconcile, before the work of the pass. It MUST start no stray delete once the pass is 30 seconds old by elapsed time, whether its listing returned late or earlier deletes were slow; it then stops, notes `archive:sweep_deferred`, and a later pass sweeps what it left. The stray deletes end within about 70 seconds of the pass start: the 30 second cutoff plus one delete of at most 40 seconds. The listing of the prefix is bounded by the pass deadline only.
+The sweep of stray archives runs in reconcile, before the work of the pass. A stray delete MUST NOT be sent once the pass is 30 seconds old by the wall clock or by elapsed time on a monotonic clock, and the AWS client MUST check both right before the request. The sweep then stops, notes `archive:sweep_deferred` and leaves the rest to a later pass. The stray deletes end within about 70 seconds: the cutoff plus one delete of at most 40 seconds. Only the pass deadline bounds the listing.
 
 #### Scenario: A late stray listing starts no delete
 - **WHEN** the listing of the prefix, or a read before it, returns when the pass is 30 seconds old or older and before the pass deadline
@@ -861,6 +926,19 @@ The sweep of stray archives runs in reconcile, before the work of the pass. It M
 - **WHEN** the system clock is stepped back during the sweep, so that it shows the pass as younger than 30 seconds, and 30 seconds of elapsed time have passed since the pass began
 - **THEN** no further stray delete starts and the pass notes `archive:sweep_deferred`
 - **AND** the strays that remain are swept by a later pass
+
+#### Scenario: A delete is not sent when elapsed time reaches the bound before the request
+- **WHEN** a stray delete passes the check of the pass, and before the AWS client sends it elapsed time on the monotonic clock reaches 30 seconds, while the wall clock was stepped back and shows the pass as younger
+- **THEN** the AWS client sends no delete and the sweep stops with `archive:sweep_deferred`
+- **AND** the stray object remains for a later pass
+
+#### Scenario: A delete is not sent when the wall clock reaches the cutoff before the request
+- **WHEN** a stray delete passes the check of the pass, and before the AWS client sends it the wall clock reaches the 30 second cutoff
+- **THEN** the AWS client sends no delete and the sweep stops with `archive:sweep_deferred`
+
+#### Scenario: A delete just inside both cutoffs is sent
+- **WHEN** a stray delete passes the check of the pass, and before the AWS client sends it neither the wall clock nor elapsed time on the monotonic clock has reached the cutoff
+- **THEN** the AWS client sends the delete
 
 #### Scenario: A stray backlog ends at the bound and the owed deletion is attempted
 - **WHEN** many strays older than one hour sit under the prefix, each of their deletes takes long, a finished build owes its archive deletion, and the work of the pass, with or without a build to follow, ends before the last start of an owed deletion

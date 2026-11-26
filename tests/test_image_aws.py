@@ -1996,6 +1996,46 @@ class DeleteDeadlineTests(Base):
         self.delete(self.lazy(10_000))
         self.assertEqual(self.names(), ["session.client", "delete_object"])
 
+    # -- a second cutoff that the caller measures -------------------------------------------------------------------
+    # The deadline is a time on the clock of this adapter. A caller that bounds the delete by elapsed time on a clock
+    # of its own passes ``stop``, a function that says whether the delete must not start. It is read in the same
+    # place as the deadline, once the client is built, right before the request, so either cutoff alone stops the
+    # delete.
+
+    def test_a_stop_that_turns_true_while_the_client_is_built_stops_the_delete_before_the_request(self):
+        with self.assertRaises(DeadlineRefusal) as raised:
+            self.delete(self.lazy(1), stop=lambda: "session.client" in self.names())
+        # Still the deadline refusal, not a provider failure that the call translated it into.
+        refusal = raised.exception
+        self.assertEqual((refusal.reason, refusal.detail), ("pass_deadline_exceeded", "archive delete"))
+        # The premise: the client was built, and the request was not sent.
+        self.assertEqual(self.names(), ["session.client"])
+
+    def test_a_delete_is_sent_unless_one_of_its_two_cutoffs_has_been_reached(self):
+        reached = self.clock()
+        for name, deadline, stop, sent in (
+            ("neither", reached + self.LEFT, lambda: False, True),
+            ("the deadline", reached, lambda: False, False),
+            ("the stop", reached + self.LEFT, lambda: True, False),
+            ("both", reached, lambda: True, False),
+        ):
+            with self.subTest(reached=name):
+                self.calls.clear()
+                if sent:
+                    self.delete(self.image_aws(), deadline=deadline, stop=stop)
+                    self.assertEqual(self.names(), ["delete_object"])
+                else:
+                    with self.assertRaises(DeadlineRefusal) as raised:
+                        self.delete(self.image_aws(), deadline=deadline, stop=stop)
+                    self.assertEqual(raised.exception.detail, "archive delete")
+                    self.assertEqual(self.names(), [])
+
+    def test_a_stop_stops_a_delete_that_has_no_deadline(self):
+        with self.assertRaises(DeadlineRefusal) as raised:
+            self.delete(self.image_aws(), stop=lambda: True)
+        self.assertEqual(raised.exception.detail, "archive delete")
+        self.assertEqual(self.names(), [])
+
 
 class PresignTests(Base):
     KEY = PREFIX + "build-0001.tar.gz"

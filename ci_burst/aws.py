@@ -826,22 +826,24 @@ class ImageAws:
             raise ProviderRefusal("AWS_ACCOUNT_UNKNOWN", "the bucket owner is no account number")
         return owner
 
-    def _invoke(self, service, method, *, read=False, absent=None, owner=None, deadline=None, detail="", **arguments):
+    def _invoke(
+        self, service, method, *, read=False, absent=None, owner=None, deadline=None, stop=None, detail="", **arguments
+    ):
         """Call the provider. ``absent`` is an error code that means "not there".
 
         An S3 call carries ``owner`` (see ``_bound_owner``) as the bucket's owner, and it is refused here, before
         any call, when there is none. ``AccessDenied`` from S3 leaves as ``IMAGE_STAGING_BUCKET_DENIED``.
 
-        With a ``deadline`` the clock is read once more after the owner is known and the client is built, right
-        before the request: the first owner check of an adapter asks STS for the account, and a call that waited
-        for the answer can be at or after the deadline. The request is then not sent (``DeadlineRefusal`` with
-        ``detail``).
+        With a ``deadline``, or a ``stop`` that the caller owns, the cutoffs are read once more after the owner is
+        known and the client is built, right before the request: the first owner check of an adapter asks STS for
+        the account, and a call that waited for the answer can be at or after either cutoff. The request is then not
+        sent (``DeadlineRefusal`` with ``detail``). See ``_check_deadline`` for the two cutoffs.
         """
         if service == "s3":
             arguments["ExpectedBucketOwner"] = self._bound_owner(owner)
         client = self._client(service)
         # Outside the ``try`` below, which would translate the refusal into a provider failure.
-        self._check_deadline(deadline, detail)
+        self._check_deadline(deadline, detail, stop)
         try:
             return getattr(client, method)(**arguments)
         except Exception as error:  # noqa: BLE001 - classified below
@@ -853,8 +855,14 @@ class ImageAws:
                 raise ProviderRefusal(IMAGE_STAGING_BUCKET_DENIED, code, uncertain=read) from None
             raise (_translate_read(error) if read else _translate(error)) from None
 
-    def _check_deadline(self, deadline, detail):
-        if deadline is not None and self._clock() >= deadline:
+    def _check_deadline(self, deadline, detail, stop=None):
+        """Refuse with ``DeadlineRefusal`` at or after either cutoff.
+
+        ``deadline`` is a time on this adapter's clock. ``stop`` is a function of the caller that says whether the
+        request must not start: a caller that bounds its work by elapsed time on a clock of its own passes it, because
+        this adapter does not see that clock.
+        """
+        if (deadline is not None and self._clock() >= deadline) or (stop is not None and stop()):
             raise DeadlineRefusal(detail)
 
     def _pages(self, service, method, request_token, response_token, deadline, detail, absent=None, **arguments):
@@ -1263,15 +1271,22 @@ class ImageAws:
                 items.append(StoredObject(key=key, size=size, last_modified=_timestamp(entry.get("LastModified"))))
         return items
 
-    def delete_object(self, bucket, key, *, owner=None, deadline=None):
+    def delete_object(self, bucket, key, *, owner=None, deadline=None, stop=None):
         """Delete one object, naming ``owner`` as the bucket's owner (see ``_bound_owner``).
 
-        With a ``deadline`` the clock is read once the S3 client is built, right before the request (``_invoke``): the
-        first S3 call of an adapter builds its client, which takes time, and a delete that would start at or after the
-        deadline is not sent (``DeadlineRefusal``).
+        With a ``deadline``, or a ``stop`` (see ``_check_deadline``), both are read once the S3 client is built, right
+        before the request (``_invoke``): the first S3 call of an adapter builds its client, which takes time, and a
+        delete that would start at or after either cutoff is not sent (``DeadlineRefusal``).
         """
         self._invoke(
-            "s3", "delete_object", owner=owner, deadline=deadline, detail="archive delete", Bucket=bucket, Key=key
+            "s3",
+            "delete_object",
+            owner=owner,
+            deadline=deadline,
+            stop=stop,
+            detail="archive delete",
+            Bucket=bucket,
+            Key=key,
         )
 
     def credential_expiry(self):

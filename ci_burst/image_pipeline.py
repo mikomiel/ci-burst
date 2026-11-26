@@ -1055,9 +1055,9 @@ class ImagePipeline:
                 close()
 
     def _user_data_bytes(self, script):
-        """The size of the user data of a build, with a URL as long as a real presigned one."""
+        """The size of the user data of a build, with a URL as long as a real presigned one and an owner."""
         url = "https://" + "x" * (SYNTHETIC_URL_CHARS - len("https://"))
-        text = image.render_user_data(script, image.warm_exports(self._image, url, "0" * 64))
+        text = image.render_user_data(script, image.warm_exports(self._image, url, "0" * 64, "0" * 12))
         return len(text.encode("utf-8"))
 
     def _deletion_items(self, aws, facts, now, deadline, mode):
@@ -1368,7 +1368,8 @@ class _Pass:
                 summary["builder_adopted"] = True
                 self._end_overdue(active, now, summary)
         if foreign:
-            aws.terminate(foreign)
+            # A termination ends spending, so no deadline holds it back (here and in ``_end_overdue``, ``_fail``).
+            aws.terminate(foreign, deadline=None)
             summary["builders_terminated"] += len(foreign)
             self.terminated_foreign = len(foreign)
             self.tele.leak("builder", len(foreign))
@@ -1547,7 +1548,7 @@ class _Pass:
         if build is None or build.builder_id is None or build.builder_id in self.ended or now < build.deadline_at:
             return
         try:
-            self.aws.terminate([build.builder_id])
+            self.aws.terminate([build.builder_id], deadline=None)
         except ProviderRefusal as refusal:
             summary["failures"].append(refusal.reason)
             return
@@ -1652,7 +1653,7 @@ class _Pass:
             return IMAGE_GATE_REQUIRED
         try:
             with self._deadline_first(build):
-                self.aws.check_credential_life(self.cfg.source.presign_seconds)
+                self.aws.check_credential_life(self.cfg.source.presign_seconds, deadline=self._cutoff(build))
             self._check_no_builder(build)
         except Refusal as refusal:
             if refusal.reason in START_REFUSALS:
@@ -2051,8 +2052,9 @@ class _Pass:
         unlisted is refused by the provider as a duplicate name. That refusal is as uncertain as any other, and the
         next pass looks again: the name is never changed.
 
-        The clock is read after the last read and right before the call, and the call is never made at or after the
-        build deadline. The build then fails as a marker that came too late, and ``_fail`` ends the builder.
+        The clock is read after the last read, and again by the adapter where the call starts
+        (``ImageAws._check_deadline``), and the call is never made at or after the build deadline. The build then
+        fails as a marker that came too late, and ``_fail`` ends the builder.
         """
         found = self._find_image(build)
         if found is not None:
@@ -2073,8 +2075,11 @@ class _Pass:
                 deployment=self.dep,
                 build_id=build.id,
                 basis_digest=build.basis_digest,
+                deadline=build.deadline_at,
                 extra_tags=tags,
             )
+        except DeadlineRefusal:
+            return self._fail(build, image_console.MARKER_TIMEOUT, console)
         except ProviderRefusal as refusal:
             # An unknown outcome may have made the image, so before the deadline the row stays as it is. The next
             # pass adopts the image when the provider lists it, and else asks again under the same name, which the
@@ -2151,7 +2156,7 @@ class _Pass:
         if build.builder_id is not None:
             found = self.aws.instances([build.builder_id], deadline=self.deadline)
             if any(item.instance_id == build.builder_id and item.state in BUILDER_STATES for item in found):
-                self.aws.terminate([build.builder_id])
+                self.aws.terminate([build.builder_id], deadline=None)
         try:
             outcome = create_candidate_version(
                 self.aws,
@@ -2225,7 +2230,7 @@ class _Pass:
         s, now = self.s, self.clock()
         if builder_alive and build.builder_id is not None and build.builder_id not in self.ended:
             try:
-                self.aws.terminate([build.builder_id])
+                self.aws.terminate([build.builder_id], deadline=None)
             except ProviderRefusal:
                 # The build is over either way. The builder is no longer the
                 # active build's, so the next pass's reconcile terminates it.

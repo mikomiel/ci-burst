@@ -259,10 +259,10 @@ class DeletionCase(unittest.TestCase):
 
     # -- the three calls ------------------------------------------------
     def images(self):
-        return self.aws.images(DEPLOYMENT)
+        return self.aws.images(DEPLOYMENT, deadline=None)
 
     def snapshots(self):
-        return self.aws.snapshots(DEPLOYMENT)
+        return self.aws.snapshots(DEPLOYMENT, deadline=None)
 
     def resolve(self, **overrides):
         values = dict(previous_pin=None, pending_journal=(), candidate=None, active=None)
@@ -520,7 +520,7 @@ class ProtectedSetRefusalTests(DeletionCase):
     def test_a_read_that_is_cut_short_is_unsafe(self):
         self.ec2.pages["describe_launch_template_versions"] = True
         with self.assertRaises(ProviderRefusal) as expected:
-            self.aws.template_versions(WORKER, [PIN])
+            self.aws.template_versions(WORKER, [PIN], deadline=None)
         self.assertEqual(expected.exception.reason, "AWS_INVENTORY_INCOMPLETE")
         refusal = self.refused()
         self.assertNotIn("next-page", refusal.detail)
@@ -1743,7 +1743,7 @@ class ApplyTests(DeletionCase):
         good = self.made(2, "failed")
         self.ec2.refused[bad.image_id] = ProviderError("UnauthorizedOperation")
         with self.assertRaises(ProviderRefusal) as expected:
-            self.aws.deregister_image(bad.image_id)
+            self.aws.deregister_image(bad.image_id, deadline=None)
         del self.calls[:]
         report = self.run_paths("all")
         self.assertEqual(
@@ -1774,7 +1774,7 @@ class ApplyTests(DeletionCase):
         plan = self.plan("all")
         self.ec2.errors["describe_images"] = ProviderError("RequestLimitExceeded")
         with self.assertRaises(ProviderRefusal) as expected:
-            self.aws.image(made.image_id)
+            self.aws.image(made.image_id, deadline=None)
         report = apply_deletions(self.aws, plan, apply=True)
         self.assertEqual(
             self.results(report), [("deregister", "deregister_unconfirmed"), ("delete_snapshot", "snapshot_kept")]
@@ -1827,7 +1827,7 @@ class ApplyTests(DeletionCase):
         plan = self.plan("all")
 
         class Broken:
-            def deregister_image(self, image_id):
+            def deregister_image(self, image_id, *, deadline):
                 raise RuntimeError("example")
 
         with self.assertRaises(RuntimeError):

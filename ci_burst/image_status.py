@@ -289,7 +289,7 @@ class _Reads:
         """
         if number not in self._versions:
             try:
-                read = self._aws.template_versions(self._name, [number])
+                read = self._aws.template_versions(self._name, [number], deadline=None)
             except ProviderRefusal as refusal:
                 if refusal.detail != VERSION_NOT_FOUND:
                     raise
@@ -306,7 +306,7 @@ class _Reads:
         if image_id is None:
             return None
         if image_id not in self._images:
-            found = self._aws.image(image_id)
+            found = self._aws.image(image_id, deadline=None)
             self._images[image_id] = MISSING_IMAGE if found is None else found.state
         return self._images[image_id]
 

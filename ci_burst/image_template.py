@@ -58,13 +58,15 @@ def create_candidate_version(
     the same token, so a crash between creating and recording the version never
     creates a second one. A refusal of the provider passes unchanged.
 
-    ``deadline`` bounds the read-back, which is a read like any other of the pass: one that would start at or
-    after it raises ``DeadlineRefusal`` before any request. The creation is one call and cannot be bounded, so a
-    pass that ran out of time during it ends here with the version in place, and the retry with the same
-    ``client_token`` finds that version instead of creating another.
+    ``deadline`` bounds the creation and the read-back: a call that would start at or after it raises
+    ``DeadlineRefusal`` before any request. A creation that has started cannot be bounded, so a pass that ran out
+    of time during it ends here with the version in place, and the retry with the same ``client_token`` finds that
+    version instead of creating another.
     """
     description = f"ci-burst {build_id} {basis_digest[:12]}"
-    version = aws.create_template_version(template_name, source_pin, image_id, description, client_token)
+    version = aws.create_template_version(
+        template_name, source_pin, image_id, description, client_token, deadline=deadline
+    )
     if version == source_pin:
         raise ProviderRefusal(
             "AWS_UNCERTAIN", f"version creation returned the source version {source_pin}", uncertain=True

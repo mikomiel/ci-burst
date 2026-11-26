@@ -698,9 +698,9 @@ class WorldAws(ImageAws):
         self._refuse("create_image")
         return super().create_image(*arguments, **keywords)
 
-    def terminate(self, instance_ids):
+    def terminate(self, instance_ids, *, deadline):
         self._refuse("terminate")
-        return super().terminate(instance_ids)
+        return super().terminate(instance_ids, deadline=deadline)
 
 
 class WorldSts:
@@ -786,13 +786,13 @@ class SlowLookupAws(WorldAws):
         self.lookups = 0
         self.began = []
 
-    def credential_expiry(self):
+    def credential_expiry(self, *, deadline):
         self.lookups += 1
         seconds = self.stalls.get(self.lookups, 0)
         if seconds:
             self.began.append(self.world.clock())
             self.world.clock.advance(seconds)
-        return super().credential_expiry()
+        return super().credential_expiry(deadline=deadline)
 
 
 class FakeSource:
@@ -1270,7 +1270,8 @@ class PlanTests(PipelineCase):
     def test_the_user_data_is_sized_with_a_url_as_long_as_a_real_one(self):
         result = self.plan()
         url = "https://" + "x" * (image_pipeline.SYNTHETIC_URL_CHARS - len("https://"))
-        text = image.render_user_data(SCRIPT, image.warm_exports(self.config.image, url, "0" * 64))
+        # Every automated launch exports the owner of the bucket too (``WARM_SRC_OWNER``, 12 digits).
+        text = image.render_user_data(SCRIPT, image.warm_exports(self.config.image, url, "0" * 64, "0" * 12))
         self.assertGreaterEqual(len(url), 4096)
         self.assertEqual(result["user_data"], {"bytes": len(text.encode("utf-8")), "limit": image.USER_DATA_LIMIT})
 
@@ -2235,6 +2236,19 @@ class FailureTests(PipelineCase):
         self.world.hooks["describe_images"] = run_out_of_time
         result = self.apply()
         self.assertEqual(spent, [True])
+        self.assert_no_image_for_a_build_out_of_time(result, build)
+
+    def test_a_deadline_that_comes_after_the_last_clock_read_before_create_image_creates_no_image(self):
+        # The pass reads the clock with ten seconds left and is then held up for thirty before ``CreateImage``.
+        build = self.marker_with_ten_seconds_left()
+        create_image = WorldAws.create_image
+
+        def held_up(aws, *arguments, **keywords):
+            self.clock.advance(30)
+            return create_image(aws, *arguments, **keywords)
+
+        with mock.patch.object(WorldAws, "create_image", held_up):
+            result = self.apply()
         self.assert_no_image_for_a_build_out_of_time(result, build)
 
     def uncertain_create(self, *, hidden_for=0.0):

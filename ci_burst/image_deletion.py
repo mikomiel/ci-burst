@@ -551,11 +551,11 @@ def _item(path, image_id, build_id, verdict, snapshot_ids, skipped_snapshots, *,
 def _deregister(aws, image_id):
     """Deregister an image and read it back: the result and the refusal's code."""
     try:
-        aws.deregister_image(image_id)
+        aws.deregister_image(image_id, deadline=None)
     except ProviderRefusal as refusal:
         return DEREGISTER_FAILED, refusal.reason
     try:
-        found = aws.image(image_id)
+        found = aws.image(image_id, deadline=None)
     except ProviderRefusal as refusal:
         return DEREGISTER_UNCONFIRMED, refusal.reason
     if found is None or found.state == _DEREGISTERED_STATE:
@@ -565,7 +565,7 @@ def _deregister(aws, image_id):
 
 def _delete_snapshot(aws, snapshot_id):
     try:
-        aws.delete_snapshot(snapshot_id)
+        aws.delete_snapshot(snapshot_id, deadline=None)
     except ProviderRefusal as refusal:
         return SNAPSHOT_FAILED, refusal.reason
     return SNAPSHOT_DELETED, None

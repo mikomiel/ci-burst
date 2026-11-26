@@ -800,7 +800,7 @@ class ImageAws:
                 self._clients[service] = self._session().client(service, region_name=self._region, config=config)
         return self._clients[service]
 
-    def account_id(self, *, deadline=None, stop=None, detail="GetCallerIdentity"):
+    def account_id(self, *, deadline, stop=None, detail="GetCallerIdentity"):
         """The account of this identity, from ``GetCallerIdentity``, asked once per instance.
 
         Every S3 call of this adapter names it as the bucket's owner. An answer that is no account number refuses,
@@ -817,7 +817,7 @@ class ImageAws:
             self._account_cache = account
         return self._account_cache
 
-    def _bound_owner(self, owner, *, deadline=None, stop=None, detail=""):
+    def _bound_owner(self, owner, *, deadline, stop=None, detail=""):
         """The account that an S3 call names as the bucket's owner.
 
         ``owner`` is the account that a row recorded for its archive. ``None`` means this identity's own account.
@@ -830,16 +830,18 @@ class ImageAws:
         return owner
 
     def _invoke(
-        self, service, method, *, read=False, absent=None, owner=None, deadline=None, stop=None, detail="", **arguments
+        self, service, method, *, deadline, read=False, absent=None, owner=None, stop=None, detail="", **arguments
     ):
         """Call the provider. ``absent`` is an error code that means "not there".
 
         An S3 call carries ``owner`` (see ``_bound_owner``) as the bucket's owner, and it is refused here, before
         any call, when there is none. ``AccessDenied`` from S3 leaves as ``IMAGE_STAGING_BUCKET_DENIED``.
 
-        A ``deadline`` or a ``stop`` is read once the owner is known and the client is built (``_check_deadline``):
-        the first owner check of an adapter asks STS for the account, which takes time.
+        A ``deadline`` or a ``stop`` is read first, before the owner lookup or the client build can reach the
+        provider, and again once the owner is known and the client is built (``_check_deadline``): the first owner
+        check of an adapter asks STS for the account, which takes time.
         """
+        self._check_deadline(deadline, detail, stop)
         if service == "s3":
             arguments["ExpectedBucketOwner"] = self._bound_owner(owner, deadline=deadline, stop=stop, detail=detail)
         client = self._client(service)
@@ -860,7 +862,8 @@ class ImageAws:
         """Refuse with ``DeadlineRefusal`` at or after either cutoff.
 
         This is where a provider call starts, for every cutoff of this adapter: it reads them right before it calls
-        the SDK operation, and does not call it at or after one. Signing and a credential refresh inside the SDK can
+        the SDK operation, and does not call it at or after one. A method reads them first too, before it resolves
+        credentials, builds a client or looks up the account. Signing and a credential refresh inside the SDK can
         delay the request after this check. ``deadline`` is a time on this adapter's clock. ``stop`` is a function of
         the caller that says whether the call must not start: a caller that bounds its work by elapsed time on a clock
         of its own passes it, because this adapter does not see that clock.
@@ -871,12 +874,11 @@ class ImageAws:
     def _pages(self, service, method, request_token, response_token, deadline, detail, absent=None, **arguments):
         """Yield every response page, refusing when the listing would be partial.
 
-        An ``absent`` error code ends the listing as empty. With a ``deadline`` no page starts at or after it: the
-        clock is read before each page, so that no owner lookup starts late, and again in ``_invoke``.
+        An ``absent`` error code ends the listing as empty. With a ``deadline`` no page starts at or after it
+        (``_invoke``).
         """
         token, pages = None, 0
         while True:
-            self._check_deadline(deadline, detail)
             page = dict(arguments)
             if token:
                 page[request_token] = token
@@ -903,7 +905,7 @@ class ImageAws:
         return self._ec2_reads
 
     # -- instances --------------------------------------------------------
-    def builders(self, deployment, *, deadline=None):
+    def builders(self, deployment, *, deadline):
         """Builders of one deployment that still exist (the single-flight precheck)."""
         filters = [
             {"Name": "tag:" + IMAGE_BUILD_TAG, "Values": ["true"]},
@@ -915,14 +917,19 @@ class ImageAws:
             items.extend(_instances(response))
         return items
 
-    def instances(self, instance_ids, *, deadline=None):
+    def instances(self, instance_ids, *, deadline):
+        self._check_deadline(deadline, "DescribeInstances by-id read")
         return self._reads().instances(instance_ids, deadline=deadline)
 
-    def console_output(self, instance_ids, *, deadline=None):
+    def console_output(self, instance_ids, *, deadline):
+        self._check_deadline(deadline, "GetConsoleOutput read")
         return self._reads().console_output(instance_ids, deadline=deadline)
 
-    def terminate(self, instance_ids):
-        return self._reads().terminate(instance_ids)
+    def terminate(self, instance_ids, *, deadline):
+        self._check_deadline(deadline, "TerminateInstances")
+        reads = self._reads()
+        self._check_deadline(deadline, "TerminateInstances")
+        return reads.terminate(instance_ids)
 
     def run_builder(
         self,
@@ -934,7 +941,7 @@ class ImageAws:
         expires_at,
         user_data,
         client_token,
-        deadline=None,
+        deadline,
     ):
         """Launch the one builder from the build launch template.
 
@@ -969,10 +976,11 @@ class ImageAws:
         return identifiers[0]
 
     # -- images and snapshots ---------------------------------------------
-    def create_image(self, instance_id, name, *, deployment, build_id, basis_digest, extra_tags=None):
+    def create_image(self, instance_id, name, *, deployment, build_id, basis_digest, deadline, extra_tags=None):
         """Image a builder without a reboot, tagging the image and its snapshots.
 
-        A reboot would rerun user data after ``cloud-init clean``.
+        A reboot would rerun user data after ``cloud-init clean``. No call starts at or after ``deadline``
+        (``_check_deadline``).
         """
         tags = {
             IMAGE_BUILD_TAG: "true",
@@ -988,6 +996,8 @@ class ImageAws:
         response = self._invoke(
             "ec2",
             "create_image",
+            deadline=deadline,
+            detail="CreateImage",
             InstanceId=instance_id,
             Name=name,
             NoReboot=True,
@@ -998,7 +1008,7 @@ class ImageAws:
             raise ProviderRefusal("AWS_UNCERTAIN", "CreateImage returned no image id", uncertain=True)
         return image_id
 
-    def images(self, deployment, *, deadline=None):
+    def images(self, deployment, *, deadline):
         filters = [
             {"Name": "tag:" + IMAGE_BUILD_TAG, "Values": ["true"]},
             {"Name": "tag:" + DEPLOYMENT_TAG, "Values": [deployment]},
@@ -1008,11 +1018,12 @@ class ImageAws:
             items.extend(_images(response))
         return items
 
-    def image(self, image_id, *, deadline=None):
+    def image(self, image_id, *, deadline):
         """One image, or ``None`` when the provider no longer knows it.
 
         No read starts at or after ``deadline`` (``_check_deadline``).
         """
+        self._check_deadline(deadline, "describe_images")
         client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
         self._check_deadline(deadline, "describe_images")
         try:
@@ -1024,7 +1035,7 @@ class ImageAws:
         found = _images(response)
         return found[0] if found else None
 
-    def snapshots(self, deployment, *, deadline=None):
+    def snapshots(self, deployment, *, deadline):
         filters = [
             {"Name": "tag:" + IMAGE_BUILD_TAG, "Values": ["true"]},
             {"Name": "tag:" + DEPLOYMENT_TAG, "Values": [deployment]},
@@ -1034,9 +1045,14 @@ class ImageAws:
             items.extend(_snapshots(response))
         return items
 
-    def snapshot(self, snapshot_id):
-        """One snapshot, or ``None`` when the provider no longer knows it."""
+    def snapshot(self, snapshot_id, *, deadline):
+        """One snapshot, or ``None`` when the provider no longer knows it.
+
+        No read starts at or after ``deadline`` (``_check_deadline``).
+        """
+        self._check_deadline(deadline, "describe_snapshots")
         client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
+        self._check_deadline(deadline, "describe_snapshots")
         try:
             response = client.describe_snapshots(SnapshotIds=[snapshot_id], OwnerIds=["self"])
         except Exception as error:  # noqa: BLE001 - classified below
@@ -1046,14 +1062,14 @@ class ImageAws:
         found = _snapshots(response)
         return found[0] if found else None
 
-    def deregister_image(self, image_id):
-        self._invoke("ec2", "deregister_image", ImageId=image_id)
+    def deregister_image(self, image_id, *, deadline):
+        self._invoke("ec2", "deregister_image", deadline=deadline, detail="DeregisterImage", ImageId=image_id)
 
-    def delete_snapshot(self, snapshot_id):
-        self._invoke("ec2", "delete_snapshot", SnapshotId=snapshot_id)
+    def delete_snapshot(self, snapshot_id, *, deadline):
+        self._invoke("ec2", "delete_snapshot", deadline=deadline, detail="DeleteSnapshot", SnapshotId=snapshot_id)
 
     # -- launch templates -------------------------------------------------
-    def launch_templates(self, names, *, deadline=None):
+    def launch_templates(self, names, *, deadline):
         """Describe templates by name. A name the provider does not know gives no entry.
 
         EC2 fails a whole request when one name is unknown, so each name is
@@ -1070,7 +1086,7 @@ class ImageAws:
                 items.extend(_launch_templates(response))
         return items
 
-    def template_versions(self, name, versions, *, deadline=None):
+    def template_versions(self, name, versions, *, deadline):
         """Read versions back in full, including the whole ``LaunchTemplateData``."""
         for version in versions:
             _require_version(version)
@@ -1084,8 +1100,8 @@ class ImageAws:
             items.extend(_template_versions(response, name))
         return items
 
-    def template_version(self, name, version):
-        found = self.template_versions(name, [version])
+    def template_version(self, name, version, *, deadline):
+        found = self.template_versions(name, [version], deadline=deadline)
         if not found:
             raise ProviderRefusal("TEMPLATE_NOT_FOUND", f"{name} version {version}")
         if len(found) != 1 or found[0].version != version:
@@ -1093,7 +1109,7 @@ class ImageAws:
         return found[0]
 
     # -- security groups --------------------------------------------------
-    def security_groups(self, *, group_ids=(), group_names=(), deadline=None):
+    def security_groups(self, *, deadline, group_ids=(), group_names=()):
         """Read security groups by id and by name, with their inbound rule counts.
 
         Ids go in one request and names in another. EC2 fails a request that
@@ -1112,11 +1128,12 @@ class ImageAws:
                 items.extend(_security_groups(response))
         return items
 
-    def create_template_version(self, name, source_version, image_id, description, client_token):
+    def create_template_version(self, name, source_version, image_id, description, client_token, *, deadline):
         """Create a non-default version that differs from the pin only in its image.
 
         ``source_version`` is the numeric pin, never ``$Latest`` or the default.
         The request sets no default and the response is read back by the caller.
+        No call starts at or after ``deadline`` (``_check_deadline``).
         """
         _require_version(source_version)
         if not isinstance(image_id, str) or not image_id.startswith("ami-"):
@@ -1124,6 +1141,8 @@ class ImageAws:
         response = self._invoke(
             "ec2",
             "create_launch_template_version",
+            deadline=deadline,
+            detail="CreateLaunchTemplateVersion",
             LaunchTemplateName=name,
             SourceVersion=str(source_version),
             LaunchTemplateData={"ImageId": image_id},
@@ -1137,7 +1156,7 @@ class ImageAws:
         return number
 
     # -- source archive storage -------------------------------------------
-    def put_archive(self, bucket, key, chunks, *, max_bytes, part_bytes=ARCHIVE_PART_BYTES, deadline=None, owner=None):
+    def put_archive(self, bucket, key, chunks, *, max_bytes, deadline, part_bytes=ARCHIVE_PART_BYTES, owner=None):
         """Stream ``chunks`` into one multipart upload, hashing the bytes as they go.
 
         Every S3 call of the upload and of its cleanup names ``owner`` as the bucket's owner (see
@@ -1265,7 +1284,7 @@ class ImageAws:
                 clean = False
         return clean
 
-    def list_objects(self, bucket, prefix, *, deadline=None, owner=None):
+    def list_objects(self, bucket, prefix, *, deadline, owner=None):
         items = []
         for response in self._pages(
             "s3",
@@ -1286,7 +1305,7 @@ class ImageAws:
                 items.append(StoredObject(key=key, size=size, last_modified=_timestamp(entry.get("LastModified"))))
         return items
 
-    def delete_object(self, bucket, key, *, owner=None, deadline=None, stop=None):
+    def delete_object(self, bucket, key, *, deadline, owner=None, stop=None):
         """Delete one object, naming ``owner`` as the bucket's owner (see ``_bound_owner``).
 
         A ``deadline`` and a ``stop`` are read once the S3 client is built (``_invoke``, ``_check_deadline``): the
@@ -1303,20 +1322,22 @@ class ImageAws:
             Key=key,
         )
 
-    def credential_expiry(self):
+    def credential_expiry(self, *, deadline):
         """Epoch expiry of this session's credentials, or ``None`` when unknown.
 
         An assumed role is assumed here, when its credentials are first read, so
         this is where the provider refuses it (an expired source key, a trust
         policy that denies the caller). That failure leaves as a ``ProviderRefusal``
-        with the provider's error code and never its message.
+        with the provider's error code and never its message. No lookup starts at
+        or after ``deadline`` (``_check_deadline``), since it can ask STS.
         """
+        self._check_deadline(deadline, "credential lookup")
         if self._expiry is not None:
             return self._expiry() if callable(self._expiry) else self._expiry
         with _sdk_failures():
             return _session_expiry(self._session())
 
-    def check_credential_life(self, expires_seconds):
+    def check_credential_life(self, expires_seconds, *, deadline):
         """Refuse with ``IMAGE_CREDENTIAL_SHORT`` unless the session outlives a URL of ``expires_seconds``.
 
         The signature dies with the credentials, so a URL that is meant to last
@@ -1324,7 +1345,7 @@ class ImageAws:
         expiry is a refusal, not "long enough". Nothing is presigned, so a caller
         can ask before it spends anything on the build the URL is for.
         """
-        expiry = self.credential_expiry()
+        expiry = self.credential_expiry(deadline=deadline)
         if expiry is None:
             raise ProviderRefusal("IMAGE_CREDENTIAL_SHORT", "the credential expiry is unknown")
         remaining = expiry - self._clock()
@@ -1334,15 +1355,15 @@ class ImageAws:
                 f"{max(int(remaining), 0)} seconds of credential life remain, {expires_seconds} are needed",
             )
 
-    def presign_get(self, bucket, key, expires_seconds, *, deadline=None, owner=None):
+    def presign_get(self, bucket, key, expires_seconds, *, deadline, owner=None):
         """Presign a GET for one object, only if the session outlives the URL.
 
-        ``check_credential_life`` decides that. The lookup of the credential can take time, so a ``deadline`` is read
-        after it, as ``_check_deadline`` says. The ``owner`` (see ``_bound_owner``) is signed as the bucket's
-        expected owner: the SDK signs it as the ``x-amz-expected-bucket-owner`` header, so the GET must send
-        that header with that value. The URL is returned and never logged, stored or placed in an error.
+        ``check_credential_life`` decides that. A ``deadline`` is read before the lookup of the credential, which can
+        ask STS, and again right before signing, as ``_check_deadline`` says. The ``owner`` (see ``_bound_owner``) is
+        signed as the bucket's expected owner: the SDK signs it as the ``x-amz-expected-bucket-owner`` header, so the
+        GET must send that header with that value. The URL is returned and never logged, stored or placed in an error.
         """
-        self.check_credential_life(expires_seconds)
+        self.check_credential_life(expires_seconds, deadline=deadline)
         owner = self._bound_owner(owner, deadline=deadline, detail="presign")
         client = self._client("s3")
         self._check_deadline(deadline, "presign")

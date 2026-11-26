@@ -732,8 +732,8 @@ of that refusal and a deadline is tracked in
 [#232](https://github.com/mikomiel/ci-burst/issues/232). Each read, upload part, presign and
 launch call of a stage takes the earlier of the two deadlines, so no call starts after one that
 returned at or after the build deadline. A call starts where the AWS client calls the SDK
-operation: the client, or the pass right before it calls the client, reads the cutoff
-there, and signing or a credential refresh inside the SDK can delay the request after that
+operation: the client reads the cutoff there, and first before it resolves credentials,
+and signing or a credential refresh inside the SDK can delay the request after that
 check. A wrong input is raised, not answered, and
 nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge on the branch or
 basis reads (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)

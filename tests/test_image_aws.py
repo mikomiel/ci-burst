@@ -488,9 +488,25 @@ class Base(unittest.TestCase):
             expires_at=NOW + 2700,
             user_data="#!/bin/bash\necho stub",
             client_token="token-0001",
+            deadline=None,
         )
         values.update(overrides)
         return (aws or self.image_aws()).run_builder(**values)
+
+
+class DeadlineSignatureTests(unittest.TestCase):
+    def test_every_operation_of_the_image_adapter_requires_a_deadline(self):
+        # A caller that forgets the cutoff fails with a TypeError; one with no cutoff passes ``deadline=None``.
+        operations = {
+            name: value for name, value in vars(ImageAws).items() if callable(value) and not name.startswith("_")
+        }
+        self.assertIn("create_image", operations)
+        for name, operation in operations.items():
+            with self.subTest(operation=name):
+                parameter = inspect.signature(operation).parameters.get("deadline")
+                self.assertIsNotNone(parameter)
+                self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+                self.assertIs(parameter.default, inspect.Parameter.empty)
 
 
 class SessionTests(Base):
@@ -544,14 +560,16 @@ class SessionTests(Base):
     def client_calls(self):
         """Every operation that needs a client of the image session, by name."""
         return {
-            "builders": lambda aws: aws.builders(DEPLOYMENT),
-            "instances": lambda aws: aws.instances(["i-0123456789abcdef0"]),
+            "builders": lambda aws: aws.builders(DEPLOYMENT, deadline=None),
+            "instances": lambda aws: aws.instances(["i-0123456789abcdef0"], deadline=None),
             "run_builder": lambda aws: self.builder(aws),
-            "image": lambda aws: aws.image("ami-0123456789abcdef0"),
-            "snapshot": lambda aws: aws.snapshot("snap-0123456789abcdef0"),
-            "deregister_image": lambda aws: aws.deregister_image("ami-0123456789abcdef0"),
-            "put_archive": lambda aws: aws.put_archive(BUCKET, PREFIX + "x.tar.gz", [b"data"], max_bytes=100),
-            "presign_get": lambda aws: aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800),
+            "image": lambda aws: aws.image("ami-0123456789abcdef0", deadline=None),
+            "snapshot": lambda aws: aws.snapshot("snap-0123456789abcdef0", deadline=None),
+            "deregister_image": lambda aws: aws.deregister_image("ami-0123456789abcdef0", deadline=None),
+            "put_archive": lambda aws: aws.put_archive(
+                BUCKET, PREFIX + "x.tar.gz", [b"data"], max_bytes=100, deadline=None
+            ),
+            "presign_get": lambda aws: aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800, deadline=None),
         }
 
     def test_a_failure_to_build_a_client_leaves_as_a_provider_refusal_from_every_operation(self):
@@ -591,7 +609,7 @@ class SessionTests(Base):
         def refusing_session(profile):
             raise refusal
 
-        with_expiry = {**self.client_calls(), "credential_expiry": lambda aws: aws.credential_expiry()}
+        with_expiry = {**self.client_calls(), "credential_expiry": lambda aws: aws.credential_expiry(deadline=None)}
         scenarios = {
             "client build": (lambda profile: RefusingClient(self.calls, self.ec2, self.s3), self.client_calls()),
             "session": (refusing_session, with_expiry),
@@ -630,23 +648,33 @@ class SessionTests(Base):
                 expires_at=NOW + 2700,
                 user_data="stub",
                 client_token="token-0001",
+                deadline=None,
             )
-            aws.builders(DEPLOYMENT)
-            aws.instances([instance_id])
-            aws.console_output([instance_id])
-            aws.create_image(instance_id, "example-warm", deployment=DEPLOYMENT, build_id="build-0001", basis_digest="0" * 64)
-            aws.images(DEPLOYMENT)
-            aws.snapshots(DEPLOYMENT)
-            aws.launch_templates(["example-worker"])
-            aws.template_version("example-worker", 3)
-            aws.create_template_version("example-worker", 3, "ami-0123456789abcdef0", "build-0001", "token-0002")
-            aws.put_archive(BUCKET, PREFIX + "build-0001.tar.gz", [b"data"], max_bytes=100)
-            aws.list_objects(BUCKET, PREFIX)
-            aws.presign_get(BUCKET, PREFIX + "build-0001.tar.gz", 1800)
-            aws.delete_object(BUCKET, PREFIX + "build-0001.tar.gz")
-            aws.deregister_image("ami-0123456789abcdef0")
-            aws.delete_snapshot("snap-0123456789abcdef0")
-            aws.terminate([instance_id])
+            aws.builders(DEPLOYMENT, deadline=None)
+            aws.instances([instance_id], deadline=None)
+            aws.console_output([instance_id], deadline=None)
+            aws.create_image(
+                instance_id,
+                "example-warm",
+                deployment=DEPLOYMENT,
+                build_id="build-0001",
+                basis_digest="0" * 64,
+                deadline=None,
+            )
+            aws.images(DEPLOYMENT, deadline=None)
+            aws.snapshots(DEPLOYMENT, deadline=None)
+            aws.launch_templates(["example-worker"], deadline=None)
+            aws.template_version("example-worker", 3, deadline=None)
+            aws.create_template_version(
+                "example-worker", 3, "ami-0123456789abcdef0", "build-0001", "token-0002", deadline=None
+            )
+            aws.put_archive(BUCKET, PREFIX + "build-0001.tar.gz", [b"data"], max_bytes=100, deadline=None)
+            aws.list_objects(BUCKET, PREFIX, deadline=None)
+            aws.presign_get(BUCKET, PREFIX + "build-0001.tar.gz", 1800, deadline=None)
+            aws.delete_object(BUCKET, PREFIX + "build-0001.tar.gz", deadline=None)
+            aws.deregister_image("ami-0123456789abcdef0", deadline=None)
+            aws.delete_snapshot("snap-0123456789abcdef0", deadline=None)
+            aws.terminate([instance_id], deadline=None)
         self.assertEqual(set(session.services), {"ec2", "s3", "sts"})
 
     def test_the_module_creates_no_iam_client(self):
@@ -1008,7 +1036,7 @@ class BuilderTests(Base):
         self.ec2.add_instance("i-0123456789abcdef1", {IMAGE_BUILD_TAG: "true", DEPLOYMENT_TAG: DEPLOYMENT}, state="terminated")
         self.ec2.add_instance("i-0123456789abcdef2", {IMAGE_BUILD_TAG: "true", DEPLOYMENT_TAG: "other"}, state="running")
         self.ec2.add_instance("i-0123456789abcdef3", {MANAGED_TAG: "true", DEPLOYMENT_TAG: DEPLOYMENT}, state="running")
-        found = self.image_aws().builders(DEPLOYMENT)
+        found = self.image_aws().builders(DEPLOYMENT, deadline=None)
         self.assertEqual([item.instance_id for item in found], [live])
         (request,) = self.requests("describe_instances")
         states = [entry for entry in request["Filters"] if entry["Name"] == "instance-state-name"][0]["Values"]
@@ -1017,7 +1045,7 @@ class BuilderTests(Base):
     def test_builder_listing_refuses_a_truncated_inventory(self):
         self.ec2.pages["describe_instances"] = True
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().builders(DEPLOYMENT)
+            self.image_aws().builders(DEPLOYMENT, deadline=None)
         self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
         self.assertEqual(len(self.requests("describe_instances")), aws_module.MAX_INVENTORY_PAGES)
 
@@ -1030,9 +1058,9 @@ class BuilderTests(Base):
         instance_id = self.builder()
         self.ec2.consoles[instance_id] = "WARM_SOURCE_SHA256 " + "0" * 64 + "\nIMAGE_READY\n"
         aws = self.image_aws()
-        self.assertEqual([item.instance_id for item in aws.instances([instance_id])], [instance_id])
-        self.assertIn("IMAGE_READY", aws.console_output([instance_id])[instance_id])
-        aws.terminate([instance_id])
+        self.assertEqual([item.instance_id for item in aws.instances([instance_id], deadline=None)], [instance_id])
+        self.assertIn("IMAGE_READY", aws.console_output([instance_id], deadline=None)[instance_id])
+        aws.terminate([instance_id], deadline=None)
         self.assertEqual(self.requests("terminate_instances"), [{"InstanceIds": [instance_id]}])
 
 
@@ -1045,6 +1073,7 @@ class ImageAndTemplateTests(Base):
             build_id="build-0001",
             basis_digest="a" * 64,
             extra_tags={"ci-burst:source-sha": "b" * 40},
+            deadline=None,
         )
         self.assertEqual(image_id, "ami-0123456789abcdef0")
         (request,) = self.requests("create_image")
@@ -1074,6 +1103,7 @@ class ImageAndTemplateTests(Base):
                         build_id="build-0001",
                         basis_digest="a" * 64,
                         extra_tags={key: "x"},
+                        deadline=None,
                     )
         self.assertEqual(self.requests("create_image"), [])
 
@@ -1081,7 +1111,8 @@ class ImageAndTemplateTests(Base):
         self.ec2.create_image = lambda **kwargs: {}
         with self.assertRaises(ProviderRefusal) as raised:
             self.image_aws().create_image(
-                "i-0123456789abcdef0", "example-warm", deployment=DEPLOYMENT, build_id="b", basis_digest="a" * 64
+                "i-0123456789abcdef0", "example-warm", deployment=DEPLOYMENT, build_id="b", basis_digest="a" * 64,
+                deadline=None,
             )
         self.assertTrue(raised.exception.uncertain)
 
@@ -1098,33 +1129,33 @@ class ImageAndTemplateTests(Base):
         self.ec2.images_store.append({"ImageId": "ami-foreign", "State": "available", "Tags": []})
         self.ec2.snapshots_store.append({"SnapshotId": "snap-0123456789abcdef0", "State": "completed", "Tags": tags})
         aws = self.image_aws()
-        (image,) = aws.images(DEPLOYMENT)
+        (image,) = aws.images(DEPLOYMENT, deadline=None)
         self.assertEqual(image.snapshot_ids, ("snap-0123456789abcdef0",))
         self.assertEqual(image.tags[BUILD_ID_TAG], "build-0001")
-        (snapshot,) = aws.snapshots(DEPLOYMENT)
+        (snapshot,) = aws.snapshots(DEPLOYMENT, deadline=None)
         self.assertEqual(snapshot.snapshot_id, "snap-0123456789abcdef0")
-        self.assertEqual(aws.image("ami-0123456789abcdef0").state, "available")
-        self.assertIsNone(aws.image("ami-0000000000000000f"))
-        self.assertEqual(aws.snapshot("snap-0123456789abcdef0").state, "completed")
-        self.assertIsNone(aws.snapshot("snap-0000000000000000f"))
+        self.assertEqual(aws.image("ami-0123456789abcdef0", deadline=None).state, "available")
+        self.assertIsNone(aws.image("ami-0000000000000000f", deadline=None))
+        self.assertEqual(aws.snapshot("snap-0123456789abcdef0", deadline=None).state, "completed")
+        self.assertIsNone(aws.snapshot("snap-0000000000000000f", deadline=None))
 
     def test_a_truncated_or_malformed_listing_is_refused_not_returned_partially(self):
         self.ec2.pages["describe_images"] = True
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().images(DEPLOYMENT)
+            self.image_aws().images(DEPLOYMENT, deadline=None)
         self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
         self.ec2.pages.clear()
         self.ec2.images_store.append(
             {"State": "available", "Tags": tag_list({IMAGE_BUILD_TAG: "true", DEPLOYMENT_TAG: DEPLOYMENT})}
         )
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().images(DEPLOYMENT)
+            self.image_aws().images(DEPLOYMENT, deadline=None)
         self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
 
     def test_an_unreadable_image_is_uncertain_and_not_absence(self):
         self.ec2.errors["describe_images"] = ProviderError("RequestLimitExceeded")
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().image("ami-0123456789abcdef0")
+            self.image_aws().image("ami-0123456789abcdef0", deadline=None)
         self.assertTrue(raised.exception.uncertain)
 
     def test_an_image_read_stops_at_the_deadline_before_any_request(self):
@@ -1138,7 +1169,7 @@ class ImageAndTemplateTests(Base):
         aws = self.image_aws()
         self.assertEqual(aws.image("ami-0123456789abcdef0", deadline=NOW + 1).state, "available")
         self.assertIsNone(aws.image("ami-0000000000000000f", deadline=NOW + 1))
-        self.assertEqual(aws.image("ami-0123456789abcdef0").state, "available")
+        self.assertEqual(aws.image("ami-0123456789abcdef0", deadline=None).state, "available")
         self.assertEqual(len(self.requests("describe_images")), 3)
 
     def test_an_unreadable_image_is_still_the_providers_refusal_when_a_deadline_is_given(self):
@@ -1149,19 +1180,20 @@ class ImageAndTemplateTests(Base):
 
     def test_deregister_and_snapshot_delete_name_exactly_one_resource(self):
         aws = self.image_aws()
-        aws.deregister_image("ami-0123456789abcdef0")
-        aws.delete_snapshot("snap-0123456789abcdef0")
+        aws.deregister_image("ami-0123456789abcdef0", deadline=None)
+        aws.delete_snapshot("snap-0123456789abcdef0", deadline=None)
         self.assertEqual(self.requests("deregister_image"), [{"ImageId": "ami-0123456789abcdef0"}])
         self.assertEqual(self.requests("delete_snapshot"), [{"SnapshotId": "snap-0123456789abcdef0"}])
 
     def test_a_failed_deregister_raises_so_the_snapshot_is_not_deleted_by_the_caller(self):
         self.ec2.errors["deregister_image"] = ProviderError("UnauthorizedOperation")
         with self.assertRaises(ProviderRefusal):
-            self.image_aws().deregister_image("ami-0123456789abcdef0")
+            self.image_aws().deregister_image("ami-0123456789abcdef0", deadline=None)
 
     def test_a_new_version_derives_from_the_numeric_pin_and_changes_only_the_image(self):
         number = self.image_aws().create_template_version(
-            "example-worker", 3, "ami-0123456789abcdef0", "build-0001 aaaaaaaaaaaa", "token-0002"
+            "example-worker", 3, "ami-0123456789abcdef0", "build-0001 aaaaaaaaaaaa", "token-0002",
+            deadline=None,
         )
         self.assertEqual(number, 5)
         (request,) = self.requests("create_launch_template_version")
@@ -1174,11 +1206,13 @@ class ImageAndTemplateTests(Base):
         for source in ("$Latest", "$Default", 0, None):
             with self.subTest(source=source):
                 with self.assertRaises(ValueError):
-                    self.image_aws().create_template_version("example-worker", source, "ami-0123456789abcdef0", "d", "t")
+                    self.image_aws().create_template_version(
+                        "example-worker", source, "ami-0123456789abcdef0", "d", "t", deadline=None
+                    )
         for image in ("resolve:ssm:/path", "", None):
             with self.subTest(image=image):
                 with self.assertRaises(ValueError):
-                    self.image_aws().create_template_version("example-worker", 3, image, "d", "t")
+                    self.image_aws().create_template_version("example-worker", 3, image, "d", "t", deadline=None)
         self.assertEqual(self.requests("create_launch_template_version"), [])
 
     def test_template_version_read_back_returns_the_whole_data_without_exposing_it(self):
@@ -1189,7 +1223,7 @@ class ImageAndTemplateTests(Base):
             "VersionDescription": "build-0001",
             "LaunchTemplateData": data,
         }
-        version = self.image_aws().template_version("example-worker", 4)
+        version = self.image_aws().template_version("example-worker", 4, deadline=None)
         self.assertEqual(version.data, data)
         self.assertIsNot(version.data, data)
         self.assertEqual(version.as_dict()["image_id"], "ami-0123456789abcdef0")
@@ -1199,11 +1233,11 @@ class ImageAndTemplateTests(Base):
 
     def test_a_missing_version_is_refused_and_a_dataless_entry_is_incomplete(self):
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().template_version("example-worker", 9)
+            self.image_aws().template_version("example-worker", 9, deadline=None)
         self.assertEqual(raised.exception.reason, "TEMPLATE_NOT_FOUND")
         self.ec2.versions_store[("example-worker", 9)] = {"VersionNumber": 9}
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().template_version("example-worker", 9)
+            self.image_aws().template_version("example-worker", 9, deadline=None)
         self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
 
     def test_launch_templates_are_described_and_an_unknown_name_is_empty(self):
@@ -1216,9 +1250,9 @@ class ImageAndTemplateTests(Base):
             }
         )
         aws = self.image_aws()
-        (info,) = aws.launch_templates(["example-worker"])
+        (info,) = aws.launch_templates(["example-worker"], deadline=None)
         self.assertEqual((info.default_version, info.latest_version), (1, 4))
-        self.assertEqual(aws.launch_templates(["example-missing"]), [])
+        self.assertEqual(aws.launch_templates(["example-missing"], deadline=None), [])
 
     def test_a_missing_name_among_several_does_not_hide_the_others(self):
         self.ec2.templates_store.append(
@@ -1229,7 +1263,7 @@ class ImageAndTemplateTests(Base):
                 "LatestVersionNumber": 4,
             }
         )
-        found = self.image_aws().launch_templates(["example-missing", "example-worker"])
+        found = self.image_aws().launch_templates(["example-missing", "example-worker"], deadline=None)
         self.assertEqual([info.name for info in found], ["example-worker"])
         self.assertEqual(
             [request["LaunchTemplateNames"] for request in self.requests("describe_launch_templates")],
@@ -1247,12 +1281,12 @@ class ImageAndTemplateTests(Base):
         self.add_group("sg-00000000000000002", "example-open", [rule, rule])
         self.add_group("sg-00000000000000003", "example-other")
         aws = self.image_aws()
-        found = aws.security_groups(group_ids=["sg-00000000000000002", "sg-00000000000000001"])
+        found = aws.security_groups(group_ids=["sg-00000000000000002", "sg-00000000000000001"], deadline=None)
         self.assertEqual(
             [(item.group_id, item.name, item.ingress_rules) for item in found],
             [("sg-00000000000000001", "example-closed", 0), ("sg-00000000000000002", "example-open", 2)],
         )
-        found = aws.security_groups(group_names=["example-open", "example-missing"])
+        found = aws.security_groups(group_names=["example-open", "example-missing"], deadline=None)
         self.assertEqual([(item.name, item.ingress_rules) for item in found], [("example-open", 2)])
         self.assertEqual(
             self.requests("describe_security_groups"),
@@ -1269,18 +1303,18 @@ class ImageAndTemplateTests(Base):
     def test_a_security_group_entry_carries_no_rule_detail(self):
         rule = {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "UserIdGroupPairs": [{"GroupId": "sg-hidden-marker"}]}
         self.add_group("sg-00000000000000001", "example-open", [rule])
-        (item,) = self.image_aws().security_groups(group_ids=["sg-00000000000000001"])
+        (item,) = self.image_aws().security_groups(group_ids=["sg-00000000000000001"], deadline=None)
         for text in (repr(item), str(item.as_dict())):
             self.assertNotIn("sg-hidden-marker", text)
 
     def test_reading_no_group_makes_no_call(self):
-        self.assertEqual(self.image_aws().security_groups(), [])
+        self.assertEqual(self.image_aws().security_groups(deadline=None), [])
         self.assertEqual(self.calls, [])
 
     def test_a_group_id_the_provider_does_not_know_fails_the_read_and_is_not_an_empty_group(self):
         self.add_group("sg-00000000000000001", "example-closed")
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().security_groups(group_ids=["sg-00000000000000001", "sg-0000000000000000f"])
+            self.image_aws().security_groups(group_ids=["sg-00000000000000001", "sg-0000000000000000f"], deadline=None)
         self.assertTrue(raised.exception.uncertain)
 
     def test_an_unreadable_security_group_is_refused_without_the_provider_message(self):
@@ -1288,7 +1322,7 @@ class ImageAndTemplateTests(Base):
         for arguments in ({"group_ids": ["sg-00000000000000001"]}, {"group_names": ["example-closed"]}):
             with self.subTest(arguments=sorted(arguments)):
                 with self.assertRaises(ProviderRefusal) as raised:
-                    self.image_aws().security_groups(**arguments)
+                    self.image_aws().security_groups(deadline=None, **arguments)
                 self.assertTrue(raised.exception.uncertain)
                 for sentinel in SENTINELS:
                     self.assertNotIn(sentinel, raised.exception.detail)
@@ -1306,7 +1340,7 @@ class ImageAndTemplateTests(Base):
         self.add_group("sg-00000000000000001", "example-closed")
         self.ec2.pages["describe_security_groups"] = True
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().security_groups(group_ids=["sg-00000000000000001"])
+            self.image_aws().security_groups(group_ids=["sg-00000000000000001"], deadline=None)
         self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
         self.ec2.pages.clear()
         for broken in (
@@ -1319,7 +1353,7 @@ class ImageAndTemplateTests(Base):
                 self.ec2.security_groups_store[:] = [broken]
                 arguments = {"group_ids": [broken["GroupId"]]} if "GroupId" in broken else {"group_names": ["example-closed"]}
                 with self.assertRaises(ProviderRefusal) as raised:
-                    self.image_aws().security_groups(**arguments)
+                    self.image_aws().security_groups(deadline=None, **arguments)
                 self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
 
     def test_a_version_read_that_returns_another_version_is_refused(self):
@@ -1329,7 +1363,7 @@ class ImageAndTemplateTests(Base):
             "LaunchTemplateData": {"ImageId": "ami-0123456789abcdef0"},
         }
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().template_version("example-worker", 4)
+            self.image_aws().template_version("example-worker", 4, deadline=None)
         self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
 
 
@@ -1337,7 +1371,7 @@ class ArchiveTests(Base):
     KEY = PREFIX + "build-0001.tar.gz"
 
     def put(self, chunks, **overrides):
-        values = dict(max_bytes=100, part_bytes=10)
+        values = dict(max_bytes=100, part_bytes=10, deadline=None)
         values.update(overrides)
         return self.image_aws().put_archive(BUCKET, self.KEY, chunks, **values)
 
@@ -1641,23 +1675,23 @@ class ArchiveTests(Base):
             {"Contents": [{"Key": PREFIX + "a", "Size": 1, "LastModified": datetime(2026, 11, 1, tzinfo=timezone.utc)}], "NextContinuationToken": "1"},
             {"Contents": [{"Key": PREFIX + "b", "Size": 2}]},
         ]
-        found = self.image_aws().list_objects(BUCKET, PREFIX)
+        found = self.image_aws().list_objects(BUCKET, PREFIX, deadline=None)
         self.assertEqual([item.key for item in found], [PREFIX + "a", PREFIX + "b"])
         self.assertEqual(found[0].last_modified, datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp())
         self.assertIsNone(found[1].last_modified)
         self.s3.pages = [{"Contents": [], "NextContinuationToken": "0"}]
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().list_objects(BUCKET, PREFIX)
+            self.image_aws().list_objects(BUCKET, PREFIX, deadline=None)
         self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
 
     def test_an_object_entry_without_a_key_is_refused(self):
         self.s3.pages = [{"Contents": [{"Size": 1}]}]
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().list_objects(BUCKET, PREFIX)
+            self.image_aws().list_objects(BUCKET, PREFIX, deadline=None)
         self.assertEqual(raised.exception.reason, "AWS_INVENTORY_INCOMPLETE")
 
     def test_delete_names_one_key(self):
-        self.image_aws().delete_object(BUCKET, self.KEY)
+        self.image_aws().delete_object(BUCKET, self.KEY, deadline=None)
         self.assertEqual(
             self.requests("delete_object"), [{"Bucket": BUCKET, "Key": self.KEY, "ExpectedBucketOwner": ACCOUNT}]
         )
@@ -1692,14 +1726,16 @@ class StagingOwnerTests(Base):
                 self.assertEqual(arguments["ExpectedBucketOwner"], ACCOUNT)
 
     def test_an_upload_names_the_account_on_every_call(self):
-        self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10)
+        self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10, deadline=None)
         self.assert_every_call_names_the_account(
             ["create_multipart_upload", "upload_part", "complete_multipart_upload"]
         )
 
     def test_the_cleanup_of_an_upload_names_the_account_on_the_abort_and_on_the_delete(self):
         with self.assertRaises(ProviderRefusal):
-            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 60, b"y" * 60], max_bytes=100, part_bytes=10)
+            self.image_aws().put_archive(
+                BUCKET, self.KEY, [b"x" * 60, b"y" * 60], max_bytes=100, part_bytes=10, deadline=None
+            )
         self.assert_every_call_names_the_account(
             ["create_multipart_upload", "upload_part", "abort_multipart_upload", "delete_object"]
         )
@@ -1707,8 +1743,8 @@ class StagingOwnerTests(Base):
     def test_a_listing_and_a_delete_name_the_account(self):
         self.s3.pages = [{"Contents": []}]
         aws = self.image_aws()
-        aws.list_objects(BUCKET, PREFIX)
-        aws.delete_object(BUCKET, self.KEY)
+        aws.list_objects(BUCKET, PREFIX, deadline=None)
+        aws.delete_object(BUCKET, self.KEY, deadline=None)
         self.assert_every_call_names_the_account(["list_objects_v2", "delete_object"])
 
     def test_the_account_is_asked_of_the_identity_once_and_every_call_carries_it(self):
@@ -1716,9 +1752,9 @@ class StagingOwnerTests(Base):
         with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
             aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clock=self.clock)
             self.s3.pages = [{"Contents": []}]
-            aws.list_objects(BUCKET, PREFIX)
-            aws.delete_object(BUCKET, self.KEY)
-            aws.put_archive(BUCKET, self.KEY, [b"x" * 5], max_bytes=100, part_bytes=10)
+            aws.list_objects(BUCKET, PREFIX, deadline=None)
+            aws.delete_object(BUCKET, self.KEY, deadline=None)
+            aws.put_archive(BUCKET, self.KEY, [b"x" * 5], max_bytes=100, part_bytes=10, deadline=None)
         self.assertEqual(self.names().count("get_caller_identity"), 1)
         self.assertLess(self.names().index("get_caller_identity"), self.names().index("list_objects_v2"))
         self.assert_every_call_names_the_account(
@@ -1731,9 +1767,9 @@ class StagingOwnerTests(Base):
         malformed = FakeSts(self.calls, account="not-an-account")
         absent = FakeSts(self.calls, account=None)
         operations = {
-            "put_archive": lambda aws: aws.put_archive(BUCKET, self.KEY, [b"x"], max_bytes=100),
-            "list_objects": lambda aws: aws.list_objects(BUCKET, PREFIX),
-            "delete_object": lambda aws: aws.delete_object(BUCKET, self.KEY),
+            "put_archive": lambda aws: aws.put_archive(BUCKET, self.KEY, [b"x"], max_bytes=100, deadline=None),
+            "list_objects": lambda aws: aws.list_objects(BUCKET, PREFIX, deadline=None),
+            "delete_object": lambda aws: aws.delete_object(BUCKET, self.KEY, deadline=None),
         }
         for label, sts in (("failing", failing), ("malformed", malformed), ("absent", absent)):
             for name, operation in operations.items():
@@ -1748,7 +1784,7 @@ class StagingOwnerTests(Base):
     def test_a_bucket_of_another_account_refuses_an_upload_before_anything_is_sent(self):
         self.s3.errors["create_multipart_upload"] = ProviderError("AccessDenied")
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10)
+            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10, deadline=None)
         refusal = raised.exception
         self.assertEqual((refusal.reason, refusal.detail, refusal.uncertain), ("IMAGE_STAGING_BUCKET_DENIED", "AccessDenied", False))
         self.assertNotIn(LEAKY_MESSAGE, str(refusal))
@@ -1759,7 +1795,7 @@ class StagingOwnerTests(Base):
     def test_a_bucket_that_changes_owner_between_parts_is_the_same_refusal_and_is_cleaned_up(self):
         self.s3.errors["upload_part"] = ProviderError("AccessDenied")
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10)
+            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10, deadline=None)
         self.assertEqual(raised.exception.reason, "IMAGE_STAGING_BUCKET_DENIED")
         self.assertNotIn("complete_multipart_upload", self.names())
         self.assert_every_call_names_the_account(
@@ -1769,11 +1805,11 @@ class StagingOwnerTests(Base):
     def test_a_delete_and_a_listing_that_the_owner_check_refuses_are_refusals_with_the_same_reason(self):
         self.s3.errors["delete_object"] = ProviderError("AccessDenied")
         with self.assertRaises(ProviderRefusal) as deleted:
-            self.image_aws().delete_object(BUCKET, self.KEY)
+            self.image_aws().delete_object(BUCKET, self.KEY, deadline=None)
         self.assertEqual((deleted.exception.reason, deleted.exception.uncertain), ("IMAGE_STAGING_BUCKET_DENIED", False))
         self.s3.errors["list_objects_v2"] = ProviderError("AccessDenied")
         with self.assertRaises(ProviderRefusal) as listed:
-            self.image_aws().list_objects(BUCKET, PREFIX)
+            self.image_aws().list_objects(BUCKET, PREFIX, deadline=None)
         self.assertEqual((listed.exception.reason, listed.exception.uncertain), ("IMAGE_STAGING_BUCKET_DENIED", True))
         # Each was asked once, with the owner.
         self.assertEqual([name for name, _ in self.s3_requests()], ["delete_object", "list_objects_v2"])
@@ -1782,7 +1818,7 @@ class StagingOwnerTests(Base):
     def test_a_bucket_that_does_not_exist_refuses_an_upload_with_its_own_reason_before_anything_is_sent(self):
         self.s3.errors["create_multipart_upload"] = ProviderError("NoSuchBucket")
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10)
+            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10, deadline=None)
         refusal = raised.exception
         self.assertEqual(
             (refusal.reason, refusal.detail, refusal.uncertain), ("IMAGE_STAGING_BUCKET_MISSING", "NoSuchBucket", False)
@@ -1796,7 +1832,7 @@ class StagingOwnerTests(Base):
     def test_a_bucket_that_goes_away_between_parts_is_the_same_refusal_and_is_cleaned_up(self):
         self.s3.errors["upload_part"] = ProviderError("NoSuchBucket")
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10)
+            self.image_aws().put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10, deadline=None)
         self.assertEqual(raised.exception.reason, "IMAGE_STAGING_BUCKET_MISSING")
         self.assertNotIn("complete_multipart_upload", self.names())
         self.assert_every_call_names_the_account(
@@ -1807,21 +1843,23 @@ class StagingOwnerTests(Base):
         # Only the upload maps it: a delete of an owed archive and the stray listing stay as they were.
         self.s3.errors["delete_object"] = ProviderError("NoSuchBucket")
         with self.assertRaises(ProviderRefusal) as deleted:
-            self.image_aws().delete_object(BUCKET, self.KEY)
+            self.image_aws().delete_object(BUCKET, self.KEY, deadline=None)
         self.assertEqual((deleted.exception.reason, deleted.exception.uncertain), ("AWS_UNCERTAIN", True))
         self.s3.errors["list_objects_v2"] = ProviderError("NoSuchBucket")
         with self.assertRaises(ProviderRefusal) as listed:
-            self.image_aws().list_objects(BUCKET, PREFIX)
+            self.image_aws().list_objects(BUCKET, PREFIX, deadline=None)
         self.assertEqual((listed.exception.reason, listed.exception.uncertain), ("AWS_UNCERTAIN", True))
 
     def test_an_owner_that_a_caller_gives_is_named_on_every_call_in_place_of_the_account_of_the_identity(self):
         aws = self.image_aws()
-        aws.put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10, owner=self.OTHER)
+        aws.put_archive(BUCKET, self.KEY, [b"x" * 25], max_bytes=100, part_bytes=10, owner=self.OTHER, deadline=None)
         with self.assertRaises(ProviderRefusal):
-            aws.put_archive(BUCKET, self.KEY, [b"x" * 60, b"y" * 60], max_bytes=100, part_bytes=10, owner=self.OTHER)
-        aws.delete_object(BUCKET, self.KEY, owner=self.OTHER)
+            aws.put_archive(
+                BUCKET, self.KEY, [b"x" * 60, b"y" * 60], max_bytes=100, part_bytes=10, owner=self.OTHER, deadline=None
+            )
+        aws.delete_object(BUCKET, self.KEY, owner=self.OTHER, deadline=None)
         self.s3.pages = [{"Contents": []}]
-        aws.list_objects(BUCKET, PREFIX, owner=self.OTHER)
+        aws.list_objects(BUCKET, PREFIX, owner=self.OTHER, deadline=None)
         calls = self.s3_requests()
         self.assertTrue(calls)
         for name, arguments in calls:
@@ -1833,15 +1871,15 @@ class StagingOwnerTests(Base):
         for owner in ("", "not-an-account", "12345", 123456789012):
             with self.subTest(owner=owner):
                 with self.assertRaises(ProviderRefusal):
-                    aws.delete_object(BUCKET, self.KEY, owner=owner)
+                    aws.delete_object(BUCKET, self.KEY, owner=owner, deadline=None)
                 with self.assertRaises(ProviderRefusal):
-                    aws.put_archive(BUCKET, self.KEY, [b"x"], max_bytes=100, owner=owner)
+                    aws.put_archive(BUCKET, self.KEY, [b"x"], max_bytes=100, owner=owner, deadline=None)
         self.assertEqual(self.s3_requests(), [])
 
     def test_another_s3_error_keeps_its_own_reason(self):
         self.s3.errors["delete_object"] = ProviderError("SlowDown")
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws().delete_object(BUCKET, self.KEY)
+            self.image_aws().delete_object(BUCKET, self.KEY, deadline=None)
         self.assertNotEqual(raised.exception.reason, "IMAGE_STAGING_BUCKET_DENIED")
 
 
@@ -1959,7 +1997,7 @@ class StagingDeadlineTests(Base):
     def test_a_call_with_no_deadline_is_not_bounded_by_the_clock(self):
         self.s3.pages = [{"Contents": []}]
         aws = self.uncached(10_000)
-        aws.list_objects(BUCKET, PREFIX)
+        aws.list_objects(BUCKET, PREFIX, deadline=None)
         self.assertEqual(self.names(), ["get_caller_identity", "list_objects_v2"])
 
 
@@ -1994,7 +2032,7 @@ class DeleteDeadlineTests(Base):
     def delete(self, aws, **keywords):
         # The build of a client needs the SDK's configuration type, which this suite does not install.
         with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
-            aws.delete_object(BUCKET, self.KEY, owner=ACCOUNT, **keywords)
+            aws.delete_object(BUCKET, self.KEY, owner=ACCOUNT, **{"deadline": None, **keywords})
 
     def test_a_delete_whose_client_build_ends_at_or_after_the_deadline_is_not_sent(self):
         for seconds in (self.LEFT, 30):
@@ -2076,7 +2114,7 @@ class PresignTests(Base):
     KEY = PREFIX + "build-0001.tar.gz"
 
     def test_presign_signs_a_get_for_the_requested_window(self):
-        url = self.image_aws(expiry=NOW + 3600).presign_get(BUCKET, self.KEY, 1800)
+        url = self.image_aws(expiry=NOW + 3600).presign_get(BUCKET, self.KEY, 1800, deadline=None)
         self.assertEqual(url, SENTINEL_URL)
         self.assertEqual(
             self.requests("generate_presigned_url"),
@@ -2090,23 +2128,23 @@ class PresignTests(Base):
         )
 
     def test_presign_signs_the_recorded_owner_of_the_bucket(self):
-        self.image_aws().presign_get(BUCKET, self.KEY, 1800, owner="210987654321")
+        self.image_aws().presign_get(BUCKET, self.KEY, 1800, owner="210987654321", deadline=None)
         (request,) = self.requests("generate_presigned_url")
         self.assertEqual(request["Params"], {"Bucket": BUCKET, "Key": self.KEY, "ExpectedBucketOwner": "210987654321"})
 
     def test_presign_refuses_when_the_session_has_less_life_than_the_window(self):
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws(expiry=NOW + 1799).presign_get(BUCKET, self.KEY, 1800)
+            self.image_aws(expiry=NOW + 1799).presign_get(BUCKET, self.KEY, 1800, deadline=None)
         self.assertEqual(raised.exception.reason, "IMAGE_CREDENTIAL_SHORT")
         self.assertFalse(raised.exception.uncertain)
         self.assertEqual(self.requests("generate_presigned_url"), [])
 
     def test_the_boundary_is_inclusive_and_the_clock_is_the_injected_one(self):
         aws = self.image_aws(expiry=NOW + 1800)
-        self.assertEqual(aws.presign_get(BUCKET, self.KEY, 1800), SENTINEL_URL)
+        self.assertEqual(aws.presign_get(BUCKET, self.KEY, 1800, deadline=None), SENTINEL_URL)
         self.clock.advance(1)
         with self.assertRaises(ProviderRefusal) as raised:
-            aws.presign_get(BUCKET, self.KEY, 1800)
+            aws.presign_get(BUCKET, self.KEY, 1800, deadline=None)
         self.assertEqual(raised.exception.reason, "IMAGE_CREDENTIAL_SHORT")
 
     def test_a_lookup_of_the_credential_that_ends_at_the_deadline_signs_no_url(self):
@@ -2130,19 +2168,31 @@ class PresignTests(Base):
 
     def test_an_expired_session_reports_no_negative_life(self):
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws(expiry=NOW - 10).presign_get(BUCKET, self.KEY, 300)
+            self.image_aws(expiry=NOW - 10).presign_get(BUCKET, self.KEY, 300, deadline=None)
         self.assertIn("0 seconds", raised.exception.detail)
 
     def test_an_unknown_expiry_is_a_refusal_not_long_enough(self):
         session = FakeSession(self.calls, self.ec2, self.s3, credentials=FakeCredentials(None))
         aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock)
         with self.assertRaises(ProviderRefusal) as raised:
-            aws.presign_get(BUCKET, self.KEY, 300)
+            aws.presign_get(BUCKET, self.KEY, 300, deadline=None)
         self.assertEqual(raised.exception.reason, "IMAGE_CREDENTIAL_SHORT")
         session.credentials = None
         aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock)
         with self.assertRaises(ProviderRefusal):
-            aws.presign_get(BUCKET, self.KEY, 300)
+            aws.presign_get(BUCKET, self.KEY, 300, deadline=None)
+        self.assertEqual(self.requests("generate_presigned_url"), [])
+
+    def test_a_passed_cutoff_resolves_no_credentials(self):
+        # The resolution of an assumed role's credentials can ask STS: a presign at or after its cutoff starts none.
+        credentials = FakeCredentials(datetime.fromtimestamp(NOW + 3600, timezone.utc))
+        session = FakeSession(self.calls, self.ec2, self.s3, credentials=credentials)
+        aws = ImageAws(
+            REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock
+        )
+        with self.assertRaises(DeadlineRefusal):
+            aws.presign_get(BUCKET, self.KEY, 1800, deadline=NOW, owner=ACCOUNT)
+        self.assertEqual(credentials.resolved, 0)
         self.assertEqual(self.requests("generate_presigned_url"), [])
 
     def test_session_credentials_are_resolved_before_their_expiry_is_read(self):
@@ -2150,28 +2200,28 @@ class PresignTests(Base):
         credentials = FakeCredentials(expiry)
         session = FakeSession(self.calls, self.ec2, self.s3, credentials=credentials)
         aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock)
-        self.assertEqual(aws.presign_get(BUCKET, self.KEY, 1800, owner=ACCOUNT), SENTINEL_URL)
+        self.assertEqual(aws.presign_get(BUCKET, self.KEY, 1800, owner=ACCOUNT, deadline=None), SENTINEL_URL)
         self.assertEqual(credentials.resolved, 1)
         short = FakeCredentials(datetime.fromtimestamp(NOW + 100, timezone.utc))
         session = FakeSession(self.calls, self.ec2, self.s3, credentials=short)
         aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock)
         with self.assertRaises(ProviderRefusal) as raised:
-            aws.presign_get(BUCKET, self.KEY, 1800)
+            aws.presign_get(BUCKET, self.KEY, 1800, deadline=None)
         self.assertEqual(raised.exception.reason, "IMAGE_CREDENTIAL_SHORT")
 
     def test_expiry_may_be_a_callable(self):
         aws = self.image_aws(expiry=lambda: NOW + 3600)
-        self.assertEqual(aws.presign_get(BUCKET, self.KEY, 1800), SENTINEL_URL)
+        self.assertEqual(aws.presign_get(BUCKET, self.KEY, 1800, deadline=None), SENTINEL_URL)
 
     def test_the_credential_check_alone_presigns_nothing(self):
         aws = self.image_aws(expiry=NOW + 1800)
-        self.assertIsNone(aws.check_credential_life(1800))
+        self.assertIsNone(aws.check_credential_life(1800, deadline=None))
         self.assertEqual(self.requests("generate_presigned_url"), [])
         self.assertEqual(self.names(), [])
 
     def test_the_credential_check_refuses_a_session_that_is_too_short_with_the_code_of_presign(self):
         with self.assertRaises(ProviderRefusal) as raised:
-            self.image_aws(expiry=NOW + 1799).check_credential_life(1800)
+            self.image_aws(expiry=NOW + 1799).check_credential_life(1800, deadline=None)
         self.assertEqual((raised.exception.reason, raised.exception.uncertain), ("IMAGE_CREDENTIAL_SHORT", False))
         self.assertIn("1799 seconds", raised.exception.detail)
         self.assertEqual(self.requests("generate_presigned_url"), [])
@@ -2180,7 +2230,7 @@ class PresignTests(Base):
         session = FakeSession(self.calls, self.ec2, self.s3, credentials=FakeCredentials(None))
         aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock)
         with self.assertRaises(ProviderRefusal) as raised:
-            aws.check_credential_life(300)
+            aws.check_credential_life(300, deadline=None)
         self.assertEqual(raised.exception.reason, "IMAGE_CREDENTIAL_SHORT")
 
     def test_a_refusal_of_the_session_passes_the_credential_check_unchanged(self):
@@ -2192,7 +2242,7 @@ class PresignTests(Base):
         with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
             aws = ImageAws(REGION, PROFILE, session_factory=refusing_session, clock=self.clock)
             with self.assertRaises(ProviderRefusal) as raised:
-                aws.check_credential_life(1800)
+                aws.check_credential_life(1800, deadline=None)
         self.assertIs(raised.exception, refusal)
 
     def test_a_credential_resolution_that_fails_is_a_provider_refusal_with_a_stable_reason(self):
@@ -2221,8 +2271,8 @@ class PresignTests(Base):
             for label, (error, detail) in failures.items():
                 aws, credentials = adapter(error)
                 calls = {
-                    "credential_expiry": aws.credential_expiry,
-                    "presign_get": lambda aws=aws: aws.presign_get(BUCKET, self.KEY, 1800),
+                    "credential_expiry": lambda aws=aws: aws.credential_expiry(deadline=None),
+                    "presign_get": lambda aws=aws: aws.presign_get(BUCKET, self.KEY, 1800, deadline=None),
                 }
                 for name, call in calls.items():
                     with self.subTest(label=label, call=name):
@@ -2310,6 +2360,7 @@ class NoSecretTests(Base):
             expires_at=NOW + 2700,
             user_data=SENTINEL_USER_DATA,
             client_token="token-0001",
+            deadline=None,
         )
 
     def test_a_provider_error_keeps_only_its_code_in_every_rendering(self):
@@ -2326,10 +2377,15 @@ class NoSecretTests(Base):
                 calls = {
                     "run_instances": lambda: self.launch(aws),
                     "create_image": lambda: aws.create_image(
-                        "i-0123456789abcdef0", "n", deployment=DEPLOYMENT, build_id="b", basis_digest="a" * 64
+                        "i-0123456789abcdef0",
+                        "n",
+                        deployment=DEPLOYMENT,
+                        build_id="b",
+                        basis_digest="a" * 64,
+                        deadline=None,
                     ),
-                    "describe_instances": lambda: aws.builders(DEPLOYMENT),
-                    "deregister_image": lambda: aws.deregister_image("ami-0123456789abcdef0"),
+                    "describe_instances": lambda: aws.builders(DEPLOYMENT, deadline=None),
+                    "deregister_image": lambda: aws.deregister_image("ami-0123456789abcdef0", deadline=None),
                 }
                 with self.subTest(label=label, method=method):
                     with mock.patch.dict(sys.modules, patched), Capture() as capture:
@@ -2359,15 +2415,21 @@ class NoSecretTests(Base):
                     setattr(fresh, attribute, value)
                 aws = ImageAws(REGION, PROFILE, clients={"ec2": self.ec2, "s3": fresh}, clock=self.clock, expiry=NOW + 3600)
                 with Capture() as capture:
-                    capture.run(lambda: aws.put_archive(BUCKET, PREFIX + "x.tar.gz", stream(), max_bytes=100, part_bytes=10))
+                    capture.run(
+                        lambda: aws.put_archive(
+                            BUCKET, PREFIX + "x.tar.gz", stream(), max_bytes=100, part_bytes=10, deadline=None
+                        )
+                    )
                 self.assertTrue(capture.rendered)
                 self.assert_clean(capture.surfaces(), name)
 
     def test_presign_errors_and_refusals_do_not_carry_the_url(self):
         self.s3.errors["generate_presigned_url"] = ProviderError("InternalError")
         with Capture() as capture:
-            capture.run(lambda: self.image_aws().presign_get(BUCKET, PREFIX + "x.tar.gz", 1800))
-            capture.run(lambda: self.image_aws(expiry=NOW + 10).presign_get(BUCKET, PREFIX + "x.tar.gz", 1800))
+            capture.run(lambda: self.image_aws().presign_get(BUCKET, PREFIX + "x.tar.gz", 1800, deadline=None))
+            capture.run(
+                lambda: self.image_aws(expiry=NOW + 10).presign_get(BUCKET, PREFIX + "x.tar.gz", 1800, deadline=None)
+            )
         self.assertEqual(len(capture.rendered), 12)
         self.assert_clean(capture.surfaces(), "presign")
 
@@ -2394,7 +2456,7 @@ class NoSecretTests(Base):
                 )
                 with self.subTest(label=label, error=type(error).__name__):
                     with mock.patch.dict(sys.modules, patched), Capture() as capture:
-                        capture.run(lambda aws=aws: aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800))
+                        capture.run(lambda aws=aws: aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800, deadline=None))
                     # Six surfaces mean a provider refusal came out, not the SDK's own error.
                     self.assertEqual(len(capture.rendered), 6)
                     self.assert_clean(capture.surfaces(), f"{label} {type(error).__name__}")
@@ -2409,17 +2471,17 @@ class NoSecretTests(Base):
         summaries = []
         with Capture() as capture:
             instance_id = self.launch(aws)
-            archive = aws.put_archive(BUCKET, PREFIX + "x.tar.gz", [b"data"], max_bytes=100)
-            url = aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800)
-            version = aws.template_version("example-worker", 3)
+            archive = aws.put_archive(BUCKET, PREFIX + "x.tar.gz", [b"data"], max_bytes=100, deadline=None)
+            url = aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800, deadline=None)
+            version = aws.template_version("example-worker", 3, deadline=None)
             summaries.extend(
                 [
                     repr(instance_id),
                     repr(archive),
                     repr(version),
                     repr(version.as_dict()),
-                    repr([item.as_dict() for item in aws.builders(DEPLOYMENT)]),
-                    repr([item for item in aws.builders(DEPLOYMENT)]),
+                    repr([item.as_dict() for item in aws.builders(DEPLOYMENT, deadline=None)]),
+                    repr([item for item in aws.builders(DEPLOYMENT, deadline=None)]),
                 ]
             )
         # The presigned URL is the return value of presign_get and nothing else.
@@ -2433,7 +2495,11 @@ class NoSecretTests(Base):
 
         aws = self.image_aws()
         with Capture() as capture:
-            capture.run(lambda: aws.put_archive(BUCKET, PREFIX + "x.tar.gz", stream(), max_bytes=100, part_bytes=10))
+            capture.run(
+                        lambda: aws.put_archive(
+                            BUCKET, PREFIX + "x.tar.gz", stream(), max_bytes=100, part_bytes=10, deadline=None
+                        )
+                    )
         self.assertEqual(len(capture.rendered), 6)
         self.assert_clean(capture.surfaces(), "source refusal")
 
@@ -2507,11 +2573,11 @@ class NoSecretTests(Base):
     def test_no_request_carries_an_instance_profile(self):
         aws = self.image_aws()
         instance_id = self.launch(aws)
-        aws.builders(DEPLOYMENT)
-        aws.create_image(instance_id, "n", deployment=DEPLOYMENT, build_id="b", basis_digest="a" * 64)
-        aws.create_template_version("example-worker", 3, "ami-0123456789abcdef0", "d", "t")
-        aws.put_archive(BUCKET, PREFIX + "x.tar.gz", [b"data"], max_bytes=100)
-        aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800)
+        aws.builders(DEPLOYMENT, deadline=None)
+        aws.create_image(instance_id, "n", deployment=DEPLOYMENT, build_id="b", basis_digest="a" * 64, deadline=None)
+        aws.create_template_version("example-worker", 3, "ami-0123456789abcdef0", "d", "t", deadline=None)
+        aws.put_archive(BUCKET, PREFIX + "x.tar.gz", [b"data"], max_bytes=100, deadline=None)
+        aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800, deadline=None)
 
         def keys(value):
             if isinstance(value, dict):
@@ -3203,6 +3269,7 @@ class RealSdkLoggingTests(RealSdkCase):
             expires_at=NOW + 2700,
             user_data=LEAKY_MESSAGE,
             client_token=SENTINEL_CLIENT_TOKEN,
+            deadline=None,
         )
         self.assertEqual(instance_id, "i-0123456789abcdef0")
         # The request really travelled through the real client and carried both values.
@@ -3241,7 +3308,7 @@ class RealSdkLoggingTests(RealSdkCase):
         requests.clear()
         aws = ImageAws(REGION, PROFILE)
         aws._session().events.register("before-send.sts.AssumeRole", sts)
-        self.assertIsNotNone(aws.credential_expiry())
+        self.assertIsNotNone(aws.credential_expiry(deadline=None))
         # The role really was assumed, through the stub.
         self.assertEqual([call["Action"] for call in requests], [["AssumeRole"]])
         self.assertEqual(markers_in(self.records.text(), ASSUMED_MARKERS), [])
@@ -3293,10 +3360,10 @@ class RealSdkCredentialFailureTests(RealSdkCase):
         key = PREFIX + "x.tar.gz"
         calls = {
             "credential_expiry": aws.credential_expiry,
-            "presign_get": lambda: aws.presign_get(BUCKET, key, 1800),
-            "builders": lambda: aws.builders(DEPLOYMENT),
-            "image": lambda: aws.image("ami-0123456789abcdef0"),
-            "put_archive": lambda: aws.put_archive(BUCKET, key, [b"data"], max_bytes=100),
+            "presign_get": lambda: aws.presign_get(BUCKET, key, 1800, deadline=None),
+            "builders": lambda: aws.builders(DEPLOYMENT, deadline=None),
+            "image": lambda: aws.image("ami-0123456789abcdef0", deadline=None),
+            "put_archive": lambda: aws.put_archive(BUCKET, key, [b"data"], max_bytes=100, deadline=None),
         }
         for name, call in calls.items():
             with self.subTest(call=name):
@@ -3339,7 +3406,7 @@ class RealSdkCredentialFailureTests(RealSdkCase):
         aws = ImageAws(REGION, PROFILE)
         aws._session().events.register("before-send.sts.AssumeRole", self.deny)
         # The credential read and a request signed with the credentials are two routes into the refresh.
-        for call in (aws.credential_expiry, lambda: aws.builders(DEPLOYMENT)):
+        for call in (lambda: aws.credential_expiry(deadline=None), lambda: aws.builders(DEPLOYMENT, deadline=None)):
             with self.assertRaises(ProviderRefusal):
                 call()
         warnings = logged.warnings_from("botocore.credentials")
@@ -3388,14 +3455,14 @@ class CreationTimeTests(Base):
         self.ec2.images_store.append(
             {"ImageId": "ami-0123456789abcdef0", "State": "available", "Tags": self.TAGS, **item}
         )
-        (image,) = self.image_aws().images(DEPLOYMENT)
+        (image,) = self.image_aws().images(DEPLOYMENT, deadline=None)
         return image.created_at
 
     def snapshot_created_at(self, **item):
         self.ec2.snapshots_store.append(
             {"SnapshotId": "snap-0123456789abcdef0", "State": "completed", "Tags": self.TAGS, **item}
         )
-        (snapshot,) = self.image_aws().snapshots(DEPLOYMENT)
+        (snapshot,) = self.image_aws().snapshots(DEPLOYMENT, deadline=None)
         return snapshot.created_at
 
     def test_an_iso_creation_date_of_an_image_is_read_as_epoch_seconds(self):
@@ -3460,7 +3527,7 @@ class CreationTimeTests(Base):
                     self.ec2.snapshots_store.append(
                         {"SnapshotId": snapshot_id, "State": "completed", "Tags": self.TAGS, "StartTime": start_time}
                     )
-                snapshots = self.image_aws().snapshots(DEPLOYMENT)
+                snapshots = self.image_aws().snapshots(DEPLOYMENT, deadline=None)
                 self.assertEqual([snapshot.created_at for snapshot in snapshots], [None, self.MOMENT.timestamp()])
 
     def test_a_time_that_cannot_be_read_does_not_refuse_the_listing(self):
@@ -3475,7 +3542,7 @@ class CreationTimeTests(Base):
                 "CreationDate": "2026-01-02T03:04:05.000Z",
             }
         )
-        images = self.image_aws().images(DEPLOYMENT)
+        images = self.image_aws().images(DEPLOYMENT, deadline=None)
         self.assertEqual([image.created_at for image in images], [None, self.MOMENT.timestamp()])
 
     def test_a_single_read_carries_the_time_too(self):
@@ -3491,8 +3558,8 @@ class CreationTimeTests(Base):
             {"SnapshotId": "snap-0123456789abcdef0", "State": "completed", "Tags": self.TAGS, "StartTime": self.MOMENT}
         )
         aws = self.image_aws()
-        self.assertEqual(aws.image("ami-0123456789abcdef0").created_at, self.MOMENT.timestamp())
-        self.assertEqual(aws.snapshot("snap-0123456789abcdef0").created_at, self.MOMENT.timestamp())
+        self.assertEqual(aws.image("ami-0123456789abcdef0", deadline=None).created_at, self.MOMENT.timestamp())
+        self.assertEqual(aws.snapshot("snap-0123456789abcdef0", deadline=None).created_at, self.MOMENT.timestamp())
 
     def test_the_time_is_not_part_of_the_status_output(self):
         self.ec2.images_store.append(
@@ -3503,7 +3570,7 @@ class CreationTimeTests(Base):
                 "CreationDate": "2026-01-02T03:04:05.000Z",
             }
         )
-        (image,) = self.image_aws().images(DEPLOYMENT)
+        (image,) = self.image_aws().images(DEPLOYMENT, deadline=None)
         self.assertEqual(
             image.as_dict(), {"image_id": "ami-0123456789abcdef0", "state": "available", "snapshot_ids": []}
         )

@@ -745,7 +745,10 @@ class Controller:
         # deployment: reconciliation ignores a terminated instance that no
         # operation names, and so does the brake. A rename leaves the old rows
         # behind as history, and their workers are no evidence for the new name.
-        evidence = read_launch_evidence(default_record_path(self.config.state.database), self.clock(), recorded)
+        # The reader reads the clock itself, after it has taken the file's
+        # status, so a heartbeat that ``export`` refreshes in between is not
+        # judged against an older time.
+        evidence = read_launch_evidence(default_record_path(self.config.state.database), self.clock, recorded)
         decision["launch_evidence"] = evidence.as_dict()
         if evidence.holds:
             decision["decision"] = "refused"

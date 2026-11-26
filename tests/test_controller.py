@@ -2862,6 +2862,31 @@ class FutileLaunchTests(ControllerCase):
             self.assertNotIn(key, result)
 
     # -- the hold ------------------------------------------------------------
+    def test_a_heartbeat_refreshed_while_the_gate_opens_the_record_still_holds(self):
+        # ``export`` can refresh the record after the pass starts its gate check
+        # and before the reader takes the file's status. The reader reads the
+        # clock after that status, so the new modification time is not after it
+        # and the record stays fresh.
+        path = self.write_records(self.three_futile(), mtime=self.clock.now - 30)
+        real_fstat = os.fstat
+        refreshed = []
+
+        def refresh_then_fstat(descriptor):
+            status = real_fstat(descriptor)
+            if not refreshed and status.st_ino == os.stat(path).st_ino:
+                refreshed.append(status.st_ino)
+                self.clock.advance(5)
+                os.utime(path, (self.clock.now, self.clock.now))
+                status = real_fstat(descriptor)
+            return status
+
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        with mock.patch("ci_burst.launch_evidence.os.fstat", refresh_then_fstat):
+            result = controller.apply()
+        self.assertEqual(len(refreshed), 1)
+        self.assert_held(result)
+        self.assert_no_launch_work()
+
     def test_three_futile_workers_hold_admission(self):
         self.write_records(self.three_futile())
         controller = self.build(observation=observation_demand(1), config=self.fleet())

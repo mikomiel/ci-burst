@@ -214,7 +214,11 @@ round. The lock is on the directories, so any user who can read a directory can
 take it and no file is left behind. Such a user can also hold the lock and
 delay a run; the shipped unit's `TimeoutStartSec` then stops it, the record is
 not refreshed, and the hold fails open once the record is stale. Runs whose
-files are all in other directories run in parallel.
+files are all in other directories run in parallel. Runs take turns only while
+each parent directory stays the same directory during a run: do not rename,
+replace or re-point a link of one while an export runs. Runs that share an event
+file must run as a user that can read it, in practice the same UID: a run that
+cannot read an existing event file exits 1 before it replaces any file.
 
 ### The event stream
 
@@ -310,7 +314,9 @@ they do not fall when an instance ages out of the provider's record window or
 when a record is pruned. `export` saves the record, which holds the totals,
 before it replaces the textfile, so a textfile never carries a total that the
 record lacks, and that holds for a collector that reads `--metrics-file` itself
-as well as for the shipped unit. Only a lost, damaged or unreadable dedupe
+as well as for the shipped unit. Counters are guaranteed not to fall only across
+runs that use the same record, so runs that write the same textfile must use the
+same `--state-file`. Only a lost, damaged or unreadable dedupe
 record (deleted, or replaced by `export` because it cannot read or load it)
 restarts a counter. `export` reads the record once per run, without blocking and
 without following a link, and treats a read that fails, even for a moment, a
@@ -340,10 +346,10 @@ record's modification time, and the collector's timestamp does not advance
 either. Where `--metrics-file` names the collector's own file (direct mode, as in
 the commands above), the collector reads each textfile as soon as `export`
 replaces it, and a textfile that it has read never carries a total that a later
-run lowers: the record already holds it. A run that read its record and then
+run with the same record lowers: the record already holds it. A run that read its record and then
 stops after it replaced the textfile, or cannot replace it, leaves the record
 level with the textfile or ahead of it, under the modification time that it read,
-and a later run writes totals that are not lower, even when an instance has left
+and a later run with the same record writes totals that are not lower, even when an instance has left
 the provider's inventory in between. A run that could not read its record
 restarts the counters, as for a deleted record (see above), and saves the new
 record under the epoch.
@@ -1829,7 +1835,7 @@ state is `fresh`. The states, in the order they are tested:
 | --- | --- |
 | `missing` | no file at the path |
 | `unreadable` | the file cannot be opened or read, is not a regular file (a FIFO, a directory) or is a link, or the reader failed in a way it did not foresee |
-| `stale` | the modification time is more than 600 seconds old, or after the controller clock |
+| `stale` | the modification time is more than 600 seconds old, or after the controller clock. The reader reads the clock after it has taken the file's status from the open descriptor, so a heartbeat that `export` refreshes while the pass reads is not after the clock; the age, the record dates and the window all use that one reading |
 | `malformed` | larger than 16 MiB, not UTF-8 JSON (a `NaN`, `Infinity` or `-Infinity` constant counts as not JSON), a JSON object that names a member twice at any level (a decoder keeps only the last value, and `export` never writes one; `export` refuses a constant and a repeat in the same way when it loads its own record, § Worker evidence), another record version, or one record with a bad field the hold reads (a `seen` after the controller clock is one), an instance key that `export` rejects, or a registration marker (`job_process`, `spot_interruption`) of a shape that `export` does not write. The hold drops the whole file. When `export` loads its own record, it drops only the record that holds such a value, the record of an ended worker that lacks a registration key, and a record dated after the clock of its run (§ Worker evidence) |
 | `fresh` | the hold is evaluated |
 

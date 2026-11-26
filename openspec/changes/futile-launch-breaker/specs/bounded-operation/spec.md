@@ -204,6 +204,11 @@ The controller MUST read the evidence only from `observed.json` in the `export` 
 - **THEN** the evidence state is `stale`
 - **AND** the gate is open
 
+#### Scenario: The heartbeat advances while the pass reads the record
+- **WHEN** `export` advances the record's modification time after the pass starts the evidence read and before the reader takes the file's status
+- **THEN** the reader reads the controller clock after it takes that status, so the modification time is not after the clock and a fresh record of three futile workers still holds
+- **AND** the age, the date of each record and the window are judged against that one reading
+
 #### Scenario: The file is malformed
 - **WHEN** the file's modification time is fresh and the file is not UTF-8 JSON, is not an object, carries a `version` other than the one `export` writes, or has an `instances` value that is not an object
 - **THEN** the evidence state is `malformed`

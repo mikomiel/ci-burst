@@ -149,6 +149,14 @@ class LaunchEvidence:
 def read_launch_evidence(path, now, recorded):
     """Return the launch evidence in the record at ``path`` against the clock ``now``.
 
+    ``now`` is a zero-argument clock, or a time for a caller that already has one.
+    The reader calls the clock once, after it has taken the file's status from the
+    open descriptor and before it reads the content, and judges the file's age,
+    the date of each record and the window against that one reading. A reading
+    taken before the open would judge a heartbeat that ``export`` refreshes in
+    between, and a record that it dates in between, as dated after the clock, so
+    the file would read as ``stale`` or ``malformed`` and the hold would open.
+
     ``recorded`` maps each operation identifier that the ledger holds for this
     deployment to its instance identifier, or to ``None`` while the ledger holds
     none. A worker counts only when its operation is in it, under the instance
@@ -209,6 +217,7 @@ def _read(path, now, recorded):
             status = os.fstat(descriptor)
             if not stat.S_ISREG(status.st_mode):
                 return LaunchEvidence(UNREADABLE)
+            now = now() if callable(now) else now
             age = now - status.st_mtime
             if not 0 <= age <= EVIDENCE_MAX_AGE_SECONDS:
                 return LaunchEvidence(STALE)

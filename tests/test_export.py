@@ -2564,6 +2564,28 @@ class RecordCadenceTests(ExportCase):
         self.assertEqual(set(repeated), set(published))
         self.assertGreater(len(repeated), len(published))
 
+    def test_an_event_file_that_cannot_be_read_fails_the_run_before_any_write(self):
+        # Only a missing event file is an empty stream. A file that exists and
+        # cannot be read, such as one that another user owns, would otherwise be
+        # replaced by the lines of this run alone, and every earlier line would be
+        # lost. The run fails before it replaces any of its three files.
+        consoles = {"i-0123456789abcdef0": CLEAN_BOOT, "i-0123456789abcdef1": CLEAN_BOOT}
+        self.run_export(self.build(self.owned(), consoles))
+        files = (self.events, self.state_file, self.metrics)
+        before = [(path.read_bytes(), os.stat(path).st_mtime_ns) for path in files]
+        owned = self.owned() + [instance("i-0123456789abcdef1", state="terminated", operation=operation_hex(2))]
+        real_open = io.open
+
+        def refuse_the_event_file(file, *arguments, **options):
+            if isinstance(file, (str, os.PathLike)) and os.fspath(file) == str(self.events):
+                raise PermissionError(13, "injected read", str(file))
+            return real_open(file, *arguments, **options)
+
+        with mock.patch("builtins.open", refuse_the_event_file), mock.patch("io.open", refuse_the_event_file):
+            with self.assertRaises(PermissionError):
+                self.run_export(self.build(owned, consoles), now=NOW + 60)
+        self.assertEqual([(path.read_bytes(), os.stat(path).st_mtime_ns) for path in files], before)
+
     def test_a_deleted_record_is_rebuilt_with_the_rebuilding_run_time(self):
         consoles = {"i-0123456789abcdef0": CLEAN_BOOT}
         self.run_export(self.build(self.owned(), consoles))

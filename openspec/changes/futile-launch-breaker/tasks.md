@@ -129,6 +129,12 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   blocking `flock` on the directory of each of the three files (each directory
   once, in the order of its device and inode numbers), taken before the clock, the record and the event
   file are read and held until the last write. Create no lock file.
+- [x] 1.16 In `_append_events`, treat only a missing event file as an empty
+  stream. Let any other error that reading an existing file raises fail the run
+  before it replaces the event file, the record or the textfile.
+- [x] 1.17 In the reader, read the controller clock after the `fstat` of the open
+  descriptor and before the content, and judge the age, the record dates and the
+  window against that one reading. The controller passes its clock, not a time.
 
 ## 2. Gate
 
@@ -301,6 +307,10 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   record path to a fresh record of three futile workers is replaced by a regular
   file that carries neither the target's records nor its modification time, and
   the reader reports no hold after a failed textfile write.
+- [x] 3.14 In `tests/test_export.py`, a run that cannot read an existing event
+  file fails before it replaces the event file, the record or the textfile. In
+  `tests/test_controller.py`, a heartbeat that `export` refreshes between the gate
+  call and the reader's `fstat` still reads `fresh`, and the hold stays.
 
 ## 4. Documentation
 

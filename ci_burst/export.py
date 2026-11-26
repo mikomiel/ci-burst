@@ -32,15 +32,18 @@ before its first read of the clock, the record or the event file until its last
 write. Runs that share any of these files, or only a directory, are serialized,
 so a manual run waits for the timer's run and the other way round, and no run
 saves totals from an older snapshot or replaces lines that another run added.
-The lock leaves no file behind (``_directory_locks``).
+The lock leaves no file behind (``_directory_locks``). This holds while each of
+those directories stays the same directory during a run.
 
 The counter contract sets the order of the last writes (``_publish``). The
 cumulative counters are saved in the record, and a collector must never read a
-total that a later run lowers, so a run saves the record before it replaces the
-metrics textfile. A textfile that a run writes never carries a total that the
-record on disk lacks, whether it is the copy that the shipped unit publishes after
-the command exits 0 or the file that a collector reads from ``--metrics-file``
-itself, and whether a write fails or the process stops. Counters fall only when
+total that a later run with the same record lowers, so a run saves the record
+before it replaces the metrics textfile. Runs that write one textfile must use
+one record: the counters of two records are unrelated. A textfile that a run
+writes never carries a total that the record on disk lacks, whether it is the
+copy that the shipped unit publishes after the command exits 0 or the file that
+a collector reads from ``--metrics-file`` itself, and whether a write fails or
+the process stops. Counters fall only when
 the record is lost, damaged or unreadable: deleted, or replaced by
 ``load_state`` because it cannot read or use it. The counters then start again,
 and until a run replaces the textfile, the textfile of an earlier run can hold
@@ -1227,12 +1230,18 @@ def _append_events(path, events, deployment):
     what makes rotation and the size bound possible. The file is a bounded
     publication, not an unbounded WAL. Returns the number of historical lines
     dropped because they no longer match the schema.
+
+    Only a missing file is an empty stream. Any other error that reading an
+    existing file raises fails the run here, before it replaces a file: a file
+    that this run cannot read, such as one that another user owns, would
+    otherwise be replaced by the lines of this run alone. A file that is read but
+    is not UTF-8 is damaged content, and its lines are dropped.
     """
     path = Path(path)
     lines = "".join(json.dumps(event, sort_keys=True) + "\n" for event in events)
     try:
         existing = path.read_bytes().decode("utf-8")
-    except (OSError, UnicodeDecodeError):
+    except (FileNotFoundError, UnicodeDecodeError):
         existing = ""
     existing, dropped = _retained_events(existing, deployment)
     combined = existing + lines
@@ -1286,7 +1295,10 @@ def _directory_locks(*paths):
     and opened, and each is locked once, in the order of its device and inode
     numbers. Two runs that reach one directory under different paths, as a host
     and a container can, still lock in the same order, so they never wait for
-    each other in a circle. The launch evidence reader takes no lock.
+    each other in a circle. The lock is held on the directories that the run
+    opened here, and the files are named by path, so runs take turns only while
+    each directory stays the same directory during a run. The launch evidence
+    reader takes no lock.
     """
     opened = {}
     try:

@@ -145,7 +145,8 @@ def _export(config, arguments):
     state_file = arguments.state_file or str(record)
     refuse_conflicting_outputs(
         {"--state-file": state_file, "--events-file": events_file, "--metrics-file": arguments.metrics_file},
-        {"the ledger database": config.state.database, "the configuration file": arguments.config},
+        files={"the ledger database": config.state.database, "the configuration file": arguments.config},
+        directories={"the image state directory": config.image and config.image.state_directory},
     )
     return Exporter(config).run(
         events_file=events_file,

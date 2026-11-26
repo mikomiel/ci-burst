@@ -1305,47 +1305,98 @@ def _write_atomic(path, content, *, times=None):
         raise
 
 
-def _entry(path):
-    """The directory entry that ``path`` names, compared by identity and not by string.
+#: The most links that one lookup follows; the kernel stops there with ``ELOOP``.
+_MAX_LINK_HOPS = 40
 
-    The value is the device and inode of the nearest directory above ``path``
-    that exists, and the names below it. Two spellings of one entry, through
-    ``..`` or a linked directory, give one value. Nothing is created.
+
+def _walk(path, option=None):
+    """The directory entry that ``path`` names, and the entries of the linked directories on its way.
+
+    An entry is a directory's device and inode, the names below it and the final
+    name. Components that exist are taken as the kernel takes them, so ``..`` and
+    a linked directory lead to the directory that they reach. From the first one
+    that does not exist the names are taken lexically: the run creates that
+    directory, and a directory that it creates is no link, so ``missing/..``
+    names the directory above ``missing``. Two spellings of one entry give one
+    value. For an output (``option``), a component that exists and is not a
+    directory, such as a link to a missing directory, is refused: the run could
+    reach it through another output's directory. Nothing is created.
     """
     path = Path.cwd() / path
-    names = [path.name]
-    directory = path.parent
-    while True:
+    directory, below, links = Path(path.anchor), [], []
+    for name in path.parts[1:-1]:
+        candidate = directory / name
+        if below:
+            if name == "..":
+                below.pop()
+            else:
+                below.append(name)
+        elif name == ".." or os.path.isdir(candidate):
+            if name != ".." and os.path.islink(candidate):
+                status = os.stat(directory)
+                links.append((status.st_dev, status.st_ino, (), name))
+            directory = candidate
+        elif option is not None and os.path.lexists(candidate):
+            raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{option} passes {candidate}, which is not a directory")
+        else:
+            below.append(name)
+    status = os.stat(directory)
+    return (status.st_dev, status.st_ino, tuple(below), path.name), links
+
+
+def _link_chain(path):
+    """``path`` and each link that a lookup of it passes, hop by hop, relative to the link's directory."""
+    chain = [Path.cwd() / path]
+    while len(chain) <= _MAX_LINK_HOPS:
         try:
-            status = os.stat(directory)
-        except (FileNotFoundError, NotADirectoryError):
-            names.insert(0, directory.name)
-            directory = directory.parent
-            continue
-        return status.st_dev, status.st_ino, tuple(names)
+            target = os.readlink(chain[-1])
+        except OSError:
+            break
+        chain.append(chain[-1].parent / target)
+    return chain
 
 
-def refuse_conflicting_outputs(outputs, protected):
-    """Refuse outputs that name one directory entry, or an entry in ``protected``.
+def refuse_conflicting_outputs(outputs, *, files, directories):
+    """Refuse, before any write, an output that would replace another output or a protected entry.
 
-    ``outputs`` and ``protected`` map an option or a description to a path. A run
-    replaces each output, so two outputs on one entry would overwrite each other,
-    and an output on the ledger or the configuration would destroy it. The check
-    compares entries, not strings, and runs before any file is opened for writing.
-    A protected path is compared as named and as resolved, because the ledger and
-    the configuration are read through a link while an output replaces the link.
+    ``outputs`` maps an option to a path, ``files`` and ``directories`` map a
+    description to a path or ``None``. Two outputs must name two entries. For a
+    protected file, each link of its chain and the file at its end are protected,
+    and so is every entry beside one of them whose name continues that name with
+    ``.`` or ``-``: the ledger's writer lock, journal and migration copies, and
+    the lock, temporary file and backups of ``image promote``. Every entry of a
+    protected directory is protected. Entries are compared by identity, not by
+    string (``_walk``), and a linked directory on the way to a protected path is
+    protected too. Paths that the configuration does not name are the
+    operator's.
     """
     seen = {}
     for option, path in outputs.items():
-        entry = _entry(path)
+        entry, _ = _walk(path, option)
         if entry in seen:
             raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{option} names the same file as {seen[entry]}")
         seen[entry] = option
-    for description, path in protected.items():
-        for candidate in {str(path), os.path.realpath(path)}:
-            entry = _entry(candidate)
-            if entry in seen:
-                raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{seen[entry]} names {description}")
+
+    def refuse_links(links, description):
+        for link in links:
+            if link in seen:
+                raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{seen[link]} names a link on the way to {description}")
+
+    for description, path in files.items():
+        for hop in () if path is None else _link_chain(path):
+            (*where, name), links = _walk(hop)
+            refuse_links(links, description)
+            for (*place, other), option in seen.items():
+                if place == where and (other == name or other.startswith((name + ".", name + "-"))):
+                    raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{option} names {description} or a file beside it")
+    for description, path in directories.items():
+        if path is None:
+            continue
+        entry, links = _walk(Path(path) / "entry")
+        refuse_links(links, description)
+        for other, option in seen.items():
+            if other[:3] == entry[:3]:
+                raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{option} names a file in {description}")
 
 
 @contextlib.contextmanager

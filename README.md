@@ -42,7 +42,7 @@ Requires Python 3.12 or newer. Live use needs the `boto3` runtime dependency
 python -m ci_burst plan   --config deployment.toml
 python -m ci_burst apply  --config deployment.toml
 python -m ci_burst status --config deployment.toml
-python -m ci_burst export --config deployment.toml --metrics-file ci-burst.prom
+python -m ci_burst export --config deployment.toml --state-file observed.json --events-file worker-events.ndjson --metrics-file ci-burst.prom
 python -m ci_burst reap   --config deployment.toml [--apply]
 ```
 

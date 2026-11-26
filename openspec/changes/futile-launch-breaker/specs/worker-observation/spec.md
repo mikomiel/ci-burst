@@ -4,15 +4,15 @@
 
 ### Requirement: One writer per set of export files
 
-A deployment MUST give each set of export files (the record, the event file, the metrics textfile and the collector file the unit publishes it to) one writer: the shipped unit `ci-burst-export.service`, which systemd runs as one instance at a time. A command run outside the unit MUST name its own record, event file and textfile and MUST NOT write the unit's collector file. The command MUST refuse with `EXPORT_PATHS_CONFLICT` two outputs naming one file, or one naming the ledger or configuration.
+A deployment MUST give each set of export files (the record, the event file, the metrics textfile and the collector file the unit publishes it to) one writer: the shipped unit `ci-burst-export.service`, which systemd runs one at a time. A command run outside the unit MUST name its own record, event file and textfile and MUST NOT write the unit's collector file. The command MUST refuse (`EXPORT_PATHS_CONFLICT`) two outputs naming one file, or one naming an entry the ledger or configuration uses.
 
 #### Scenario: A manual export of the unit's files
 - **WHEN** an operator wants an export of the unit's set of export files
 - **THEN** they run `systemctl start ci-burst-export.service`, and systemd does not start a second instance while one runs
 
 #### Scenario: Outputs that name one file are refused
-- **WHEN** two outputs of the command name one file, by any spelling, or an output names the ledger or the configuration file
-- **THEN** the command refuses with `EXPORT_PATHS_CONFLICT` and exits 2 before it writes any file
+- **WHEN** two outputs of the command name one file by any spelling, or an output names a link or the file on the way to the ledger database or the configuration file, an entry beside one of those whose name continues it with `.` or `-`, or an entry in the image state directory
+- **THEN** the command refuses with `EXPORT_PATHS_CONFLICT` and exits 2 before it writes or creates anything; it checks no other path
 
 ## MODIFIED Requirements
 

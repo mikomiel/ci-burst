@@ -146,7 +146,7 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   row and in the worker-observation spec that a set of export files has one
   writer, the shipped unit. In the CLI, refuse with `EXPORT_PATHS_CONFLICT`
   (exit 2), before any write, two outputs that name one directory entry or an
-  output that names the ledger or the configuration.
+  output on an entry that the ledger, the configuration or the image state uses.
 
 ## 2. Gate
 
@@ -309,10 +309,11 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   `stale`.
 - [x] 3.13 Lock mechanism tests in `tests/test_export.py`: a run waits while its
   directory is held, creates no lock file, and an output at the former lock path
-  cannot replace the lock. Outputs that name one entry, under the same or another
-  spelling, or the ledger or the configuration, are refused with exit 2 and
-  nothing written. An event file or record whose read fails after its open fails
-  the run or notes `state_rebuilt`. A record whose
+  cannot replace the lock. Exit 2, nothing written or created: two outputs on one
+  entry (any spelling, `missing/..`, a link to a missing directory); an output on
+  a link, file, sidecar or directory link of the ledger's or configuration's path,
+  or in the image state directory. A read that fails after its open fails the run
+  (event file) or notes `state_rebuilt` (record). A record whose
   first read fails notes `state_rebuilt` and restarts the counters, and after a
   failed textfile write it carries the epoch, not a fresh heartbeat. A link at the
   record path to a fresh record of three futile workers is replaced by a regular

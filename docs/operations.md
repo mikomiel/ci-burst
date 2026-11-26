@@ -176,7 +176,7 @@ standard-library tests run without the SDK, a token or a cloud account.
 python -m ci_burst plan   --config deployment.toml   # observation only
 python -m ci_burst apply  --config deployment.toml   # may launch the configured fleet
 python -m ci_burst status --config deployment.toml   # evidence, no mutation
-python -m ci_burst export --config deployment.toml --metrics-file PATH
+python -m ci_burst export --config deployment.toml --state-file PATH --events-file PATH --metrics-file PATH
 python -m ci_burst reap   --config deployment.toml   # expired resources, no launch
 python -m ci_burst reap   --config deployment.toml --apply
 ```
@@ -198,12 +198,12 @@ console of the instances this deployment owns and turns the shipped first-boot
 markers into two artefacts:
 
 ```sh
-python -m ci_burst export --config deployment.toml --metrics-file PATH \
-  [--events-file PATH] [--state-file PATH]
+python -m ci_burst export --config deployment.toml --state-file PATH \
+  --events-file PATH --metrics-file PATH
 ```
 
-The two optional paths default to `<ledger directory>/export/`, as
-`worker-events.ndjson` and `observed.json`.
+`--state-file` and `--events-file` default to `observed.json` and
+`worker-events.ndjson` in `<ledger directory>/export/`: the unit's files.
 
 **One writer.** A set of export files (the record, the event file, the metrics
 textfile and the collector file that the unit publishes it to) has one writer:
@@ -211,11 +211,11 @@ the shipped unit `ci-burst-export.service`. For a manual export of that set, run
 `systemctl start ci-burst-export.service`; systemd runs one instance of the unit
 at a time, its publication step included. A `ci-burst export` command run
 outside the unit names its own `--state-file`, `--events-file` and
-`--metrics-file` (with the unit's configuration, the defaults are the unit's
-files) and does not write the unit's collector file. Any other sharing
+`--metrics-file` and does not write the unit's collector file. Any other sharing
 is unsupported, and the guarantees of this section do not hold for it. `export`
-refuses with `EXPORT_PATHS_CONFLICT` (exit 2), before it writes anything, when
-two of its outputs name one file or one names the ledger or the configuration.
+refuses with `EXPORT_PATHS_CONFLICT` (exit 2), before it writes anything, two
+outputs that name one file and an output on an entry that the ledger, the
+configuration or `[image].state_directory` uses. Other paths are the operator's.
 
 Each run reads the event file without blocking and without following a link.
 Only a missing event file is an empty stream; a run that cannot read an existing

@@ -3083,12 +3083,17 @@ class ExportCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(buffer.getvalue())["decision"], "reported")
 
-    def run_cli(self, **paths):
-        """Run ``export`` with a stub exporter; return the exit code and whether it ran."""
+    def run_cli(self, *, config=None, **paths):
+        """Run ``export`` with a stub exporter; return the exit code and whether it ran.
+
+        ``config`` is the path given to ``--config``; by default a fresh file whose
+        ledger is ``state/state.sqlite3``.
+        """
         from ci_burst.cli import main
 
-        database = self.root / "state" / "state.sqlite3"
-        config = write_config(self.root, config={"state": {"database": str(database)}})
+        if config is None:
+            config = write_config(self.root, config={"state": {"database": str(self.root / "state" / "state.sqlite3")}})
+        database = load(config).state.database
         ran = []
         stub = type(
             "StubExporter",
@@ -3131,6 +3136,92 @@ class ExportCliTests(unittest.TestCase):
                 self.assertEqual(code, 2, output)
                 self.assertEqual(ran, [])
                 self.assertEqual(target.read_bytes() if target.exists() else None, before)
+
+    def test_a_missing_directory_and_dot_dot_cannot_alias_a_protected_file_or_an_output(self):
+        # The run creates a missing directory, so "new/.." then names its parent.
+        _, _, _, _, config = self.run_cli(metrics_file=self.root / "unused.prom")
+        before = config.read_bytes()
+        code, ran, output, _, _ = self.run_cli(metrics_file=self.root / "new" / ".." / config.name)
+        self.assertEqual((code, ran), (2, []), output)
+        self.assertEqual(config.read_bytes(), before)
+        record = self.root / "fresh" / "observed.json"
+        code, ran, output, _, _ = self.run_cli(state_file=record, metrics_file=self.root / "fresh" / "new" / ".." / record.name)
+        self.assertEqual((code, ran), (2, []), output)
+        self.assertFalse((self.root / "new").exists())
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_an_output_that_names_an_entry_the_ledger_opens_is_refused(self):
+        # The writer lock, the rollback journal, the WAL files and the migration
+        # backups sit beside the database under its name.
+        _, _, _, database, _ = self.run_cli(metrics_file=self.root / "unused.prom")
+        for suffix in (".lock", "-journal", "-wal", "-shm", ".pre-v5.1700000000"):
+            with self.subTest(suffix):
+                code, ran, output, _, _ = self.run_cli(metrics_file=database.parent / (database.name + suffix))
+                self.assertEqual((code, ran), (2, []), output)
+        # A file beside the database under another name is still allowed.
+        code, _, output, _, _ = self.run_cli(metrics_file=database.parent / "state.prom")
+        self.assertEqual(code, 0, output)
+
+    def test_an_output_on_a_link_of_the_configuration_chain_is_refused(self):
+        # deployment.toml -> current.toml -> release.toml: replacing the middle
+        # link would repoint the configuration.
+        (self.root / "releases").mkdir()
+        release = write_config(self.root / "releases")
+        current, deployment = self.root / "current.toml", self.root / "deployment.toml"
+        current.symlink_to(release)
+        deployment.symlink_to(current.name)
+        for name in (current, release, self.root / "releases" / (release.name + ".lock")):
+            with self.subTest(name.name):
+                code, ran, output, _, _ = self.run_cli(config=deployment, metrics_file=name)
+                self.assertEqual((code, ran), (2, []), output)
+        self.assertEqual(os.readlink(current), str(release))
+
+    def test_an_output_through_a_link_to_a_missing_directory_is_refused(self):
+        # The run would create "real" for the record, and "link" would then lead
+        # to it, so the two outputs would name one entry.
+        (self.root / "link").symlink_to("real")
+        code, ran, output, _, _ = self.run_cli(
+            state_file=self.root / "real" / "observed.json", metrics_file=self.root / "link" / "observed.json"
+        )
+        self.assertEqual((code, ran), (2, []), output)
+        self.assertFalse((self.root / "real").exists())
+
+    def test_an_output_on_a_directory_link_on_the_way_to_a_protected_file_is_refused(self):
+        (self.root / "releases" / "3").mkdir(parents=True)
+        write_config(self.root / "releases" / "3")
+        (self.root / "current").symlink_to(Path("releases") / "3")
+        code, ran, output, _, _ = self.run_cli(
+            config=self.root / "current" / "deployment.toml", metrics_file=self.root / "current"
+        )
+        self.assertEqual((code, ran), (2, []), output)
+        self.assertTrue((self.root / "current").is_symlink())
+
+    def test_each_link_of_the_ledger_database_chain_is_protected(self):
+        (self.root / "db").mkdir()
+        link, real = self.root / "db" / "link.sqlite3", self.root / "db" / "real.sqlite3"
+        link.symlink_to(real.name)
+        config = write_config(self.root, config={"state": {"database": str(link)}})
+        for name in (link.name, real.name, link.name + ".lock", real.name + "-journal"):
+            with self.subTest(name):
+                code, ran, output, _, _ = self.run_cli(config=config, metrics_file=self.root / "db" / name)
+                self.assertEqual((code, ran), (2, []), output)
+
+    def test_an_output_in_the_image_state_directory_is_refused(self):
+        from test_image_pipeline import DEPLOYMENT, render_toml
+
+        directory = self.root / "image-state"
+        directory.mkdir()
+        (self.root / "config").mkdir()
+        config = write_config(
+            self.root / "config",
+            config={"deployment": DEPLOYMENT, "state": {"database": str(self.root / "state" / "state.sqlite3")}},
+        )
+        config.write_text(config.read_text() + render_toml(state_directory=str(directory)))
+        for name in ("image-state.sqlite.lock", "ci-burst.prom"):
+            with self.subTest(name):
+                code, ran, output, _, _ = self.run_cli(config=config, metrics_file=directory / name)
+                self.assertEqual((code, ran), (2, []), output)
+        self.assertEqual(os.listdir(directory), [])
 
     def test_the_exporter_builds_a_live_adapter_when_none_is_injected(self):
         config = load(write_config(self.root))

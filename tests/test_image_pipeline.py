@@ -734,17 +734,21 @@ class UncachedAccountAws(ImageAws):
 
 
 class SlowClientSession:
-    """The session of an adapter that has no S3 client yet: building the first one takes ``seconds`` of the clock."""
+    """The session of an adapter that has no S3 client yet: building the first one takes ``seconds`` of the clock.
 
-    def __init__(self, world, seconds):
+    ``sts`` is the STS client that it builds, for an adapter that has no account either.
+    """
+
+    def __init__(self, world, seconds, sts=None):
         self.w = world
         self.seconds = seconds
+        self.sts = sts
         self.built = []
 
     def client(self, service, region_name=None, config=None):
         self.built.append(service)
         self.w.clock.advance(self.seconds)
-        return {"ec2": self.w.ec2, "s3": self.w.s3}[service]
+        return {"ec2": self.w.ec2, "s3": self.w.s3, "sts": self.sts}[service]
 
 
 class LazyClientAws(ImageAws):
@@ -2765,6 +2769,42 @@ class FailureTests(PipelineCase):
     def test_a_last_listing_that_ends_after_the_pass_deadline_launches_no_builder(self):
         started_at, result = self.a_pass_whose_last_listing_before_the_launch_takes(PASS_DEADLINE_SECONDS + 60)
         self.assert_a_last_listing_that_ended_the_pass_launched_nothing(started_at, result)
+
+    @contextmanager
+    def time_after_the_last_listing(self, seconds):
+        """Let ``seconds`` pass after the last listing before the launch has been read, before the launch call."""
+        real = image_pipeline._Pass._check_no_builder
+
+        def then_wait(stage, build=None):
+            real(stage, build)
+            if self.world.arguments("generate_presigned_url"):
+                self.clock.advance(seconds)
+
+        with mock.patch.object(image_pipeline._Pass, "_check_no_builder", then_wait):
+            yield
+
+    def test_a_launch_call_that_would_start_after_the_build_deadline_is_not_made(self):
+        first = self.resumed_stage_with_100_seconds_left()
+        mark = len(self.world.calls)
+        with self.time_after_the_last_listing(150):
+            result = self.apply()
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+
+    def test_a_launch_call_that_would_start_after_the_pass_deadline_leaves_the_row_for_the_next_pass(self):
+        started_at = self.clock()
+        with self.time_after_the_last_listing(PASS_DEADLINE_SECONDS):
+            result = self.apply()
+        self.assert_a_last_listing_that_ended_the_pass_launched_nothing(started_at, result)
+
+    def test_the_archive_url_and_the_builder_are_bound_to_the_recorded_owner(self):
+        self.apply()
+        build = self.only_build()
+        (presign,) = self.world.arguments("generate_presigned_url")
+        self.assertEqual(presign["Params"]["ExpectedBucketOwner"], build.archive_owner)
+        (launch,) = self.world.launches
+        self.assertIn(f"export WARM_SRC_OWNER={build.archive_owner}\n", launch["UserData"])
 
     def test_a_last_listing_that_ends_just_inside_the_pass_deadline_launches_the_builder(self):
         # The same pass with a listing that ends inside the deadline, so the refusals above are the deadline's.
@@ -5479,6 +5519,33 @@ class OwedArchiveBoundTests(PipelineCase):
         self.assertNotIn(key, self.world.objects)
         self.assertIsNotNone(self.only_build_named("owed-00").archive_deleted_at)
 
+    def test_an_sts_client_build_that_ends_inside_the_reserve_asks_for_no_account_in_a_cleanup_pass(self):
+        # No gate and nothing in flight, so the owner check of the owed delete is the first use of the account. The
+        # build of the STS client ends inside the reserve: no lookup starts, and neither does the delete.
+        (key,) = self.owe(1)
+        self.configure(render_toml(gate=""))
+        session = SlowClientSession(
+            self.world, PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS + 5, sts=WorldSts(self.world, 1)
+        )
+        sdk_config = mock.patch.object(aws_module, "_sdk_config", return_value=object())
+        sdk_config.start()
+        self.addCleanup(sdk_config.stop)
+        self.aws_factory = lambda: ImageAws(
+            REGION,
+            PROFILE,
+            clients={"ec2": self.world.ec2, "s3": self.world.s3},
+            clock=self.world.clock,
+            expiry=self.world.clock() + self.world.credential_life,
+            session_factory=lambda profile: session,
+        )
+        self.restart()
+        result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_GATE_REQUIRED"), result)
+        self.assertEqual(session.built, ["sts"])
+        self.assertEqual(self.world.arguments("get_caller_identity"), [])
+        self.assert_the_row_is_deferred_and_untouched(key)
+        self.assertEqual(result["reconcile"]["owed_archives_deferred"], 1, result)
+
     def test_a_quick_client_build_leaves_the_owed_delete_to_start(self):
         # The same pass as the first test with a client build that ends before the reserve: the delete starts, so the
         # checks above can tell a deferred delete from one that never ran.
@@ -6266,6 +6333,18 @@ class OwedArchiveBoundTests(PipelineCase):
         with mock.patch.object(image_pipeline._Pass, "_delete_owed", side_effect=RuntimeError("tail broke")):
             refusal = self.refused(self.apply, "AWS_UNCERTAIN")
         self.assertEqual(refusal.detail, "ProviderError")
+
+    def test_a_cleanup_pass_does_not_need_the_warm_script(self):
+        (key,) = self.owe(1)
+        self.configure(render_toml(gate=""), script=None)
+        original = image.shipped_script
+        absent = self.dir / "absent-warm-cache.sh"
+        with mock.patch.object(image, "shipped_script", lambda: original(absent)):
+            result = self.apply()
+        self.assertEqual((result["decision"], result["reason"]), ("refused", "IMAGE_GATE_REQUIRED"), result)
+        self.assertIn("delete_object", self.world.names())
+        self.assertNotIn(key, self.world.objects)
+        self.assertIsNotNone(self.only_build().archive_deleted_at)
 
     def test_a_pass_with_no_gate_and_nothing_in_flight_runs_only_the_owed_deletions(self):
         (key,) = self.owe(1)

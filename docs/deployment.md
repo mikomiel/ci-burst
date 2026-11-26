@@ -752,7 +752,9 @@ Notes on the values:
   role as the bucket's expected owner (`ExpectedBucketOwner`), which it reads once per pass
   from `sts:GetCallerIdentity` and which asks for no permission. The row of a build records
   that account (`archive_owner`) with the bucket and the key when the archive is first
-  staged, and a stage done again and every delete of that archive name the recorded one. A
+  staged, and a stage done again and every delete of that archive name the recorded one. The
+  presigned URL of the archive signs the recorded owner too, and the builder sends it with
+  its GET (`WARM_SRC_OWNER`, see [warm-image.md](warm-image.md#inputs)). A
   pass whose role is in another account than the one that staged the archive makes no S3
   call about it: a stage done again ends refused with `IMAGE_STAGING_OWNER_CHANGED`, and a
   delete counts as failed and stays owed, even where a bucket of that name exists in the new

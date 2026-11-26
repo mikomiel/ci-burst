@@ -18,6 +18,9 @@
 #   WARM_SRC_URL           required  https URL of the .tar.gz source archive,
 #                                    fetchable without credentials
 #   WARM_SRC_SHA256        required  the archive's sha256, 64 hex digits
+#   WARM_SRC_OWNER         optional  12-digit account sent as the
+#                                    x-amz-expected-bucket-owner header; a URL
+#                                    that signs that header needs it
 #   WARM_COMMANDS          required  warm commands, one per line; blank lines
 #                                    and lines starting with # are ignored
 #   WARM_GATE_COMMAND      optional  one command that proves the warm layer is
@@ -62,6 +65,7 @@ exec > >(tee -a /dev/ttyS0) 2>&1 || true
 
 WARM_SRC_URL=${WARM_SRC_URL:-}
 WARM_SRC_SHA256=${WARM_SRC_SHA256:-}
+WARM_SRC_OWNER=${WARM_SRC_OWNER:-}
 WARM_COMMANDS=${WARM_COMMANDS:-}
 WARM_GATE_COMMAND=${WARM_GATE_COMMAND:-}
 WARM_LIFETIME_SECONDS=${WARM_LIFETIME_SECONDS:-5400}
@@ -143,6 +147,7 @@ esac
 [ -n "$WARM_SRC_SHA256" ] || refuse "WARM_SRC_SHA256 is required"
 expected_sha256=${WARM_SRC_SHA256,,}
 [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || refuse "WARM_SRC_SHA256 must be 64 hex digits"
+[ -z "$WARM_SRC_OWNER" ] || [[ "$WARM_SRC_OWNER" =~ ^[0-9]{12}$ ]] || refuse "WARM_SRC_OWNER must be 12 digits"
 [ -n "$WARM_SRC_URL" ] || refuse "WARM_SRC_URL is required"
 case $WARM_SRC_URL in
   https://*) ;;
@@ -300,7 +305,10 @@ echo "STEP metadata blocked"
 # --disable (first) skips every curl config file, all curl output is dropped, and
 # --proto keeps a redirect on https.
 fetch_rc=0
-printf 'url = "%s"\n' "$WARM_SRC_URL" |
+{
+  printf 'url = "%s"\n' "$WARM_SRC_URL"
+  [ -z "$WARM_SRC_OWNER" ] || printf 'header = "x-amz-expected-bucket-owner: %s"\n' "$WARM_SRC_OWNER"
+} |
   curl --disable -fsS --proto '=https' --max-time 600 -o "$ARCHIVE" --config - >/dev/null 2>&1 || fetch_rc=$?
 if [ "$fetch_rc" -ne 0 ]; then
   echo "WARM FAIL fetch rc=${fetch_rc}"

@@ -729,8 +729,8 @@ a row only when neither deadline has passed, even when a slow call has left the 
 session too short for the archive URL. One outcome is not read this way: a listing that
 shows a builder is refused with `IMAGE_BUILD_ALREADY_ACTIVE` whenever it returns. The order
 of that refusal and a deadline is tracked in
-[#232](https://github.com/mikomiel/ci-burst/issues/232). Each read, upload part and presign
-of a stage takes the earlier of the two deadlines, so no call starts after one that
+[#232](https://github.com/mikomiel/ci-burst/issues/232). Each read, upload part, presign and
+launch call of a stage takes the earlier of the two deadlines, so no call starts after one that
 returned at or after the build deadline. A call starts where the AWS client calls the SDK
 operation: the client, or the pass right before it calls the client, reads the cutoff
 there, and signing or a credential refresh inside the SDK can delay the request after that

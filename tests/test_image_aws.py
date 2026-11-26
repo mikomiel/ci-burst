@@ -908,6 +908,21 @@ class ProfileRouteTests(Base):
 
 
 class BuilderTests(Base):
+    def test_a_launch_whose_client_build_ends_at_the_deadline_is_not_called(self):
+        session = SlowClientSession(self.calls, self.ec2, self.s3, self.clock, 5)
+        aws = self.image_aws(clients={}, session_factory=lambda profile: session)
+        for deadline, launched in ((NOW + 5, 0), (NOW + 6, 1)):
+            with self.subTest(deadline=deadline):
+                self.calls.clear()
+                self.clock.now = NOW
+                aws._clients.clear()
+                with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
+                    try:
+                        self.builder(aws, deadline=deadline)
+                    except DeadlineRefusal as refusal:
+                        self.assertEqual(refusal.detail, "RunInstances")
+                self.assertEqual(len(self.requests("run_instances")), launched)
+
     def test_the_builder_request_has_the_image_tags_and_never_the_managed_tag(self):
         self.builder()
         (request,) = self.requests("run_instances")
@@ -949,7 +964,17 @@ class BuilderTests(Base):
         parameters = set(inspect.signature(ImageAws.run_builder).parameters)
         self.assertEqual(
             parameters,
-            {"self", "template_name", "template_version", "deployment", "build_id", "expires_at", "user_data", "client_token"},
+            {
+                "self",
+                "template_name",
+                "template_version",
+                "deployment",
+                "build_id",
+                "expires_at",
+                "user_data",
+                "client_token",
+                "deadline",
+            },
         )
 
     def test_a_launch_response_must_identify_exactly_one_instance(self):
@@ -1921,6 +1946,16 @@ class StagingDeadlineTests(Base):
                     operation(self.uncached(30), self.clock())
                 self.assertEqual(self.names(), [])
 
+    def test_a_listing_whose_sts_client_build_ends_at_the_deadline_asks_for_no_account(self):
+        # The early read passes, then building the STS client takes the time left: no STS call and no S3 call.
+        self.s3.pages = [{"Contents": []}]
+        session = SlowClientSession(self.calls, self.ec2, self.s3, self.clock, self.LEFT)
+        aws = self.image_aws(account=None, clients={"s3": self.s3}, session_factory=lambda profile: session)
+        with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
+            with self.assertRaises(DeadlineRefusal):
+                aws.list_objects(BUCKET, PREFIX, deadline=self.clock() + self.LEFT)
+        self.assertEqual(self.names(), ["session.client"])
+
     def test_a_call_with_no_deadline_is_not_bounded_by_the_clock(self):
         self.s3.pages = [{"Contents": []}]
         aws = self.uncached(10_000)
@@ -2045,8 +2080,19 @@ class PresignTests(Base):
         self.assertEqual(url, SENTINEL_URL)
         self.assertEqual(
             self.requests("generate_presigned_url"),
-            [{"ClientMethod": "get_object", "Params": {"Bucket": BUCKET, "Key": self.KEY}, "ExpiresIn": 1800}],
+            [
+                {
+                    "ClientMethod": "get_object",
+                    "Params": {"Bucket": BUCKET, "Key": self.KEY, "ExpectedBucketOwner": ACCOUNT},
+                    "ExpiresIn": 1800,
+                }
+            ],
         )
+
+    def test_presign_signs_the_recorded_owner_of_the_bucket(self):
+        self.image_aws().presign_get(BUCKET, self.KEY, 1800, owner="210987654321")
+        (request,) = self.requests("generate_presigned_url")
+        self.assertEqual(request["Params"], {"Bucket": BUCKET, "Key": self.KEY, "ExpectedBucketOwner": "210987654321"})
 
     def test_presign_refuses_when_the_session_has_less_life_than_the_window(self):
         with self.assertRaises(ProviderRefusal) as raised:
@@ -2104,7 +2150,7 @@ class PresignTests(Base):
         credentials = FakeCredentials(expiry)
         session = FakeSession(self.calls, self.ec2, self.s3, credentials=credentials)
         aws = ImageAws(REGION, PROFILE, session_factory=lambda profile: session, clients={"s3": self.s3}, clock=self.clock)
-        self.assertEqual(aws.presign_get(BUCKET, self.KEY, 1800), SENTINEL_URL)
+        self.assertEqual(aws.presign_get(BUCKET, self.KEY, 1800, owner=ACCOUNT), SENTINEL_URL)
         self.assertEqual(credentials.resolved, 1)
         short = FakeCredentials(datetime.fromtimestamp(NOW + 100, timezone.utc))
         session = FakeSession(self.calls, self.ec2, self.s3, credentials=short)

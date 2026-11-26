@@ -257,6 +257,7 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 - **WHEN** a pass makes an S3 call against a staging bucket: the upload, its abort, a delete or a listing
 - **THEN** the call names the account of the image identity as the expected bucket owner, read once per pass from `GetCallerIdentity`, and no call goes out without it
 - **AND** the row records that account as `archive_owner` with the bucket and the key, and a stage done again and every delete of the archive name the recorded owner
+- **AND** the presigned GET of the archive signs the recorded owner, and the builder sends it as the `x-amz-expected-bucket-owner` header (`WARM_SRC_OWNER`)
 - **AND** an `AccessDenied` answer sends nothing more and gives `IMAGE_STAGING_BUCKET_DENIED`: when neither deadline has passed as it returns, a stage done again ends its row as a refused start with no failure counted and a first stage fails the build; a refused delete counts as failed and stays owed
 
 #### Scenario: The bucket does not exist
@@ -653,7 +654,7 @@ Every provider read of a pass, except the read that confirms a deregistration, M
 - **THEN** the command refuses with `pass_deadline_exceeded`
 
 ### Requirement: A cutoff is read where a provider call starts
-A provider call starts where the AWS client calls the SDK operation. The AWS client, or the pass with no other call in between, MUST read each cutoff of the call right before that point and MUST NOT call the operation at or after it. In a stage, each template read, listing page, upload part and presign MUST take the earlier of the two deadlines. Signing and a credential refresh inside the SDK can delay the request after that check, and no cutoff bounds that delay.
+A provider call starts where the AWS client calls the SDK operation. The AWS client, or the pass with no other call in between, MUST read each cutoff of the call right before that point and MUST NOT call the operation at or after it. In a stage, each template read, listing page, upload part, presign and launch call MUST take the earlier of the two deadlines. Signing and a credential refresh inside the SDK can delay the request after that check, and no cutoff bounds that delay.
 
 #### Scenario: A cutoff passes before the SDK operation is called
 - **WHEN** a cutoff passes while the AWS client builds its client, looks up the account, or looks up the credential for a presign that the session outlives

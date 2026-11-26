@@ -214,16 +214,19 @@ def build_decision(
     return _result(True, "start", None, clear)
 
 
-def warm_exports(config, source_url, archive_sha256):
-    """The ``WARM_*`` inputs of one build, from configuration and two build facts.
+def warm_exports(config, source_url, archive_sha256, source_owner=None):
+    """The ``WARM_*`` inputs of one build, from configuration and the build facts.
 
     ``config`` is the enabled ``ImageConfig``. ``source_url`` is the presigned
-    archive URL and ``archive_sha256`` the hash of the staged archive. The
-    names and encodings are the ones ``warm-cache.sh`` reads.
+    archive URL and ``archive_sha256`` the hash of the staged archive.
+    ``source_owner`` is the account that the URL signs as the bucket's expected
+    owner. The names and encodings are the ones ``warm-cache.sh`` reads.
     """
     exports = render_commands(config.warm.commands, config.warm.gate_command)
     exports["WARM_SRC_URL"] = source_url
     exports["WARM_SRC_SHA256"] = archive_sha256
+    if source_owner is not None:
+        exports["WARM_SRC_OWNER"] = source_owner
     exports["WARM_LIFETIME_SECONDS"] = str(config.warm.lifetime_seconds)
     exports["WARM_SNAPSHOT_SECONDS"] = str(config.warm.snapshot_seconds)
     exports["WARM_SRC_STRIP_COMPONENTS"] = str(config.source.strip_components)

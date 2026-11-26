@@ -378,6 +378,7 @@ class RefusalTests(WarmHarness, unittest.TestCase):
         cases = {
             "a digest that is not 64 hex digits": {"WARM_SRC_SHA256": "abc123"},
             "a missing URL": {"WARM_SRC_URL": ""},
+            "an owner that is not 12 digits": {"WARM_SRC_OWNER": "21098765432x"},
             "a URL that is not https": {"WARM_SRC_URL": "http://builder-source.invalid/a.tar.gz"},
             "a URL with whitespace": {"WARM_SRC_URL": "https://builder-source.invalid/a b"},
             "a URL with a quote": {"WARM_SRC_URL": 'https://builder-source.invalid/a"b'},
@@ -505,6 +506,12 @@ class FetchTests(WarmHarness, unittest.TestCase):
         config = (self.stub / "curl-config").read_text(encoding="utf-8")
         self.assertEqual(config, f'url = "{SOURCE_URL}"\n')
         self.assertNotIn(SECRET_URL_TOKEN, self.output)
+
+    def test_the_expected_owner_reaches_curl_as_a_header_on_stdin(self):
+        completed = self.start(WARM_SRC_OWNER="210987654321")
+        self.assertEqual(completed.returncode, 0, self.output)
+        config = (self.stub / "curl-config").read_text(encoding="utf-8")
+        self.assertEqual(config, f'url = "{SOURCE_URL}"\nheader = "x-amz-expected-bucket-owner: 210987654321"\n')
 
     def ipv6(self, enabled):
         marker = self.proc / "net" / "if_inet6"

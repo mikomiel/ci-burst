@@ -882,10 +882,16 @@ class ImagePipeline:
         that finds a build in flight or an archive deletion owed: that pass settles them and launches nothing new
         (``_Pass._start_refusal``, and ``_Pass._run`` for a pass with no build).
         """
-        if self._gate_missing() and not (apply and self._settlement_pending()):
-            raise ImageRefusal(
-                IMAGE_GATE_REQUIRED, "image.warm.gate_command is empty and image.warm.allow_no_gate is false"
-            )
+        if self._gate_missing():
+            if not (apply and self._settlement_pending()):
+                raise ImageRefusal(
+                    IMAGE_GATE_REQUIRED, "image.warm.gate_command is empty and image.warm.allow_no_gate is false"
+                )
+            # A cleanup pass needs no script, so the pass reads it only when it settles a build (``_Pass._run``).
+            return self._script
+        return self._load_script()
+
+    def _load_script(self):
         if self._script is None:
             self._script = image.shipped_script()
         return self._script
@@ -1237,8 +1243,11 @@ class _Pass:
         self.tele.write_metrics(self.s, now)
 
     def _run(self):
+        cleanup_only = self.p._gate_missing() and self.s.active_build(self.dep) is None
+        if self.script is None and not cleanup_only:
+            self.script = self.p._load_script()
         self.aws = self.p._aws_factory()
-        if self.p._gate_missing() and self.s.active_build(self.dep) is None:
+        if cleanup_only:
             return self._cleanup_only()
         reconcile = self._reconcile()
         self.summary = reconcile
@@ -1792,11 +1801,11 @@ class _Pass:
             build = s.advance_build(
                 build.id,
                 archive_bucket=cfg.storage.bucket,
-                archive_owner=aws.account_id(),
+                archive_owner=aws.account_id(deadline=self._cutoff(build)),
                 archive_key=f"{_archive_prefix(cfg.storage.prefix)}{build.id}.tar.gz",
             )
         else:
-            self._check_archive_owner(build)
+            self._check_archive_owner(build, deadline=self._cutoff(build))
         chunks = self._source().archive(build.source_sha, cfg.source.max_archive_bytes, deadline=self._cutoff(build))
         try:
             # The upload takes time, and so does the refusal that S3 or the forge can end it with. Both deadlines are
@@ -1847,13 +1856,14 @@ class _Pass:
         )
         return build
 
-    def _check_archive_owner(self, build):
+    def _check_archive_owner(self, build, *, deadline=None):
         """Refuse with ``IMAGE_STAGING_OWNER_CHANGED`` unless the row's owner is the account of this session.
 
         The recorded bucket name may exist in the account that this identity is in now, and it is not the bucket
-        that the row staged to. A row with no recorded owner is refused too. The detail holds no account number.
+        that the row staged to. A row with no recorded owner is refused too. The detail holds no account number. A
+        lookup of the account does not start at or after ``deadline`` (``ImageAws.account_id``).
         """
-        if build.archive_owner != self.aws.account_id():
+        if build.archive_owner != self.aws.account_id(deadline=deadline):
             raise ProviderRefusal(
                 IMAGE_STAGING_OWNER_CHANGED, "the account of the archive's bucket is not the account of this session"
             )
@@ -1897,8 +1907,9 @@ class _Pass:
         Three things are not read this way, because nothing is gained by it. The answer of the launch call itself: a
         builder that it started must be recorded, and a refusal of it ends the row by the provider's code. The result
         of a listing that shows a builder (``_check_no_builder``). The lookup of the account that owns the bucket
-        (``account_id``): the listing of the stray archives asked for it earlier in reconcile, which every pass runs
-        before it can stage, and the adapter keeps the answer, so the lookup takes no time here.
+        (``account_id``): every lookup takes the cutoffs of the call that needs it (``ImageAws._check_deadline``), the
+        listing of the stray archives in reconcile, which every pass runs before it can stage, looks it up first, and
+        the adapter keeps the answer, so the lookup takes no time here.
         """
         try:
             yield
@@ -1918,7 +1929,8 @@ class _Pass:
         (``_deadline_first``). The presign takes time, and the session can age during it so that it refuses
         ``IMAGE_CREDENTIAL_SHORT``, which would end the row as a refused start (``_stage``). So both deadlines are read
         when the presign has returned, whether it answered or refused, and again when the listing of the builders that
-        follows has returned (``_check_no_builder``), right before the launch call. At or after the build deadline the
+        follows has returned (``_check_no_builder``), right before the launch call, and the adapter reads the earlier
+        of the two where the launch call starts (``ImageAws._check_deadline``). At or after the build deadline the
         launch is refused with ``CONSOLE_BLIND``; at or after the pass deadline with ``DeadlineRefusal``, and the row
         waits for the next pass (``_settle_a_cut_stage``). A build that is out of time when the presign returns starts
         no listing. The answer of the launch call is never read this way: a builder that it started is recorded, and a
@@ -1927,9 +1939,14 @@ class _Pass:
         aws, cfg = self.aws, self.cfg
         with self._deadline_first(build):
             url = aws.presign_get(
-                build.archive_bucket, upload.key, cfg.source.presign_seconds, deadline=self._cutoff(build)
+                build.archive_bucket,
+                upload.key,
+                cfg.source.presign_seconds,
+                deadline=self._cutoff(build),
+                owner=build.archive_owner,
             )
-        user_data = image.render_user_data(self.script, image.warm_exports(cfg, url, upload.sha256))
+        exports = image.warm_exports(cfg, url, upload.sha256, build.archive_owner)
+        user_data = image.render_user_data(self.script, exports)
         self._check_no_builder(build)
         try:
             return aws.run_builder(
@@ -1940,6 +1957,7 @@ class _Pass:
                 expires_at=build.deadline_at,
                 user_data=user_data,
                 client_token=build.client_token,
+                deadline=self._cutoff(build),
             )
         except ProviderRefusal as refusal:
             if refusal.uncertain:
@@ -2250,9 +2268,10 @@ class _Pass:
         key that was never written as a success, so a row whose upload never happened settles at the first try.
 
         The owner check can be the first use of the account in this session, a provider call that takes time, and the
-        first S3 call of the session builds its client, which takes time too. With ``not_after`` set, the clock is read
-        once the check has passed and again by the adapter, where the delete starts (``ImageAws._check_deadline``): a
-        delete that would start at or after it does not start. The row is then left as it was (not tried, still owed)
+        first S3 call of the session builds its client, which takes time too. With ``not_after`` set, the adapter reads
+        it where the lookup starts, the clock is read once the check has passed, and the adapter reads it again where
+        the delete starts (``ImageAws._check_deadline``): a lookup or a delete that would start at or after it does not
+        start. The row is then left as it was (not tried, still owed)
         for a later pass.
         """
         if not build.archive_key or not build.archive_bucket:
@@ -2261,7 +2280,7 @@ class _Pass:
         self.delete_attempted.add(build.id)
         try:
             # No call is made about the archive of a row that another account owns, or that records no owner.
-            self._check_archive_owner(build)
+            self._check_archive_owner(build, deadline=not_after)
             if not_after is not None and self.clock() >= not_after:
                 self.delete_attempted.discard(build.id)
                 return None
@@ -2269,8 +2288,8 @@ class _Pass:
                 build.archive_bucket, build.archive_key, owner=build.archive_owner, deadline=not_after
             )
         except DeadlineRefusal:
-            # The client of the first S3 call was built after the cutoff, so the adapter did not call the delete: it
-            # never started, as in the check above.
+            # The client of the first STS or S3 call was built after the cutoff, so the adapter did not call the lookup
+            # or the delete: it never started, as in the check above.
             self.delete_attempted.discard(build.id)
             return None
         except ProviderRefusal as refusal:

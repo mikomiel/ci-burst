@@ -498,8 +498,8 @@ def payload_of(text):
 class WarmExportsTests(unittest.TestCase):
     def test_the_names_are_the_inputs_the_script_reads(self):
         read = set(re.findall(r"(?m)^(WARM_[A-Z0-9_]+)=\$\{\1:?-", SCRIPT.read_text(encoding="utf-8")))
-        self.assertEqual(len(read), 7)
-        self.assertEqual(set(image.warm_exports(load_image(), SENTINEL_URL, "ab" * 32)), read)
+        self.assertEqual(len(read), 8)
+        self.assertEqual(set(image.warm_exports(load_image(), SENTINEL_URL, "ab" * 32, "210987654321")), read)
 
     def test_the_values_come_from_the_configuration_and_the_two_build_facts(self):
         values = image.warm_exports(load_image(), SENTINEL_URL, "ab" * 32)

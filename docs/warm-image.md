@@ -77,6 +77,7 @@ front of the script ([step 3](#3-render-the-user-data)).
 |---|---|---|
 | `WARM_SRC_URL` | yes | `https` URL of a `.tar.gz` source archive that the builder can fetch without credentials. |
 | `WARM_SRC_SHA256` | yes | The archive's sha256, 64 hex digits. The script refuses to run without it and stops when the fetched bytes differ. |
+| `WARM_SRC_OWNER` | no | A 12-digit account that the fetch sends as the `x-amz-expected-bucket-owner` header. A URL that signs that header needs it, and S3 then refuses the GET when another account owns the bucket. |
 | `WARM_COMMANDS` | yes | The warm commands, one per line. Blank lines and lines that start with `#` are ignored. At least one is required. |
 | `WARM_GATE_COMMAND` | no | One command that tests that the warm layer is enough, run after the warm commands in the same account, environment and network. The script does not forbid downloads: the command must, with its tool's offline switch ([Examples](#examples)). The script tests only the command's final exit status, so join steps that must all succeed with `&&`, never `;`. |
 | `WARM_LIFETIME_SECONDS` | no | Builder lifetime bound, 600 to 14400, default 5400. |

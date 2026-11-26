@@ -800,28 +800,31 @@ class ImageAws:
                 self._clients[service] = self._session().client(service, region_name=self._region, config=config)
         return self._clients[service]
 
-    def account_id(self):
+    def account_id(self, *, deadline=None, stop=None, detail="GetCallerIdentity"):
         """The account of this identity, from ``GetCallerIdentity``, asked once per instance.
 
         Every S3 call of this adapter names it as the bucket's owner. An answer that is no account number refuses,
-        so no S3 call goes out without an owner.
+        so no S3 call goes out without an owner. The lookup starts at the cutoffs of the call that needs it
+        (``_check_deadline``), after the STS client is built.
         """
         if self._account_cache is None:
-            response = self._invoke("sts", "get_caller_identity", read=True)
+            response = self._invoke(
+                "sts", "get_caller_identity", read=True, deadline=deadline, stop=stop, detail=detail
+            )
             account = response.get("Account") if isinstance(response, Mapping) else None
             if not isinstance(account, str) or not re.fullmatch(r"[0-9]{12}", account):
                 raise ProviderRefusal("AWS_ACCOUNT_UNKNOWN", "get_caller_identity returned no account", uncertain=True)
             self._account_cache = account
         return self._account_cache
 
-    def _bound_owner(self, owner):
+    def _bound_owner(self, owner, *, deadline=None, stop=None, detail=""):
         """The account that an S3 call names as the bucket's owner.
 
         ``owner`` is the account that a row recorded for its archive. ``None`` means this identity's own account.
         Anything that is no account number refuses, so no S3 call goes out without an owner.
         """
         if owner is None:
-            return self.account_id()
+            return self.account_id(deadline=deadline, stop=stop, detail=detail)
         if not isinstance(owner, str) or not re.fullmatch(r"[0-9]{12}", owner):
             raise ProviderRefusal("AWS_ACCOUNT_UNKNOWN", "the bucket owner is no account number")
         return owner
@@ -838,7 +841,7 @@ class ImageAws:
         the first owner check of an adapter asks STS for the account, which takes time.
         """
         if service == "s3":
-            arguments["ExpectedBucketOwner"] = self._bound_owner(owner)
+            arguments["ExpectedBucketOwner"] = self._bound_owner(owner, deadline=deadline, stop=stop, detail=detail)
         client = self._client(service)
         # Outside the ``try`` below, which would translate the refusal into a provider failure.
         self._check_deadline(deadline, detail, stop)
@@ -921,13 +924,24 @@ class ImageAws:
     def terminate(self, instance_ids):
         return self._reads().terminate(instance_ids)
 
-    def run_builder(self, *, template_name, template_version, deployment, build_id, expires_at, user_data, client_token):
+    def run_builder(
+        self,
+        *,
+        template_name,
+        template_version,
+        deployment,
+        build_id,
+        expires_at,
+        user_data,
+        client_token,
+        deadline=None,
+    ):
         """Launch the one builder from the build launch template.
 
         The request is built from fixed parameters only: a numeric template
         version, on-demand capacity, one instance, no instance profile and the
         build tags. It has no field through which the managed tag or a profile
-        could be added.
+        could be added. No launch starts at or after ``deadline`` (``_check_deadline``).
         """
         _require_version(template_version)
         tags = [
@@ -939,6 +953,8 @@ class ImageAws:
         response = self._invoke(
             "ec2",
             "run_instances",
+            deadline=deadline,
+            detail="RunInstances",
             LaunchTemplate={"LaunchTemplateName": template_name, "Version": str(template_version)},
             MinCount=1,
             MaxCount=1,
@@ -1142,7 +1158,7 @@ class ImageAws:
         clean up.
         """
         self._check_deadline(deadline, "archive upload")
-        owner = self._bound_owner(owner)
+        owner = self._bound_owner(owner, deadline=deadline, detail="archive upload")
         started = self._invoke(
             "s3",
             "create_multipart_upload",
@@ -1318,19 +1334,22 @@ class ImageAws:
                 f"{max(int(remaining), 0)} seconds of credential life remain, {expires_seconds} are needed",
             )
 
-    def presign_get(self, bucket, key, expires_seconds, *, deadline=None):
+    def presign_get(self, bucket, key, expires_seconds, *, deadline=None, owner=None):
         """Presign a GET for one object, only if the session outlives the URL.
 
         ``check_credential_life`` decides that. The lookup of the credential can take time, so a ``deadline`` is read
-        after it, as ``_check_deadline`` says. The URL is returned and never logged, stored or placed in an error.
+        after it, as ``_check_deadline`` says. The ``owner`` (see ``_bound_owner``) is signed as the bucket's
+        expected owner: the SDK signs it as the ``x-amz-expected-bucket-owner`` header, so the GET must send
+        that header with that value. The URL is returned and never logged, stored or placed in an error.
         """
         self.check_credential_life(expires_seconds)
+        owner = self._bound_owner(owner, deadline=deadline, detail="presign")
         client = self._client("s3")
         self._check_deadline(deadline, "presign")
         try:
             return client.generate_presigned_url(
                 "get_object",
-                Params={"Bucket": bucket, "Key": key},
+                Params={"Bucket": bucket, "Key": key, "ExpectedBucketOwner": owner},
                 ExpiresIn=expires_seconds,
             )
         except Exception as error:  # noqa: BLE001 - classified below

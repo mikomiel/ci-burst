@@ -1345,18 +1345,23 @@ def _trace(path):
 
 
 def refuse_conflicting_outputs(outputs, *, export_directory, files, directories):
-    """Refuse, before any write, outputs that could replace each other or a protected entry.
+    """Refuse, before any write, outputs that could replace each other or an entry that a lookup reads.
 
-    Each output's directory must exist, except ``export_directory``, which the
-    caller creates in the existing ledger directory when this returns it. An
-    output replaces only its own entry, and ``os.replace`` of a file cannot
-    replace a directory. Every entry that the lookup of a protected path reads
-    (``_trace``) is protected, with the names that continue a final entry's name
-    with ``.`` or ``-`` (the ledger's lock, journal and copies; the lock,
-    temporary file and backups of ``image promote``) and every entry of a
-    protected directory. Other paths are the operator's.
+    Returns the spelling of each output that every later step uses (``.`` and
+    doubled separators dropped; a last component that is empty, ``.`` or ``..``
+    asks for a directory and is refused) and the directory the caller creates.
+    Each output's directory must exist, except ``export_directory`` in the
+    existing ledger directory, and an output replaces only its own entry:
+    ``os.replace`` of a file cannot replace a directory. Protected are the
+    entries that the lookup (``_trace``) of each output's directory reads, its
+    own included, so no output repoints a later step; those of each path in
+    ``files`` and ``directories`` (tuples: as named and as opened), with the
+    names that continue a final entry's name with ``.`` or ``-`` (the ledger's
+    lock, journal and copies; the lock, temporary file and backups of
+    ``image promote``); and every entry of a protected directory. Other paths
+    are the operator's.
     """
-    claimed, create, missing = {}, None, []
+    spellings, claimed, create, missing, read = {}, {}, None, [], set()
 
     def claim(entry, what):
         if entry in claimed:
@@ -1364,6 +1369,9 @@ def refuse_conflicting_outputs(outputs, *, export_directory, files, directories)
         claimed[entry] = what
 
     for option, path in outputs.items():
+        if os.path.basename(os.fspath(path)) in ("", ".", ".."):
+            raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{option} must end with a file name")
+        spellings[option] = str(Path(path))
         path = Path.cwd() / path
         try:
             status = os.stat(path.parent)
@@ -1371,6 +1379,7 @@ def refuse_conflicting_outputs(outputs, *, export_directory, files, directories)
             status = None
         if status is not None and stat.S_ISDIR(status.st_mode):
             claim((status.st_dev, status.st_ino, path.name), option)
+            read.update(entry for entry, _ in _trace(path.parent)[0])
         elif status is None and path.parent == export_directory and not os.path.isdir(export_directory.parent):
             missing.append(f"the ledger directory {export_directory.parent} of {option} is missing")
         elif status is None and path.parent == export_directory and not os.path.lexists(export_directory):
@@ -1379,15 +1388,20 @@ def refuse_conflicting_outputs(outputs, *, export_directory, files, directories)
                 claim((ledger.st_dev, ledger.st_ino, export_directory.name), "the export directory")
                 create = export_directory
             claim((None, None, path.name), option)
+            read.update(entry for entry, _ in _trace(export_directory.parent)[0])
         else:
             missing.append(f"the directory of {option} is missing; export creates only {export_directory}")
+    for entry, what in claimed.items():
+        if entry in read:
+            raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{what} names an entry that the lookup of an output reads")
     protected = []
-    for description, path in (files | directories).items():
-        items, final = ((), None) if path is None else _trace(path)
-        protected += [(entry, family, description) for entry, family in items]
-        if final is not None and description in directories:
-            status = os.stat(final)
-            protected.append(((status.st_dev, status.st_ino, None), False, description))
+    for description, paths in (files | directories).items():
+        for path in {path for path in paths if path is not None}:
+            items, final = _trace(path)
+            protected += [(entry, family, description) for entry, family in items]
+            if final is not None and description in directories:
+                status = os.stat(final)
+                protected.append(((status.st_dev, status.st_ino, None), False, description))
     for (device, inode, name), family, description in protected:
         for (other_device, other_inode, other), what in claimed.items():
             if (other_device, other_inode) == (device, inode) and (
@@ -1396,7 +1410,7 @@ def refuse_conflicting_outputs(outputs, *, export_directory, files, directories)
                 raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{what} names an entry that {description} uses")
     if missing:
         raise ConfigRefusal("EXPORT_DIRECTORY_MISSING", missing[0])
-    return create
+    return spellings, create
 
 
 @contextlib.contextmanager

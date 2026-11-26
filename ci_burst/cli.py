@@ -143,18 +143,21 @@ def _export(config, arguments):
     record = default_record_path(config.state.database)
     events_file = arguments.events_file or str(record.parent / "worker-events.ndjson")
     state_file = arguments.state_file or str(record)
-    create = refuse_conflicting_outputs(
+    paths, create = refuse_conflicting_outputs(
         {"--state-file": state_file, "--events-file": events_file, "--metrics-file": arguments.metrics_file},
         export_directory=record.parent,
-        files={"the ledger database": config.state.named_database, "the configuration file": arguments.config},
-        directories={"the image state directory": config.named_image_state_directory},
+        files={
+            "the ledger database": (config.state.named_database, config.state.database),
+            "the configuration file": (arguments.config,),
+        },
+        directories={"the image state directory": (config.named_image_state_directory,)},
     )
     if create is not None:
         create.mkdir(exist_ok=True)
     return Exporter(config).run(
-        events_file=events_file,
-        metrics_file=arguments.metrics_file,
-        state_file=state_file,
+        events_file=paths["--events-file"],
+        metrics_file=paths["--metrics-file"],
+        state_file=paths["--state-file"],
     )
 
 

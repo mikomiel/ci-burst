@@ -3281,6 +3281,53 @@ class ExportCliTests(unittest.TestCase):
         self.assertIn("EXPORT_DIRECTORY_MISSING", output)
         self.assertIn("the ledger directory", output)
 
+    def test_the_database_that_the_program_opens_is_protected_as_well_as_its_spelling(self):
+        # The loader resolves "state/old/../state.sqlite3" to state/state.sqlite3
+        # although state/old does not exist; the ledger opens that file.
+        (self.root / "state").mkdir()
+        config = write_config(self.root, config={"state": {"database": "state/old/../state.sqlite3"}})
+        self.assert_refused(config=config, metrics_file=self.root / "state" / "state.sqlite3")
+
+    def test_an_output_cannot_replace_a_link_that_another_outputs_lookup_reads(self):
+        (self.root / "real").mkdir()
+        (self.root / "alias").symlink_to("real")
+        self.run_cli(metrics_file=self.root / "unused.prom")
+        self.assert_refused(state_file=self.root / "alias" / "observed.json", metrics_file=self.root / "alias")
+        self.assertTrue((self.root / "alias").is_symlink())
+
+    def test_an_output_spelling_that_the_lookup_reads_differently_is_refused(self):
+        # A trailing slash, "." or ".." at the end asks for a directory where the
+        # write would replace a file.
+        record = self.root / "state" / "export" / "observed.json"
+        record.parent.mkdir(parents=True)
+        record.write_text("{}")
+        self.run_cli(metrics_file=self.root / "unused.prom")
+        for suffix in ("/", "/.", "/.."):
+            with self.subTest(suffix):
+                self.assert_refused(state_file=str(record) + suffix, metrics_file=self.root / "unused.prom")
+                self.assertEqual(record.read_text(), "{}")
+
+    def test_a_missing_ledger_directory_does_not_stop_explicit_outputs(self):
+        # Only the export directory needs the ledger directory; the exporter
+        # reports a missing ledger itself (ledger_omitted).
+        config = write_config(self.root, config={"state": {"database": str(self.root / "ledger" / "state.sqlite3")}})
+        code, ran, output, _, _ = self.run_cli(
+            config=config,
+            state_file=self.root / "observed.json",
+            events_file=self.root / "events.ndjson",
+            metrics_file=self.root / "ci-burst.prom",
+        )
+        self.assertEqual((code, len(ran)), (0, 1), output)
+        self.assertFalse((self.root / "ledger").exists())
+
+    def test_every_step_gets_one_normalized_spelling_of_each_output(self):
+        (self.root / "out").mkdir()
+        _, ran, output, _, _ = self.run_cli(
+            state_file=f"{self.root}//out/./observed.json", metrics_file=f"{self.root}/out//ci-burst.prom"
+        )
+        self.assertEqual(ran[0]["state_file"], str(self.root / "out" / "observed.json"), output)
+        self.assertEqual(ran[0]["metrics_file"], str(self.root / "out" / "ci-burst.prom"))
+
     def test_the_default_paths_create_only_the_export_directory(self):
         code, ran, output, database, _ = self.run_cli(metrics_file=self.root / "state" / "export" / "ci-burst.prom")
         self.assertEqual(code, 0, output)

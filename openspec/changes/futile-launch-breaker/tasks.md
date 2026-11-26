@@ -311,9 +311,10 @@ instance identifiers and 32-character hexadecimal operation identifiers.
 - [x] 3.13 Lock mechanism tests in `tests/test_export.py`: a run waits while its
   directory is held, creates no lock file, and an output at the former lock path
   cannot replace the lock. Exit 2, nothing written or created: an output under a
-  missing directory but the export directory; two outputs on one entry; an output
-  on an entry that the lookup of the ledger (relative or not), the configuration
-  or the image state directory (enabled or not) reads. A read that fails after its
+  missing directory but the export directory; a path ending in `/`, `.` or `..`;
+  two outputs on one entry; an output on an entry that the lookup of another
+  output, the ledger (named or opened), the configuration or the image state
+  directory (enabled or not) reads. A read that fails after its
   open fails the run (event file) or notes `state_rebuilt` (record). A record whose
   first read fails notes `state_rebuilt` and restarts the counters, and after a
   failed textfile write it carries the epoch, not a fresh heartbeat. A link at the

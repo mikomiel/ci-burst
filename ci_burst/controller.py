@@ -42,7 +42,7 @@ from .aws import (
     is_capacity_failure,
 )
 from .config import ZoneCandidate
-from .cost import CostModel
+from .cost import CostModel, _frozen_max_price_micros
 from .credit import evidence as credit_evidence
 from .errors import DeadlineRefusal, PASS_DEADLINE_EXCEEDED, ProviderRefusal, Refusal, StateRefusal
 from .export import default_record_path
@@ -138,6 +138,23 @@ def _frozen_deployment(operation):
             if isinstance(value, str) and value:
                 return value
     return None
+
+
+def _request_damaged(operation):
+    """Whether the stored request is not the one admission hashed and priced.
+
+    A resume sends the stored request again under the same client token, so the
+    request must hash to the ``request_sha256`` stored with it, computed as
+    admission computes it, and must carry the ``MaxPrice`` that admission
+    committed. A request that does not decode, or cannot be hashed, is damaged
+    as well. The pass refuses such a row and goes on, so none of that may raise.
+    """
+    try:
+        return not _frozen_max_price_micros(operation.request_json) or (
+            _sha256(operation.request()) != operation.request_sha256
+        )
+    except (TypeError, ValueError, RecursionError):
+        return True
 
 
 @dataclass(frozen=True)
@@ -1170,6 +1187,14 @@ class Controller:
                 # block admission instead.
                 attempt["decision"] = "refused"
                 attempt["reasons"] = ["unresolved_intent_lifetime_short"]
+            elif _request_damaged(operation):
+                # Admission froze the request, its hash and its price, and the same
+                # client token cannot carry another request. A request that has lost
+                # its MaxPrice or no longer matches its hash may not be what the
+                # provider was asked. Fail closed: keep the unresolved ownership and
+                # the reservation, send nothing and block admission instead.
+                attempt["decision"] = "refused"
+                attempt["reasons"] = ["unresolved_intent_request_damaged"]
             else:
                 self._send(operation, operation.request(), attempt, "resumed", first_attempt=False)
             record = {

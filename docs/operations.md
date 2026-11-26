@@ -2018,7 +2018,7 @@ ago (#222). Each intent stores the lifetime it was admitted under, so the
 mismatch refusal does not infer it from `expires_at` and `created_at`. All four keep the unresolved
 ownership and block admission while they remain unresolved: a later reconciliation that finds the instance settles the row, and otherwise an operator must. When more than one launch intent is unresolved,
 `apply` retries them in creation order and stops at the first intent whose age
-exceeds the client-token window or the 900-second bound, whose lifetime elapsed or differs, or whose
+exceeds the client-token window or the 900-second bound, whose lifetime elapsed or differs, whose stored request is damaged, or whose
 retry is not accepted. Intents after the deciding one are not sent and retain their existing
 ledger state for the next apply.
 
@@ -2058,6 +2058,17 @@ owned inventory does not prove that its request was never sent
 ([container.md § Rollback](container.md#rollback), step 4, covers an unresolved
 intent).
 
+A fifth refusal protects the stored request. Before `apply` sends an intent
+again, it hashes the stored request as admission did and compares the result
+with the `request_sha256` stored with it. It also requires a usable `MaxPrice`,
+the price ceiling that admission wrote into every request. `apply` refuses an
+intent whose request does not decode, hashes to another value, or has no usable
+`MaxPrice` with `unresolved_intent_request_damaged`, and sends nothing. The row,
+its request, its client token and its reservation stay as they are, and the
+intent blocks admission while it remains unresolved. Reconciliation settles it
+when the provider shows its instance. Otherwise no command repairs it: keep
+cleanup running, do not edit or delete the row, and escalate.
+
 Every attempted intent produces one `resumes` record in creation order. A
 record's `expires_at` and `reservation` always come from the durable operation,
 whatever the outcome; `instance_id` is `null` until a launch is confirmed, and
@@ -2071,11 +2082,12 @@ whatever the outcome; `instance_id` is `null` until a launch is confirmed, and
 | `refused` | `["unresolved_intent_lifetime_elapsed"]` | `null` | absent | from the operation | `[]` |
 | `refused` | `["unresolved_intent_lifetime_mismatch"]` | `null` | absent | from the operation | `[]` |
 | `refused` | `["unresolved_intent_lifetime_short"]` | `null` | absent | from the operation | `[]` |
+| `refused` | `["unresolved_intent_request_damaged"]` | `null` | absent | from the operation | `[]` |
 
 Every record also carries `operation`. The top level carries the deciding
 intent's `operation`, `decision`, `expires_at` and `reservation`; its
 `instance_id` appears only when that intent was confirmed, its `reasons` only for
-the four refusals above, and its `refusal` only for an uncertain retry. The top
+the five refusals above, and its `refusal` only for an uncertain retry. The top
 level carries no `attempts` field, and a resume sends one frozen request, so a
 record's `attempts` is always empty.
 

@@ -50,11 +50,15 @@ def _stored_price_micros(value):
     whole, dot, fraction = value.strip().partition(".")
     if not whole.isdigit() or (dot and (not fraction or not fraction.isdigit())):
         return 0
-    micros = int(whole) * MICROS_PER_UNIT
-    if dot:
-        micros += int(fraction[:PRICE_FRACTION_DIGITS].ljust(PRICE_FRACTION_DIGITS, "0"))
-        if fraction[PRICE_FRACTION_DIGITS:].strip("0"):
-            micros += 1
+    try:
+        micros = int(whole) * MICROS_PER_UNIT
+        if dot:
+            micros += int(fraction[:PRICE_FRACTION_DIGITS].ljust(PRICE_FRACTION_DIGITS, "0"))
+            if fraction[PRICE_FRACTION_DIGITS:].strip("0"):
+                micros += 1
+    except ValueError:
+        # ``isdigit`` also accepts "²", and ``int`` refuses a digit string past the interpreter's length limit.
+        return 0
     return micros if micros > 0 else 0
 
 

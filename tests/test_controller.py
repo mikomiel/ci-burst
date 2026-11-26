@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ci_burst.config import load
-from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment
+from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment, _sha256
 from ci_burst.credit import CreditSpecification
 from ci_burst.errors import (
     ConfigRefusal,
@@ -70,6 +70,10 @@ _V2_SCHEMA = """
     CREATE INDEX operations_window ON operations (reservation_window);
     PRAGMA user_version = 2;
 """
+
+
+#: The request of a seeded unsent intent that ``apply`` may send again: it holds the price admission froze.
+_PRICED_REQUEST = {"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": "0.040000"}}}
 
 
 class ControllerCase(unittest.TestCase):
@@ -130,13 +134,15 @@ class ControllerCase(unittest.TestCase):
         ``None`` for a row from before schema 5, to seed a mismatch.
         """
         created = self.clock.now - age
+        if request is None:
+            request = _PRICED_REQUEST if state == "intent" and not instance_id else {"seed": True}
         ledger = Ledger(self.config.state.database, clock=lambda: created).connect()
         with ledger.transaction():
             ledger.new_operation(
                 operation_id=operation_id,
                 client_token="ci-burst-" + operation_id,
-                request={"seed": True} if request is None else request,
-                request_sha256="0" * 64,
+                request=request,
+                request_sha256=_sha256(request),
                 expires_at=expires_at if expires_at is not None else created + 3600,
                 reservation_micros=reservation,
                 window_start=current_window(created, self.config.budget.window_seconds),
@@ -734,6 +740,60 @@ class ApplyTests(ControllerCase):
         self.assertEqual(result["decision"], "refused")
         self.assertIn("unresolved_intent_lifetime_elapsed", result["reasons"])
         self.assertEqual([call for call in self.aws.calls if call[0] == "run_spot"], [])
+
+    def assert_resume_refuses_a_damaged_request(self, damage, *, hash_matches):
+        # A real unresolved intent: the first send is lost, so the row is `uncertain` and holds its reservation.
+        # ``damage`` takes the decoded request and the stored hash and returns the ``(request_json, request_sha256)``
+        # to store in their place. ``hash_matches`` states whether the stored hash is the hash of the stored request,
+        # so a case cannot reach the refusal through the other check by accident.
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        self.assertEqual(first["decision"], "uncertain")
+        stored = self.reopened().operation(first["operation"])
+        request_json, request_sha256 = damage(json.loads(stored.request_json), stored.request_sha256)
+        connection = sqlite3.connect(self.config.state.database)
+        with connection:
+            connection.execute(
+                "UPDATE operations SET request_json = ?, request_sha256 = ? WHERE id = ?",
+                (request_json, request_sha256, stored.id),
+            )
+        connection.close()
+        before = self.reopened().operation(stored.id)
+        self.assertGreater(before.reservation_micros, 0)
+        self.assertEqual(_sha256(json.loads(before.request_json)) == before.request_sha256, hash_matches)
+        self.aws.run_error = None
+        # A fresh controller and ledger model a restarted process.
+        result = self.build(observation=observation_demand(), aws=self.aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["unresolved_intent_request_damaged"])
+        self.assertEqual(result["operation"], stored.id)
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1, "only the first send")
+        self.assertEqual(self.reopened().operation(stored.id), before, "the row and its reservation stay")
+
+    def test_resume_refuses_a_stored_request_that_lost_its_max_price(self):
+        # The price is the ceiling that admission committed, and the stored hash no longer matches the request.
+        def lose_the_price(request, digest):
+            del request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"]
+            return json.dumps(request, sort_keys=True, separators=(",", ":")), digest
+
+        self.assert_resume_refuses_a_damaged_request(lose_the_price, hash_matches=False)
+
+    def test_resume_refuses_a_request_without_a_max_price_whose_hash_matches(self):
+        # Rewriting the hash with the request leaves only the missing price to refuse it.
+        def rewrite_without_the_price(request, digest):
+            del request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"]
+            return json.dumps(request, sort_keys=True, separators=(",", ":")), _sha256(request)
+
+        self.assert_resume_refuses_a_damaged_request(rewrite_without_the_price, hash_matches=True)
+
+    def test_resume_refuses_a_stored_request_that_no_longer_matches_its_hash(self):
+        # The price is intact and only another field changed, so only the hash can refuse it.
+        def raise_the_count(request, digest):
+            request["MaxCount"] = 2
+            return json.dumps(request, sort_keys=True, separators=(",", ":")), digest
+
+        self.assert_resume_refuses_a_damaged_request(raise_the_count, hash_matches=False)
 
     def test_changed_placement_cannot_replace_an_unresolved_intent(self):
         controller = self.build(observation=observation_demand())
@@ -4073,6 +4133,12 @@ class CostTrackingTests(ControllerCase):
     def test_an_active_row_whose_frozen_request_has_a_null_max_price_keeps_its_reservation(self):
         self.assert_a_request_without_a_usable_max_price_keeps_its_reservation(
             lambda spot: spot.update(MaxPrice=None)
+        )
+
+    def test_an_active_row_whose_frozen_request_has_a_malformed_max_price_keeps_its_reservation(self):
+        # "²" passes ``str.isdigit`` but ``int`` refuses it, so it must not raise while cost is reported.
+        self.assert_a_request_without_a_usable_max_price_keeps_its_reservation(
+            lambda spot: spot.update(MaxPrice="²")
         )
 
     def test_a_lowered_configuration_does_not_reprice_an_admitted_operation(self):

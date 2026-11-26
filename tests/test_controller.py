@@ -74,6 +74,7 @@ _V2_SCHEMA = """
 
 #: The request of a seeded unsent intent that ``apply`` may send again: it holds the price admission froze.
 _PRICED_REQUEST = {"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": "0.040000"}}}
+_ADMITTED_AT_CAP = {"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": "0.200000"}}}
 
 
 class ControllerCase(unittest.TestCase):
@@ -786,6 +787,14 @@ class ApplyTests(ControllerCase):
             return json.dumps(request, sort_keys=True, separators=(",", ":")), _sha256(request)
 
         self.assert_resume_refuses_a_damaged_request(rewrite_without_the_price, hash_matches=True)
+
+    def test_resume_refuses_a_number_max_price_whose_hash_matches(self):
+        # Admission writes the price as a string; a JSON number under its own hash is not a request it froze.
+        def price_as_a_number(request, digest):
+            request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"] = 0.04
+            return json.dumps(request, sort_keys=True, separators=(",", ":")), _sha256(request)
+
+        self.assert_resume_refuses_a_damaged_request(price_as_a_number, hash_matches=True)
 
     def test_resume_refuses_a_stored_request_that_no_longer_matches_its_hash(self):
         # The price is intact and only another field changed, so only the hash can refuse it.
@@ -3662,8 +3671,8 @@ class CostTrackingTests(ControllerCase):
             ledger.new_operation(
                 operation_id="a",
                 client_token="ci-burst-a",
-                request={"seed": True},
-                request_sha256="0" * 64,
+                request=_ADMITTED_AT_CAP,
+                request_sha256=_sha256(_ADMITTED_AT_CAP),
                 expires_at=self.clock.now + 3600,
                 reservation_micros=200_001,
                 window_start=current_window(self.clock.now, config.budget.window_seconds),

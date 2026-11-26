@@ -406,9 +406,9 @@ class AdmittedBasisTests(unittest.TestCase):
         ended = self.admitted(request_json=lowered, request_sha256=sha(FROZEN_REQUEST), state="terminal")
         self.assertEqual(self.original_model().reservation_floor_micros(ended), 0)
 
-    def test_a_price_with_a_digit_outside_ascii_is_no_price(self):
-        for price in ("²", "0.²", "0.010000²", "٣", "9" * 5000):
-            with self.subTest(price=price[:12]):
+    def test_a_price_admission_would_not_write_is_no_price(self):
+        for price in ("²", "0.²", "0.010000²", "٣", "9" * 5000, "0.01" + "0" * 5000, "0.0400001", " 0.040000", 0.04, 1):
+            with self.subTest(price=repr(price)[:14]):
                 request = json.dumps({"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": price}}})
                 self.assertEqual(_frozen_max_price_micros(request), 0)
         self.assertEqual(_frozen_max_price_micros(FROZEN_REQUEST), 40_000)

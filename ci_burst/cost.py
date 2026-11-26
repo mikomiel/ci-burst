@@ -31,32 +31,20 @@ PRICE_FRACTION_DIGITS = 6
 
 
 def _stored_price_micros(value):
-    """Exact micros of one stored price, or zero when it is not a usable price.
+    """Exact micros of one stored price, or zero when it is not a price admission writes.
 
-    A malformed stored request must never raise while cost is reported, so an
-    unparseable price contributes nothing and the other bounds apply. A value
-    with more precision than micros rounds up, because a ceiling may over-state
-    but must not under-state.
+    Admission writes ``MaxPrice`` as a string of ASCII digits with a fraction of
+    six digits (``format_money``). Any other value, a JSON number or a longer
+    fraction included, is no usable price. A malformed stored request must never
+    raise while cost is reported, so it contributes nothing and the other bounds apply.
     """
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int):
-        return value * MICROS_PER_UNIT if value > 0 else 0
-    if isinstance(value, float):
-        if not math.isfinite(value) or value <= 0:
-            return 0
-        value = f"{value:.{PRICE_FRACTION_DIGITS}f}"
     if not isinstance(value, str):
         return 0
-    whole, dot, fraction = value.strip().partition(".")
-    if not _ascii_digits(whole) or (dot and not _ascii_digits(fraction)):
+    whole, dot, fraction = value.partition(".")
+    if not _ascii_digits(whole) or (dot and not _ascii_digits(fraction)) or len(fraction) > PRICE_FRACTION_DIGITS:
         return 0
     try:
-        micros = int(whole) * MICROS_PER_UNIT
-        if dot:
-            micros += int(fraction[:PRICE_FRACTION_DIGITS].ljust(PRICE_FRACTION_DIGITS, "0"))
-            if fraction[PRICE_FRACTION_DIGITS:].strip("0"):
-                micros += 1
+        micros = int(whole) * MICROS_PER_UNIT + int(fraction.ljust(PRICE_FRACTION_DIGITS, "0"))
     except ValueError:
         # ``int`` refuses a digit string past the interpreter's length limit.
         return 0

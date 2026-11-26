@@ -2063,6 +2063,25 @@ class PresignTests(Base):
             aws.presign_get(BUCKET, self.KEY, 1800)
         self.assertEqual(raised.exception.reason, "IMAGE_CREDENTIAL_SHORT")
 
+    def test_a_lookup_of_the_credential_that_ends_at_the_deadline_signs_no_url(self):
+        # The lookup takes time and the session still outlives the URL: the deadline alone refuses the signing call.
+        def slow_expiry():
+            self.clock.advance(60)
+            return NOW + 3600
+
+        for deadline, signed in ((NOW + 60, []), (NOW + 61, [SENTINEL_URL])):
+            with self.subTest(deadline=deadline):
+                self.clock.advance(NOW - self.clock())
+                self.calls.clear()
+                aws = self.image_aws(expiry=slow_expiry)
+                try:
+                    urls = [aws.presign_get(BUCKET, self.KEY, 1800, deadline=deadline)]
+                except DeadlineRefusal as refusal:
+                    self.assertEqual(refusal.detail, "presign")
+                    urls = []
+                self.assertEqual(urls, signed)
+                self.assertEqual(len(self.requests("generate_presigned_url")), len(signed))
+
     def test_an_expired_session_reports_no_negative_life(self):
         with self.assertRaises(ProviderRefusal) as raised:
             self.image_aws(expiry=NOW - 10).presign_get(BUCKET, self.KEY, 300)

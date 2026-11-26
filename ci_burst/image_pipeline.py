@@ -60,25 +60,23 @@ time while it stages the archive does not fail the build either: the row stays
 ``building`` with no builder, and the next pass stages the archive again under
 the key and the bucket that the row recorded before the first upload, whatever
 the configuration says by then, and launches. The build deadline still ends such
-a build. That pass checks first that the inputs still give the digest of the row:
-the hashes of the basis files that the row recorded when it was inserted (no file
-is read), the warm settings and the script. Changed inputs, a changed set of basis
-paths included, end the row ``failed`` with ``IMAGE_INPUTS_CHANGED``, count no
-failure and launch nothing, and the next pass decides from the new inputs. It then runs the template check of
-a start again: an unsafe template ends the row ``failed`` and the pass answers
-``refused``, like a refused start check.
+a build. That pass first checks the inputs of the row (no file is read), the gate and
+the template again (``_Pass._restage``): changed inputs, a missing gate or an unsafe
+template end the row ``failed``, count no failure and launch nothing, and the pass
+answers ``refused``.
 
-One rule holds in a start, in a stage that is done again (``_Pass._restage``) and in the launch: a deadline decides
-before the outcome of any call that takes time (``_Pass._deadline_first``). Those calls are the read of the template,
-the lookup of the credential, the upload, the presign and the listing of the builders. When one of them has returned,
-with a result or with a refusal, both deadlines are read again, before the pipeline inserts a row, uploads, launches
-or ends a row on that refusal. The build deadline decides first: at or after it no builder is launched, and the build
-fails ``CONSOLE_BLIND``. At or after the pass deadline none is launched either, and the row is left as a stage that the
-pass deadline ended: ``building`` with no builder and no archive hash, for the next pass to stage again. Before a row
-exists only the pass deadline applies, and the pass ends on it (``DeadlineRefusal``) with no row. So
-``IMAGE_CREDENTIAL_SHORT``, an unsafe template and a refusal of the bucket end a row only when neither deadline has
-passed. Two outcomes are not read this way: the answer of the launch call itself, because a builder that it started
-must be recorded, and a listing that shows a builder, which is refused whenever it returns (issue #232).
+One rule holds in a start, in a stage that is done again and in the launch: a deadline decides before the outcome of
+any call that takes time (``_Pass._deadline_first``). Those calls are the read of the template, the lookup of the
+credential, the upload, the presign and the listing of the builders, and in a stage done again the checks of the
+inputs and the gate, which the pass reaches after reads that took time. When one of them has returned, with a result
+or with a refusal, both deadlines are read again, before the pipeline inserts a row, uploads, launches or ends a row
+on that refusal. The build deadline decides first: the build fails ``CONSOLE_BLIND``. At or after the pass deadline
+the row is left ``building`` with no builder and no archive hash, for the next pass to stage again. Before a row
+exists only the pass deadline applies, and the pass ends on it (``DeadlineRefusal``) with no row. The reads, the
+upload and the presign of a stage hand the adapter the earlier of the two deadlines (``_Pass._cutoff``), so a call
+that returns after the build deadline is followed by no other. Two outcomes are not read this way: the answer of the
+launch call itself, because a builder that it started must be recorded, and a listing that shows a builder, which is
+refused whenever it returns (issue #232).
 
 The archive of a build is deleted when the build ends, from the bucket and the
 key its row recorded, and the row records the time (``archive_deleted_at``). A
@@ -89,9 +87,9 @@ archive at once. A pass starts at most ``OWED_ARCHIVES_PER_PASS`` of them
 after its own work, on the time that work leaves, and also when the pass ended on a
 refusal: none starts once the pass deadline is less than ``OWED_DELETE_RESERVE_SECONDS``
 away. The owner check of a delete can be the first use of the account of this session, a provider
-call that takes time, and the first S3 call builds the S3 client, which takes time too. So the clock is
-read again after the check, and once more by the adapter after it built the client, right before the S3
-request: a delete that would start inside the reserve does not start, and its row stays owed. A backlog
+call that takes time, so the clock is read again after the check, and once more by the adapter where the
+delete starts (``ImageAws._check_deadline``): a delete that would start inside the reserve does not, and its row
+stays owed. A backlog
 of slow refused deletions cannot take the time that a stage, a decision
 or a build needs. If passes never leave that time, the bucket lifecycle rule stays the
 backstop. A refused
@@ -108,23 +106,21 @@ bound left are noted ``archive:delete_deferred``.
 The stray archives (older than an hour, named by no row) are swept in reconcile, before the work of the pass, and
 the sweep has a bound of its own: no delete starts once the pass is ``STRAY_SWEEP_SECONDS`` old. Two clocks measure
 that age, and the first to reach it stops the sweep: the wall clock, and elapsed time on a monotonic clock, which a
-wall clock that is stepped back cannot stretch. The adapter evaluates both after it has built its S3 client, right
-before the request, because time passes between the check of the pass and the request (``ImageAws.delete_object``,
-``stop``). The pass reads the monotonic clock before each delete too, as an early stop that saves the call. The sweep
-then stops and the pass notes ``archive:sweep_deferred``. That is the one bound that elapsed time measures: the pass
-deadline, the build deadline and the cutoff of the owed deletions are times on the wall clock, as every persisted
-time is, and a wall clock that is stepped back stretches them. The bound is a time, not a count, so it holds for many
-quick deletes and for a few slow ones. A delete takes at most about ``OWED_DELETE_RESERVE_SECONDS``, so the stray
-deletes end within about the bound plus that reserve of the pass start (30 + 40 = 70 seconds). The work and the owed
-deletions run on the time that is left: the last start of an owed deletion is the pass deadline minus the reserve
-(200 seconds). That bounds the deletes and promises nothing to a pass. Four limits remain. (1) The listing reads
-every page before the first delete, and only the pass deadline bounds it; a listing that returns after the bound is
-followed by no delete.
-(2) A pass whose reads before the sweep take the bound or longer sweeps nothing. (3) A pass whose own work, without
-the sweep, ends between 130 and 200 seconds can still lose its owed turn, and one that ends after 200 seconds loses
-it with or without strays. (4) The sweep keeps no record of its attempts and the listing is in key order, so a stray
-at the front whose delete times out in every pass can keep the strays behind it unswept. All four cost storage only:
-the strays wait for a later pass, and the bucket lifecycle rule stays the backstop.
+wall clock that is stepped back cannot stretch. The adapter evaluates both where the delete starts
+(``ImageAws._check_deadline``, ``stop``), and the pass reads the monotonic clock before each delete too, as an early
+stop that saves the call. The sweep then stops and the pass notes ``archive:sweep_deferred``. That is the one bound
+that elapsed time measures: the pass deadline, the build deadline and the cutoff of the owed deletions are times on
+the wall clock, as every persisted time is, and a wall clock that is stepped back stretches them. The bound is a
+time, not a count, so it holds for many quick deletes and for a few slow ones. It bounds when a delete starts, not
+when the last one ends: that one can run for the timeouts of the SDK client, and a credential refresh inside the SDK
+can add to them. The work and the owed deletions run on the time that is left, and the last start of an owed
+deletion is the pass deadline minus the reserve (200 seconds). Four limits remain. (1) The listing reads every page
+before the first delete, and only the pass deadline bounds it; a listing that returns after the bound is followed by
+no delete. (2) A pass whose reads before the sweep take the bound or longer sweeps nothing. (3) Slow stray deletes
+can push the work of a pass past 200 seconds, and the pass then loses its owed turn, as one whose work ends after
+200 seconds does with or without strays. (4) The sweep keeps no record of its attempts and the listing is in key
+order, so a stray at the front whose delete times out in every pass can keep the strays behind it unswept. All four
+cost storage only: the strays wait for a later pass, and the bucket lifecycle rule stays the backstop.
 
 The gate requirement (``IMAGE_GATE_REQUIRED``: neither a gate command nor the
 opt-out ``allow_no_gate``) guards a launch, not a build that has a row. ``plan``
@@ -206,20 +202,15 @@ SUPERVISOR_SLEEP_SECONDS = 30
 STRAY_ARCHIVE_AGE_SECONDS = 3600
 #: The sweep of stray archives starts no delete once the pass is this old, by the wall clock or by elapsed time on a
 #: monotonic clock, whichever reaches it first. The pass checks the monotonic clock before each delete, and the adapter
-#: evaluates both right before the request. It runs before the work of the pass, so it takes a fixed early share of
-#: the pass: the stray deletes end within about this bound and one delete, which is ``OWED_DELETE_RESERVE_SECONDS`` at
-#: most (30 + 40 = 70 seconds), and the work and the owed deletions run on the rest of the pass, up to the last start
-#: of an owed deletion (the pass deadline minus the same reserve, 200 seconds). A deletion that is quick takes
-#: milliseconds, so the bound only matters when deletes are slow. It bounds the deletes and nothing else: the listing
-#: that comes first is bounded by the pass deadline only, and a pass whose own work, without the sweep, ends between
-#: 130 and 200 seconds can still lose its owed turn to a slow backlog. The module docstring lists the four limits.
+#: evaluates both where the delete starts. It runs before the work of the pass, so it takes an early share of the pass.
+#: A deletion that is quick takes milliseconds, so the bound only matters when deletes are slow. It bounds the start
+#: of the deletes and nothing else; the module docstring lists the limits.
 STRAY_SWEEP_SECONDS = 30
 #: One pass starts at most this many owed archive deletions, after its own work and on the time that work leaves. A
 #: deletion starts only while the clock is before the pass deadline minus ``OWED_DELETE_RESERVE_SECONDS``: the read
-#: timeout of the SDK client, which one delete can use up, and a margin. The clock is read again after the owner check,
-#: which can ask the provider for the account first, and once more by the adapter after it built its S3 client, so the
-#: S3 request itself never starts inside the reserve. A backlog of slow refused deletions cannot take the time that a
-#: stage, a decision or a build needs.
+#: timeout of the SDK client, which one delete can use up, and a margin. The clock is read again after the owner
+#: check, which can ask the provider for the account first, and once more by the adapter where the delete starts. A
+#: backlog of slow refused deletions cannot take the time that a stage, a decision or a build needs.
 OWED_ARCHIVES_PER_PASS = 8
 OWED_DELETE_RESERVE_SECONDS = READ_TIMEOUT_SECONDS + 10
 
@@ -1334,8 +1325,8 @@ class _Pass:
     def _sweep_over(self):
         """True once the pass is ``STRAY_SWEEP_SECONDS`` old by elapsed time on the monotonic clock.
 
-        The adapter calls it right before the request of a stray delete (``ImageAws.delete_object``), next to the
-        wall-clock cutoff that it is given, so the one injected clock of the pass decides in both places.
+        The adapter calls it where a stray delete starts (``ImageAws._check_deadline``), next to the wall-clock cutoff
+        that it is given, so the one injected clock of the pass decides in both places.
         """
         return self.monotonic() - self.started_monotonic >= STRAY_SWEEP_SECONDS
 
@@ -1378,9 +1369,9 @@ class _Pass:
         # have a bound of their own: none starts once the pass is ``STRAY_SWEEP_SECONDS`` old, whether the listing
         # returned late or the deletes before it were slow. Two clocks measure that age, and the first to reach it
         # stops the sweep: the wall clock (``sweep_until``) and elapsed time on the monotonic clock (``_sweep_over``),
-        # because a wall clock that is stepped back would stretch the first. The adapter evaluates both right before
-        # the request of each delete (``stop``), because time passes between this loop and that request; the read here
-        # is an early stop that saves the call. A stray that the bound leaves is swept by a later pass.
+        # because a wall clock that is stepped back would stretch the first. The adapter evaluates both where each
+        # delete starts (``stop``), because time passes between this loop and that point; the read here is an early
+        # stop that saves the call. A stray that the bound leaves is swept by a later pass.
         storage = self.cfg.storage
         keep = {active.archive_key} if active is not None and active.archive_key else set()
         keep.update(row.archive_key for row in s.archives_owed(dep) if row.archive_bucket == storage.bucket)
@@ -1670,7 +1661,7 @@ class _Pass:
         provider's, or the pass deadline's) ends no row and no pass with its own code after one.
         """
         try:
-            found = self.aws.builders(self.dep, deadline=self.deadline)
+            found = self.aws.builders(self.dep, deadline=self._cutoff(build))
         except Refusal:
             self._refuse_past_a_deadline(build)
             raise
@@ -1705,13 +1696,10 @@ class _Pass:
     def _settle_a_cut_stage(self, build):
         """Settle a build whose stage the pass deadline cut before a builder was launched.
 
-        The cut can fall anywhere that a call takes time: in a read before the upload (the template, the credential,
-        the listing of the builders), in the upload stream, when the upload has returned, when the presign has
-        returned, or when the last listing of the builders has returned (``_deadline_first``). The row stays
-        ``building`` with no builder and no staged archive, and the next pass stages it again (``_restage``). A build
-        that is out of time ends here instead, in the pass that sees it, as ``_restage`` ends it on entry:
-        ``CONSOLE_BLIND``, and ``_fail`` deletes the archive that the row names. The pass deadline never decides
-        before the build deadline.
+        The cut can fall wherever a call of the stage has returned (``_deadline_first``) or the adapter refused to start
+        one. The row stays ``building`` with no builder and no staged archive, and the next pass stages it again
+        (``_restage``). A build that is out of time ends here instead, in the pass that sees it: ``CONSOLE_BLIND``, and
+        ``_fail`` deletes the archive that the row names. The pass deadline never decides before the build deadline.
         """
         if self.clock() >= build.deadline_at:
             return self._fail(build, image_console.CONSOLE_BLIND, builder_alive=False)
@@ -1723,55 +1711,35 @@ class _Pass:
         """Stage again a build that has no builder and no staged archive, because the pass deadline ended its stage.
 
         The key and the bucket are the recorded ones (``_stage_and_launch``), so the new archive replaces whatever the
-        earlier stage left, even when the configured prefix or bucket has changed since. The build deadline still
-        bounds the build: past it the build fails with the code of a console that never showed anything, and
-        ``_fail`` deletes the archive the row names. The deadline is checked here on entry, again when each call that
-        takes time has returned (``_deadline_first``: the checks, the upload and the launch), and wherever the pass
-        deadline cuts the stage (``_settle_a_cut_stage``).
+        earlier stage left, even when the configured prefix or bucket has changed since.
 
-        The inputs are checked first: the hashes of the basis files that the row recorded when it was inserted, the
-        warm settings and the script, as this pass reads them, must give the digest that the row was inserted under,
-        because that digest is what tags the image. The check reads no basis file, so a slow forge cannot use up
-        the pass before the upload. Changed inputs end the row as a refused start check does: ``failed`` with
-        ``IMAGE_INPUTS_CHANGED``, no failure counted, and the pass answers ``refused``. The next pass decides from
-        the new inputs.
+        Three checks of a start run again first, because each can have changed since the row was written. The inputs
+        (``_check_inputs_unchanged``) must still give the digest that the row was inserted under, because that digest
+        tags the image. The gate requirement comes next, before the template is read, so that no template refusal masks
+        it: the digest does not hold the opt-out, so a row inserted under it gives the same digest once it is gone. The
+        build template is read last, because the rules of its groups can change between two passes. Changed inputs, a
+        missing gate or an unsafe template end the row as a refused start (``_end_refused``): ``failed`` with its code,
+        no failure counted, and the next pass decides from the new inputs. Damaged recorded hashes are raised
+        (``IMAGE_STATE_UNREADABLE``) and leave the row. The other checks of a launch (``_start_refusal``) run last.
 
-        The template check of a start runs again, because the template and the rules of its groups can change
-        between two passes. An unsafe template ends the row the same way, with its own code, when neither deadline has
-        passed as the read returns (``_deadline_first``). A deadline that has passed decides first: the pass deadline
-        inside that check, or inside the start checks that run last, leaves the row as it is for the next pass, or
-        ends it when the build deadline has passed by then (``_settle_a_cut_stage``). With no deadline passed, any
-        other refusal of a read is raised and leaves the row too.
-
-        The gate requirement runs between the two, before the template is read. The file can lose its gate command
-        and the opt-out while the row waits, and the digest does not hold the opt-out: a row inserted under it gives
-        the same digest once it is gone. That row ends with ``IMAGE_GATE_REQUIRED`` and no failure, and no builder is
-        launched. The other checks of a launch (``_start_refusal``) run last.
-
-        A deadline decides before the outcome of any call that took time (``_deadline_first``), here as in ``_start``
-        and ``_launch``. The template read, the lookup of the credential and the listing of the builders each take time,
-        and the session ages during them. So both deadlines are read when each of them has returned, the build deadline
-        first (``_refuse_past_a_deadline``), before the pipeline acts on what it produced: at or after the build
-        deadline the build fails ``CONSOLE_BLIND``, and at or after the pass deadline the row is left for the next
-        pass, whether the call answered or refused. An unsafe template and the refusal ``IMAGE_CREDENTIAL_SHORT`` end
-        the row only when neither deadline has passed, and the upload starts only then. A listing that shows a builder
-        is the exception: it is refused whenever it returns (``_check_no_builder``, issue #232).
+        The pass reaches these checks after reads that took time, the pin read of ``_run`` among them, so all three run
+        inside ``_deadline_first``: a deadline that has passed when they return decides before their outcome. At or
+        after the build deadline the build fails ``CONSOLE_BLIND`` and ``_fail`` deletes the archive that the row names;
+        at or after the pass deadline the row stays for the next pass (``_settle_a_cut_stage``). The reads of the
+        template take the earlier deadline (``_cutoff``). A listing that shows a builder is the exception: it is refused
+        whenever it returns (``_check_no_builder``, issue #232).
         """
-        if self.clock() >= build.deadline_at:
-            return self._fail(build, image_console.CONSOLE_BLIND, builder_alive=False)
         try:
-            self._check_inputs_unchanged(build)
-            if self.p._gate_missing():
-                # Before the template read: a withdrawn opt-out is the refusal this row owes, and an unsafe template
-                # or a refused read of its groups would otherwise mask it.
-                raise ImageRefusal(IMAGE_GATE_REQUIRED)
             with self._deadline_first(build):
-                self.p._check_build_template(self.aws, self.deadline)
+                self._check_inputs_unchanged(build)
+                if self.p._gate_missing():
+                    raise ImageRefusal(IMAGE_GATE_REQUIRED)
+                self.p._check_build_template(self.aws, self._cutoff(build))
         except DeadlineRefusal:
             return self._settle_a_cut_stage(build)
         except ImageRefusal as refusal:
             if refusal.reason == image_console.CONSOLE_BLIND:
-                # The build deadline passed during the read, and it decides before any refusal of the read does.
+                # The build deadline had passed when the checks returned, and it decides before any of their refusals.
                 return self._fail(build, refusal.reason, builder_alive=False)
             return self._end_refused(build, refusal.reason)
         try:
@@ -1829,7 +1797,7 @@ class _Pass:
             )
         else:
             self._check_archive_owner(build)
-        chunks = self._source().archive(build.source_sha, cfg.source.max_archive_bytes, deadline=self.deadline)
+        chunks = self._source().archive(build.source_sha, cfg.source.max_archive_bytes, deadline=self._cutoff(build))
         try:
             # The upload takes time, and so does the refusal that S3 or the forge can end it with. Both deadlines are
             # read once it has returned (``_deadline_first``): a deadline that has passed decides before the outcome,
@@ -1841,7 +1809,7 @@ class _Pass:
                     build.archive_key,
                     chunks,
                     max_bytes=cfg.source.max_archive_bytes,
-                    deadline=self.deadline,
+                    deadline=self._cutoff(build),
                     owner=build.archive_owner,
                 )
         finally:
@@ -1906,6 +1874,14 @@ class _Pass:
         if now >= self.deadline:
             raise DeadlineRefusal("the start of a build")
 
+    def _cutoff(self, build=None):
+        """The deadline that a call of a stage hands the adapter: the earlier of the pass and the build deadline.
+
+        A call that returns after the build deadline is then followed by no later call of the stage, and
+        ``_deadline_first`` ends the build ``CONSOLE_BLIND``. Before a row exists only the pass deadline applies.
+        """
+        return self.deadline if build is None else min(self.deadline, build.deadline_at)
+
     @contextmanager
     def _deadline_first(self, build=None):
         """Run a call that can take time, then read both deadlines before the pipeline acts on what it produced.
@@ -1939,23 +1915,20 @@ class _Pass:
         it by its build-id tag or fails the build.
 
         A deadline decides before the outcome of any call that took time, here as in ``_start`` and ``_restage``
-        (``_deadline_first``). The upload that ended the stage has just been read that way. The presign takes time
-        too, and so does the listing of the builders that follows it: either can end after the pass deadline, the build
-        deadline or both, and the session can have aged too much during the presign, so that it refuses
-        ``IMAGE_CREDENTIAL_SHORT``, which ends the row as a refused start (``_stage``). A stage that a deadline has cut
-        must not end that way, because the pass deadline alone leaves the row for the next pass. So both deadlines are
-        read when the presign has returned, whether it answered or refused, and again when the listing has returned
-        (``_check_no_builder``), right before the call, whether it showed no builder or the provider refused it. At or
-        after the build deadline the launch is refused with
-        ``CONSOLE_BLIND``; at or after the pass deadline with ``DeadlineRefusal``, and the row then waits for the next
-        pass to stage it again, unless the build deadline has passed by then (``_settle_a_cut_stage``). A build that
-        is out of time when the presign returns asks for no listing. A listing that the pass deadline refuses reaches
-        ``_stage`` as ``DeadlineRefusal`` as well. The answer of the launch call is never read this way: a builder
-        that it started is recorded, and a refusal ends the row by its own code.
+        (``_deadline_first``). The presign takes time, and the session can age during it so that it refuses
+        ``IMAGE_CREDENTIAL_SHORT``, which would end the row as a refused start (``_stage``). So both deadlines are read
+        when the presign has returned, whether it answered or refused, and again when the listing of the builders that
+        follows has returned (``_check_no_builder``), right before the launch call. At or after the build deadline the
+        launch is refused with ``CONSOLE_BLIND``; at or after the pass deadline with ``DeadlineRefusal``, and the row
+        waits for the next pass (``_settle_a_cut_stage``). A build that is out of time when the presign returns starts
+        no listing. The answer of the launch call is never read this way: a builder that it started is recorded, and a
+        refusal ends the row by its own code.
         """
         aws, cfg = self.aws, self.cfg
         with self._deadline_first(build):
-            url = aws.presign_get(build.archive_bucket, upload.key, cfg.source.presign_seconds)
+            url = aws.presign_get(
+                build.archive_bucket, upload.key, cfg.source.presign_seconds, deadline=self._cutoff(build)
+            )
         user_data = image.render_user_data(self.script, image.warm_exports(cfg, url, upload.sha256))
         self._check_no_builder(build)
         try:
@@ -2278,7 +2251,7 @@ class _Pass:
 
         The owner check can be the first use of the account in this session, a provider call that takes time, and the
         first S3 call of the session builds its client, which takes time too. With ``not_after`` set, the clock is read
-        once the check has passed and again, by the adapter, once the client is built, right before the request: a
+        once the check has passed and again by the adapter, where the delete starts (``ImageAws._check_deadline``): a
         delete that would start at or after it does not start. The row is then left as it was (not tried, still owed)
         for a later pass.
         """
@@ -2296,8 +2269,8 @@ class _Pass:
                 build.archive_bucket, build.archive_key, owner=build.archive_owner, deadline=not_after
             )
         except DeadlineRefusal:
-            # The client of the first S3 call was built after the cutoff, so the adapter did not send the request: the
-            # delete never started, as in the check above.
+            # The client of the first S3 call was built after the cutoff, so the adapter did not call the delete: it
+            # never started, as in the check above.
             self.delete_attempted.discard(build.id)
             return None
         except ProviderRefusal as refusal:

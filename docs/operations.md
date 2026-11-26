@@ -715,7 +715,9 @@ Two refusals belong to the start itself and count no failure:
 and again just before the launch. One rule applies in a new start, in a stage done again
 and in the launch: a deadline decides before the outcome of any call that takes time.
 These calls are the read of the build template, the lookup of the credential, the upload,
-the presign and the listing of the builders. When one of them has returned, with a result
+the presign and the listing of the builders. A stage done again reaches its checks of the
+inputs and the gate after reads that took time, the pin read among them, so they count
+too. When one of them has returned, with a result
 or with a refusal, the pass reads both deadlines again before it acts on the outcome:
 before it writes the row, before it uploads, before it launches and before a refusal
 ends the row. The build deadline decides first, and a build that is out of time ends with
@@ -727,7 +729,12 @@ a row only when neither deadline has passed, even when a slow call has left the 
 session too short for the archive URL. One outcome is not read this way: a listing that
 shows a builder is refused with `IMAGE_BUILD_ALREADY_ACTIVE` whenever it returns. The order
 of that refusal and a deadline is tracked in
-[#232](https://github.com/mikomiel/ci-burst/issues/232). A wrong input is raised, not answered, and
+[#232](https://github.com/mikomiel/ci-burst/issues/232). Each read, upload part and presign
+of a stage takes the earlier of the two deadlines, so no call starts after one that
+returned at or after the build deadline. A call starts where the AWS client calls the SDK
+operation: the client, or the pass right before it calls the client, reads the cutoff
+there, and signing or a credential refresh inside the SDK can delay the request after that
+check. A wrong input is raised, not answered, and
 nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge on the branch or
 basis reads (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
 or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
@@ -739,7 +746,7 @@ or unavailable forge cannot hold the stage. Once those rechecks pass, the stage 
 a start refusal such as `IMAGE_CREDENTIAL_SHORT` ends the row `refused` without a
 failure, and a definite refusal of the archive request ends it as a failed build,
 counted, with exit `1`. Both hold only when neither deadline has passed when the
-refused call returns: a deadline decides first (below). A pass that
+refused call returns: a deadline decides first. A pass that
 finds a build in flight, or an archive deletion that a finished build still owes,
 runs and settles it even without a gate; a launch that pass would then make is
 refused with `IMAGE_GATE_REQUIRED`, answered `refused`, and counts no failure.
@@ -756,8 +763,8 @@ the script must still give the row's digest, and the configured `basis_paths` mu
 be the recorded set. A different digest or a different set of paths ends the row
 `failed` with `IMAGE_INPUTS_CHANGED`. No basis file is read again: the files at a
 commit do not change. A row whose recorded hashes are missing or malformed is
-damaged state, raised as `IMAGE_STATE_UNREADABLE`, and is not read from the forge
-instead. Malformed includes an empty path, a path that `basis_paths` could never
+damaged state, raised as `IMAGE_STATE_UNREADABLE` when neither deadline has passed,
+and is not read from the forge instead. Malformed includes an empty path, a path that `basis_paths` could never
 hold (a control character, a `..` or a leading `/`, or a lone surrogate, which is
 no text in UTF-8 and which the TOML file cannot spell), more paths than `basis_paths`
 takes, and a path that the stored text names twice, whatever its values. That is
@@ -769,20 +776,11 @@ row with `IMAGE_INPUTS_CHANGED` too. A file that
 lost the opt-out of a row inserted under `allow_no_gate` keeps the digest and ends
 the row with `IMAGE_GATE_REQUIRED`; an unsafe build template then ends it with
 `IMAGE_BUILD_TEMPLATE_UNSAFE`. Each is answered `refused`, counts no failure, writes
-no `image_build_failed` event and tries to delete the row's archive. A pass past
-the build deadline that reaches its deadline check ends the row instead. The build
-deadline decides before the pass deadline, wherever a deadline cuts the stage:
-in a read before the upload (the template, the credential, the listing of the builders),
-in the stream of the upload, when the upload has returned, when the archive URL has been
-presigned, or when the last listing of the builders has returned, before the provider call.
-The stage reads both deadlines when each of these calls has returned, as the rule above says,
-so the answer of a call that a deadline cut does not end the stage: not a short session
-(`IMAGE_CREDENTIAL_SHORT`), not an unsafe template verdict, not a refused bucket and not a
-listing that the provider refused. When the cut falls
-at or after the build deadline, the pass ends the build `failed` with `CONSOLE_BLIND` in
-that pass and tries to delete the archive, and a build that is out of time when a call
-returns asks for no later call: no upload, no presign, no listing and no launch. When only
-the pass deadline has passed, the row stays and the next pass stages it again.
+no `image_build_failed` event and tries to delete the row's archive, when neither deadline
+has passed as the checks return. Wherever a deadline cuts the stage, the rule above
+decides: at or after the build deadline the pass ends the build `failed` with
+`CONSOLE_BLIND` and tries to delete the archive, and when only the pass deadline has
+passed, the row stays and the next pass stages it again.
 `lifetime_seconds` and `snapshot_seconds` are not in the digest: a
 stage that launches renders them from the file as it reads it then.
 
@@ -1284,29 +1282,26 @@ The sweep has a bound of its own, in time. It runs in reconcile, before the work
 takes a fixed early share of the pass: no stray delete starts once the pass is 30 seconds old
 (`STRAY_SWEEP_SECONDS`). Two clocks measure that age, and the first to reach it stops the sweep:
 the wall clock, and elapsed time on a monotonic clock. The pass reads the monotonic clock before
-each delete, as an early stop. The AWS client evaluates both clocks, after it has built its S3 client
-and right before the request, because time passes between that check and the request. A wall clock
+each delete, as an early stop, and the AWS client evaluates both where the delete starts
+([When a build starts](#when-a-build-starts)). A wall clock
 that is stepped back (a time correction, a host that resumed) cannot stretch the bound, because the
 monotonic clock still reaches it. A backlog of slow or refused deletes, or a listing that
 returns after that time, starts no delete after it. The sweep stops, the pass notes
 `archive:sweep_deferred`, and a later pass sweeps the strays that it left. Elapsed time measures this
 bound only: the pass deadline, the build deadline and the cutoff of the owed deletions are times on
 the wall clock, as every stored time is, and a wall clock that is stepped back stretches them.
-One delete takes at most about 40 seconds (the 30 second read timeout of the AWS client plus a
-margin), so the stray deletes end within about 70 seconds of the pass start: the 30 second cutoff
-plus one delete. That is all the bound says; it is not a promise to every pass. The 30 seconds are
-a budget, not a measurement: 30 + 40 = 70 seconds leaves the stage, the decision and the owed
-deletions the rest of the 240 second pass, and the last start of an owed deletion is at 200 seconds
-(240 minus the 40 seconds that one delete can take). Four limits remain:
+The bound is on when a delete starts, not on when the last one ends: that one can run for the
+timeouts of the AWS client, and a credential refresh inside the SDK, which ci-burst sets no
+timeout for, can add to them. The last start of an owed deletion is at 200 seconds (240 minus
+the 40 second reserve). Four limits remain:
 
 1. The listing reads every page before the first delete, and only the pass deadline bounds it. A
    listing that returns after the 30 second cutoff is followed by no delete, and a listing that runs
    to the pass deadline leaves nothing for the work or the owed deletions.
 2. A pass whose reads before the sweep take 30 seconds or longer sweeps nothing and, when a stray is
    due, notes `archive:sweep_deferred`.
-3. A pass whose own work, without the sweep, ends between 130 and 200 seconds into the pass (200
-   minus the 70 seconds within which the stray deletes end) can still lose its owed turn to a slow backlog. One
-   whose work ends after 200 seconds loses it with or without strays.
+3. Slow stray deletes can push the work of a pass past 200 seconds, and the pass then loses its
+   owed turn, as one whose work ends after 200 seconds does with or without strays.
 4. The sweep keeps no record of its attempts and the listing is in key order, so a stray at the
    front whose delete times out in every pass can keep the strays behind it from being swept.
 
@@ -1382,7 +1377,7 @@ passing plan does not rule these out.
 | `WARM_FAILED` | the builder printed a failure marker: the script failed, for example in the archive fetch, a warm command or the gate. Read the cause in the framed tail of the event or the console |
 | `IMAGE_MARKER_DIGEST_MISMATCH` | the builder reports another archive digest than the staged one |
 | `MARKER_TIMEOUT` | no ready marker by the build deadline, or the marker was first read at or after it while the builder was still running |
-| `CONSOLE_BLIND` | the console returned no text by the deadline, the provider refused the console read in a pass at or after the deadline (`notes` holds `console_read:<reason>`), or the launch fell at or after it. A stage in which a call returns at or after the build deadline ends this way too, in that pass, whichever call it is (the read of the template, the lookup of the credential, the listing of the builders when it shows none, the upload, the presign), and whether the call answered or refused: a short session, an unsafe template, a refused bucket or a listing that the provider refused does not end the row first. A build that is out of time when a call returns asks for no later call, so no upload, no presign and no launch follows. A console read refused before the deadline makes the pass raise, and the next pass reads again |
+| `CONSOLE_BLIND` | the console returned no text by the deadline, the provider refused the console read in a pass at or after the deadline (`notes` holds `console_read:<reason>`), or the launch fell at or after it. A stage in which a call returns at or after the build deadline ends this way too, in that pass, whichever call it is (the read of the template, the lookup of the credential, the listing of the builders when it shows none, the upload, the presign), and whether the call answered or refused: a short session, an unsafe template, a refused bucket or a listing that the provider refused does not end the row first. No later call of the stage starts after a call that returned at or after the build deadline. A console read refused before the deadline makes the pass raise, and the next pass reads again |
 | `IMAGE_BUILDER_GONE` | a pass did not see the builder as active, or no builder was recorded, while the build had no recorded image. It is not proof that the builder ended. A later applying pass asks the provider to terminate a tagged builder that it lists and that is not the active build's, and does not check the result: verify the final state yourself. Find the instance by the failed row's `builder_id` or its `ci-burst:build-id` tag, not by the deployment tags alone, which also match a newer builder ([Leaked builders and the backstop](#leaked-builders-and-the-backstop)). An image may still exist; the deletion rule handles it as the image of a failed build |
 | `IMAGE_NOT_AVAILABLE` | the image failed, or was not `available` by the deadline |
 | `TEMPLATE_DRIFT` | the candidate version differs from the pin in a field other than `ImageId`, or does not carry the build's image; `drift_fields` names them |

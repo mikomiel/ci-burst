@@ -834,10 +834,8 @@ class ImageAws:
         An S3 call carries ``owner`` (see ``_bound_owner``) as the bucket's owner, and it is refused here, before
         any call, when there is none. ``AccessDenied`` from S3 leaves as ``IMAGE_STAGING_BUCKET_DENIED``.
 
-        With a ``deadline``, or a ``stop`` that the caller owns, the cutoffs are read once more after the owner is
-        known and the client is built, right before the request: the first owner check of an adapter asks STS for
-        the account, and a call that waited for the answer can be at or after either cutoff. The request is then not
-        sent (``DeadlineRefusal`` with ``detail``). See ``_check_deadline`` for the two cutoffs.
+        A ``deadline`` or a ``stop`` is read once the owner is known and the client is built (``_check_deadline``):
+        the first owner check of an adapter asks STS for the account, which takes time.
         """
         if service == "s3":
             arguments["ExpectedBucketOwner"] = self._bound_owner(owner)
@@ -858,9 +856,11 @@ class ImageAws:
     def _check_deadline(self, deadline, detail, stop=None):
         """Refuse with ``DeadlineRefusal`` at or after either cutoff.
 
-        ``deadline`` is a time on this adapter's clock. ``stop`` is a function of the caller that says whether the
-        request must not start: a caller that bounds its work by elapsed time on a clock of its own passes it, because
-        this adapter does not see that clock.
+        This is where a provider call starts, for every cutoff of this adapter: it reads them right before it calls
+        the SDK operation, and does not call it at or after one. Signing and a credential refresh inside the SDK can
+        delay the request after this check. ``deadline`` is a time on this adapter's clock. ``stop`` is a function of
+        the caller that says whether the call must not start: a caller that bounds its work by elapsed time on a clock
+        of its own passes it, because this adapter does not see that clock.
         """
         if (deadline is not None and self._clock() >= deadline) or (stop is not None and stop()):
             raise DeadlineRefusal(detail)
@@ -868,9 +868,8 @@ class ImageAws:
     def _pages(self, service, method, request_token, response_token, deadline, detail, absent=None, **arguments):
         """Yield every response page, refusing when the listing would be partial.
 
-        An ``absent`` error code ends the listing as empty. With a ``deadline`` no page is requested at or after it:
-        the clock is read before each page, so that no owner lookup starts late, and again once the owner is known,
-        right before the request (``_invoke``).
+        An ``absent`` error code ends the listing as empty. With a ``deadline`` no page starts at or after it: the
+        clock is read before each page, so that no owner lookup starts late, and again in ``_invoke``.
         """
         token, pages = None, 0
         while True:
@@ -996,10 +995,10 @@ class ImageAws:
     def image(self, image_id, *, deadline=None):
         """One image, or ``None`` when the provider no longer knows it.
 
-        ``deadline`` is checked before the request, as the listings check it before each page.
+        No read starts at or after ``deadline`` (``_check_deadline``).
         """
-        self._check_deadline(deadline, "describe_images")
         client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
+        self._check_deadline(deadline, "describe_images")
         try:
             response = client.describe_images(ImageIds=[image_id], Owners=["self"])
         except Exception as error:  # noqa: BLE001 - classified below
@@ -1136,9 +1135,9 @@ class ImageAws:
         iterator raises leaves here as a new one with the same reason code and a
         fixed detail, of the same class where the class can be rebuilt from its
         reason, detail and uncertainty (see ``_rebuilt_refusal``). ``deadline`` is
-        checked before the upload opens, again right before the call that opens it (with no ``owner``, the lookup of
+        read before the upload opens, again where the call that opens it starts (with no ``owner``, the lookup of
         the account comes between the two and takes time), before each chunk and each part, and
-        immediately before completion, so a stalled stream or a slow last part
+        before completion, so a stalled stream or a slow last part
         ends the upload instead of finishing it. A deadline that ends before the opening call leaves no upload to
         clean up.
         """
@@ -1274,9 +1273,8 @@ class ImageAws:
     def delete_object(self, bucket, key, *, owner=None, deadline=None, stop=None):
         """Delete one object, naming ``owner`` as the bucket's owner (see ``_bound_owner``).
 
-        With a ``deadline``, or a ``stop`` (see ``_check_deadline``), both are read once the S3 client is built, right
-        before the request (``_invoke``): the first S3 call of an adapter builds its client, which takes time, and a
-        delete that would start at or after either cutoff is not sent (``DeadlineRefusal``).
+        A ``deadline`` and a ``stop`` are read once the S3 client is built (``_invoke``, ``_check_deadline``): the
+        first S3 call of an adapter builds its client, which takes time.
         """
         self._invoke(
             "s3",
@@ -1320,14 +1318,15 @@ class ImageAws:
                 f"{max(int(remaining), 0)} seconds of credential life remain, {expires_seconds} are needed",
             )
 
-    def presign_get(self, bucket, key, expires_seconds):
+    def presign_get(self, bucket, key, expires_seconds, *, deadline=None):
         """Presign a GET for one object, only if the session outlives the URL.
 
-        ``check_credential_life`` decides that. The URL is returned and never
-        logged, stored or placed in an error.
+        ``check_credential_life`` decides that. The lookup of the credential can take time, so a ``deadline`` is read
+        after it, as ``_check_deadline`` says. The URL is returned and never logged, stored or placed in an error.
         """
         self.check_credential_life(expires_seconds)
         client = self._client("s3")
+        self._check_deadline(deadline, "presign")
         try:
             return client.generate_presigned_url(
                 "get_object",

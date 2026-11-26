@@ -3231,6 +3231,33 @@ class FailureTests(PipelineCase):
         self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
         self.assert_no_listing_before_the_row_ends(mark)
 
+    def test_a_resumed_stage_whose_upload_stream_passes_the_build_deadline_sends_no_part(self):
+        # The first chunk of the stream arrives after the build deadline and before the pass deadline: the adapter sends
+        # no part and no completion, and the build ends blind.
+        first = self.resumed_stage_with_100_seconds_left()
+        waits = []
+
+        def first_chunk_is_slow():
+            if not waits:
+                waits.append(self.clock())
+                self.clock.advance(150)
+
+        self.source.on_chunk = first_chunk_is_slow
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(len(waits), 1)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        names = self.world.names(mark)
+        self.assertIn("create_multipart_upload", names)
+        self.assertNotIn("upload_part", names)
+        self.assertNotIn("complete_multipart_upload", names)
+        build = self.assert_failed(result, "CONSOLE_BLIND")
+        self.assertEqual(build.id, first.id)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.objects, {})
+
     def test_a_resumed_stage_whose_upload_outlasts_only_the_pass_deadline_is_staged_again_by_the_next_pass(self):
         # The control of the two tests above: the same completion, with the build deadline far off, leaves the row for
         # the next pass. The pass deadline alone never ends a build.
@@ -3273,6 +3300,20 @@ class FailureTests(PipelineCase):
         self.assertEqual(len(cut), 1)
         self.assertLess(cut[0], min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
         self.assertGreaterEqual(self.clock(), max(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assertEqual(self.requested_second_pages(), [])
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+
+    def test_a_last_listing_whose_first_page_ends_after_only_the_build_deadline_requests_no_second_page(self):
+        # The first page returns after the build deadline and before the pass deadline: the adapter refuses the second
+        # page for the build deadline, and the build ends blind.
+        first = self.resumed_stage_with_100_seconds_left()
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        with self.a_last_listing_of_two_pages_that_takes(150) as cut:
+            result = self.apply()
+        self.assertEqual(len(cut), 1)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
         self.assertEqual(self.requested_second_pages(), [])
         self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
 
@@ -3562,6 +3603,78 @@ class FailureTests(PipelineCase):
         self.assertEqual(len(self.archive_keys()), 2)
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
         self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_a_template_read_that_ends_after_the_build_deadline_starts_no_later_read_of_the_check(self):
+        # The first read of the check returns after the build deadline and before the pass deadline. The build is out
+        # of time, so the adapter does not call the next read of the check, and the row ends ``CONSOLE_BLIND``.
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_call_that_takes("describe_launch_templates", 150)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], first.deadline_at)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+        later = self.world.calls[mark:][self.world.names(mark).index("describe_launch_templates") + 1 :]
+        self.assertNotIn("describe_security_groups", [name for name, _ in later])
+        versions = [kwargs for name, kwargs in later if name == "describe_launch_template_versions"]
+        self.assertNotIn(BUILDER, [kwargs.get("LaunchTemplateName") for kwargs in versions])
+
+    # -- the pin read before a stage done again takes time too ---------------------------------------------------------
+    # ``_run`` reads the pin before it advances the active build. When that read ends at or after the pass deadline, the
+    # checks of a stage done again decide nothing: the row waits for the next pass, whatever the inputs say.
+
+    def a_pin_image_read_that_ends(self, at):
+        """Make the read of the pin's image, the last read of the pin, end at ``at`` seconds after the pass starts.
+
+        Returns the clock readings at which the read began.
+        """
+        began, started_at = [], self.clock()
+
+        def slow(arguments):
+            if arguments.get("ImageIds") == [ami(0xA1)]:
+                began.append(self.clock())
+                self.clock.advance(started_at + at - self.clock())
+
+        self.world.hooks["describe_images"] = slow
+        return began
+
+    def test_a_pin_read_that_ends_at_the_pass_deadline_leaves_a_resumed_stage_with_changed_inputs_for_the_next_pass(self):
+        first = self.unstaged_build()
+        paths = 'basis_paths = ["example.lock"]'
+        self.configure(render_toml().replace(paths, 'basis_paths = ["example.lock", "other.lock"]'))
+        started_at = self.clock()
+        began = self.a_pin_image_read_that_ends(PASS_DEADLINE_SECONDS)
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the pin read began inside the pass deadline and ended at it.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assert_unstaged(build)
+        self.assertIsNone(build.archive_deleted_at)
+        self.assertNotIn("delete_object", self.world.names(mark))
+        # The next pass reads the pin in time and ends the row on the changed inputs.
+        del self.world.hooks["describe_images"]
+        self.assert_inputs_changed(self.apply(), first)
+
+    def test_a_pin_read_that_ends_inside_the_pass_deadline_still_ends_a_resumed_stage_with_changed_inputs(self):
+        # The control of the test above: one second earlier, the changed inputs decide.
+        first = self.unstaged_build()
+        paths = 'basis_paths = ["example.lock"]'
+        self.configure(render_toml().replace(paths, 'basis_paths = ["example.lock", "other.lock"]'))
+        started_at = self.clock()
+        began = self.a_pin_image_read_that_ends(PASS_DEADLINE_SECONDS - 1)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_inputs_changed(result, first)
 
     # -- a deadline decides before the credential in the start checks too ---------------------------------------------
     # The checks of a launch run after the template read, which takes time, and the first of them reads the life of the
@@ -4077,6 +4190,19 @@ class FailureTests(PipelineCase):
         self.assertGreaterEqual(self.clock(), first.deadline_at)
         self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
         self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+        self.assertEqual(self.world.urls, [])
+
+    def test_a_presign_whose_credential_lookup_ends_after_the_build_deadline_signs_no_url_on_a_long_session(self):
+        # The session outlives the URL, so the lookup does not refuse: the deadline alone keeps the URL from being made.
+        first = self.resumed_stage_with_100_seconds_left()
+        adapters = self.credential_lookups_that_take({2: 150})
+        self.world.credential_life = float(HOUR)
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(adapters[-1].lookups, 2)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+        self.assertNotIn("generate_presigned_url", self.world.names(mark))
         self.assertEqual(self.world.urls, [])
 
     def test_a_presign_whose_credential_lookup_ends_inside_both_deadlines_still_refuses_the_start(self):

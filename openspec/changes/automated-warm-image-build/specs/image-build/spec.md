@@ -457,7 +457,7 @@ A refused start MUST NOT count as a failed build. The refusal MUST add no failur
 - **THEN** it counts toward `max_builds_per_day` and `min_build_interval_seconds` like any other row
 
 ### Requirement: A deadline decides before the outcome of a call that takes time
-A deadline MUST decide before the outcome of any call that takes time. In a new start, a stage done again and the launch, the pass MUST read both deadlines again when the read of the template, the lookup of the credential, the upload, the presign or the listing of the builders returns, with a result or a refusal, before it inserts a row, uploads, launches or ends a row on a refusal. The build deadline MUST decide first. This requirement does not decide a listing that shows a builder.
+A deadline MUST decide before the outcome of any call that takes time. In a new start, a stage done again and the launch, the pass MUST read both deadlines again when the read of the template, the lookup of the credential, the upload, the presign, the listing of the builders or the inputs or gate check of a stage done again returns, before it inserts a row, uploads, launches or ends a row. The build deadline MUST decide first. This requirement does not decide a listing that shows a builder.
 
 #### Scenario: A late listing of a new start writes no row
 - **WHEN** the listing of the builders in the start checks of a new start shows no builder and returns at or after the pass deadline
@@ -522,7 +522,7 @@ A deadline MUST decide before the outcome of any call that takes time. In a new 
 - **THEN** no builder is launched and the row ends `failed` with the code of the provider
 
 ### Requirement: A stage done again launches only under the inputs of its row
-The row MUST record the hash of each basis file when it is inserted. A pass that stages a build again MUST recompute the digest from those hashes, the warm and gate commands, `strip_components` and the script, and MUST read no basis file. A different digest, or a different set of `basis_paths`, MUST end the row `failed` with `IMAGE_INPUTS_CHANGED` as a refused start: no builder, the archive deleted, no failure counted. A row without valid hashes MUST raise `IMAGE_STATE_UNREADABLE`.
+The row MUST record the hash of each basis file when it is inserted. A pass that stages a build again MUST recompute the digest from those hashes, the warm and gate commands, `strip_components` and the script, and MUST read no basis file. With neither deadline passed as the check returns, a different digest or set of `basis_paths` MUST end the row `failed` with `IMAGE_INPUTS_CHANGED` as a refused start, and a row without valid hashes MUST raise `IMAGE_STATE_UNREADABLE`.
 
 #### Scenario: The gate command changes before the stage is done again
 - **WHEN** a build row is inserted with a gate command, the pass deadline ends its stage and the configuration then holds no gate command
@@ -553,9 +553,10 @@ The row MUST record the hash of each basis file when it is inserted. A pass that
 #### Scenario: The set of basis paths changes
 - **WHEN** the configured `basis_paths` gained or lost a path since the row was inserted
 - **THEN** the row ends `failed` with `IMAGE_INPUTS_CHANGED` without a forge read, counts no failure and launches no builder
+- **AND** when a read before the check, such as the pin read, returned at or after the pass deadline and before the build deadline, the row stays `building` for the next pass instead
 
 #### Scenario: The row records no valid hashes
-- **WHEN** a pass stages again a row whose `basis_file_hashes` is empty or malformed
+- **WHEN** a pass stages again a row whose `basis_file_hashes` is empty or malformed, and neither deadline has passed
 - **THEN** the pass raises `IMAGE_STATE_UNREADABLE`, reads no file of the forge and leaves the row as it is
 
 #### Scenario: The branch head moves
@@ -651,6 +652,13 @@ Every provider read of a pass, except the read that confirms a deregistration, M
 - **WHEN** a read of `plan` before its deletion plan, or a reconcile read or the pin read of a `run` pass, would start at or after the deadline
 - **THEN** the command refuses with `pass_deadline_exceeded`
 
+### Requirement: A cutoff is read where a provider call starts
+A provider call starts where the AWS client calls the SDK operation. The AWS client, or the pass with no other call in between, MUST read each cutoff of the call right before that point and MUST NOT call the operation at or after it. In a stage, each template read, listing page, upload part and presign MUST take the earlier of the two deadlines. Signing and a credential refresh inside the SDK can delay the request after that check, and no cutoff bounds that delay.
+
+#### Scenario: A cutoff passes before the SDK operation is called
+- **WHEN** a cutoff passes while the AWS client builds its client, looks up the account, or looks up the credential for a presign that the session outlives
+- **THEN** the client does not call the SDK operation and refuses with `pass_deadline_exceeded`, whichever cutoff passed
+
 ### Requirement: Basis reads are bounded by the pass deadline
 A read of a basis file MUST NOT start at or after the pass deadline: `plan` and the decision of a `run` pass MUST read the clock before each read, and MUST refuse with `pass_deadline_exceeded`. A stage done again reads no basis file. The forge client puts no deadline on a request, so a read that has started MAY end after the deadline.
 
@@ -719,15 +727,14 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **AND** the failure path ends the builder
 
 #### Scenario: A resumed stage outlasts the deadline
-- **WHEN** the build deadline passes during the upload of a resumed stage, or during the calls between the upload and the launch call (the presign and the listing of the builders unless it shows a builder)
-- **THEN** no builder is launched and the build fails with `CONSOLE_BLIND`
+- **WHEN** the build deadline passes during a read of the template check of a resumed stage, during its upload, or during the calls between the upload and the launch call (the presign and the listing of the builders unless it shows a builder)
+- **THEN** no later call of the stage starts, no builder is launched and the build fails with `CONSOLE_BLIND`
 - **AND** the pass tries to delete the archive that the row names
 
 #### Scenario: A resumed stage outlasts both deadlines
 - **WHEN** a call of a resumed stage ends at or after the build deadline and at or after the pass deadline: a read in the checks before the upload (the template, the credential, the listing of the builders unless it shows a builder), a wait in the stream of the upload, the completion of the upload, the presign, or the last listing of the builders before the launch call unless it shows a builder
 - **THEN** no builder is launched and the build fails with `CONSOLE_BLIND` in that pass, and the row is not left for the next pass to stage again
 - **AND** the pass tries to delete the archive that the row names
-- **AND** a build that is out of time when a call returns asks for no later call: no upload, no presign and no listing
 
 #### Scenario: A resumed stage outlasts only the pass deadline
 - **WHEN** a call of a resumed stage ends at or after the pass deadline and before the build deadline: a read in the checks before the upload (the template, the credential, the listing of the builders unless it shows a builder), a wait in the stream of the upload, the completion of the upload, the presign, or the last listing of the builders before the launch call unless it shows a builder
@@ -906,7 +913,7 @@ Every pass MUST reconcile before any transition; its first call MUST end the bui
 - **AND** the pass result reports that run as `retention`
 
 ### Requirement: The sweep of stray archives has a bound of its own
-The sweep of stray archives runs in reconcile, before the work of the pass. A stray delete MUST NOT be sent once the pass is 30 seconds old by the wall clock or by elapsed time on a monotonic clock, and the AWS client MUST check both right before the request. The sweep then stops, notes `archive:sweep_deferred` and leaves the rest to a later pass. The stray deletes end within about 70 seconds: the cutoff plus one delete of at most 40 seconds. Only the pass deadline bounds the listing.
+The sweep of stray archives runs in reconcile, before the work of the pass. A stray delete MUST NOT start once the pass is 30 seconds old by the wall clock or by elapsed time on a monotonic clock, and the AWS client MUST read both where the delete starts. The sweep then stops, notes `archive:sweep_deferred` and leaves the rest to a later pass. The bound is on the start of the deletes, not on their end. Only the pass deadline bounds the listing.
 
 #### Scenario: A late stray listing starts no delete
 - **WHEN** the listing of the prefix, or a read before it, returns when the pass is 30 seconds old or older and before the pass deadline
@@ -927,18 +934,10 @@ The sweep of stray archives runs in reconcile, before the work of the pass. A st
 - **THEN** no further stray delete starts and the pass notes `archive:sweep_deferred`
 - **AND** the strays that remain are swept by a later pass
 
-#### Scenario: A delete is not sent when elapsed time reaches the bound before the request
-- **WHEN** a stray delete passes the check of the pass, and before the AWS client sends it elapsed time on the monotonic clock reaches 30 seconds, while the wall clock was stepped back and shows the pass as younger
-- **THEN** the AWS client sends no delete and the sweep stops with `archive:sweep_deferred`
-- **AND** the stray object remains for a later pass
-
-#### Scenario: A delete is not sent when the wall clock reaches the cutoff before the request
-- **WHEN** a stray delete passes the check of the pass, and before the AWS client sends it the wall clock reaches the 30 second cutoff
-- **THEN** the AWS client sends no delete and the sweep stops with `archive:sweep_deferred`
-
-#### Scenario: A delete just inside both cutoffs is sent
-- **WHEN** a stray delete passes the check of the pass, and before the AWS client sends it neither the wall clock nor elapsed time on the monotonic clock has reached the cutoff
-- **THEN** the AWS client sends the delete
+#### Scenario: The AWS client reads both cutoffs where a delete starts
+- **WHEN** a stray delete passes the check of the pass, and before it starts the wall clock reaches the cutoff, or elapsed time on the monotonic clock reaches 30 seconds while the wall clock was stepped back and shows the pass as younger
+- **THEN** the AWS client does not call the delete, the sweep stops with `archive:sweep_deferred` and the stray object remains for a later pass
+- **AND** with neither cutoff reached, the AWS client calls the delete
 
 #### Scenario: A stray backlog ends at the bound and the owed deletion is attempted
 - **WHEN** many strays older than one hour sit under the prefix, each of their deletes takes long, a finished build owes its archive deletion, and the work of the pass, with or without a build to follow, ends before the last start of an owed deletion

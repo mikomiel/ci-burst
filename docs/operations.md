@@ -712,9 +712,13 @@ Two refusals belong to the start itself and count no failure:
 `IMAGE_CREDENTIAL_SHORT` (the role session would not outlive the archive URL, or its expiry is unknown, see
 [deployment.md](deployment.md#image-build-role-and-source-identity-optional)) and
 `IMAGE_BUILD_ALREADY_ACTIVE`. A pass checks both before it writes the build row
-and again just before the launch. A build that is out of time before that second
-check starts ends with `CONSOLE_BLIND` instead, because the build deadline decides
-first. A wrong input is raised, not answered, and
+and again just before the launch. The launch reads both deadlines before it checks the
+credential, and again after its last read, right before the provider call, so a deadline
+decides before the credential does: a build that is out of time when the launch begins
+ends with `CONSOLE_BLIND` instead, because the build deadline decides first, and a pass
+that is at or after its own deadline launches nothing and leaves the row `building` for
+the next pass to stage again, even when a slow upload has left the role session too short
+for the archive URL. A wrong input is raised, not answered, and
 nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge on the branch or
 basis reads (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
 or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
@@ -759,11 +763,14 @@ no `image_build_failed` event and tries to delete the row's archive. A pass past
 the build deadline that reaches its deadline check ends the row instead. The build
 deadline decides before the pass deadline, wherever the pass deadline cuts the stage:
 in a read of the checks before the upload, in the stream of the upload, at its
-completion or in the last listing of the builders before the launch. When the cut falls
+completion, or in the launch, before the archive URL is presigned or in the last listing
+of the builders before the provider call. The launch reads the clock before it presigns,
+so a stage that a deadline cut never ends with `IMAGE_CREDENTIAL_SHORT`, however short the
+session has become. When the cut falls
 at or after the build deadline, the pass ends the build `failed` with `CONSOLE_BLIND` in
-that pass and tries to delete the archive, and a build that is out of time before the
-last listing of the builders asks for none. When only the pass deadline has passed, the row stays and the
-next pass stages it again. `lifetime_seconds` and `snapshot_seconds` are not in the digest: a
+that pass and tries to delete the archive, and a build that is out of time when the launch
+begins asks for no presign and no listing. When only the pass deadline has passed, the row
+stays and the next pass stages it again. `lifetime_seconds` and `snapshot_seconds` are not in the digest: a
 stage that launches renders them from the file as it reads it then.
 
 A build that has no verdict by `build_deadline_seconds` ends `failed` in a pass that
@@ -1180,7 +1187,8 @@ To find such a builder, filter on both `ci-burst:image-build = true` and `ci-bur
 When passes do run, every applying pass reconciles before it does anything else.
 It terminates the active build's builder once its deadline has passed. It then
 terminates every tagged builder that is not the active build's. It deletes any object under the archive
-prefix that is not the active archive and is older than one hour; it checks neither
+prefix that is not the active archive and is older than one hour, but starts no delete once the
+pass is 30 seconds old (see below); it checks neither
 the key name nor the writer of the object, so the prefix must belong to this
 deployment alone
 ([deployment.md](deployment.md#the-image-tables-optional)). It adopts a builder or
@@ -1259,6 +1267,32 @@ The sweep of stray archives leaves every owed archive alone, including one that 
 bound deferred in this pass: only the owed deletion retries it, within the bound, and
 records the attempt.
 
+The sweep has a bound of its own, in time. It runs in reconcile, before the work of the pass, so it
+takes a fixed early share of the pass: no stray delete starts once the pass is 30 seconds old
+(`STRAY_SWEEP_SECONDS`). The clock is read right before each request, so a backlog of slow or
+refused deletes, or a listing that returns after that time, starts no delete after it. The sweep
+stops, the pass notes `archive:sweep_deferred`, and a later pass sweeps the strays that it left.
+One delete takes at most about 40 seconds (the 30 second read timeout of the AWS client plus a
+margin), so the stray deletes end within about 70 seconds of the pass start: the 30 second cutoff
+plus one delete. That is all the bound says; it is not a promise to every pass. The 30 seconds are
+a budget, not a measurement: 30 + 40 = 70 seconds leaves the stage, the decision and the owed
+deletions the rest of the 240 second pass, and the last start of an owed deletion is at 200 seconds
+(240 minus the 40 seconds that one delete can take). Four limits remain:
+
+1. The listing reads every page before the first delete, and only the pass deadline bounds it. A
+   listing that returns after the 30 second cutoff is followed by no delete, and a listing that runs
+   to the pass deadline leaves nothing for the work or the owed deletions.
+2. A pass whose reads before the sweep take 30 seconds or longer sweeps nothing and, when a stray is
+   due, notes `archive:sweep_deferred`.
+3. A pass whose own work, without the sweep, ends between 130 and 200 seconds into the pass (200
+   minus the 70 seconds within which the stray deletes end) can still lose its owed turn to a slow backlog. One
+   whose work ends after 200 seconds loses it with or without strays.
+4. The sweep keeps no record of its attempts and the listing is in key order, so a stray at the
+   front whose delete times out in every pass can keep the strays behind it from being swept.
+
+Each limit costs storage only: the bucket lifecycle rule on the prefix removes the objects in the
+end ([deployment.md](deployment.md#the-image-tables-optional)).
+
 A builder that outlives its lifetime is a defect. To remove it, filter on both `ci-burst:image-build = true` and `ci-burst:deployment = <your deployment>`, then terminate the exact instance id: the
 image-build tag alone can match the builder of another deployment in the same
 account and Region.
@@ -1328,7 +1362,7 @@ passing plan does not rule these out.
 | `WARM_FAILED` | the builder printed a failure marker: the script failed, for example in the archive fetch, a warm command or the gate. Read the cause in the framed tail of the event or the console |
 | `IMAGE_MARKER_DIGEST_MISMATCH` | the builder reports another archive digest than the staged one |
 | `MARKER_TIMEOUT` | no ready marker by the build deadline, or the marker was first read at or after it while the builder was still running |
-| `CONSOLE_BLIND` | the console returned no text by the deadline, the provider refused the console read in a pass at or after the deadline (`notes` holds `console_read:<reason>`), or the launch fell at or after it. A stage that the pass deadline cuts at or after the build deadline ends this way too, in that pass: in a read of the checks before the upload, in the stream of the upload, at its completion or in the last listing of the builders. A build that is out of time before the last listing of the builders asks for none. A console read refused before the deadline makes the pass raise, and the next pass reads again |
+| `CONSOLE_BLIND` | the console returned no text by the deadline, the provider refused the console read in a pass at or after the deadline (`notes` holds `console_read:<reason>`), or the launch fell at or after it. A stage that the pass deadline cuts at or after the build deadline ends this way too, in that pass: in a read of the checks before the upload, in the stream of the upload, at its completion, in the launch before the archive URL is presigned (a short session does not end it `IMAGE_CREDENTIAL_SHORT` first) or in the last listing of the builders. A build that is out of time when the launch begins asks for no presign and no listing. A console read refused before the deadline makes the pass raise, and the next pass reads again |
 | `IMAGE_BUILDER_GONE` | a pass did not see the builder as active, or no builder was recorded, while the build had no recorded image. It is not proof that the builder ended. A later applying pass asks the provider to terminate a tagged builder that it lists and that is not the active build's, and does not check the result: verify the final state yourself. Find the instance by the failed row's `builder_id` or its `ci-burst:build-id` tag, not by the deployment tags alone, which also match a newer builder ([Leaked builders and the backstop](#leaked-builders-and-the-backstop)). An image may still exist; the deletion rule handles it as the image of a failed build |
 | `IMAGE_NOT_AVAILABLE` | the image failed, or was not `available` by the deadline |
 | `TEMPLATE_DRIFT` | the candidate version differs from the pin in a field other than `ImageId`, or does not carry the build's image; `drift_fields` names them |
@@ -1346,6 +1380,7 @@ changing the reason code. Do not assume that nothing is left. The row names the 
 before the upload, so when the build ends its deletion is owed and retried (see
 [Leaked builders and the backstop](#leaked-builders-and-the-backstop)); the reconcile sweep
 deletes stray objects under the prefix only once they are older than one hour, and
+starts no delete once the pass is 30 seconds old, and
 an incomplete multipart upload is not an object: give the staging prefix a
 lifecycle rule that aborts incomplete multipart uploads
 ([deployment.md](deployment.md#the-image-tables-optional)).

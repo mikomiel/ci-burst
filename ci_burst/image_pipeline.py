@@ -21,7 +21,8 @@ Three entry points make up the Python API (the command line is task 6.1):
 A pass holds the state file's writer lock and runs, in this order:
 
 1. reconcile: terminate the active build's builder once its deadline has come;
-   terminate every builder that is not the active build's; delete stray archives; adopt
+   terminate every builder that is not the active build's; delete stray archives (a
+   sweep that starts no delete once the pass is ``STRAY_SWEEP_SECONDS`` old); adopt
    what a crash left behind; record every tagged image that has no row as an
    unverified candidate and follow it; remove the images of failed builds
 2. observe the configured pin
@@ -65,12 +66,15 @@ is read), the warm settings and the script. Changed inputs, a changed set of bas
 paths included, end the row ``failed`` with ``IMAGE_INPUTS_CHANGED``, count no
 failure and launch nothing, and the next pass decides from the new inputs. It then runs the template check of
 a start again: an unsafe template ends the row ``failed`` and the pass answers
-``refused``, like a refused start check. The launch reads the clock again right
-before the provider call, after its last read (the listing of the builders):
-at or after the build deadline no builder is launched, and the build fails
-``CONSOLE_BLIND``. At or after the pass deadline none is launched either, and the
-row is left as a stage that the pass deadline ended: ``building`` with no builder
-and no archive hash, for the next pass to stage again.
+``refused``, like a refused start check. The launch reads the clock twice: before it
+presigns the archive URL, and again right before the provider call, after its last read
+(the listing of the builders). At or after the build deadline no builder is launched,
+and the build fails ``CONSOLE_BLIND``. At or after the pass deadline none is launched
+either, and the row is left as a stage that the pass deadline ended: ``building`` with no
+builder and no archive hash, for the next pass to stage again. The first reading comes
+first because a deadline decides before the credential does: the upload can end after a
+deadline, with the session too short for the URL by then, and the refusal
+``IMAGE_CREDENTIAL_SHORT`` would end a row that the pass deadline alone must leave ``building``.
 
 The archive of a build is deleted when the build ends, from the bucket and the
 key its row recorded, and the row records the time (``archive_deleted_at``). A
@@ -96,6 +100,21 @@ delete counts as failed and stays owed. A stage done again that S3 refuses for t
 way, with no failure counted: ``IMAGE_STAGING_BUCKET_DENIED``, or ``IMAGE_STAGING_BUCKET_MISSING`` when the
 bucket that the row recorded no longer exists. Rows that the
 bound left are noted ``archive:delete_deferred``.
+
+The stray archives (older than an hour, named by no row) are swept in reconcile, before the work of the pass, and
+the sweep has a bound of its own: no delete starts once the pass is ``STRAY_SWEEP_SECONDS`` old. The adapter reads
+the clock right before each delete and refuses it at or after that time; the sweep then stops and the pass notes
+``archive:sweep_deferred``. The bound is a time, not a count, so it holds for many quick deletes and for a few slow
+ones. A delete takes at most about ``OWED_DELETE_RESERVE_SECONDS``, so the stray deletes end within about the bound
+plus that reserve of the pass start (30 + 40 = 70 seconds). The work and the owed deletions run on the time that is
+left: the last start of an owed deletion is the pass deadline minus the reserve (200 seconds). That bounds the
+deletes and promises nothing to a pass. Four limits remain. (1) The listing reads every page before the first
+delete, and only the pass deadline bounds it; a listing that returns after the bound is followed by no delete.
+(2) A pass whose reads before the sweep take the bound or longer sweeps nothing. (3) A pass whose own work, without
+the sweep, ends between 130 and 200 seconds can still lose its owed turn, and one that ends after 200 seconds loses
+it with or without strays. (4) The sweep keeps no record of its attempts and the listing is in key order, so a stray
+at the front whose delete times out in every pass can keep the strays behind it unswept. All four cost storage only:
+the strays wait for a later pass, and the bucket lifecycle rule stays the backstop.
 
 The gate requirement (``IMAGE_GATE_REQUIRED``: neither a gate command nor the
 opt-out ``allow_no_gate``) guards a launch, not a build that has a row. ``plan``
@@ -174,6 +193,15 @@ SUPERVISOR_SLEEP_SECONDS = 30
 #: An object under the staging prefix that is not the active archive goes once it
 #: is strictly older than this.
 STRAY_ARCHIVE_AGE_SECONDS = 3600
+#: The sweep of stray archives starts no delete once the pass is this old. It runs before the work of the pass, so it
+#: takes a fixed early share of the pass: the stray deletes end within about this bound and one delete, which is
+#: ``OWED_DELETE_RESERVE_SECONDS`` at most (30 + 40 = 70 seconds), and the work and the owed deletions run on the rest
+#: of the pass, up to the last start of an owed deletion (the pass deadline minus the same reserve, 200 seconds). A
+#: deletion that is quick takes milliseconds, so the bound only matters when deletes are slow. It bounds the deletes
+#: and nothing else: the listing that comes first is bounded by the pass deadline only, and a pass whose own work,
+#: without the sweep, ends between 130 and 200 seconds can still lose its owed turn to a slow backlog. The module
+#: docstring lists the four limits.
+STRAY_SWEEP_SECONDS = 30
 #: One pass starts at most this many owed archive deletions, after its own work and on the time that work leaves. A
 #: deletion starts only while the clock is before the pass deadline minus ``OWED_DELETE_RESERVE_SECONDS``: the read
 #: timeout of the SDK client, which one delete can use up, and a margin. The clock is read again after the owner check,
@@ -1317,17 +1345,24 @@ class _Pass:
             self.tele.leak("builder", len(foreign))
         # Stray archives: not the active archive, not one that a finished build still owes (whether or not the
         # bound reached it in this pass: its retries and their timestamps belong to ``_delete_owed``), and older
-        # than an hour.
+        # than an hour. The listing is bounded by the pass deadline and ends before the first delete, so the deletes
+        # have a bound of their own: none starts once the pass is ``STRAY_SWEEP_SECONDS`` old, whether the listing
+        # returned late or the deletes before it were slow. The adapter reads the clock right before each request
+        # and refuses it at or after that time. A stray that the bound leaves is swept by a later pass.
         storage = self.cfg.storage
         keep = {active.archive_key} if active is not None and active.archive_key else set()
         keep.update(row.archive_key for row in s.archives_owed(dep) if row.archive_bucket == storage.bucket)
+        sweep_until = self.started_at + STRAY_SWEEP_SECONDS
         for stored in aws.list_objects(storage.bucket, _archive_prefix(storage.prefix), deadline=self.deadline):
             if stored.key in keep or stored.last_modified is None:
                 continue
             if now - stored.last_modified <= STRAY_ARCHIVE_AGE_SECONDS:
                 continue
             try:
-                aws.delete_object(storage.bucket, stored.key)
+                aws.delete_object(storage.bucket, stored.key, deadline=sweep_until)
+            except DeadlineRefusal:
+                self._note("archive:sweep_deferred")
+                break
             except ProviderRefusal as refusal:
                 summary["failures"].append(refusal.reason)
             else:
@@ -1609,7 +1644,8 @@ class _Pass:
     def _settle_a_cut_stage(self, build):
         """Settle a build whose stage the pass deadline cut before a builder was launched.
 
-        The cut can fall anywhere: in the checks that come before the upload, in the upload stream, or in the last
+        The cut can fall anywhere: in the checks that come before the upload, in the upload stream, at the end of
+        the upload (the launch then refuses before it presigns, whatever the credential's life), or in the last
         read before the launch call. The row stays ``building`` with no builder and no staged archive, and the next
         pass stages it again (``_restage``). A build that is out of time ends here instead, in the pass that sees it,
         as ``_restage`` ends it on entry: ``CONSOLE_BLIND``, and ``_fail`` deletes the archive that the row names. The
@@ -1628,7 +1664,7 @@ class _Pass:
         earlier stage left, even when the configured prefix or bucket has changed since. The build deadline still
         bounds the build: past it the build fails with the code of a console that never showed anything, and
         ``_fail`` deletes the archive the row names. The deadline is checked here on entry, again in ``_launch``,
-        before the last listing and right before the provider call, and wherever the pass deadline cuts the stage
+        before the presign and right before the provider call, and wherever the pass deadline cuts the stage
         (``_settle_a_cut_stage``), because the checks, the upload and the reads in between take time.
 
         The inputs are checked first: the hashes of the basis files that the row recorded when it was inserted, the
@@ -1770,13 +1806,20 @@ class _Pass:
                 IMAGE_STAGING_OWNER_CHANGED, "the account of the archive's bucket is not the account of this session"
             )
 
-    def _refuse_past_the_build_deadline(self, build):
-        """Refuse with ``CONSOLE_BLIND`` at or after the build deadline.
+    def _refuse_past_a_deadline(self, build):
+        """Refuse a step of the launch that would start at or after either deadline. The build deadline decides first.
 
-        ``_stage`` ends the build with this code, and ``_fail`` deletes the archive that the row names.
+        At or after the build deadline the refusal is ``CONSOLE_BLIND``, the code of a console that never showed
+        anything: ``_stage`` ends the build with it, and ``_fail`` deletes the archive that the row names. Otherwise,
+        at or after the pass deadline, it is a ``DeadlineRefusal``: the stage was cut and no builder was launched, so
+        the row waits for the next pass to stage it again (``_stage_and_launch``, ``_stage``). One reading of the
+        clock decides both.
         """
-        if self.clock() >= build.deadline_at:
+        now = self.clock()
+        if now >= build.deadline_at:
             raise ImageRefusal(image_console.CONSOLE_BLIND)
+        if now >= self.deadline:
+            raise DeadlineRefusal("builder launch")
 
     def _launch(self, build, upload):
         """Presign, render, check the tags and launch. The URL and the user data live only here.
@@ -1785,30 +1828,23 @@ class _Pass:
         with an unknown outcome: the builder may exist, and the next pass adopts
         it by its build-id tag or fails the build.
 
-        The build deadline decides before the pass deadline. The upload that ended the stage can end after both, and
-        the last read, the listing of the builders, raises ``DeadlineRefusal`` once the pass is out of time. So the
-        build deadline is read before that listing, which a build that is out of time does not ask for. A listing that
-        the pass deadline refuses reaches ``_stage`` as ``DeadlineRefusal``, which reads the build deadline again
-        (``_settle_a_cut_stage``).
-
-        The clock is read once more, after the last read and right before the call, and no builder is launched at or
-        after either deadline. At or after the build deadline the call is refused with ``CONSOLE_BLIND``, the code of a
-        console that never showed anything. At or after the pass deadline it is refused with ``DeadlineRefusal``: the
-        listing starts inside the pass and can end after it, and the row then waits for the next pass to stage it
-        again (``_stage_and_launch``, ``_stage``), unless the build deadline has passed by then.
+        A deadline decides before the credential does. The upload that ended the stage can end after the pass
+        deadline, the build deadline or both, and the session can have aged too much during it: the presign then
+        refuses ``IMAGE_CREDENTIAL_SHORT``, which ends the row as a refused start (``_stage``). A stage that a deadline
+        has cut must not end that way, because the pass deadline alone leaves the row for the next pass. So both
+        deadlines are read before the presign, and again after the last read, right before the call, because the
+        listing of the builders in between takes time (``_refuse_past_a_deadline``). At or after the build deadline
+        the launch is refused with ``CONSOLE_BLIND``; at or after the pass deadline with ``DeadlineRefusal``, and the
+        row then waits for the next pass to stage it again, unless the build deadline has passed by then
+        (``_settle_a_cut_stage``). A build that is out of time when the launch begins asks for no listing. A listing
+        that the pass deadline refuses reaches ``_stage`` as ``DeadlineRefusal`` as well.
         """
         aws, cfg = self.aws, self.cfg
+        self._refuse_past_a_deadline(build)
         url = aws.presign_get(build.archive_bucket, upload.key, cfg.source.presign_seconds)
         user_data = image.render_user_data(self.script, image.warm_exports(cfg, url, upload.sha256))
-        self._refuse_past_the_build_deadline(build)
         self._check_no_builder()
-        now = self.clock()
-        if now >= build.deadline_at:
-            # The upload and the reads before this call take time. ``_stage`` ends the build with this code and
-            # ``_fail`` deletes the archive that the row names.
-            raise ImageRefusal(image_console.CONSOLE_BLIND)
-        if now >= self.deadline:
-            raise DeadlineRefusal("RunInstances")
+        self._refuse_past_a_deadline(build)
         try:
             return aws.run_builder(
                 template_name=cfg.build.launch_template_name,

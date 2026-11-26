@@ -774,7 +774,9 @@ Notes on the values:
   or person writes under it, and no prefix of another deployment is the same as
   yours, inside it or around it. Every applying pass deletes each object under the
   prefix that is more than one hour old, except the archive of the active build,
-  and it checks neither the name of the key nor who wrote the object. A prefix
+  but starts no delete once the pass is 30 seconds old (a backlog that does not fit takes
+  several passes, and a pass whose listing of the prefix returns after that time deletes
+  nothing), and it checks neither the name of the key nor who wrote the object. A prefix
   shared with another deployment, or the example prefix reused in a shared bucket,
   can delete that deployment's archive or unrelated objects.
 

@@ -47,12 +47,13 @@ from ci_burst.aws import (
     SecurityGroup,
 )
 from ci_burst.config import load
-from ci_burst.errors import ObservationRefusal, ProviderRefusal, Refusal
+from ci_burst.errors import DeadlineRefusal, ObservationRefusal, ProviderRefusal, Refusal
 from ci_burst.forgejo import BranchHead
 from ci_burst.image_pipeline import (
     OWED_ARCHIVES_PER_PASS,
     OWED_DELETE_RESERVE_SECONDS,
     PASS_DEADLINE_SECONDS,
+    STRAY_SWEEP_SECONDS,
     ImagePipeline,
 )
 from ci_burst.image_state import ImageState
@@ -3279,6 +3280,82 @@ class FailureTests(PipelineCase):
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
         self.assertEqual(self.events("image_build_failed"), [])
 
+    # -- a deadline decides before the credential does -----------------------------------------------------------------
+    # The launch presigns the URL, and the presign refuses ``IMAGE_CREDENTIAL_SHORT`` when the session has too little
+    # life left. A completion that ends late can leave the session short too. A stage that is out of time must not end
+    # as a refused start then: both deadlines are read before the presign, the build deadline first.
+
+    def a_session_that_runs_short_during_a_completion_that_takes(self, seconds):
+        """Make the completion of the upload take ``seconds``, on a session that is then too short for the URL.
+
+        The session has 1850 seconds of life when the pass starts: enough for the check before the upload (the URL
+        lives 1800), too little for the presign once the completion has taken 100 seconds or more. Returns the times at
+        which the completion began.
+        """
+        self.world.credential_life = 1850.0
+        return self.a_completion_that_takes(seconds)
+
+    def test_a_completion_that_ends_after_the_pass_deadline_leaves_the_row_for_the_next_pass_although_the_session_is_short(self):
+        # The pass deadline alone cut the stage, so the row waits. The check of the credential, which would end it, never runs.
+        began = self.a_session_that_runs_short_during_a_completion_that_takes(PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the completion began inside the pass deadline and ended after it.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assert_unstaged(build)
+        self.assertLess(self.clock(), build.deadline_at)
+        # Nothing was presigned, and the archive that the stage stored is still there for the next pass.
+        self.assertEqual(self.world.urls, [])
+        self.assertNotIn("generate_presigned_url", self.world.names(mark))
+        self.assertEqual(list(self.world.objects), [build.archive_key])
+        self.assertNotIn("delete_object", self.world.names(mark))
+        # The next pass has a session that is long enough again: it stages the archive again and launches.
+        del self.world.hooks["complete_multipart_upload"]
+        result = self.apply()
+        self.assertEqual(result["decision"], "building", result)
+        launched = self.only_build()
+        self.assertEqual(launched.id, build.id)
+        self.assertIsNotNone(launched.builder_id)
+        self.assertEqual(launched.archive_sha256, ARCHIVE_SHA)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_a_completion_that_ends_after_both_deadlines_ends_the_build_blind_although_the_session_is_short(self):
+        # The build deadline decides before the pass deadline, and both decide before the credential: the row ends
+        # ``CONSOLE_BLIND`` and counts. It is not a refused start.
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_session_that_runs_short_during_a_completion_that_takes(PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the completion began inside both deadlines and ended after both.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assertGreaterEqual(self.clock(), max(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+        self.assertEqual(self.world.urls, [])
+        self.assertNotIn("generate_presigned_url", self.world.names(mark))
+
+    def test_a_completion_that_ends_after_the_build_deadline_ends_the_build_blind_although_the_session_is_short(self):
+        # The control of the test above for a pass deadline that has not passed: the build deadline alone decides.
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_session_that_runs_short_during_a_completion_that_takes(150)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_nothing_launched_for_a_build_out_of_time(result, first, mark)
+        self.assertEqual(self.world.urls, [])
+        self.assertNotIn("generate_presigned_url", self.world.names(mark))
+
     # -- the same rule where the pass deadline cuts the stage itself -------------------------------------------------
     # The pass can run out of time in the upload stream and in the checks that come before the stage, as well as in
     # the launch. The build deadline decides there too: a build that is out of time ends ``CONSOLE_BLIND`` in the pass
@@ -4726,16 +4803,199 @@ class OwedArchiveBoundTests(PipelineCase):
         self.assertNotIn("describe_images", self.world.names())
         self.assertEqual(self.builds(), [])
 
-    def test_a_stray_listing_whose_account_lookup_ends_before_the_pass_deadline_is_sent_and_sweeps(self):
+    def test_a_stray_listing_whose_account_lookup_ends_before_the_pass_deadline_is_sent_but_sweeps_nothing(self):
         # The same pass with a lookup of 4 of the 5 seconds, so the refusal above is the deadline's.
         stray, deadline, asked = self.a_stray_object_and_a_first_read_that_leaves_5_seconds(4)
         result = self.apply()
         (asked_at,) = asked
         self.assertLess(asked_at + 4, deadline)
         self.assertEqual(len(self.world.arguments("list_objects_v2")), 1)
-        self.assertEqual([call["Key"] for call in self.world.arguments("delete_object")], [stray])
-        self.assertNotIn(stray, self.world.objects)
-        self.assertEqual(result["reconcile"]["archives_deleted"], 1)
+        # The listing was sent, but the pass is past the sweep bound (``STRAY_SWEEP_SECONDS``): no delete starts.
+        self.assertEqual(self.world.arguments("delete_object"), [])
+        self.assertEqual(self.world.objects[stray][0], b"stray")
+        self.assertEqual(result["reconcile"]["archives_deleted"], 0)
+        self.assertIn("archive:sweep_deferred", result["notes"])
+
+    # -- the sweep of stray archives has a bound of its own ------------------------------------------------------------
+    # The sweep runs in reconcile, before the work of the pass, and its listing is bounded by the pass deadline only.
+    # It starts no delete once the pass is ``STRAY_SWEEP_SECONDS`` old, so a late listing or a backlog of slow deletes
+    # starts none after that, and the stray deletes end within about that bound and one delete (30 + 40 seconds). The
+    # work and the owed deletions at the end run on the time that is left; a pass whose own work uses all of it leaves
+    # them none, with or without strays, and one whose work ends between 130 and 200 seconds can still lose its turn.
+
+    def strays(self, count):
+        """``count`` stray archives: older than an hour, and named by no row."""
+        for number in range(count):
+            self.world.objects[f"{PREFIX}stray-{number:02d}.tar.gz"] = (b"stray", NOW - 2 * HOUR)
+
+    def remaining_strays(self):
+        return [name for name in self.world.objects if "/stray-" in name]
+
+    def a_listing_that_takes(self, seconds):
+        """Make the stray listing take ``seconds`` of the clock. Returns the times it began at."""
+        began = []
+
+        def slow(arguments):
+            began.append(self.clock())
+            self.clock.advance(seconds)
+
+        self.world.hooks["list_objects_v2"] = slow
+        return began
+
+    def stray_deletes_that_take(self, seconds):
+        """Make each delete of a stray object take ``seconds`` of the clock. Returns the times they began at.
+
+        A hook of ``delete_object`` that is set already (the owed deletions of ``owe``) keeps handling the other keys.
+        """
+        others = self.world.hooks.get("delete_object")
+        began = []
+
+        def slow(arguments):
+            if "/stray-" in arguments["Key"]:
+                began.append(self.clock())
+                self.clock.advance(seconds)
+            elif others is not None:
+                others(arguments)
+
+        self.world.hooks["delete_object"] = slow
+        return began
+
+    def test_a_listing_that_returns_at_the_sweep_bound_starts_no_stray_delete(self):
+        self.strays(3)
+        listed = self.a_listing_that_takes(STRAY_SWEEP_SECONDS)
+        started_at = self.clock()
+        result = self.apply()
+        # The premise: the listing began inside the bound and returned at it, inside the pass deadline.
+        (began,) = listed
+        self.assertLess(began, started_at + STRAY_SWEEP_SECONDS)
+        self.assertLess(began + STRAY_SWEEP_SECONDS, started_at + PASS_DEADLINE_SECONDS)
+        # So no delete started, and the strays are all still there.
+        self.assertEqual(self.world.arguments("delete_object"), [])
+        self.assertEqual(len(self.remaining_strays()), 3)
+        self.assertEqual(result["reconcile"]["archives_deleted"], 0)
+        self.assertIn("archive:sweep_deferred", result["notes"])
+        # The pass went on with its own work, and a later pass with a quick listing sweeps them.
+        self.assertEqual(result["decision"], "building", result)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        del self.world.hooks["list_objects_v2"]
+        later = self.apply()
+        self.assertEqual(later["reconcile"]["archives_deleted"], 3, later)
+        self.assertEqual(self.remaining_strays(), [])
+        self.assertNotIn("archive:sweep_deferred", later["notes"])
+
+    def test_a_listing_that_returns_just_inside_the_sweep_bound_sweeps_every_stray(self):
+        # The same pass with a listing one second shorter, so the test above can tell a bound from a sweep that never ran.
+        self.strays(3)
+        listed = self.a_listing_that_takes(STRAY_SWEEP_SECONDS - 1)
+        started_at = self.clock()
+        result = self.apply()
+        (began,) = listed
+        self.assertLess(began + STRAY_SWEEP_SECONDS - 1, started_at + STRAY_SWEEP_SECONDS)
+        self.assertEqual(len(self.world.arguments("delete_object")), 3)
+        self.assertEqual(self.remaining_strays(), [])
+        self.assertEqual(result["reconcile"]["archives_deleted"], 3)
+        self.assertNotIn("archive:sweep_deferred", result["notes"])
+
+    def test_slow_stray_deletes_start_no_new_delete_at_or_after_the_sweep_bound(self):
+        self.strays(5)
+        # The first delete ends inside the bound, so a second one starts. It ends after the bound, so no third starts.
+        seconds = STRAY_SWEEP_SECONDS * 2 // 3
+        began = self.stray_deletes_that_take(seconds)
+        started_at = self.clock()
+        result = self.apply()
+        self.assertTrue(all(start < started_at + STRAY_SWEEP_SECONDS for start in began), began)
+        self.assertEqual(len(began), 2, began)
+        self.assertGreaterEqual(began[-1] + seconds, started_at + STRAY_SWEEP_SECONDS)
+        self.assertEqual(result["reconcile"]["archives_deleted"], 2)
+        self.assertEqual(len(self.remaining_strays()), 3)
+        self.assertIn("archive:sweep_deferred", result["notes"])
+        # The pass still had its time: it started and launched the build.
+        self.assertEqual(result["decision"], "building", result)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    def test_a_stray_backlog_leaves_the_owed_delete_its_turn(self):
+        # Twenty strays whose deletes each take as long as one can, and a finished build that owes its archive. The pass
+        # has no work to do, so the sweep is all that can take the time that the owed delete needs.
+        (owed,) = self.owe(1)
+        self.strays(20)
+        self.pin_current()
+        began = self.stray_deletes_that_take(OWED_DELETE_RESERVE_SECONDS)
+        started_at = self.clock()
+        result = self.apply()
+        # The sweep stopped at its bound: one delete began inside it and took the reserve, and no other began.
+        self.assertEqual(len(began), 1, began)
+        self.assertEqual(len(self.remaining_strays()), 19)
+        self.assertIn("archive:sweep_deferred", result["notes"])
+        # The owed delete started after the sweep, and inside its own bound.
+        (start,) = self.starts
+        self.assertGreaterEqual(start, began[0] + OWED_DELETE_RESERVE_SECONDS)
+        self.assertLess(start, started_at + PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS)
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1)
+        self.assertNotIn(owed, self.world.objects)
+        self.assertIsNotNone(self.only_build_named("owed-00").archive_deleted_at)
+        self.assertNotIn("archive:delete_deferred", result["notes"])
+
+    def test_a_stray_backlog_leaves_a_pass_that_ends_a_build_and_its_owed_delete_their_time(self):
+        # The same backlog in a pass that has work: it starts a build and follows it to its end, which takes about 120
+        # seconds in this world. The sweep (the bound and one delete) and that work still leave the owed delete its turn.
+        # A bound of 60 seconds would not: the sweep would take 80 and the owed delete would start at 201.
+        (owed,) = self.owe(1)
+        self.strays(20)
+        began = self.stray_deletes_that_take(OWED_DELETE_RESERVE_SECONDS)
+        self.world.console_plan = [(30.0, READY)]
+        started_at = self.clock()
+        result = self.apply()
+        # The sweep stopped after its first delete, and the work ran to the end of the build.
+        self.assertEqual(len(began), 1, began)
+        self.assertEqual(len(self.remaining_strays()), 19)
+        self.assertIn("archive:sweep_deferred", result["notes"])
+        self.assertEqual(result["decision"], "candidate", result)
+        # The owed delete started after the work, inside its own bound, and settled.
+        (start,) = self.starts
+        self.assertGreaterEqual(start, began[0] + OWED_DELETE_RESERVE_SECONDS)
+        self.assertLess(start, started_at + PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS)
+        self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1)
+        self.assertNotIn(owed, self.world.objects)
+        self.assertNotIn("archive:delete_deferred", result["notes"])
+
+    def test_the_last_stray_delete_ends_before_the_last_start_of_an_owed_delete(self):
+        # One delete can use up the reserve, so the last stray delete ends at the bound plus the reserve (70 seconds).
+        # An owed delete starts until the pass deadline minus the reserve (200 seconds): the stray deletes leave it
+        # that time. This checks the constants only; the listing before the first delete is not part of it.
+        self.assertLess(STRAY_SWEEP_SECONDS + OWED_DELETE_RESERVE_SECONDS, PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS)
+
+    def test_every_stray_delete_is_given_the_sweep_bound_as_its_deadline(self):
+        self.strays(2)
+        deadlines = []
+        delete = ImageAws.delete_object
+
+        def spy(adapter, bucket, stray, **keywords):
+            deadlines.append(keywords.get("deadline"))
+            return delete(adapter, bucket, stray, **keywords)
+
+        started_at = self.clock()
+        with mock.patch.object(ImageAws, "delete_object", spy):
+            self.apply()
+        self.assertEqual(deadlines, [started_at + STRAY_SWEEP_SECONDS] * 2)
+
+    def test_a_stray_delete_that_the_adapter_refuses_for_the_deadline_ends_the_sweep_without_a_failure(self):
+        self.strays(3)
+        refused = []
+
+        def refuse(adapter, bucket, stray, **keywords):
+            refused.append(stray)
+            raise DeadlineRefusal("archive delete")
+
+        with mock.patch.object(ImageAws, "delete_object", refuse):
+            result = self.apply()
+        # The first delete was refused for the deadline: the sweep stopped, noted it and counted no failure.
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(result["reconcile"]["failures"], [])
+        self.assertEqual(result["reconcile"]["archives_deleted"], 0)
+        self.assertIn("archive:sweep_deferred", result["notes"])
+        # The pass went on with its own work.
+        self.assertEqual(result["decision"], "building", result)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
 
     def test_an_active_build_advances_in_a_pass_that_meets_a_slow_refused_backlog(self):
         self.owe(12, stuck=range(12))

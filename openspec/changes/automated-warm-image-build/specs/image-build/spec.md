@@ -285,7 +285,7 @@ The archive key MUST be the configured prefix, exactly one `/` and `<build-id>.t
 - **THEN** reconcile does not list or delete it
 
 ### Requirement: Credentials and URLs are not persisted
-The presigned archive URL, tokens, rendered user data and raw provider payloads MUST NOT appear in logs, events, the state file, command output or error messages. The command MUST NOT presign when the credential session has less remaining life than `source.presign_seconds` and MUST refuse with `IMAGE_CREDENTIAL_SHORT`. The URL MUST exist only in the rendered user data in memory.
+The presigned archive URL, tokens, rendered user data and raw provider payloads MUST NOT appear in logs, events, the state file, command output or error messages. The command MUST NOT presign when the credential session has less remaining life than `source.presign_seconds` and MUST refuse with `IMAGE_CREDENTIAL_SHORT`, unless a deadline has passed first. The URL MUST exist only in the rendered user data in memory.
 
 #### Scenario: A build runs
 - **WHEN** a pass presigns, launches and fails
@@ -414,9 +414,19 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **AND** the refusal adds no failure and starts no cooldown
 
 #### Scenario: The session runs short during the upload
-- **WHEN** the build row exists and the session has less life than `presign_seconds` once the archive is staged
+- **WHEN** the build row exists and the session has less life than `presign_seconds` once the archive is staged, and neither deadline has passed when the launch begins
 - **THEN** the row ends `failed` with `IMAGE_CREDENTIAL_SHORT`, the pass tries to delete its archive and no builder is launched
 - **AND** the pass answers `refused` and counts no failure
+
+#### Scenario: The session runs short and only the pass deadline has passed
+- **WHEN** the upload ends at or after the pass deadline and before the build deadline, and the session has less life than `presign_seconds`
+- **THEN** the launch presigns nothing and no builder is launched, and the row stays `building` with no builder and no `archive_sha256`
+- **AND** the pass counts no failure, keeps the archive, and the next pass stages the build again
+
+#### Scenario: The session runs short and the build deadline has passed
+- **WHEN** the upload ends at or after the build deadline, and the session has less life than `presign_seconds`
+- **THEN** the launch presigns nothing, no builder is launched and the row ends `failed` with `CONSOLE_BLIND`, not `IMAGE_CREDENTIAL_SHORT`
+- **AND** the pass tries to delete the archive that the row names
 
 #### Scenario: A builder appears before the launch
 - **WHEN** a builder of the deployment exists at the check before the launch call, and the build deadline has not passed when that check starts
@@ -635,13 +645,13 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **AND** the pass tries to delete the archive that the row names
 
 #### Scenario: A resumed stage outlasts both deadlines
-- **WHEN** a read in the checks before the upload of a resumed stage, a wait in the stream of the upload, the completion of the upload, or the last listing of the builders before the launch call, ends at or after the build deadline and at or after the pass deadline
+- **WHEN** a read in the checks before the upload of a resumed stage, a wait in the stream of the upload, the completion of the upload, or the last listing of the builders before the launch call when it shows no builder, ends at or after the build deadline and at or after the pass deadline
 - **THEN** no builder is launched and the build fails with `CONSOLE_BLIND` in that pass, and the row is not left for the next pass to stage again
 - **AND** the pass tries to delete the archive that the row names
-- **AND** a build that is out of time before that listing asks for no listing
+- **AND** a build that is out of time when the launch begins asks for no presign and no listing
 
 #### Scenario: A resumed stage outlasts only the pass deadline
-- **WHEN** a read in the checks before the upload of a resumed stage, a wait in the stream of the upload, the completion of the upload, or the last listing of the builders before the launch call, ends at or after the pass deadline and before the build deadline
+- **WHEN** a read in the checks before the upload of a resumed stage, a wait in the stream of the upload, the completion of the upload, or the last listing of the builders before the launch call when it shows no builder, ends at or after the pass deadline and before the build deadline
 - **THEN** no builder is launched and the row stays `building` with no builder and no `archive_sha256`
 - **AND** the next pass stages again and no failure is counted
 
@@ -776,14 +786,14 @@ A `CreateImage` call with an unknown outcome MUST NOT fail the build before the 
 - **THEN** the build fails with the code of the refusal and the failure path ends the builder
 
 ### Requirement: Reconcile runs first and cleans leaks
-Every pass MUST reconcile before any transition, and its first call MUST end the builder of an active build that is past its build deadline, as a non-leak. Reconcile MUST then terminate every other builder-tagged instance, delete objects under the prefix that are not the active archive and are older than one hour, and, before any start, clean the images of failed builds only under the image deletion rule. Owed archive deletions MUST run last, on the time the pass leaves.
+Every pass MUST reconcile before any transition; its first call MUST end the builder of an active build past its build deadline, as a non-leak. Reconcile MUST then terminate every other builder-tagged instance, delete objects under the prefix that are not the active archive and are older than one hour, within the bound of the next requirement, and, before any start, clean failed builds' images only under the image deletion rule. Owed archive deletions MUST run last, on the time the pass leaves.
 
 #### Scenario: A leaked builder
 - **WHEN** a builder is tagged for the deployment and the state file has no matching active build
 - **THEN** reconcile terminates it before any other step
 
 #### Scenario: A stray archive
-- **WHEN** an object older than one hour sits under the prefix and is not the active archive
+- **WHEN** an object older than one hour sits under the prefix and is not the active archive, and the sweep has not reached its bound (see the next requirement)
 - **THEN** reconcile deletes it
 
 #### Scenario: The sweep leaves an owed archive to the bounded retry
@@ -815,6 +825,28 @@ Every pass MUST reconcile before any transition, and its first call MUST end the
 - **WHEN** the image of a failed build is still `pending` after reconcile and is not protected
 - **THEN** the deletion rule removes it at the end of the pass under its pending-image path
 - **AND** the pass result reports that run as `retention`
+
+### Requirement: The sweep of stray archives has a bound of its own
+The sweep of stray archives runs in reconcile, before the work of the pass. It MUST start no stray delete once the pass is 30 seconds old, whether its listing returned late or earlier deletes were slow; it then stops, notes `archive:sweep_deferred`, and a later pass sweeps what it left. The stray deletes therefore end within about 70 seconds of the pass start: the 30 second cutoff plus one delete of at most 40 seconds. The listing of the prefix is bounded by the pass deadline only.
+
+#### Scenario: A late stray listing starts no delete
+- **WHEN** the listing of the prefix, or a read before it, returns when the pass is 30 seconds old or older and before the pass deadline
+- **THEN** no stray delete starts and the stray objects remain
+- **AND** the pass notes `archive:sweep_deferred`, goes on with its own work, and a later pass sweeps them
+
+#### Scenario: A listing that the pass deadline stops
+- **WHEN** the pass deadline has passed before the listing of the prefix requests a page
+- **THEN** the pass ends with `pass_deadline_exceeded`, no stray delete starts and nothing after the listing runs
+
+#### Scenario: Slow stray deletes stop at the bound
+- **WHEN** stray deletes take long and the pass becomes 30 seconds old before the sweep has ended
+- **THEN** the delete that is running ends as the provider answers and no further stray delete starts
+- **AND** the pass notes `archive:sweep_deferred` and goes on with its own work
+
+#### Scenario: A stray backlog ends at the bound and the owed deletion is attempted
+- **WHEN** many strays older than one hour sit under the prefix, each of their deletes takes long, a finished build owes its archive deletion, and the work of the pass, with or without a build to follow, ends before the last start of an owed deletion
+- **THEN** the sweep stops at its bound, the work runs, and the pass attempts the owed deletion at its end
+- **AND** no stray delete starts after the bound
 
 ### Requirement: Orphans are recorded and the builder has its own backstop
 A tagged image that has no state row MUST be recorded as an unverified `candidate`, in whatever state the image is, and MUST NOT be pinned. The builder's lifetime timer and terminate-on-shutdown setting MUST remain the leak backstop that does not depend on the controller.

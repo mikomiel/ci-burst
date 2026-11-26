@@ -710,15 +710,22 @@ class WorldAws(ImageAws):
 
 
 class WorldSts:
-    """``GetCallerIdentity`` of the world: the answer takes ``seconds`` of the fake clock, as a slow STS does."""
+    """``GetCallerIdentity`` of the world: the answer takes ``seconds`` of the fake clock, as a slow STS does.
+
+    ``error``, when set, is raised once in place of the answer, after the same ``seconds``.
+    """
 
     def __init__(self, world, seconds):
         self.w = world
         self.seconds = seconds
+        self.error = None
 
     def get_caller_identity(self):
         self.w.enter("get_caller_identity", {})
         self.w.clock.advance(self.seconds)
+        if self.error is not None:
+            error, self.error = self.error, None
+            raise error
         return {"Account": self.w.account}
 
 
@@ -5496,6 +5503,26 @@ class OwedArchiveBoundTests(PipelineCase):
         self.assertEqual(result["reconcile"]["owed_archives_deleted"], 1, result)
         self.assertNotIn(key, self.world.objects)
         self.assertIsNotNone(self.only_build_named("owed-00").archive_deleted_at)
+
+    def test_an_account_lookup_refused_inside_the_reserve_leaves_the_owed_delete_untried(self):
+        # As above, but the lookup's answer that ends inside the reserve is a refusal. No delete started, so the row is
+        # deferred and keeps its place, as for a lookup that answers there; it is not counted as a failed delete.
+        (key,) = self.owe(1)
+        self.configure(render_toml(gate=""))
+        sts = self.uncached_account(PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS + 5)
+        sts.error = ProviderError("RequestTimeout")
+        started_at = self.clock()
+        result = self.apply()
+        # The premise: the one lookup ended inside the reserve.
+        self.assertGreater(self.clock(), started_at + PASS_DEADLINE_SECONDS - OWED_DELETE_RESERVE_SECONDS)
+        self.assertEqual(len(self.world.arguments("get_caller_identity")), 1)
+        self.assert_the_row_is_deferred_and_untouched(key)
+        reconcile = result["reconcile"]
+        self.assertEqual(
+            (reconcile["owed_archives_deleted"], reconcile["owed_archive_delete_failed"], reconcile["owed_archives_deferred"]),
+            (0, 0, 1),
+        )
+        self.assertNotIn("archive:delete_failed", result["notes"])
 
     def test_an_account_lookup_after_a_refused_read_starts_no_owed_delete_inside_the_reserve(self):
         (key,) = self.owe(1)

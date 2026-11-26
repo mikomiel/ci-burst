@@ -2289,10 +2289,9 @@ class _Pass:
 
         The owner check can be the first use of the account in this session, a provider call that takes time, and the
         first S3 call of the session builds its client, which takes time too. With ``not_after`` set, the adapter reads
-        it where the lookup starts, the clock is read once the check has passed, and the adapter reads it again where
-        the delete starts (``ImageAws._check_deadline``): a lookup or a delete that would start at or after it does not
-        start. The row is then left as it was (not tried, still owed)
-        for a later pass.
+        it where the lookup starts, the clock is read once the check has returned (with an answer or a refusal), and the
+        adapter reads it again where the delete starts (``ImageAws._check_deadline``): a lookup or a delete that would
+        start at or after it does not start. The row is then left as it was (not tried, still owed) for a later pass.
         """
         if not build.archive_key or not build.archive_bucket:
             return False
@@ -2300,10 +2299,18 @@ class _Pass:
         self.delete_attempted.add(build.id)
         try:
             # No call is made about the archive of a row that another account owns, or that records no owner.
-            self._check_archive_owner(build, deadline=not_after)
+            try:
+                self._check_archive_owner(build, deadline=not_after)
+                refused = None
+            except ProviderRefusal as refusal:
+                refused = refusal
+            # One reading of the clock decides either outcome of the lookup: one that returns at or after the cutoff,
+            # with an answer or a refusal, started no delete and leaves the row as it was.
             if not_after is not None and self.clock() >= not_after:
                 self.delete_attempted.discard(build.id)
                 return None
+            if refused is not None:
+                raise refused
             self.aws.delete_object(
                 build.archive_bucket, build.archive_key, owner=build.archive_owner, deadline=not_after
             )

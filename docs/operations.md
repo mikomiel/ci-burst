@@ -945,11 +945,14 @@ command, and the product does not lock an operator's editor. A race with an edit
 a file, a link, a mount or the state directory during one command is outside the
 contract, and the product makes no promise about it. Findings of that class are
 tracked in [#226](https://github.com/mikomiel/ci-burst/issues/226). They are not
-fixed one by one. Changing `aws.region` or `aws.launch_template_name` while the image
-state holds candidates or promotion journal rows is outside the contract too:
-`promote` refuses a candidate recorded from another template or Region (`PIN_MOVED`),
-but rollback, `status --refresh` and image deletion read version numbers under the
-Region and the name the TOML gives now.
+fixed one by one. Changing `aws.region` or `aws.launch_template_name`, or replacing
+the launch template under the same name, while the image state holds an unfinished
+build, candidates or promotion journal rows is outside the contract too. The record
+names the template by name and Region only: `promote` refuses a candidate recorded
+from another name or Region (`PIN_MOVED`) but cannot tell a template replaced under
+the same name, and a build pass, rollback, `status --refresh` and image deletion read
+under the Region and the name the TOML gives now. After such a change, run a new
+build.
 
 #### Promote reason codes
 

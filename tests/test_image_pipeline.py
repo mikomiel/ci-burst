@@ -3538,6 +3538,126 @@ class FailureTests(PipelineCase):
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
         self.assertEqual(self.events("image_build_failed"), [])
 
+    # -- a deadline decides before the credential in the start checks too ---------------------------------------------
+    # The checks of a launch run after the template read, which takes time, and the first of them reads the life of the
+    # session. A session that aged during that read must not end the row as a refused start once a deadline has passed:
+    # the pass deadline alone leaves the row for the next pass, and the build deadline ends it ``CONSOLE_BLIND``. Before
+    # a row exists nothing is staged, and the pass deadline ends the pass.
+
+    def a_session_that_runs_short_during_a_call_that_takes(self, call, seconds):
+        """Make the provider call ``call`` take ``seconds``, on a session that is then too short for the URL.
+
+        The session has 1850 seconds of life when the pass starts: enough for the URL (it lives 1800) until ``call`` has
+        taken 100 seconds or more. Returns the times at which ``call`` began.
+        """
+        self.world.credential_life = 1850.0
+        return self.a_call_that_takes(call, seconds)
+
+    def test_a_template_read_that_ends_after_the_pass_deadline_leaves_a_resumed_stage_for_the_next_pass_although_the_session_is_short(self):
+        # The pass deadline alone cut the stage, so the row waits. The check of the credential, which would end it, never runs.
+        first = self.unstaged_build()
+        began = self.a_session_that_runs_short_during_a_call_that_takes("describe_security_groups", PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the last read of the template check began inside the pass deadline and ended after it.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assertEqual((result["decision"], result["reason"]), ("building", None), result)
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+        build = self.only_build()
+        self.assertEqual(build.id, first.id)
+        self.assert_unstaged(build)
+        self.assertLess(self.clock(), build.deadline_at)
+        # Nothing ended the row: no delete of its archive, no second upload and no listing of the builders after the read.
+        names = self.world.names(mark)
+        self.assertNotIn("describe_instances", names[names.index("describe_security_groups") :])
+        self.assertNotIn("create_multipart_upload", names)
+        self.assertNotIn("delete_object", names)
+        # The next pass has a session that is long enough again: it stages the archive again and launches.
+        del self.world.hooks["describe_security_groups"]
+        self.world.credential_life = float(HOUR)
+        self.world.console_plan = [(30.0, READY)]
+        result = self.apply()
+        self.assertEqual(result["decision"], "candidate", result)
+        self.assertEqual(self.only_build().id, first.id)
+        self.assertEqual(len(self.archive_keys()), 2)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        self.assertEqual(self.events("image_build_failed"), [])
+
+    def test_a_template_read_that_ends_after_both_deadlines_ends_a_resumed_stage_blind_although_the_session_is_short(self):
+        # The build deadline decides before the pass deadline, and both decide before the credential: the row ends
+        # ``CONSOLE_BLIND`` and counts. It is not a refused start.
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_session_that_runs_short_during_a_call_that_takes("describe_security_groups", PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        # The premise: the read began inside both deadlines and ended after both.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assertGreaterEqual(self.clock(), max(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+        names = self.world.names(mark)
+        self.assertNotIn("describe_instances", names[names.index("describe_security_groups") :])
+
+    def test_a_template_read_that_ends_after_the_build_deadline_ends_a_resumed_stage_blind_although_the_session_is_short(self):
+        # The control of the test above for a pass deadline that has not passed: the build deadline alone decides.
+        first = self.resumed_stage_with_100_seconds_left()
+        began = self.a_session_that_runs_short_during_a_call_that_takes("describe_security_groups", 150)
+        started_at = self.clock()
+        mark = len(self.world.calls)
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], first.deadline_at)
+        self.assertGreaterEqual(self.clock(), first.deadline_at)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_ended_blind_before_a_second_stage(result, first, mark)
+        names = self.world.names(mark)
+        self.assertNotIn("describe_instances", names[names.index("describe_security_groups") :])
+
+    def test_a_template_read_that_ends_inside_both_deadlines_still_ends_a_resumed_stage_on_a_short_session(self):
+        # The control of the three tests above: the same read inside both deadlines leaves the credential to decide.
+        first = self.unstaged_build()
+        began = self.a_session_that_runs_short_during_a_call_that_takes("describe_security_groups", 100)
+        started_at = self.clock()
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(self.clock(), min(first.deadline_at, started_at + PASS_DEADLINE_SECONDS))
+        self.assert_refused(result, "IMAGE_CREDENTIAL_SHORT")
+        build = self.only_build()
+        self.assertEqual((build.id, build.state, build.reason_code), (first.id, "failed", "IMAGE_CREDENTIAL_SHORT"))
+        self.assertEqual(len(self.archive_keys()), 1)
+        self.assertEqual(self.world.arguments("run_instances"), [])
+
+    def test_a_template_read_that_ends_after_the_pass_deadline_ends_a_new_start_on_the_deadline_although_the_session_is_short(self):
+        # No row exists, so the credential check could only change the answer: the deadline decides before it all the same.
+        began = self.a_session_that_runs_short_during_a_call_that_takes("describe_security_groups", PASS_DEADLINE_SECONDS + 60)
+        started_at = self.clock()
+        self.refused(self.apply, "pass_deadline_exceeded")
+        # The premise: the read began inside the pass deadline and ended after it.
+        self.assertEqual(len(began), 1)
+        self.assertLess(began[0], started_at + PASS_DEADLINE_SECONDS)
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        # Nothing was written or started, and the listing of the builders did not follow the read.
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.world.arguments("create_multipart_upload"), [])
+        self.assertEqual(self.world.arguments("run_instances"), [])
+        self.assertEqual(self.world.urls, [])
+        names = self.world.names()
+        self.assertNotIn("describe_instances", names[names.index("describe_security_groups") :])
+
+    def test_a_template_read_that_ends_inside_the_pass_deadline_still_refuses_a_new_start_on_a_short_session(self):
+        # The control of the test above: the same read inside the pass deadline leaves the credential to decide.
+        began = self.a_session_that_runs_short_during_a_call_that_takes("describe_security_groups", 100)
+        started_at = self.clock()
+        result = self.apply()
+        self.assertEqual(len(began), 1)
+        self.assertLess(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        self.assert_refused(result, "IMAGE_CREDENTIAL_SHORT")
+        self.assertEqual(self.builds(), [])
+
     def test_a_forge_that_fails_during_the_stage_fails_the_build_by_its_code_alone(self):
         self.source.fail_after_first = ObservationRefusal("FORGEJO_UNAVAILABLE", "token=" + TOKEN)
         result = self.apply()
@@ -4996,6 +5116,116 @@ class OwedArchiveBoundTests(PipelineCase):
         # The pass went on with its own work.
         self.assertEqual(result["decision"], "building", result)
         self.assertEqual(len(self.world.arguments("run_instances")), 1)
+
+    # -- the bound is elapsed time too: a wall clock that is stepped back cannot stretch it -----------------------------
+    # The pass deadline and the deadline that the adapter checks before each request are times on the wall clock. A wall
+    # clock that is stepped back (a time correction, a host that resumed) would keep a sweep going past its bound, so the
+    # pipeline also reads elapsed time on a monotonic clock before each stray delete. The sweep stops at whichever clock
+    # reaches the bound first. The tests above run on the real monotonic clock, which a pass that only advances the fake
+    # wall clock moves by milliseconds, so there the wall clock alone decides.
+
+    def a_pipeline_with_a_monotonic_clock(self, monotonic):
+        """Build the pipeline of this test again, on the same files and with the injected monotonic clock."""
+        self.pipeline = ImagePipeline(
+            self.config,
+            self.config_path,
+            aws_factory=self.aws_factory,
+            source_factory=self.source_factory,
+            state=self.state,
+            clock=self.clock,
+            monotonic=monotonic,
+            sleep=self.sleep,
+            script=SCRIPT,
+        )
+
+    def a_call_that_takes_while_the_wall_clock_steps_back(self, call, seconds, monotonic, *, only=None):
+        """Make the provider call ``call`` take ``seconds`` of elapsed time, and step the wall clock back by as much.
+
+        The wall clock then shows none of the time that the call took. ``only`` picks the calls by their arguments.
+        Returns the readings of the wall clock and of the monotonic clock at which each call began.
+        """
+        began = []
+
+        def slow(arguments):
+            if only is None or only(arguments):
+                began.append((self.clock(), monotonic()))
+                monotonic.advance(seconds)
+                self.clock.advance(-seconds)
+
+        self.world.hooks[call] = slow
+        return began
+
+    def test_a_wall_clock_that_steps_back_does_not_stretch_the_bound_of_the_stray_sweep(self):
+        self.strays(5)
+        monotonic = Clock(1000.0)
+        self.a_pipeline_with_a_monotonic_clock(monotonic)
+        # Each delete takes 12 seconds, and the wall clock steps back by 12 seconds with it: it never shows the bound.
+        seconds = STRAY_SWEEP_SECONDS * 2 // 5
+        began = self.a_call_that_takes_while_the_wall_clock_steps_back(
+            "delete_object", seconds, monotonic, only=lambda arguments: "/stray-" in arguments["Key"]
+        )
+        started_at, started_on = self.clock(), monotonic()
+        result = self.apply()
+        # The premise: the wall clock was before the bound whenever a delete began, so only elapsed time could stop the sweep.
+        self.assertTrue(all(wall < started_at + STRAY_SWEEP_SECONDS for wall, _ in began), began)
+        # Three deletes began inside the bound, at 0, 12 and 24 seconds of elapsed time, and a fourth would have at 36.
+        self.assertEqual([elapsed - started_on for _, elapsed in began], [0, seconds, 2 * seconds])
+        self.assertEqual(result["reconcile"]["archives_deleted"], 3)
+        self.assertEqual(len(self.remaining_strays()), 2)
+        self.assertEqual(result["reconcile"]["failures"], [])
+        self.assertIn("archive:sweep_deferred", result["notes"])
+        # The pass went on with its own work, and a later pass sweeps what the bound left.
+        self.assertEqual(result["decision"], "building", result)
+        self.assertEqual(len(self.world.arguments("run_instances")), 1)
+        del self.world.hooks["delete_object"]
+        later = self.apply()
+        self.assertEqual(later["reconcile"]["archives_deleted"], 2, later)
+        self.assertEqual(self.remaining_strays(), [])
+        self.assertNotIn("archive:sweep_deferred", later["notes"])
+
+    def test_a_listing_that_returns_at_the_bound_by_elapsed_time_starts_no_stray_delete_on_a_wall_clock_that_stepped_back(self):
+        self.strays(3)
+        monotonic = Clock(1000.0)
+        self.a_pipeline_with_a_monotonic_clock(monotonic)
+        listed = self.a_call_that_takes_while_the_wall_clock_steps_back("list_objects_v2", STRAY_SWEEP_SECONDS, monotonic)
+        result = self.apply()
+        # The premise: the listing took the bound in elapsed time, which it alone spent, and the wall clock went back by as much.
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(monotonic(), 1000.0 + STRAY_SWEEP_SECONDS)
+        self.assertEqual(self.world.arguments("delete_object"), [])
+        self.assertEqual(len(self.remaining_strays()), 3)
+        self.assertEqual(result["reconcile"]["archives_deleted"], 0)
+        self.assertIn("archive:sweep_deferred", result["notes"])
+        self.assertEqual(result["decision"], "building", result)
+
+    def test_a_listing_that_returns_just_inside_the_bound_by_elapsed_time_sweeps_every_stray_on_a_wall_clock_that_stepped_back(self):
+        # The same pass with a listing one second shorter, so the test above can tell a bound from a sweep that never ran.
+        self.strays(3)
+        monotonic = Clock(1000.0)
+        self.a_pipeline_with_a_monotonic_clock(monotonic)
+        listed = self.a_call_that_takes_while_the_wall_clock_steps_back(
+            "list_objects_v2", STRAY_SWEEP_SECONDS - 1, monotonic
+        )
+        result = self.apply()
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(monotonic(), 1000.0 + STRAY_SWEEP_SECONDS - 1)
+        self.assertEqual(len(self.world.arguments("delete_object")), 3)
+        self.assertEqual(self.remaining_strays(), [])
+        self.assertEqual(result["reconcile"]["archives_deleted"], 3)
+        self.assertNotIn("archive:sweep_deferred", result["notes"])
+
+    def test_the_wall_clock_still_stops_the_sweep_when_elapsed_time_has_not_reached_the_bound(self):
+        # The control of the tests above for the other clock: a wall clock that jumps ahead ends the sweep as before,
+        # whatever the monotonic clock says. The adapter refuses the delete for the deadline that it was given.
+        self.strays(3)
+        monotonic = Clock(1000.0)
+        self.a_pipeline_with_a_monotonic_clock(monotonic)
+        self.a_listing_that_takes(STRAY_SWEEP_SECONDS)
+        result = self.apply()
+        self.assertEqual(monotonic(), 1000.0)
+        self.assertEqual(self.world.arguments("delete_object"), [])
+        self.assertEqual(len(self.remaining_strays()), 3)
+        self.assertIn("archive:sweep_deferred", result["notes"])
 
     def test_an_active_build_advances_in_a_pass_that_meets_a_slow_refused_backlog(self):
         self.owe(12, stuck=range(12))

@@ -404,6 +404,10 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **THEN** the pass answers `refused` with `IMAGE_CREDENTIAL_SHORT` or `IMAGE_BUILD_ALREADY_ACTIVE`
 - **AND** it writes no build row and no archive and counts no failure
 
+#### Scenario: The session runs short after the pass deadline, before the row exists
+- **WHEN** the read of the build template of a new start ends at or after the pass deadline, and the session then has less life than `presign_seconds`
+- **THEN** the pass ends with `pass_deadline_exceeded`, not `refused`, and writes no build row and no archive
+
 #### Scenario: The template precheck refuses
 - **WHEN** the template precheck refuses a start
 - **THEN** the pass ends with that refusal, writes no build row and no archive and counts no failure
@@ -427,6 +431,16 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **WHEN** the upload ends at or after the build deadline, and the session has less life than `presign_seconds`
 - **THEN** the launch presigns nothing, no builder is launched and the row ends `failed` with `CONSOLE_BLIND`, not `IMAGE_CREDENTIAL_SHORT`
 - **AND** the pass tries to delete the archive that the row names
+
+#### Scenario: The session runs short during the checks of a resumed stage and only the pass deadline has passed
+- **WHEN** a pass stages again a build, the read of the build template ends at or after the pass deadline and before the build deadline, and the session then has less life than `presign_seconds`
+- **THEN** the pass checks no credential and launches nothing, and the row stays `building` with no builder and no `archive_sha256`, not `failed` with `IMAGE_CREDENTIAL_SHORT`
+- **AND** the pass counts no failure, deletes no archive, and the next pass stages the build again
+
+#### Scenario: The session runs short during the checks of a resumed stage and the build deadline has passed
+- **WHEN** a pass stages again a build, the read of the build template ends at or after the build deadline, whether or not the pass deadline has passed, and the session then has less life than `presign_seconds`
+- **THEN** no builder is launched and the row ends `failed` with `CONSOLE_BLIND`, not `IMAGE_CREDENTIAL_SHORT`
+- **AND** the pass counts the failure and tries to delete the archive that the row names
 
 #### Scenario: A builder appears before the launch
 - **WHEN** a builder of the deployment exists at the check before the launch call, and the build deadline has not passed when that check starts
@@ -827,7 +841,7 @@ Every pass MUST reconcile before any transition; its first call MUST end the bui
 - **AND** the pass result reports that run as `retention`
 
 ### Requirement: The sweep of stray archives has a bound of its own
-The sweep of stray archives runs in reconcile, before the work of the pass. It MUST start no stray delete once the pass is 30 seconds old, whether its listing returned late or earlier deletes were slow; it then stops, notes `archive:sweep_deferred`, and a later pass sweeps what it left. The stray deletes therefore end within about 70 seconds of the pass start: the 30 second cutoff plus one delete of at most 40 seconds. The listing of the prefix is bounded by the pass deadline only.
+The sweep of stray archives runs in reconcile, before the work of the pass. It MUST start no stray delete once the pass is 30 seconds old by elapsed time, whether its listing returned late or earlier deletes were slow; it then stops, notes `archive:sweep_deferred`, and a later pass sweeps what it left. The stray deletes end within about 70 seconds of the pass start: the 30 second cutoff plus one delete of at most 40 seconds. The listing of the prefix is bounded by the pass deadline only.
 
 #### Scenario: A late stray listing starts no delete
 - **WHEN** the listing of the prefix, or a read before it, returns when the pass is 30 seconds old or older and before the pass deadline
@@ -842,6 +856,11 @@ The sweep of stray archives runs in reconcile, before the work of the pass. It M
 - **WHEN** stray deletes take long and the pass becomes 30 seconds old before the sweep has ended
 - **THEN** the delete that is running ends as the provider answers and no further stray delete starts
 - **AND** the pass notes `archive:sweep_deferred` and goes on with its own work
+
+#### Scenario: A wall clock that is stepped back does not stretch the bound
+- **WHEN** the system clock is stepped back during the sweep, so that it shows the pass as younger than 30 seconds, and 30 seconds of elapsed time have passed since the pass began
+- **THEN** no further stray delete starts and the pass notes `archive:sweep_deferred`
+- **AND** the strays that remain are swept by a later pass
 
 #### Scenario: A stray backlog ends at the bound and the owed deletion is attempted
 - **WHEN** many strays older than one hour sit under the prefix, each of their deletes takes long, a finished build owes its archive deletion, and the work of the pass, with or without a build to follow, ends before the last start of an owed deletion

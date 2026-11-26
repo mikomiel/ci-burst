@@ -718,7 +718,11 @@ decides before the credential does: a build that is out of time when the launch 
 ends with `CONSOLE_BLIND` instead, because the build deadline decides first, and a pass
 that is at or after its own deadline launches nothing and leaves the row `building` for
 the next pass to stage again, even when a slow upload has left the role session too short
-for the archive URL. A wrong input is raised, not answered, and
+for the archive URL. The checks before the upload follow the same rule, because the read
+of the build template that comes before them takes time too: a stage done again reads both
+deadlines after that read and before the credential check, the build deadline first, and a
+new start reads the pass deadline there (no row exists yet, so the pass ends with
+`pass_deadline_exceeded` instead of answering `refused`). A wrong input is raised, not answered, and
 nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge on the branch or
 basis reads (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
 or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
@@ -728,8 +732,8 @@ opt-out, and an unsafe template verdict end its row and are answered `refused`
 (below). The recheck of the digest reads no basis file of the forge, so a slow
 or unavailable forge cannot hold the stage. Once those rechecks pass, the stage runs the same staging and launch checks as a first stage:
 a start refusal such as `IMAGE_CREDENTIAL_SHORT` ends the row `refused` without a
-failure, and a definite refusal of the archive request ends it as a failed build,
-counted, with exit `1`. A pass that
+failure, unless a deadline has passed first (below), and a definite refusal of the
+archive request ends it as a failed build, counted, with exit `1`. A pass that
 finds a build in flight, or an archive deletion that a finished build still owes,
 runs and settles it even without a gate; a launch that pass would then make is
 refused with `IMAGE_GATE_REQUIRED`, answered `refused`, and counts no failure.
@@ -764,7 +768,8 @@ the build deadline that reaches its deadline check ends the row instead. The bui
 deadline decides before the pass deadline, wherever the pass deadline cuts the stage:
 in a read of the checks before the upload, in the stream of the upload, at its
 completion, or in the launch, before the archive URL is presigned or in the last listing
-of the builders before the provider call. The launch reads the clock before it presigns,
+of the builders before the provider call. The stage reads the clock after the template
+read and before the credential check, and the launch reads it before it presigns,
 so a stage that a deadline cut never ends with `IMAGE_CREDENTIAL_SHORT`, however short the
 session has become. When the cut falls
 at or after the build deadline, the pass ends the build `failed` with `CONSOLE_BLIND` in
@@ -1269,9 +1274,14 @@ records the attempt.
 
 The sweep has a bound of its own, in time. It runs in reconcile, before the work of the pass, so it
 takes a fixed early share of the pass: no stray delete starts once the pass is 30 seconds old
-(`STRAY_SWEEP_SECONDS`). The clock is read right before each request, so a backlog of slow or
-refused deletes, or a listing that returns after that time, starts no delete after it. The sweep
-stops, the pass notes `archive:sweep_deferred`, and a later pass sweeps the strays that it left.
+(`STRAY_SWEEP_SECONDS`). Two clocks measure that age, and the first to reach it stops the sweep:
+the AWS client reads the wall clock right before each request, and the pass reads elapsed time on a
+monotonic clock before each delete, so a wall clock that is stepped back (a time correction, a host
+that resumed) cannot stretch the bound. A backlog of slow or refused deletes, or a listing that
+returns after that time, starts no delete after it. The sweep stops, the pass notes
+`archive:sweep_deferred`, and a later pass sweeps the strays that it left. Elapsed time measures this
+bound only: the pass deadline, the build deadline and the cutoff of the owed deletions are times on
+the wall clock, as every stored time is, and a wall clock that is stepped back stretches them.
 One delete takes at most about 40 seconds (the 30 second read timeout of the AWS client plus a
 margin), so the stray deletes end within about 70 seconds of the pass start: the 30 second cutoff
 plus one delete. That is all the bound says; it is not a promise to every pass. The 30 seconds are

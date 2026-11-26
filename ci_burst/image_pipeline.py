@@ -74,7 +74,10 @@ either, and the row is left as a stage that the pass deadline ended: ``building`
 builder and no archive hash, for the next pass to stage again. The first reading comes
 first because a deadline decides before the credential does: the upload can end after a
 deadline, with the session too short for the URL by then, and the refusal
-``IMAGE_CREDENTIAL_SHORT`` would end a row that the pass deadline alone must leave ``building``.
+``IMAGE_CREDENTIAL_SHORT`` would end a row that the pass deadline alone must leave ``building``. The checks of a
+start follow the same rule, because the template read before them takes time too: both deadlines are read after it
+and before the credential check, the build deadline first, in a stage that is done again (``_Pass._restage``) and,
+for the pass deadline only, before a row exists (``_Pass._start``: the pass then ends on the deadline).
 
 The archive of a build is deleted when the build ends, from the bucket and the
 key its row recorded, and the row records the time (``archive_deleted_at``). A
@@ -102,9 +105,13 @@ bucket that the row recorded no longer exists. Rows that the
 bound left are noted ``archive:delete_deferred``.
 
 The stray archives (older than an hour, named by no row) are swept in reconcile, before the work of the pass, and
-the sweep has a bound of its own: no delete starts once the pass is ``STRAY_SWEEP_SECONDS`` old. The adapter reads
-the clock right before each delete and refuses it at or after that time; the sweep then stops and the pass notes
-``archive:sweep_deferred``. The bound is a time, not a count, so it holds for many quick deletes and for a few slow
+the sweep has a bound of its own: no delete starts once the pass is ``STRAY_SWEEP_SECONDS`` old. Two clocks measure
+that age, and the first to reach it stops the sweep. The adapter reads the wall clock right before each delete and
+refuses it at or after that time. The pass also reads elapsed time on a monotonic clock before each delete, so a wall
+clock that is stepped back cannot stretch the bound. The sweep then stops and the pass notes
+``archive:sweep_deferred``. That is the one bound that elapsed time measures: the pass deadline, the build deadline
+and the cutoff of the owed deletions are times on the wall clock, as every persisted time is, and a wall clock that
+is stepped back stretches them. The bound is a time, not a count, so it holds for many quick deletes and for a few slow
 ones. A delete takes at most about ``OWED_DELETE_RESERVE_SECONDS``, so the stray deletes end within about the bound
 plus that reserve of the pass start (30 + 40 = 70 seconds). The work and the owed deletions run on the time that is
 left: the last start of an owed deletion is the pass deadline minus the reserve (200 seconds). That bounds the
@@ -193,13 +200,14 @@ SUPERVISOR_SLEEP_SECONDS = 30
 #: An object under the staging prefix that is not the active archive goes once it
 #: is strictly older than this.
 STRAY_ARCHIVE_AGE_SECONDS = 3600
-#: The sweep of stray archives starts no delete once the pass is this old. It runs before the work of the pass, so it
-#: takes a fixed early share of the pass: the stray deletes end within about this bound and one delete, which is
-#: ``OWED_DELETE_RESERVE_SECONDS`` at most (30 + 40 = 70 seconds), and the work and the owed deletions run on the rest
-#: of the pass, up to the last start of an owed deletion (the pass deadline minus the same reserve, 200 seconds). A
-#: deletion that is quick takes milliseconds, so the bound only matters when deletes are slow. It bounds the deletes
-#: and nothing else: the listing that comes first is bounded by the pass deadline only, and a pass whose own work,
-#: without the sweep, ends between 130 and 200 seconds can still lose its owed turn to a slow backlog. The module
+#: The sweep of stray archives starts no delete once the pass is this old, by the wall clock (the adapter's deadline
+#: check) or by elapsed time on a monotonic clock (the pipeline's check), whichever reaches it first. It runs before the
+#: work of the pass, so it takes a fixed early share of the pass: the stray deletes end within about this bound and one
+#: delete, which is ``OWED_DELETE_RESERVE_SECONDS`` at most (30 + 40 = 70 seconds), and the work and the owed deletions
+#: run on the rest of the pass, up to the last start of an owed deletion (the pass deadline minus the same reserve, 200
+#: seconds). A deletion that is quick takes milliseconds, so the bound only matters when deletes are slow. It bounds the
+#: deletes and nothing else: the listing that comes first is bounded by the pass deadline only, and a pass whose own
+#: work, without the sweep, ends between 130 and 200 seconds can still lose its owed turn to a slow backlog. The module
 #: docstring lists the four limits.
 STRAY_SWEEP_SECONDS = 30
 #: One pass starts at most this many owed archive deletions, after its own work and on the time that work leaves. A
@@ -793,7 +801,10 @@ class ImagePipeline:
     FRESH ``ImageAws`` and is called once per pass and once per ``plan``: the
     presigned archive URL dies with the role session, so a session is never
     reused across passes. ``source_factory()`` returns a ``ForgejoSource``.
-    ``state`` is an ``ImageState``. ``clock`` and ``sleep`` are injectable, and
+    ``state`` is an ``ImageState``. ``clock``, ``monotonic`` and ``sleep`` are
+    injectable. ``clock`` is the wall clock: every deadline and every time that is
+    written down comes from it. ``monotonic`` measures elapsed time only, and no
+    persisted time comes from it: the stray sweep is its one user (``_Pass``).
     ``script`` is the bytes of the warm script (the shipped one by default; its
     absence is ``IMAGE_SCRIPT_MISSING``).
 
@@ -829,6 +840,7 @@ class ImagePipeline:
         source_factory,
         state,
         clock=time.time,
+        monotonic=time.monotonic,
         sleep=time.sleep,
         script=None,
     ):
@@ -839,6 +851,7 @@ class ImagePipeline:
         self._source_factory = source_factory
         self._state = state
         self._clock = clock
+        self._monotonic = monotonic
         self._sleep = sleep
         self._script = script
 
@@ -1154,6 +1167,10 @@ class _Pass:
         self.clock = pipeline._clock
         self.sleep = pipeline._sleep
         self.started_at = self.clock()
+        #: The elapsed time of the pass, for the stray sweep only (``_reconcile``). A reading means nothing alone, and
+        #: no deadline and no persisted time comes from it.
+        self.monotonic = pipeline._monotonic
+        self.started_monotonic = self.monotonic()
         self.deadline = self.started_at + PASS_DEADLINE_SECONDS
         self.poll_until = self.deadline - CLEANUP_RESERVE_SECONDS
         self.tele = _Telemetry(self.s.directory, self.dep, self.clock)
@@ -1347,8 +1364,10 @@ class _Pass:
         # bound reached it in this pass: its retries and their timestamps belong to ``_delete_owed``), and older
         # than an hour. The listing is bounded by the pass deadline and ends before the first delete, so the deletes
         # have a bound of their own: none starts once the pass is ``STRAY_SWEEP_SECONDS`` old, whether the listing
-        # returned late or the deletes before it were slow. The adapter reads the clock right before each request
-        # and refuses it at or after that time. A stray that the bound leaves is swept by a later pass.
+        # returned late or the deletes before it were slow. Two clocks measure that age, and the first to reach it
+        # stops the sweep. The adapter reads the wall clock right before each request and refuses it at or after
+        # ``sweep_until``; a wall clock that is stepped back would stretch that time, so the elapsed time on the
+        # monotonic clock is read before each delete too. A stray that the bound leaves is swept by a later pass.
         storage = self.cfg.storage
         keep = {active.archive_key} if active is not None and active.archive_key else set()
         keep.update(row.archive_key for row in s.archives_owed(dep) if row.archive_bucket == storage.bucket)
@@ -1359,6 +1378,8 @@ class _Pass:
             if now - stored.last_modified <= STRAY_ARCHIVE_AGE_SECONDS:
                 continue
             try:
+                if self.monotonic() - self.started_monotonic >= STRAY_SWEEP_SECONDS:
+                    raise DeadlineRefusal("the stray sweep")
                 aws.delete_object(storage.bucket, stored.key, deadline=sweep_until)
             except DeadlineRefusal:
                 self._note("archive:sweep_deferred")
@@ -1572,9 +1593,16 @@ class _Pass:
         the hashes of the basis files that gave ``digest``: the row keeps them, so a stage that is done again reads
         no file. ``_run`` never starts a build without a gate, so ``_start_refusal`` holds the gate requirement only
         as the guard of every launch.
+
+        A deadline decides before the credential does, as in ``_launch``: the template read takes time, and the
+        session ages during it. The pass deadline is read after that read and before the start checks, whose first
+        is the credential check. No row exists yet, so only the pass deadline can have passed, and the pass ends
+        on it (``DeadlineRefusal``) instead of answering ``refused`` for a credential that the late read aged.
         """
         s, aws, cfg = self.s, self.aws, self.cfg
         self.p._check_build_template(aws, self.deadline)
+        if self.clock() >= self.deadline:
+            raise DeadlineRefusal("the start checks")
         reason = self._start_refusal()
         if reason is not None:
             self.refused = reason
@@ -1663,9 +1691,10 @@ class _Pass:
         The key and the bucket are the recorded ones (``_stage_and_launch``), so the new archive replaces whatever the
         earlier stage left, even when the configured prefix or bucket has changed since. The build deadline still
         bounds the build: past it the build fails with the code of a console that never showed anything, and
-        ``_fail`` deletes the archive the row names. The deadline is checked here on entry, again in ``_launch``,
-        before the presign and right before the provider call, and wherever the pass deadline cuts the stage
-        (``_settle_a_cut_stage``), because the checks, the upload and the reads in between take time.
+        ``_fail`` deletes the archive the row names. The deadline is checked here on entry, again after the template
+        check, again in ``_launch``, before the presign and right before the provider call, and wherever the pass
+        deadline cuts the stage (``_settle_a_cut_stage``), because the checks, the upload and the reads in between
+        take time.
 
         The inputs are checked first: the hashes of the basis files that the row recorded when it was inserted, the
         warm settings and the script, as this pass reads them, must give the digest that the row was inserted under,
@@ -1684,6 +1713,13 @@ class _Pass:
         and the opt-out while the row waits, and the digest does not hold the opt-out: a row inserted under it gives
         the same digest once it is gone. That row ends with ``IMAGE_GATE_REQUIRED`` and no failure, and no builder is
         launched. The other checks of a launch (``_start_refusal``) run last.
+
+        A deadline decides before the credential does, here as in ``_launch``. The template read takes time and the
+        session ages during it, and the first of the checks that run last reads the life of the session. So both
+        deadlines are read between the template check and those checks, the build deadline first
+        (``_refuse_past_a_deadline``): at or after the build deadline the build fails ``CONSOLE_BLIND``, and at or
+        after the pass deadline the row is left for the next pass. The refusal ``IMAGE_CREDENTIAL_SHORT`` ends the row
+        only when neither deadline has passed.
         """
         if self.clock() >= build.deadline_at:
             return self._fail(build, image_console.CONSOLE_BLIND, builder_alive=False)
@@ -1699,9 +1735,15 @@ class _Pass:
         except ImageRefusal as refusal:
             return self._end_refused(build, refusal.reason)
         try:
+            # The template read took time and the session aged during it: both deadlines are read before the first of
+            # the start checks, the credential check, so that a deadline decides before the credential does.
+            self._refuse_past_a_deadline(build)
             reason = self._start_refusal()
         except DeadlineRefusal:
             return self._settle_a_cut_stage(build)
+        except ImageRefusal as refusal:
+            # The build deadline (``_start_refusal`` returns the refusals of a start): ``_stage`` ends it the same way.
+            return self._fail(build, refusal.reason, builder_alive=False)
         if reason is not None:
             return self._end_refused(build, reason)
         return self._stage(build, restage=True)

@@ -168,9 +168,6 @@ class BudgetConfig:
 @dataclass(frozen=True)
 class StateConfig:
     database: Path
-    #: The database as the file names it, joined to the file's directory but not
-    #: resolved: a link in that name is an entry that ``export`` must not replace.
-    named_database: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -248,10 +245,6 @@ class Config:
     budget: BudgetConfig
     state: StateConfig
     image: ImageConfig = field(default_factory=ImageConfig)
-    #: ``[image].state_directory`` as the file names it, enabled or not. A
-    #: disabled table keeps ``image`` disabled, but its directory may still hold
-    #: an image database that ``export`` must not replace.
-    named_image_state_directory: Path | None = None
 
     def require_worker_lifetime(self):
         """Refuse admission unless ``aws.max_lifetime_seconds`` is the lifetime the worker bootstrap arms.
@@ -646,16 +639,15 @@ def _image_state_directory(table, where, *, required, ledger_directory):
 
 
 def _image(raw, aws_profile, forgejo_token_env, worker_template, ledger_directory):
-    """Return the validated image configuration, or the disabled value, and the state directory that the table names.
+    """Return the validated image configuration, or the disabled value.
 
     The tables are checked whenever they are present, so an unknown key, an
     out-of-range value or an unsafe path never waits for the operator to enable
-    the feature. Required keys and the returned fields exist only when enabled;
-    the state directory is returned beside them whether enabled or not.
+    the feature. Required keys and the returned fields exist only when enabled.
     """
     image_table = raw.get("image")
     if image_table is None:
-        return ImageConfig(), None
+        return ImageConfig()
     where = "image"
     table = _table(
         image_table,
@@ -707,7 +699,7 @@ def _image(raw, aws_profile, forgejo_token_env, worker_template, ledger_director
     storage = _image_storage(table, required=enabled)
     state_directory = _image_state_directory(table, where, required=enabled, ledger_directory=ledger_directory)
     if not enabled:
-        return ImageConfig(), state_directory
+        return ImageConfig()
     return ImageConfig(
         enabled=True,
         profile=profile,
@@ -717,7 +709,7 @@ def _image(raw, aws_profile, forgejo_token_env, worker_template, ledger_director
         storage=storage,
         state_directory=state_directory,
         **values,
-    ), state_directory
+    )
 
 
 def load(path):
@@ -860,12 +852,10 @@ def loads(text, path):
     )
 
     state_table = _table(raw.get("state", {}), "state", ("database",))
-    named_database = database = Path(_string(state_table, "database", "state"))
+    database = Path(_string(state_table, "database", "state"))
     if not database.is_absolute():
-        named_database = config_path.parent / database
-        database = named_database.resolve()
-    state = StateConfig(database=database, named_database=named_database)
-    image, image_state_directory = _image(raw, profile, forgejo.token_env, aws.launch_template_name, database.parent)
+        database = (config_path.parent / database).resolve()
+    state = StateConfig(database=database)
 
     return Config(
         deployment=deployment,
@@ -876,6 +866,5 @@ def loads(text, path):
         aws=aws,
         budget=budget,
         state=state,
-        image=image,
-        named_image_state_directory=image_state_directory,
+        image=_image(raw, profile, forgejo.token_env, aws.launch_template_name, database.parent),
     )

@@ -70,7 +70,7 @@ from pathlib import Path
 from .aws import Aws
 from .config import INSTANCE_TYPE_PATTERN, MAX_INSTANCE_TYPE_LENGTH
 from .cost import CostModel
-from .errors import ConfigRefusal, ProviderRefusal
+from .errors import ProviderRefusal
 from .ledger import NONTERMINAL, TERMINAL, Ledger, current_window
 
 #: One run reads at most this many consoles. The budget is spent on records that
@@ -1305,114 +1305,6 @@ def _write_atomic(path, content, *, times=None):
         raise
 
 
-#: The most links that one lookup follows; the kernel stops there with ``ELOOP``.
-_MAX_LINK_HOPS = 40
-
-
-def _trace(path):
-    """Each entry (directory device, inode, name) that a lookup of ``path`` reads, as the kernel reads them.
-
-    Every link met at any depth is followed relative to its directory, up to
-    ``_MAX_LINK_HOPS``. Each item says whether the names that continue the
-    entry's name count too: true at the end of the path, for a link there (the
-    ledger names its lock after the name it was given) and for the entry where
-    the lookup stops, existing or not. Also returns the directory it ends at.
-    """
-    remaining = list((Path.cwd() / path).parts)
-    directory, items, hops = Path(remaining.pop(0)), [], 0
-    while remaining:
-        name = remaining.pop(0)
-        if name == "..":
-            directory = directory.parent
-            continue
-        status = os.stat(directory)
-        entry, candidate = (status.st_dev, status.st_ino, name), directory / name
-        if os.path.islink(candidate):
-            items.append((entry, not remaining))
-            hops += 1
-            if hops > _MAX_LINK_HOPS:
-                return items, None
-            target = Path(os.readlink(candidate))
-            if target.is_absolute():
-                directory = Path(target.anchor)
-            remaining[:0] = target.parts[1:] if target.is_absolute() else target.parts
-        elif remaining and os.path.isdir(candidate):
-            directory = candidate
-        else:
-            items.append((entry, True))
-            return items, candidate if os.path.isdir(candidate) else None
-    return items, directory
-
-
-def refuse_conflicting_outputs(outputs, *, export_directory, files, directories):
-    """Refuse, before any write, outputs that could replace each other or an entry that a lookup reads.
-
-    Returns the spelling of each output that every later step uses (``.`` and
-    doubled separators dropped; a last component that is empty, ``.`` or ``..``
-    asks for a directory and is refused) and the directory the caller creates.
-    Each output's directory must exist, except ``export_directory`` in the
-    existing ledger directory, and an output replaces only its own entry:
-    ``os.replace`` of a file cannot replace a directory. Protected are the
-    entries that the lookup (``_trace``) of each output's directory reads, its
-    own included, so no output repoints a later step; those of each path in
-    ``files`` and ``directories`` (tuples: as named and as opened), with the
-    names that continue a final entry's name with ``.`` or ``-`` (the ledger's
-    lock, journal and copies; the lock, temporary file and backups of
-    ``image promote``); and every entry of a protected directory. Other paths
-    are the operator's.
-    """
-    spellings, claimed, create, missing, read = {}, {}, None, [], set()
-
-    def claim(entry, what):
-        if entry in claimed:
-            raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{what} names the same entry as {claimed[entry]}")
-        claimed[entry] = what
-
-    for option, path in outputs.items():
-        if os.path.basename(os.fspath(path)) in ("", ".", ".."):
-            raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{option} must end with a file name")
-        spellings[option] = str(Path(path))
-        path = Path.cwd() / path
-        try:
-            status = os.stat(path.parent)
-        except (FileNotFoundError, NotADirectoryError):
-            status = None
-        if status is not None and stat.S_ISDIR(status.st_mode):
-            claim((status.st_dev, status.st_ino, path.name), option)
-            read.update(entry for entry, _ in _trace(path.parent)[0])
-        elif status is None and path.parent == export_directory and not os.path.isdir(export_directory.parent):
-            missing.append(f"the ledger directory {export_directory.parent} of {option} is missing")
-        elif status is None and path.parent == export_directory and not os.path.lexists(export_directory):
-            if create is None:
-                ledger = os.stat(export_directory.parent)
-                claim((ledger.st_dev, ledger.st_ino, export_directory.name), "the export directory")
-                create = export_directory
-            claim((None, None, path.name), option)
-            read.update(entry for entry, _ in _trace(export_directory.parent)[0])
-        else:
-            missing.append(f"the directory of {option} is missing; export creates only {export_directory}")
-    for entry, what in claimed.items():
-        if entry in read:
-            raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{what} names an entry that the lookup of an output reads")
-    protected = []
-    for description, paths in (files | directories).items():
-        for path in {path for path in paths if path is not None}:
-            items, final = _trace(path)
-            protected += [(entry, family, description) for entry, family in items]
-            if final is not None and description in directories:
-                status = os.stat(final)
-                protected.append(((status.st_dev, status.st_ino, None), False, description))
-    for (device, inode, name), family, description in protected:
-        for (other_device, other_inode, other), what in claimed.items():
-            if (other_device, other_inode) == (device, inode) and (
-                name is None or other == name or family and other.startswith((name + ".", name + "-"))
-            ):
-                raise ConfigRefusal("EXPORT_PATHS_CONFLICT", f"{what} names an entry that {description} uses")
-    if missing:
-        raise ConfigRefusal("EXPORT_DIRECTORY_MISSING", missing[0])
-    return spellings, create
-
-
 @contextlib.contextmanager
 def _directory_locks(*paths):
     """Hold an exclusive lock on the directory of each of ``paths`` while the block runs.
@@ -1421,11 +1313,9 @@ def _directory_locks(*paths):
     The locks are a guard that makes an accidental second run wait until the
     first releases them; they attach no guarantee. The lock is on the directory
     and not on a file, so a run creates no file for it and no output path can
-    replace it. A missing directory is created here only for a direct caller:
-    the command line has refused any but the export directory and created that
-    one. Each directory is locked once, in the order of its device and inode
-    numbers, so two runs that reach one directory under different paths never
-    wait for each other in a circle.
+    replace it. The directories are created first and opened, and each is locked
+    once, in the order of its device and inode numbers, so two runs that reach
+    one directory under different paths never wait for each other in a circle.
     The launch evidence reader takes no lock.
     """
     opened = {}

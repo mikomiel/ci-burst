@@ -4028,6 +4028,53 @@ class CostTrackingTests(ControllerCase):
         self.assertEqual(result["decision"], "refused")
         self.assertIn("budget_allowance_exhausted", result["reasons"])
 
+    def assert_a_request_without_a_usable_max_price_keeps_its_reservation(self, damage):
+        # The test above with a frozen request that still decodes: ``damage`` edits
+        # the decoded ``SpotOptions``, so the floor cannot come from a failed decode.
+        def config(**aws):
+            path = write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 2},
+                    "aws": {"max_lifetime_seconds": 3600} | aws,
+                    "budget": {"allowance": "0.59", "incidental_per_hour": "0.05", "non_compute_allowance": "0.5"},
+                },
+            )
+            return load(path)
+
+        first = self.build(observation=observation_demand(1), config=config(max_spot_price="0.0400")).apply()
+        self.assertEqual(first["decision"], "launched")
+        self.assertEqual(first["budget"]["per_launch_reservation"], "0.590000")
+        operation_id = first["operation"]
+        request = json.loads(self.reopened().operation(operation_id).request_json)
+        damage(request["InstanceMarketOptions"]["SpotOptions"])
+        connection = sqlite3.connect(self.config.state.database)
+        with connection:
+            connection.execute(
+                "UPDATE operations SET request_json = ? WHERE id = ?", (json.dumps(request), operation_id)
+            )
+        connection.close()
+        self.clock.advance(600)
+        lowered = self.build(
+            observation=observation_demand(1),
+            config=config(max_spot_price="0.0100"),
+            aws=FakeAws(spot_quote=quote(price_micros=10_000, clock=self.clock)),
+        )
+        result = lowered.apply()
+        self.assertEqual(result["budget"]["committed"], "0.590000")
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("budget_allowance_exhausted", result["reasons"])
+
+    def test_an_active_row_whose_frozen_request_has_no_max_price_keeps_its_reservation(self):
+        self.assert_a_request_without_a_usable_max_price_keeps_its_reservation(
+            lambda spot: spot.pop("MaxPrice")
+        )
+
+    def test_an_active_row_whose_frozen_request_has_a_null_max_price_keeps_its_reservation(self):
+        self.assert_a_request_without_a_usable_max_price_keeps_its_reservation(
+            lambda spot: spot.update(MaxPrice=None)
+        )
+
     def test_a_lowered_configuration_does_not_reprice_an_admitted_operation(self):
         config = load(
             write_config(

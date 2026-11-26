@@ -81,7 +81,8 @@ def _frozen_max_price_micros(request_json):
 
     The ceiling admission committed is already stored in the request the
     provider received; a schema-3 row does not need a second column for it. A
-    request that does not decode gives zero here, and an operation that still
+    request that has no usable ``MaxPrice`` (it does not decode, or the price is
+    missing, null or malformed) gives zero here, and an operation that still
     needs its ceiling keeps its reservation instead (``reservation_floor_micros``).
     """
     request = _decoded_request(request_json)
@@ -168,16 +169,18 @@ class CostModel:
         and its commitment may fall below the reservation as its minutes are
         accepted under the ceiling.
 
-        A non-terminal row whose frozen request does not decode keeps the same
-        floor. Its ``MaxPrice`` is the ceiling admission committed, and without it
-        the configured maximum, which may since have been lowered, and the
-        accepted price would price the remaining life below that ceiling. A
-        terminal row needs no ceiling for the remaining life, so its request may
-        stay undecodable without a floor.
+        A non-terminal row whose frozen request has no usable ``MaxPrice`` keeps
+        the same floor: the request does not decode, or decodes with the price
+        missing, null or malformed. The controller writes a price into every
+        request, so such a row is damaged. The price is the ceiling admission
+        committed, and without it the configured maximum, which may since have
+        been lowered, and the accepted price would price the remaining life below
+        that ceiling. A terminal row needs no ceiling for the remaining life, so
+        a request without a usable ``MaxPrice`` gives it no floor.
         """
         damaged = (
             operation.state not in TERMINAL_STATES
-            and _decoded_request(operation.request_json) is UNDECODABLE
+            and not _frozen_max_price_micros(operation.request_json)
         )
         if not (operation.admitted_inputs_backfilled or damaged):
             return 0

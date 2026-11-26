@@ -1221,7 +1221,10 @@ def _retained_events(existing, deployment):
     dropped rather than carried forward, and the caller reports the drop.
     """
     kept, dropped = [], 0
-    for line in existing.splitlines():
+    # A line ends at LF alone, as the caller cut it: ``splitlines`` also cuts on a
+    # bare CR and on Unicode separators, so one damaged line would be republished
+    # in part. A CRLF line still parses, because JSON whitespace includes CR.
+    for line in existing.split("\n"):
         if not line.strip():
             continue
         try:

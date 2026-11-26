@@ -1498,8 +1498,10 @@ window for the same reason.
 The schema-3 upgrade marks every non-terminal row whose admitted inputs it
 backfilled with `admitted_inputs_backfilled = 1`; a terminal row keeps `0` and
 its stored settled cost. That stored mark makes the row's reservation the
-commitment floor. So does a non-terminal row whose frozen request does not
-decode: without its `MaxPrice`, a lowered `max_spot_price` and the accepted price
+commitment floor. So does a non-terminal row whose frozen request has no usable
+`MaxPrice`: the request does not decode, or the price is missing, null or
+malformed. The controller writes a price into every request, so such a row is
+damaged. Without the price, a lowered `max_spot_price` and the accepted price
 would price the remaining life below the ceiling that admission committed. A
 terminal row needs no ceiling for its remaining life and keeps no such floor.
 The floor is not inferred from a whole-life estimate, because

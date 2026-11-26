@@ -1575,6 +1575,32 @@ class ExporterTests(ExportCase):
             ["i-0123456789abcdef1:step:register", "i-0123456789abcdef3:step:register"],
         )
 
+    def test_a_historical_line_with_a_bare_carriage_return_is_dropped_as_one_line(self):
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        base = {
+            "ts": "2026-11-11T00:00:00Z",
+            "deployment": "test-deployment",
+            "zone": "eu-central-1a",
+            "operation": None,
+            "event": "step",
+            "step": "register",
+        }
+        lines = [
+            json.dumps(dict(base, id=f"i-0123456789abcdef{index}:step:register", instance=f"i-0123456789abcdef{index}")).encode()
+            for index in (1, 2, 3)
+        ]
+        # The middle line is one LF line: garbage, a bare CR, then a valid event. It
+        # is one line of the file, so the valid event after the CR goes with it.
+        lines[1] = b"garbage\r" + lines[1]
+        self.events.write_bytes(b"\n".join(lines) + b"\n")
+
+        result = self.run_export(self.build([], {}))
+
+        self.assertIn("events_pruned", result["notes"])
+        self.assertEqual(
+            [event["id"] for event in self.events_read()],
+            ["i-0123456789abcdef1:step:register", "i-0123456789abcdef3:step:register"],
+        )
 
     def test_historical_event_values_are_validated_per_field(self):
         secret = "SYNTHETIC-CONSOLE-SECRET-123"

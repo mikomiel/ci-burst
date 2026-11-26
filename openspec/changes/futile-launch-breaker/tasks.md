@@ -138,8 +138,9 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   descriptor and before the content, and judge the age, the record dates and the
   window against that one reading. The controller passes its clock, not a time.
 - [x] 1.18 In `CostModel.reservation_floor_micros`, keep the stored reservation as
-  the floor of a non-terminal row whose frozen request does not decode, as for a
-  backfilled row: without its `MaxPrice`, a lowered configured maximum and the
+  the floor of a non-terminal row whose frozen request has no usable `MaxPrice`
+  (the request does not decode, or the price is missing, null or malformed), as
+  for a backfilled row: without it, a lowered configured maximum and the
   accepted price would price the remaining life below the ceiling that admission
   committed. A terminal row keeps the tolerance.
 - [x] 1.19 State once in `docs/operations.md`, in the `design.md` shared-files

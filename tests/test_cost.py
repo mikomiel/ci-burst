@@ -98,7 +98,7 @@ class AccrualTests(unittest.TestCase):
 class CommitmentTests(unittest.TestCase):
     def test_remaining_life_is_priced_at_the_cap(self):
         # 3_000 seconds left at the configured maximum of 0.20 per hour.
-        self.assertEqual(model().remaining_micros(operation(), 1_000_600.0), 166_667)
+        self.assertEqual(model().remaining_micros(operation(request_json=FROZEN_REQUEST), 1_000_600.0), 166_667)
 
     def test_an_unresolved_intent_commits_its_whole_worst_case(self):
         intent = operation(instance_id=None, state="intent")
@@ -106,7 +106,9 @@ class CommitmentTests(unittest.TestCase):
         self.assertEqual(model().committed_micros(intent, 1_000_600.0), CAP + BUFFER)
 
     def test_a_live_operation_commits_spend_plus_remaining_plus_buffer(self):
-        self.assertEqual(model().committed_micros(operation(), 1_000_600.0), 16_667 + 166_667 + BUFFER)
+        self.assertEqual(
+            model().committed_micros(operation(request_json=FROZEN_REQUEST), 1_000_600.0), 16_667 + 166_667 + BUFFER
+        )
 
     def test_a_settled_operation_commits_exactly_its_settled_cost(self):
         settled = operation(state="terminal", settled_micros=12_345)
@@ -121,7 +123,9 @@ class CommitmentTests(unittest.TestCase):
         )
         # A row admitted under the shorter model's own basis: its flag is 0, so
         # the admitted-worst-case floor does not apply.
-        live = operation(expires_at=1_003_600.0, admitted_buffer_micros=0, reservation_micros=200_000)
+        live = operation(
+            expires_at=1_003_600.0, admitted_buffer_micros=0, reservation_micros=200_000, request_json=FROZEN_REQUEST
+        )
         self.assertEqual(shorter.lifetime_seconds(live), 3600)
         self.assertEqual(shorter.accrued_micros(live, 1_000_600.0), 16_667)
         self.assertEqual(shorter.remaining_micros(live, 1_000_600.0), 166_667)
@@ -130,7 +134,7 @@ class CommitmentTests(unittest.TestCase):
         )
 
     def test_a_shorter_stored_lifetime_bounds_a_longer_configuration(self):
-        live = operation(expires_at=1_000_060.0, reservation_micros=53_334)
+        live = operation(expires_at=1_000_060.0, reservation_micros=53_334, request_json=FROZEN_REQUEST)
         self.assertEqual(model().lifetime_seconds(live), 60)
         # The stored 60-second lifetime bounds a 3_600-second configuration.
         self.assertEqual(model().accrued_micros(live, 1_000_600.0), 1_667)

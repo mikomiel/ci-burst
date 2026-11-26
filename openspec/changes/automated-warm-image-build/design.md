@@ -292,7 +292,7 @@ With `--write` it refuses unless the candidate is verified:
 - the full `LaunchTemplateData` differs from the pin that the version was derived from only in `ImageId`;
 - the offline gate was configured and passed (or `allow_no_gate` was set and the record says so);
 - `verified_at` is within `promote_max_age_seconds` (default 172800);
-- the pin in the TOML now equals the record's `source_pin`, so the diff basis is still true;
+- the pin and the launch template name in the TOML now equal the record's `source_pin` and `source_template`, so the diff basis is still true;
 - no `[[aws.availability_zones]]` entry carries its own `launch_template_version` (see open question 3).
 
 It then edits only the `launch_template_version` key of the `[aws]` table:

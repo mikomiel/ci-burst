@@ -726,8 +726,8 @@ def _session_expiry(session, check):
 
     Assumed-role credentials resolve lazily and carry no expiry until the first
     refresh, so they are resolved first. The resolved secret is discarded here.
-    ``check`` reads the cutoff right before the discovery and before the refresh,
-    since the build of the session and the discovery take time.
+    ``check`` reads the cutoff right before the discovery and right before the
+    refresh in this function.
     """
     check()
     credentials = session.get_credentials()

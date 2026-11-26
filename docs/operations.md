@@ -945,7 +945,11 @@ command, and the product does not lock an operator's editor. A race with an edit
 a file, a link, a mount or the state directory during one command is outside the
 contract, and the product makes no promise about it. Findings of that class are
 tracked in [#226](https://github.com/mikomiel/ci-burst/issues/226). They are not
-fixed one by one.
+fixed one by one. Renaming `aws.launch_template_name` while the image state holds
+candidates or promotion journal rows is outside the contract too: `promote` refuses
+a candidate recorded from another template (`PIN_MOVED`), but rollback,
+`status --refresh` and image deletion read version numbers under the name the TOML
+gives now.
 
 #### Promote reason codes
 
@@ -969,7 +973,7 @@ plan when the file is a stale view or the journal cannot be read.
 | `PROMOTE_DRIFT_NOT_CLEAN` | the record shows a drift result other than `clean` | do not promote this candidate; find what differs, then rebuild |
 | `PROMOTE_GATE_NOT_PASSED` | the build did not pass a configured gate, or it ran with no gate and `allow_no_gate` is `false` | configure a gate and rebuild, or set `allow_no_gate` on purpose |
 | `IMAGE_VERIFICATION_STALE` | the record has no verification time, lies in the future, or is older than `promote_max_age_seconds` | `image status --refresh`, then promote again |
-| `PIN_MOVED` | the TOML pins a version other than the one this candidate was copied from | run a new build; its candidate is copied from the current pin |
+| `PIN_MOVED` | the TOML pins a version other than the one this candidate was copied from, or names a launch template other than the one it was copied from | run a new build; its candidate is copied from the current pin |
 | `PROMOTE_ZONE_PIN` | a zone entry carries its own `launch_template_version` | edit the file by hand and keep every pin consistent |
 | `PROMOTE_PIN_LINE_AMBIGUOUS` | the edit did not find exactly one plain `launch_template_version = <digits>` line inside `[aws]` | edit the file by hand |
 | `PROMOTE_REPARSE_FAILED` | the strict loader refused the new text, or it differs from the old in more than the pin | edit the file by hand; nothing was written |

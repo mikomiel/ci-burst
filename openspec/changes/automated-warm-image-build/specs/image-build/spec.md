@@ -1054,7 +1054,7 @@ No timer and no process that holds AWS credentials MUST write the deployment TOM
 - **THEN** `promote` still completes, with or without `--write`
 
 ### Requirement: Promotion writes only a verified candidate
-`promote --write` MUST refuse unless the candidate record shows: the image `available`; the template version existing; the full `LaunchTemplateData` differing from its source pin only in `ImageId`; the offline gate configured and passed (or `allow_no_gate` recorded); a `verified_at` within `promote_max_age_seconds`; and a TOML pin equal to the record's source pin.
+`promote --write` MUST refuse unless the candidate record shows: the image `available`; the template version existing; the full `LaunchTemplateData` differing from its source pin only in `ImageId`; the offline gate configured and passed (or `allow_no_gate` recorded); a `verified_at` within `promote_max_age_seconds`; and a TOML pin and launch template name equal to the record's source pin and source template.
 
 #### Scenario: An unverified candidate
 - **WHEN** the candidate record lacks any verification item
@@ -1065,7 +1065,7 @@ No timer and no process that holds AWS credentials MUST write the deployment TOM
 - **THEN** `promote --write` refuses with `IMAGE_VERIFICATION_STALE` and tells the operator to run `image status --refresh`
 
 #### Scenario: The pin moved
-- **WHEN** the TOML pin differs from the record's source pin
+- **WHEN** the TOML pin differs from the record's source pin, or the TOML names a launch template other than the record's source template
 - **THEN** `promote --write` refuses with `PIN_MOVED`
 
 #### Scenario: A foreign version

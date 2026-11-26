@@ -902,6 +902,19 @@ class VerificationTests(PromoteCase):
         self.assertIn("version 4", error["detail"])
         self.assertIn("version 3", error["detail"])
 
+    def test_a_template_that_changed_since_the_record_was_made_is_refused(self):
+        other = "example-ci-burst-spare"
+        self.change("build-b", source_template=WORKER)  # made from WORKER's version 3, as a pass records it
+        self.edit_file(f'launch_template_name = "{WORKER}"'.encode(), f'launch_template_name = "{other}"'.encode())
+        before = self.config_path.read_bytes()  # the pin is still 3, now a version of another template
+        error = self.refusal(("--version", "5"), "PIN_MOVED")
+        self.assertEqual(
+            error["detail"],
+            f"the file names launch template {other}; the record was derived from launch template {WORKER}",
+        )
+        self.assertEqual(self.config_path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
     def test_a_version_that_no_candidate_owns_is_refused(self):
         self.refusal(("--version", "99"), "PROMOTE_VERSION_NOT_CANDIDATE")
 

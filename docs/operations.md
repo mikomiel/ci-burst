@@ -951,8 +951,11 @@ build, candidates or promotion journal rows is outside the contract too. The rec
 names the template by name and Region only: `promote` refuses a candidate recorded
 from another name or Region (`PIN_MOVED`) but cannot tell a template replaced under
 the same name, and a build pass, rollback, `status --refresh` and image deletion read
-under the Region and the name the TOML gives now. After such a change, run a new
-build.
+under the Region and the name the TOML gives now. Make such a change only when no
+promotion journal row is pending: with one pending, the edit leaves the TOML matching
+neither recorded hash (`PROMOTION_JOURNAL_DIVERGED`), and there is no resolve path
+yet ([#205](https://github.com/mikomiel/ci-burst/issues/205)). After the change, run
+a new build.
 
 #### Promote reason codes
 

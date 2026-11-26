@@ -2160,7 +2160,12 @@ class _Pass:
         if build.source_template is None or build.source_region is None or build.source_pin is None:
             # The token of the version is the build's, so every request under it names the template and the pin
             # recorded here, and the row records the Region that the first one goes to. A template, Region or pin
-            # that changed later leaves the candidate refused at promotion (``PIN_MOVED``).
+            # that changed later leaves the candidate refused at promotion (``PIN_MOVED``). The values are recorded
+            # only while the pass deadline has not passed, so a pass out of time records nothing. The record must
+            # precede the first request, so a stop between the two can still leave values with no request sent; a
+            # pin moved after that ends in ``PIN_MOVED`` and a new build, so that state fails closed.
+            if self.clock() >= self.deadline:
+                raise DeadlineRefusal("the first version request")
             settings = self.p._config.aws
             build = self.s.advance_build(
                 build.id,

@@ -4469,6 +4469,26 @@ class FailureTests(PipelineCase):
         )
         self.assertEqual(self.world.next_version, 6)
 
+    def test_a_pass_that_runs_out_of_time_while_ending_the_builder_records_no_source_values(self):
+        # The image is available and the builder lives, so the pass ends it first, and that call takes the rest of the
+        # pass. The version request that follows does not start, so the row must record nothing that it is made under:
+        # a pin that moved before the next pass would leave the first real request on the old pin (``PIN_MOVED``).
+        self.world.console_plan = [(30.0, READY)]
+        self.world.hooks["terminate_instances"] = lambda arguments: self.clock.advance(PASS_DEADLINE_SECONDS)
+        started_at = self.clock()
+        result = self.apply()
+        build = self.only_build()
+        # The premise: the builder was ended once, its image was available, and the pass deadline passed by then.
+        self.assertEqual(self.world.arguments("terminate_instances"), [{"InstanceIds": [build.builder_id]}])
+        self.assertEqual(self.world.images[build.image_id]["State"], "available")
+        self.assertGreaterEqual(self.clock(), started_at + PASS_DEADLINE_SECONDS)
+        # No version request was made, and the row holds none of the values that one would have carried.
+        self.assertEqual(self.world.arguments("create_launch_template_version"), [])
+        self.assertEqual((build.source_template, build.source_region, build.source_pin), (None, None, None))
+        self.assertEqual((result["decision"], result["reason"]), ("imaging", None))
+        self.assertEqual(build.state, "imaging")
+        self.assertIn("pass_deadline_exceeded", result["notes"])
+
     def test_a_version_that_cannot_be_created_before_the_deadline_fails_the_build(self):
         self.world.console_plan = [(30.0, READY)]
         self.world.fail("create_launch_template_version", ProviderError("RequestLimitExceeded"))

@@ -2315,8 +2315,8 @@ class _Pass:
                 build.archive_bucket, build.archive_key, owner=build.archive_owner, deadline=not_after
             )
         except DeadlineRefusal:
-            # The client of the first STS or S3 call was built after the cutoff, so the adapter did not call the lookup
-            # or the delete: it never started, as in the check above.
+            # The client of the first STS or S3 call was built, or failed to build, after the cutoff, so the adapter
+            # did not call the lookup or the delete: it never started, as in the check above.
             self.delete_attempted.discard(build.id)
             return None
         except ProviderRefusal as refusal:

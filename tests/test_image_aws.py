@@ -2049,6 +2049,25 @@ class DeleteDeadlineTests(Base):
                 self.assertGreaterEqual(self.clock(), deadline)
                 self.assertEqual(self.names(), ["session.client"])
 
+    def test_a_delete_whose_client_build_fails_at_or_after_the_deadline_is_a_deadline_refusal(self):
+        # A build that fails after the cutoff started no delete either, so the cutoff decides, as for a build that
+        # succeeds late. One that fails before the cutoff stays the provider failure.
+        class FailingSlowSession(SlowClientSession):
+            def client(self, service, region_name=None, config=None):
+                self.clock.advance(self.seconds)
+                raise RuntimeError(LEAKY_MESSAGE)
+
+        for seconds, expected in ((self.LEFT, DeadlineRefusal), (30, DeadlineRefusal), (self.LEFT - 1, ProviderRefusal)):
+            with self.subTest(build_seconds=seconds):
+                self.clock.now = NOW
+                deadline = self.clock() + self.LEFT
+                session = FailingSlowSession(self.calls, self.ec2, self.s3, self.clock, seconds)
+                aws = self.image_aws(clients={}, session_factory=lambda profile, session=session: session)
+                with self.assertRaises((DeadlineRefusal, ProviderRefusal)) as raised:
+                    self.delete(aws, deadline=deadline)
+                self.assertIs(type(raised.exception), expected)
+                self.assertEqual(self.names(), [])
+
     def test_a_delete_whose_client_build_ends_before_the_deadline_is_sent(self):
         # The same delete with a quicker build, so the refusals above are the deadline's and not the fake's.
         deadline = self.clock() + self.LEFT

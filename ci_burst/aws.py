@@ -842,13 +842,19 @@ class ImageAws:
         any call, when there is none. ``AccessDenied`` from S3 leaves as ``IMAGE_STAGING_BUCKET_DENIED``.
 
         A ``deadline`` or a ``stop`` is read first, before the owner lookup or the client build can reach the
-        provider, and again once the owner is known and the client is built (``_check_deadline``): the first owner
-        check of an adapter asks STS for the account, which takes time.
+        provider, and again once the owner is known and the client is built or has failed to build
+        (``_check_deadline``): the first owner check of an adapter asks STS for the account, which takes time.
         """
         self._check_deadline(deadline, detail, stop)
         if service == "s3":
             arguments["ExpectedBucketOwner"] = self._bound_owner(owner, deadline=deadline, stop=stop, detail=detail)
-        client = self._client(service)
+        try:
+            client = self._client(service)
+        except ProviderRefusal:
+            # A build that failed at or after a cutoff started no call either, so the cutoff decides, as for a build
+            # that succeeded late; a failure before the cutoff stays the provider failure.
+            self._check_deadline(deadline, detail, stop)
+            raise
         # Outside the ``try`` below, which would translate the refusal into a provider failure.
         self._check_deadline(deadline, detail, stop)
         try:
@@ -868,7 +874,8 @@ class ImageAws:
         This is where a provider call starts, for every cutoff of this adapter: it reads them right before it calls
         the SDK operation, and does not call it at or after one. A method reads them first too, before it resolves
         credentials, builds a client or looks up the account. Signing and a credential refresh inside the SDK can
-        delay the request after this check. ``deadline`` is a time on this adapter's clock. ``stop`` is a function of
+        delay the request after this check, and a failure there counts as a call that started, even when it ends after
+        the cutoff: this adapter cannot tell whether the request left. ``deadline`` is a time on this adapter's clock. ``stop`` is a function of
         the caller that says whether the call must not start: a caller that bounds its work by elapsed time on a clock
         of its own passes it, because this adapter does not see that clock.
         """

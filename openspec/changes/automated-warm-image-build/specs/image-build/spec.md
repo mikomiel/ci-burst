@@ -653,6 +653,11 @@ Every provider read of a pass, except the read that confirms a deregistration, M
 - **WHEN** a deletion path has read what it needs and the pass deadline is reached before its first deletion call starts
 - **THEN** no deletion call is made and its result is `refused` with `pass_deadline_exceeded`
 
+#### Scenario: A later item of a deletion run meets the deadline
+- **WHEN** a deletion run has made a deletion call and the pass deadline is reached before the first deletion call of a later item, an image with its snapshots or a lone snapshot
+- **THEN** that item and the items after it are not tried in that pass
+- **AND** the result counts the calls made before it
+
 #### Scenario: A read before the build is reached meets the deadline
 - **WHEN** a read of `plan` before its deletion plan, or a reconcile read or the pin read of a `run` pass, would start at or after the deadline
 - **THEN** the command refuses with `pass_deadline_exceeded`

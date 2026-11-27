@@ -1719,7 +1719,7 @@ class ApplyTests(DeletionCase):
         self.assertEqual(self.results(report), [("deregister", "deregistered"), ("delete_snapshot", "snapshot_deleted")])
         self.assertEqual((self.stored_images(), self.stored_snapshots()), (set(), set()))
 
-    def test_only_the_first_deletion_call_takes_the_deadline(self):
+    def test_each_item_reads_the_deadline_at_its_first_deletion_call(self):
         self.made(1, "failed")
         self.made(2, "failed")
         plan = self.plan("all")
@@ -1732,8 +1732,50 @@ class ApplyTests(DeletionCase):
         delete = mock.patch.object(self.aws, "delete_snapshot", wraps=self.aws.delete_snapshot)
         with deregister as deregistered, delete as deleted:
             apply_deletions(self.aws, plan, apply=True, deadline=NOW + 1)
-        self.assertEqual([call.kwargs["deadline"] for call in deregistered.call_args_list], [NOW + 1, None])
+        self.assertEqual([call.kwargs["deadline"] for call in deregistered.call_args_list], [NOW + 1, NOW + 1])
         self.assertEqual([call.kwargs["deadline"] for call in deleted.call_args_list], [None, None])
+
+    def test_a_first_item_that_fails_leaves_the_deadline_to_the_next_one(self):
+        # The first deregistration fails without reaching the provider (a client that does not build) and the clock
+        # passes the deadline meanwhile: the next item reads the deadline and does not start.
+        self.made(1, "failed")
+        self.made(2, "failed")
+        plan = self.plan("all")
+        del self.calls[:]
+        clock = self.aws._clock
+        calls = []
+
+        def first_fails_late(image_id, *, deadline):
+            calls.append(deadline)
+            if len(calls) == 1:
+                clock.advance(10)
+                raise ProviderRefusal("AWS_UNCERTAIN", "client build failed")
+            return ImageAws.deregister_image(self.aws, image_id, deadline=deadline)
+
+        with mock.patch.object(self.aws, "deregister_image", side_effect=first_fails_late):
+            report = apply_deletions(self.aws, plan, apply=True, deadline=NOW + 5)
+        self.assertEqual(calls, [NOW + 5, NOW + 5])
+        self.assertEqual(self.results(report), [("deregister", "deregister_failed"), ("delete_snapshot", "snapshot_kept")])
+        self.assertNotIn("deregister_image", self.names())
+        self.assertNotIn("delete_snapshot", self.names())
+
+    def test_a_later_item_that_would_start_after_the_deadline_stops_the_run(self):
+        self.made(1, "failed")
+        self.made(2, "failed")
+        plan = self.plan("all")
+        del self.calls[:]
+        clock = self.aws._clock
+
+        def slow_delete(snapshot_id, *, deadline):
+            ImageAws.delete_snapshot(self.aws, snapshot_id, deadline=deadline)
+            clock.advance(10)
+
+        with mock.patch.object(self.aws, "delete_snapshot", side_effect=slow_delete):
+            report = apply_deletions(self.aws, plan, apply=True, deadline=NOW + 5)
+        # The first item finished; the second would have started after the deadline, so it waits for a later pass.
+        self.assertEqual(self.results(report), [("deregister", "deregistered"), ("delete_snapshot", "snapshot_deleted")])
+        self.assertEqual(self.names(), ["deregister_image", "describe_images", "delete_snapshot"])
+        self.assertEqual(len(self.stored_images()), 1)
 
     def test_every_image_is_confirmed_before_its_own_snapshots_and_not_the_next_images(self):
         self.made(1, "failed")

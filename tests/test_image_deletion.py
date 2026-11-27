@@ -1719,6 +1719,22 @@ class ApplyTests(DeletionCase):
         self.assertEqual(self.results(report), [("deregister", "deregistered"), ("delete_snapshot", "snapshot_deleted")])
         self.assertEqual((self.stored_images(), self.stored_snapshots()), (set(), set()))
 
+    def test_only_the_first_deletion_call_takes_the_deadline(self):
+        self.made(1, "failed")
+        self.made(2, "failed")
+        plan = self.plan("all")
+        del self.calls[:]
+        # The adapter's clock reads NOW: a run that would start at the deadline starts nothing.
+        with self.assertRaises(DeadlineRefusal):
+            apply_deletions(self.aws, plan, apply=True, deadline=NOW)
+        self.assertEqual(self.calls, [])
+        deregister = mock.patch.object(self.aws, "deregister_image", wraps=self.aws.deregister_image)
+        delete = mock.patch.object(self.aws, "delete_snapshot", wraps=self.aws.delete_snapshot)
+        with deregister as deregistered, delete as deleted:
+            apply_deletions(self.aws, plan, apply=True, deadline=NOW + 1)
+        self.assertEqual([call.kwargs["deadline"] for call in deregistered.call_args_list], [NOW + 1, None])
+        self.assertEqual([call.kwargs["deadline"] for call in deleted.call_args_list], [None, None])
+
     def test_every_image_is_confirmed_before_its_own_snapshots_and_not_the_next_images(self):
         self.made(1, "failed")
         self.made(2, "failed")

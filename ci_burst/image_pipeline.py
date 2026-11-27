@@ -1065,7 +1065,7 @@ class ImagePipeline:
 
         The protected set is resolved first, and a refusal of any read or of the rule passes unchanged. A last read
         that returns at or after ``deadline`` refuses too (``DeadlineRefusal``): no plan is made from inputs that came
-        after the cutoff, so no deletion starts after it.
+        after the cutoff. The first deletion call of a run reads the deadline again (``apply_deletions``).
         """
         protected = image_deletion.protected_set(
             aws,
@@ -2347,7 +2347,11 @@ class _Pass:
             plan = self.p._deletion_items(self.aws, facts, now, self.deadline, mode)
         except Refusal as refusal:
             return {"refused": refusal.reason}
-        report = image_deletion.apply_deletions(self.aws, plan, apply=True)
+        try:
+            report = image_deletion.apply_deletions(self.aws, plan, apply=True, deadline=self.deadline)
+        except DeadlineRefusal as refusal:
+            # The first deletion call would have started at or after the cutoff, so nothing was deleted.
+            return {"refused": refusal.reason}
         orphans = {row.image_id for row in facts.builds if row.reason_code == IMAGE_ORPHAN_RECORDED and row.image_id}
         counts, leaked = _deletion_counts(report, orphans)
         for kind, count in leaked.items():

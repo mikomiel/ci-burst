@@ -7356,6 +7356,28 @@ class RetentionTests(PipelineCase):
         self.assertEqual(self.world.arguments("deregister_image"), [])
         self.assertEqual(self.world.arguments("delete_snapshot"), [])
 
+    def test_a_retention_plan_that_ends_after_the_deadline_starts_no_deletion(self):
+        # The inventory returns in time; working out the retention plan (the second plan of the pass, after the
+        # failed-image path of reconcile) takes the pass past its deadline. The first deletion call does not start.
+        self.three_usable_images(0xB1)
+        plan_deletions = image_pipeline.image_deletion.plan_deletions
+        plans = []
+
+        def slow(*arguments, **keywords):
+            plan = plan_deletions(*arguments, **keywords)
+            plans.append(plan)
+            if len(plans) == 2:
+                self.clock.advance(PASS_DEADLINE_SECONDS)
+            return plan
+
+        with mock.patch.object(image_pipeline.image_deletion, "plan_deletions", slow):
+            result = self.apply()
+        self.assertEqual(len(plans), 2)
+        self.assertEqual(result["retention"], {"refused": "pass_deadline_exceeded"})
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xB1), ami(0xC1), ami(0xD1)})
+        self.assertEqual(self.world.arguments("deregister_image"), [])
+        self.assertEqual(self.world.arguments("delete_snapshot"), [])
+
     def test_a_dry_run_whose_snapshot_inventory_returns_after_the_deadline_lists_nothing(self):
         self.three_usable_images(0xB1)
         self.a_late_snapshot_inventory(1)

@@ -649,6 +649,10 @@ Every provider read of a pass, except the read that confirms a deregistration, M
 - **WHEN** the pass deadline is reached before a deletion path, or the deletion plan of `plan`, has read what it needs
 - **THEN** it deletes nothing and its result is `refused` with `pass_deadline_exceeded`
 
+#### Scenario: The first deletion call of a run meets the deadline
+- **WHEN** a deletion path has read what it needs and the pass deadline is reached before its first deletion call starts
+- **THEN** no deletion call is made and its result is `refused` with `pass_deadline_exceeded`
+
 #### Scenario: A read before the build is reached meets the deadline
 - **WHEN** a read of `plan` before its deletion plan, or a reconcile read or the pin read of a `run` pass, would start at or after the deadline
 - **THEN** the command refuses with `pass_deadline_exceeded`

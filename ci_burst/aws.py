@@ -833,6 +833,21 @@ class ImageAws:
             raise ProviderRefusal("AWS_ACCOUNT_UNKNOWN", "the bucket owner is no account number")
         return owner
 
+    @contextlib.contextmanager
+    def _preparing(self, deadline, detail, stop=None):
+        """Run the steps that prepare a provider call; a refusal from one at or after a cutoff is the cutoff's.
+
+        An owner lookup, a client build and a credential check start no call of the operation they prepare, so when
+        one refuses at or after a cutoff, the cutoff decides (``DeadlineRefusal``), as for one that succeeded late.
+        A refusal before the cutoff stays the provider failure. A call that the operation itself started is not a
+        step here: its failure is the provider's, even when it ends after the cutoff (``_check_deadline``).
+        """
+        try:
+            yield
+        except ProviderRefusal:
+            self._check_deadline(deadline, detail, stop)
+            raise
+
     def _invoke(
         self, service, method, *, deadline, read=False, absent=None, owner=None, stop=None, detail="", **arguments
     ):
@@ -842,19 +857,16 @@ class ImageAws:
         any call, when there is none. ``AccessDenied`` from S3 leaves as ``IMAGE_STAGING_BUCKET_DENIED``.
 
         A ``deadline`` or a ``stop`` is read first, before the owner lookup or the client build can reach the
-        provider, and again once the owner is known and the client is built or has failed to build
-        (``_check_deadline``): the first owner check of an adapter asks STS for the account, which takes time.
+        provider, and again once both are done, whether they succeeded or refused (``_check_deadline``): the first
+        owner check of an adapter asks STS for the account, which takes time.
         """
         self._check_deadline(deadline, detail, stop)
-        if service == "s3":
-            arguments["ExpectedBucketOwner"] = self._bound_owner(owner, deadline=deadline, stop=stop, detail=detail)
-        try:
+        with self._preparing(deadline, detail, stop):
+            if service == "s3":
+                arguments["ExpectedBucketOwner"] = self._bound_owner(
+                    owner, deadline=deadline, stop=stop, detail=detail
+                )
             client = self._client(service)
-        except ProviderRefusal:
-            # A build that failed at or after a cutoff started no call either, so the cutoff decides, as for a build
-            # that succeeded late; a failure before the cutoff stays the provider failure.
-            self._check_deadline(deadline, detail, stop)
-            raise
         # Outside the ``try`` below, which would translate the refusal into a provider failure.
         self._check_deadline(deadline, detail, stop)
         try:
@@ -930,15 +942,20 @@ class ImageAws:
 
     def instances(self, instance_ids, *, deadline):
         self._check_deadline(deadline, "DescribeInstances by-id read")
-        return self._reads().instances(instance_ids, deadline=deadline)
+        with self._preparing(deadline, "DescribeInstances by-id read"):
+            reads = self._reads()
+        return reads.instances(instance_ids, deadline=deadline)
 
     def console_output(self, instance_ids, *, deadline):
         self._check_deadline(deadline, "GetConsoleOutput read")
-        return self._reads().console_output(instance_ids, deadline=deadline)
+        with self._preparing(deadline, "GetConsoleOutput read"):
+            reads = self._reads()
+        return reads.console_output(instance_ids, deadline=deadline)
 
     def terminate(self, instance_ids, *, deadline):
         self._check_deadline(deadline, "TerminateInstances")
-        reads = self._reads()
+        with self._preparing(deadline, "TerminateInstances"):
+            reads = self._reads()
         self._check_deadline(deadline, "TerminateInstances")
         return reads.terminate(instance_ids)
 
@@ -1035,7 +1052,8 @@ class ImageAws:
         No read starts at or after ``deadline`` (``_check_deadline``).
         """
         self._check_deadline(deadline, "describe_images")
-        client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
+        with self._preparing(deadline, "describe_images"):
+            client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
         self._check_deadline(deadline, "describe_images")
         try:
             response = client.describe_images(ImageIds=[image_id], Owners=["self"])
@@ -1062,7 +1080,8 @@ class ImageAws:
         No read starts at or after ``deadline`` (``_check_deadline``).
         """
         self._check_deadline(deadline, "describe_snapshots")
-        client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
+        with self._preparing(deadline, "describe_snapshots"):
+            client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
         self._check_deadline(deadline, "describe_snapshots")
         try:
             response = client.describe_snapshots(SnapshotIds=[snapshot_id], OwnerIds=["self"])
@@ -1188,7 +1207,8 @@ class ImageAws:
         clean up.
         """
         self._check_deadline(deadline, "archive upload")
-        owner = self._bound_owner(owner, deadline=deadline, detail="archive upload")
+        with self._preparing(deadline, "archive upload"):
+            owner = self._bound_owner(owner, deadline=deadline, detail="archive upload")
         started = self._invoke(
             "s3",
             "create_multipart_upload",
@@ -1377,9 +1397,10 @@ class ImageAws:
         The URL is returned and never logged, stored or placed in an error.
         """
         self._check_deadline(deadline, "presign")
-        owner = self._bound_owner(owner, deadline=deadline, detail="presign")
-        client = self._client("s3")
-        self.check_credential_life(expires_seconds, deadline=deadline)
+        with self._preparing(deadline, "presign"):
+            owner = self._bound_owner(owner, deadline=deadline, detail="presign")
+            client = self._client("s3")
+            self.check_credential_life(expires_seconds, deadline=deadline)
         self._check_deadline(deadline, "presign")
         try:
             return client.generate_presigned_url(

@@ -572,6 +572,56 @@ class SessionTests(Base):
             "presign_get": lambda aws: aws.presign_get(BUCKET, PREFIX + "x.tar.gz", 1800, deadline=None),
         }
 
+    def test_a_client_build_that_fails_at_or_after_the_deadline_is_the_deadline_in_every_operation(self):
+        # A build that fails at or after the cutoff started no call of the operation, so the cutoff decides, as for a
+        # build that succeeds late; one that fails before the cutoff stays the provider failure.
+        clock = self.clock
+        instance = "i-0123456789abcdef0"
+
+        class FailingSlowSession(FakeSession):
+            seconds = 0
+
+            def client(self, service, region_name=None, config=None):
+                clock.advance(self.seconds)
+                raise RuntimeError(LEAKY_MESSAGE)
+
+        def operations(deadline):
+            return {
+                "builders": lambda aws: aws.builders(DEPLOYMENT, deadline=deadline),
+                "instances": lambda aws: aws.instances([instance], deadline=deadline),
+                "console_output": lambda aws: aws.console_output([instance], deadline=deadline),
+                "terminate": lambda aws: aws.terminate([instance], deadline=deadline),
+                "run_builder": lambda aws: self.builder(aws, deadline=deadline),
+                "image": lambda aws: aws.image("ami-0123456789abcdef0", deadline=deadline),
+                "snapshot": lambda aws: aws.snapshot("snap-0123456789abcdef0", deadline=deadline),
+                "deregister_image": lambda aws: aws.deregister_image("ami-0123456789abcdef0", deadline=deadline),
+                "put_archive": lambda aws: aws.put_archive(
+                    BUCKET, PREFIX + "x.tar.gz", [b"data"], max_bytes=100, owner=ACCOUNT, deadline=deadline
+                ),
+                "presign_get": lambda aws: aws.presign_get(
+                    BUCKET, PREFIX + "x.tar.gz", 1800, owner=ACCOUNT, deadline=deadline
+                ),
+            }
+
+        with mock.patch.object(aws_module, "_sdk_config", return_value=object()):
+            for seconds, expected in ((5, DeadlineRefusal), (30, DeadlineRefusal), (4, ProviderRefusal)):
+                for name, call in operations(NOW + 5).items():
+                    with self.subTest(build_seconds=seconds, call=name):
+                        self.clock.now = NOW
+                        session = FailingSlowSession(self.calls, self.ec2, self.s3)
+                        session.seconds = seconds
+                        aws = ImageAws(
+                            REGION,
+                            PROFILE,
+                            session_factory=lambda profile, session=session: session,
+                            clock=self.clock,
+                            expiry=NOW + 3600,
+                        )
+                        with self.assertRaises((DeadlineRefusal, ProviderRefusal)) as raised:
+                            call(aws)
+                        self.assertIs(type(raised.exception), expected)
+        self.assertEqual(self.names(), [])
+
     def test_a_failure_to_build_a_client_leaves_as_a_provider_refusal_from_every_operation(self):
         class NoClient(FakeSession):
             def client(self, service, region_name=None, config=None):
@@ -1932,6 +1982,36 @@ class StagingDeadlineTests(Base):
                 # The premise: the lookup started with time left, and ended at or after the deadline.
                 self.assertGreaterEqual(self.clock(), deadline)
                 self.assertEqual(self.names(), ["get_caller_identity"])
+
+    def test_an_account_lookup_that_fails_at_or_after_the_deadline_is_the_deadline_in_every_s3_call(self):
+        # A lookup that fails after the cutoff started no S3 call either, so the cutoff decides, as for a lookup
+        # that answers late. One that fails before the cutoff stays the provider failure.
+        class FailingSlowSts(SlowSts):
+            def get_caller_identity(self):
+                self.calls.append(("get_caller_identity", {}))
+                self.clock.advance(self.seconds)
+                raise ProviderError("RequestTimeout")
+
+        self.s3.pages = [{"Contents": []}]
+        operations = {
+            "list_objects": lambda aws, deadline: aws.list_objects(BUCKET, PREFIX, deadline=deadline),
+            "put_archive": lambda aws, deadline: aws.put_archive(
+                BUCKET, self.KEY, [b"x"], max_bytes=100, deadline=deadline
+            ),
+            "presign_get": lambda aws, deadline: aws.presign_get(BUCKET, self.KEY, 1800, deadline=deadline),
+        }
+        cases = ((self.LEFT, DeadlineRefusal), (30, DeadlineRefusal), (self.LEFT - 1, ProviderRefusal))
+        for name, operation in operations.items():
+            for seconds, expected in cases:
+                with self.subTest(operation=name, lookup_seconds=seconds):
+                    self.again()
+                    deadline = self.clock() + self.LEFT
+                    sts = FailingSlowSts(self.calls, self.clock, seconds)
+                    aws = self.image_aws(account=None, clients={"ec2": self.ec2, "s3": self.s3, "sts": sts})
+                    with self.assertRaises((DeadlineRefusal, ProviderRefusal)) as raised:
+                        operation(aws, deadline)
+                    self.assertIs(type(raised.exception), expected)
+                    self.assertEqual(self.names(), ["get_caller_identity"])
 
     def test_a_listing_whose_account_lookup_ends_before_the_deadline_is_sent(self):
         # The same listing with a quicker lookup, so the refusals above are the deadline's and not the fake's.

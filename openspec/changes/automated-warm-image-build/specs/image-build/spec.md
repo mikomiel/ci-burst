@@ -657,7 +657,7 @@ Every provider read of a pass, except the read that confirms a deregistration, M
 A provider call starts where the AWS client calls the SDK operation. The AWS client MUST read each cutoff of the call before it resolves credentials and again right before that point, and MUST NOT call the operation at or after it. In a stage, each template read, listing page, upload part, presign and launch call MUST take the earlier of the two deadlines. Signing and a credential refresh inside the SDK can delay the request after that check, and no cutoff bounds that delay.
 
 #### Scenario: A cutoff passes before the SDK operation is called
-- **WHEN** a cutoff passes while the AWS client builds its client, looks up the account, or looks up the credential for a presign that the session outlives
+- **WHEN** a cutoff passes while the AWS client builds its client, looks up the account, or looks up the credential for a presign that the session outlives, whether that step answers or refuses
 - **THEN** the client does not call the SDK operation and refuses with `pass_deadline_exceeded`, whichever cutoff passed
 
 ### Requirement: Basis reads are bounded by the pass deadline

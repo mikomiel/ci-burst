@@ -71,6 +71,17 @@ def request_damaged(operation):
     return digest != operation.request_sha256 or not _frozen_max_price_micros(text)
 
 
+def _committed_max_price_micros(operation):
+    """The ``MaxPrice`` admission froze in ``operation``'s request, or zero when the stored request is damaged.
+
+    A damaged price (``request_damaged``) is not the one admission committed, so a raised one must not raise the
+    commitment; a non-terminal row keeps its reservation as the floor instead.
+    """
+    if request_damaged(operation):
+        return 0
+    return _frozen_max_price_micros(operation.request_json)
+
+
 #: ``_decoded_request``'s answer for a frozen request that does not decode.
 UNDECODABLE = object()
 
@@ -142,11 +153,12 @@ class CostModel:
 
         The frozen request's ``MaxPrice`` is the ceiling admission committed;
         the configured maximum and the accepted price are the other bounds. A
-        stored request that cannot be parsed contributes nothing.
+        stored request that is damaged (``request_damaged``) contributes nothing;
+        a non-terminal one keeps its reservation as the floor instead.
         """
         return max(
             self.price_cap_micros,
-            _frozen_max_price_micros(operation.request_json),
+            _committed_max_price_micros(operation),
             operation.price_micros or 0,
         )
 

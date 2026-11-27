@@ -214,6 +214,11 @@ outside the unit names its own `--state-file`, `--events-file` and
 `--metrics-file` and does not write the unit's collector file. Any other sharing
 is unsupported, and the guarantees of this section do not hold for it.
 
+Each run opens the directory of each of its files to lock it and to sync a
+rename into it, so the exporter must be able to read each directory as well as
+write and search it. A directory it cannot read stops the run with exit 1 before
+it reads or replaces any file.
+
 Each run reads the event file without blocking and without following a link.
 Only a missing event file is an empty stream; a run that cannot read an existing
 one, or finds a link, a FIFO or a directory there, exits 1 before it replaces
@@ -1504,8 +1509,10 @@ its text no longer hashes to the stored `request_sha256`, or it has no usable
 every request and stores the hash of the exact text. The hash detects a stored
 text that disagrees with its stored hash; a row whose text and hash were rewritten
 together is outside what it detects. A damaged price is no
-longer the ceiling that admission committed, and a lowered `max_spot_price` and
-the accepted price would price the remaining life below it. A terminal row needs
+longer the ceiling that admission committed, so it does not raise the ceiling
+of the row. A lowered
+`max_spot_price` and the accepted price would price the remaining life below
+that ceiling, which the floor prevents. A terminal row needs
 no ceiling for its remaining life and keeps no such floor.
 The floor is not inferred from a whole-life estimate, because
 such an estimate includes the current configured ceiling: raising

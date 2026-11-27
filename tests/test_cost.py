@@ -426,6 +426,20 @@ class AdmittedBasisTests(unittest.TestCase):
         self.assertNotEqual(request, FROZEN_REQUEST)
         self.assertEqual(self.original_model().reservation_floor_micros(self.admitted(request_json=request)), 590_000)
 
+    def test_a_damaged_price_does_not_raise_the_ceiling(self):
+        # Only the stored text changed; its hash is still the one admission stored for the 0.040000 request.
+        for price in ("9.040000", "0.000001"):
+            with self.subTest(price=price):
+                text = FROZEN_REQUEST.replace('"0.040000"', '"' + price + '"')
+                damaged = self.admitted(request_json=text, request_sha256=sha(FROZEN_REQUEST))
+                trusted = self.admitted(request_json=None)
+                for model in (self.original_model(), self.lowered_model()):
+                    self.assertEqual(model.price_ceiling_micros(damaged), model.price_ceiling_micros(trusted))
+        # The reservation stays the floor of the live row, so the commitment never falls below what was admitted.
+        raised = FROZEN_REQUEST.replace('"0.040000"', '"9.040000"')
+        live = self.admitted(request_json=raised, request_sha256=sha(FROZEN_REQUEST))
+        self.assertEqual(self.lowered_model().reservation_floor_micros(live), 590_000)
+
     def test_an_oversized_price_does_not_price_the_ceiling(self):
         # A price past any real one, even under its own hash, must not reach the arithmetic or the export.
         huge = FROZEN_REQUEST.replace('"0.040000"', '"' + "9" * 4300 + '.000000"')

@@ -1,7 +1,10 @@
+import io
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,7 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ci_burst.config import load
-from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment
+from ci_burst.controller import INSTANCE_RETENTION_SECONDS, Controller, _frozen_deployment, _sha256
 from ci_burst.credit import CreditSpecification
 from ci_burst.errors import (
     ConfigRefusal,
@@ -19,6 +22,8 @@ from ci_burst.errors import (
     StateRefusal,
 )
 from ci_burst.aws import Aws, DEPLOYMENT_TAG, MANAGED_TAG, OPERATION_TAG, SpotQuote
+from ci_burst.export import Exporter
+from ci_burst.launch_evidence import read_launch_evidence
 from ci_burst.ledger import Ledger, current_window
 from ci_burst.money import format_money
 
@@ -26,13 +31,17 @@ from support import (
     Clock,
     FakeAws,
     FakeObserver,
+    futile_record,
     instance,
+    ledger_holding,
     observation_demand,
     observation_empty,
     runners_snapshot,
     quote,
+    registered_record,
     template,
     write_config,
+    write_observed,
 )
 
 #: A version-2 ledger row seeded before the writable run upgrades it to version 4.
@@ -61,6 +70,11 @@ _V2_SCHEMA = """
     CREATE INDEX operations_window ON operations (reservation_window);
     PRAGMA user_version = 2;
 """
+
+
+#: The request of a seeded unsent intent that ``apply`` may send again: it holds the price admission froze.
+_PRICED_REQUEST = {"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": "0.040000"}}}
+_ADMITTED_AT_CAP = {"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": "0.200000"}}}
 
 
 class ControllerCase(unittest.TestCase):
@@ -121,13 +135,15 @@ class ControllerCase(unittest.TestCase):
         ``None`` for a row from before schema 5, to seed a mismatch.
         """
         created = self.clock.now - age
+        if request is None:
+            request = _PRICED_REQUEST if state == "intent" and not instance_id else {"seed": True}
         ledger = Ledger(self.config.state.database, clock=lambda: created).connect()
         with ledger.transaction():
             ledger.new_operation(
                 operation_id=operation_id,
                 client_token="ci-burst-" + operation_id,
-                request={"seed": True} if request is None else request,
-                request_sha256="0" * 64,
+                request=request,
+                request_sha256=_sha256(request),
                 expires_at=expires_at if expires_at is not None else created + 3600,
                 reservation_micros=reservation,
                 window_start=current_window(created, self.config.budget.window_seconds),
@@ -725,6 +741,68 @@ class ApplyTests(ControllerCase):
         self.assertEqual(result["decision"], "refused")
         self.assertIn("unresolved_intent_lifetime_elapsed", result["reasons"])
         self.assertEqual([call for call in self.aws.calls if call[0] == "run_spot"], [])
+
+    def assert_resume_refuses_a_damaged_request(self, damage, *, hash_matches):
+        # A real unresolved intent: the first send is lost, so the row is `uncertain` and holds its reservation.
+        # ``damage`` takes the decoded request and the stored hash and returns the ``(request_json, request_sha256)``
+        # to store in their place. ``hash_matches`` states whether the stored hash is the hash of the stored request,
+        # so a case cannot reach the refusal through the other check by accident.
+        controller = self.build(observation=observation_demand())
+        self.aws.run_error = ProviderRefusal("AWS_UNCERTAIN", "ReadTimeout", uncertain=True)
+        first = controller.apply()
+        self.assertEqual(first["decision"], "uncertain")
+        stored = self.reopened().operation(first["operation"])
+        request_json, request_sha256 = damage(json.loads(stored.request_json), stored.request_sha256)
+        connection = sqlite3.connect(self.config.state.database)
+        with connection:
+            connection.execute(
+                "UPDATE operations SET request_json = ?, request_sha256 = ? WHERE id = ?",
+                (request_json, request_sha256, stored.id),
+            )
+        connection.close()
+        before = self.reopened().operation(stored.id)
+        self.assertGreater(before.reservation_micros, 0)
+        self.assertEqual(_sha256(json.loads(before.request_json)) == before.request_sha256, hash_matches)
+        self.aws.run_error = None
+        # A fresh controller and ledger model a restarted process.
+        result = self.build(observation=observation_demand(), aws=self.aws).apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["unresolved_intent_request_damaged"])
+        self.assertEqual(result["operation"], stored.id)
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1, "only the first send")
+        self.assertEqual(self.reopened().operation(stored.id), before, "the row and its reservation stay")
+
+    def test_resume_refuses_a_stored_request_that_lost_its_max_price(self):
+        # The price is the ceiling that admission committed, and the stored hash no longer matches the request.
+        def lose_the_price(request, digest):
+            del request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"]
+            return json.dumps(request, sort_keys=True, separators=(",", ":")), digest
+
+        self.assert_resume_refuses_a_damaged_request(lose_the_price, hash_matches=False)
+
+    def test_resume_refuses_a_request_without_a_max_price_whose_hash_matches(self):
+        # Rewriting the hash with the request leaves only the missing price to refuse it.
+        def rewrite_without_the_price(request, digest):
+            del request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"]
+            return json.dumps(request, sort_keys=True, separators=(",", ":")), _sha256(request)
+
+        self.assert_resume_refuses_a_damaged_request(rewrite_without_the_price, hash_matches=True)
+
+    def test_resume_refuses_a_number_max_price_whose_hash_matches(self):
+        # Admission writes the price as a string; a JSON number under its own hash is not a request it froze.
+        def price_as_a_number(request, digest):
+            request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"] = 0.04
+            return json.dumps(request, sort_keys=True, separators=(",", ":")), _sha256(request)
+
+        self.assert_resume_refuses_a_damaged_request(price_as_a_number, hash_matches=True)
+
+    def test_resume_refuses_a_stored_request_that_no_longer_matches_its_hash(self):
+        # The price is intact and only another field changed, so only the hash can refuse it.
+        def raise_the_count(request, digest):
+            request["MaxCount"] = 2
+            return json.dumps(request, sort_keys=True, separators=(",", ":")), digest
+
+        self.assert_resume_refuses_a_damaged_request(raise_the_count, hash_matches=False)
 
     def test_changed_placement_cannot_replace_an_unresolved_intent(self):
         controller = self.build(observation=observation_demand())
@@ -1606,6 +1684,37 @@ class IntentScopeTests(ControllerCase):
         self.assertEqual(ledger.operation(old).request_json, retained.request_json)
         self.assertEqual(ledger.operation(old).request_sha256, retained.request_sha256)
 
+    def test_a_history_row_nested_past_the_json_limit_does_not_stop_a_pass(self):
+        # Every pass reads each row of the ledger, terminal ones too, to see whether
+        # its frozen request names another deployment. A request that the decoder
+        # cannot take is unbound, like any other that does not decode.
+        old = self.seed(
+            state="terminal",
+            operation_id="nested-op",
+            instance_id=None,
+            reservation=0,
+            age=10 * self.config.budget.window_seconds,
+        )
+        nested = "[" * 100_000 + "]" * 100_000
+        connection = sqlite3.connect(self.config.state.database)
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE operations SET request_json = ? WHERE id = ?", (nested, old))
+        connection.commit()
+        with self.assertRaises(RecursionError):
+            self.reopened().operation(old).request()
+        self.assertFalse((self.config.state.database.parent / "export" / "observed.json").exists())
+        no_record = {"state": "missing", "considered": 0, "futile": 0}
+
+        planned = self.build(observation=observation_demand()).plan()
+        self.assertEqual(planned["decision"], "would_launch")
+        self.assertEqual(planned["launch_evidence"], no_record)
+
+        result = self.build(observation=observation_demand()).apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_evidence"], no_record)
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertEqual(self.reopened().operation(old).request_json, nested)
+
 
 class FrozenDeploymentTests(unittest.TestCase):
     """``_frozen_deployment`` reads only a well-formed deployment tag."""
@@ -1651,6 +1760,16 @@ class FrozenDeploymentTests(unittest.TestCase):
 
     def test_invalid_request_json_is_unbound(self):
         self.assertIsNone(_frozen_deployment(self.operation("not json")))
+
+    def test_a_request_nested_past_the_json_limit_is_unbound(self):
+        nested = "[" * 100_000 + "]" * 100_000
+        self.assertIsNone(_frozen_deployment(self.operation(nested)))
+
+    def test_a_request_that_is_not_text_is_unbound(self):
+        self.assertIsNone(_frozen_deployment(self.operation(42)))
+
+    def test_a_request_that_is_not_utf8_is_unbound(self):
+        self.assertIsNone(_frozen_deployment(self.operation(b"\x80\x81")))
 
 
 class FleetTests(ControllerCase):
@@ -2720,6 +2839,680 @@ class ClaimGraceTests(ControllerCase):
             self.assertEqual(result["launch_count"], 1)
 
 
+class FutileLaunchTests(ControllerCase):
+    """Repeated futile launches hold admission until their evidence ages out.
+
+    The record that ``export`` writes sits beside the ledger. The fake clock is
+    not wall time, so every record file gets an explicit modification time.
+    """
+
+    WINDOW = 3600
+
+    def setUp(self):
+        super().setUp()
+        #: The operations that the fixture recorded in the ledger, in the order it did.
+        self.recorded = []
+
+    def fleet(self, max_instances=4, **sections):
+        values = {"controller": {"max_instances": max_instances}}
+        values.update(sections)
+        return load(write_config(self.root, config=values))
+
+    def record_path(self):
+        return self.config.state.database.parent / "export" / "observed.json"
+
+    def write_records(self, records, *, mtime=None, ledger=True):
+        """Write the record file, and by default the ledger rows that go with its workers.
+
+        A worker counts only when the ledger holds its operation. The default is
+        the state of a deployment that launched those workers and has since
+        reconciled their ended instances: one terminal row per operation, with no
+        instance identifier and no cost. ``ledger=False`` writes the file alone.
+        """
+        path = write_observed(self.record_path(), records, mtime=self.clock.now if mtime is None else mtime)
+        if ledger:
+            self.record_in_ledger(records)
+        return path
+
+    def record_in_ledger(self, records, *, instance_ids=None):
+        """Record the operation of each record as an ended one, once, whatever the file says.
+
+        ``instance_ids`` maps an operation to the instance that the row names; a
+        row that has no entry names none.
+        """
+        for record in records:
+            operation = record["operation"]
+            if operation is not None and operation not in self.recorded:
+                self.seed(
+                    state="terminal",
+                    operation_id=operation,
+                    instance_id=(instance_ids or {}).get(operation),
+                    reservation=0,
+                )
+                self.recorded.append(operation)
+
+    def record_under(self, deployment, records):
+        """Record the operation of each record as an ended one that ``deployment`` launched.
+
+        The frozen request carries the deployment tag, as ``apply`` writes it. The
+        rows of ``record_in_ledger`` carry none.
+        """
+        request = {
+            "TagSpecifications": [
+                {"ResourceType": "instance", "Tags": [{"Key": DEPLOYMENT_TAG, "Value": deployment}]}
+            ]
+        }
+        for record in records:
+            operation = record["operation"]
+            self.seed(state="terminal", operation_id=operation, instance_id=None, reservation=0, request=request)
+            self.recorded.append(operation)
+
+    def three_futile(self, newest_age=60):
+        return [futile_record(self.clock.now - newest_age - 60 * index, index=index) for index in range(3)]
+
+    def assert_no_launch_work(self):
+        names = [call[0] for call in self.aws.calls]
+        self.assertNotIn("template", names)
+        self.assertNotIn("spot_quote", names)
+        self.assertEqual(self.aws.mutations(), [])
+        self.assert_no_operation_of_its_own()
+
+    def assert_no_operation_of_its_own(self):
+        """The pass recorded no operation: the ledger holds the fixture's rows and nothing else."""
+        held = [operation.id for operation in self.reopened().operations()]
+        self.assertEqual(sorted(held), sorted(self.recorded))
+
+    def assert_held(self, result):
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reasons"], ["recent_launches_futile"])
+        self.assertEqual(result["launch_count"], 0)
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 3})
+        for key in ("candidates", "budget", "selected", "template", "price"):
+            self.assertNotIn(key, result)
+
+    # -- the hold ------------------------------------------------------------
+    def test_a_heartbeat_refreshed_while_the_gate_opens_the_record_still_holds(self):
+        # ``export`` can refresh the record after the pass starts its gate check
+        # and before the reader takes the file's status. The reader reads the
+        # clock after that status, so the new modification time is not after it
+        # and the record stays fresh.
+        path = self.write_records(self.three_futile(), mtime=self.clock.now - 30)
+        real_fstat = os.fstat
+        refreshed = []
+
+        def refresh_then_fstat(descriptor):
+            status = real_fstat(descriptor)
+            if not refreshed and status.st_ino == os.stat(path).st_ino:
+                refreshed.append(status.st_ino)
+                self.clock.advance(5)
+                os.utime(path, (self.clock.now, self.clock.now))
+                status = real_fstat(descriptor)
+            return status
+
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        with mock.patch("ci_burst.launch_evidence.os.fstat", refresh_then_fstat):
+            result = controller.apply()
+        self.assertEqual(len(refreshed), 1)
+        self.assert_held(result)
+        self.assert_no_launch_work()
+
+    def test_three_futile_workers_hold_admission(self):
+        self.write_records(self.three_futile())
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        result = controller.apply()
+        self.assert_held(result)
+        self.assert_no_launch_work()
+
+    def test_a_hold_reaches_the_command_as_a_refusal(self):
+        from ci_burst import cli
+
+        self.write_records(self.three_futile())
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        buffer = io.StringIO()
+        with mock.patch.object(cli, "Controller", lambda config: controller), redirect_stdout(buffer):
+            code = cli.main(["plan", "--config", str(self.root / "deployment.toml")])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(buffer.getvalue())["reasons"], ["recent_launches_futile"])
+
+    def test_two_futile_and_one_registered_admit(self):
+        now = self.clock.now
+        self.write_records(
+            [
+                futile_record(now - 60, index=1),
+                registered_record(now - 120, index=2),
+                futile_record(now - 180, index=3),
+            ]
+        )
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertNotIn("recent_launches_futile", result["reasons"])
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 2})
+        self.assertEqual(len([call for call in self.aws.calls if call[0] == "run_spot"]), 1)
+
+    def test_records_that_are_not_evidence_do_not_count(self):
+        now = self.clock.now
+        self.write_records(
+            [
+                futile_record(now - 60, index=1),
+                futile_record(now - 120, index=2),
+                # The console was never read to the end, the instance still
+                # runs, or the record names no operation of this deployment.
+                futile_record(now - 30, index=3, exit_code=None),
+                futile_record(now - 30, index=4, state="running"),
+                futile_record(now - 30, index=5, state="shutting-down"),
+                futile_record(now - 30, index=6, operation=None),
+            ]
+        )
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 2, "futile": 2})
+
+    def test_a_worker_outside_the_window_does_not_count(self):
+        now = self.clock.now
+        self.write_records(
+            [
+                futile_record(now - 60, index=1),
+                futile_record(now - 120, index=2),
+                futile_record(now - self.WINDOW - 1, index=3),
+            ]
+        )
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 2, "futile": 2})
+
+    def test_the_newest_workers_by_end_time_decide(self):
+        now = self.clock.now
+        older_registered = registered_record(now - 900, index=9)
+        self.write_records([older_registered] + self.three_futile())
+        held = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assert_held(held)
+        newer_registered = registered_record(now - 10, index=9)
+        self.write_records(self.three_futile() + [newer_registered])
+        admitted = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assertEqual(admitted["decision"], "launched")
+        self.assertEqual(admitted["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 2})
+
+    def test_a_hold_ends_when_its_evidence_ages_out(self):
+        self.write_records(self.three_futile(newest_age=60))
+        held = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assert_held(held)
+        # The oldest of the three was read 180 seconds ago. Move it past the
+        # window and keep the file fresh, as a running export would.
+        self.clock.advance(self.WINDOW - 180 + 1)
+        os.utime(self.record_path(), (self.clock.now, self.clock.now))
+        result = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 2, "futile": 2})
+        self.assertEqual(len(result["launches"]), 1)
+
+    # -- the gate fails open ----------------------------------------------------
+    def assert_admits_as_before(self, state):
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        result = controller.apply()
+        self.assertEqual(result["decision"], "launched", result)
+        self.assertEqual(result["launch_evidence"], {"state": state, "considered": 0, "futile": 0})
+        self.assertEqual(len(result["launches"]), 1)
+
+    def test_a_missing_record_admits_and_reports_it(self):
+        self.assertFalse(self.record_path().exists())
+        self.assert_admits_as_before("missing")
+
+    def test_an_unreadable_record_admits_and_reports_it(self):
+        self.record_path().mkdir(parents=True)
+        self.assert_admits_as_before("unreadable")
+
+    def test_a_stale_record_admits_and_reports_it(self):
+        self.write_records(self.three_futile(), mtime=self.clock.now - 601)
+        self.assert_admits_as_before("stale")
+
+    def test_a_record_dated_in_the_future_admits_and_reports_it(self):
+        self.write_records(self.three_futile(), mtime=self.clock.now + 60)
+        self.assert_admits_as_before("stale")
+
+    def test_a_malformed_record_admits_and_reports_it(self):
+        records = self.three_futile() + [futile_record(self.clock.now - 30, index=7, steps="register")]
+        self.write_records(records)
+        self.assert_admits_as_before("malformed")
+
+    def test_evidence_returns_when_export_writes_again(self):
+        self.write_records(self.three_futile(), mtime=self.clock.now - 601)
+        planned = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(planned["decision"], "would_launch")
+        self.assertEqual(planned["launch_evidence"], {"state": "stale", "considered": 0, "futile": 0})
+        os.utime(self.record_path(), (self.clock.now, self.clock.now))
+        held = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assert_held(held)
+
+    # -- precedence ------------------------------------------------------------
+    def test_earlier_reasons_keep_precedence_and_carry_no_evidence(self):
+        cases = {
+            "no_runnable_demand": dict(observation=observation_empty()),
+            "slot_busy": dict(observation=observation_demand(1), max_instances=1, seed="busy"),
+            "awaiting_claim": dict(observation=observation_demand(1), seed="booting"),
+        }
+        for reason, case in cases.items():
+            with self.subTest(reason):
+                self.setUp()
+                self.write_records(self.three_futile())
+                if case.get("seed"):
+                    self.seed(operation_id=case["seed"], instance_id="i-" + case["seed"])
+                controller = self.build(
+                    observation=case["observation"], config=self.fleet(case.get("max_instances", 4))
+                )
+                if case.get("seed"):
+                    self.aws.instances_result = [
+                        instance(instance_id="i-" + case["seed"], operation=case["seed"], state="running")
+                    ]
+                result = controller.apply()
+                self.assertIn(reason, result["reasons"])
+                self.assertNotIn("recent_launches_futile", result["reasons"])
+                self.assertNotIn("launch_evidence", result)
+
+    def test_an_owned_state_discrepancy_keeps_precedence(self):
+        self.write_records(self.three_futile())
+        controller = self.build(observation=observation_demand(1), config=self.fleet())
+        self.aws.instances_result = [instance(instance_id="i-stray", operation="unknown-operation", state="running")]
+        result = controller.apply()
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("owned_state_discrepancy", result["reasons"])
+        self.assertNotIn("recent_launches_futile", result["reasons"])
+        self.assertNotIn("launch_evidence", result)
+
+    def test_a_hold_precedes_the_later_reasons(self):
+        later = {
+            "template_unusable": dict(aws=lambda: FakeAws(template_facts=ProviderRefusal("TEMPLATE_NOT_FOUND"))),
+            "spot_price_unavailable": dict(aws=lambda: FakeAws(spot_quote=None)),
+            "budget_allowance_exhausted": dict(budget={"allowance": "0.01"}),
+        }
+        for reason, case in later.items():
+            with self.subTest(reason):
+                self.setUp()
+                self.write_records(self.three_futile())
+                aws = case["aws"]() if "aws" in case else None
+                config = self.fleet(**({"budget": case["budget"]} if "budget" in case else {}))
+                result = self.build(observation=observation_demand(1), aws=aws, config=config).apply()
+                self.assert_held(result)
+                self.assert_no_launch_work()
+
+    def test_an_open_gate_leaves_the_later_reasons_unchanged(self):
+        later = {
+            "template_unusable": dict(aws=lambda: FakeAws(template_facts=ProviderRefusal("TEMPLATE_NOT_FOUND"))),
+            "spot_price_unavailable": dict(aws=lambda: FakeAws(spot_quote=None)),
+            "budget_allowance_exhausted": dict(budget={"allowance": "0.01"}),
+        }
+        for reason, case in later.items():
+            with self.subTest(reason):
+                self.setUp()
+                now = self.clock.now
+                self.write_records([futile_record(now - 60, index=1), futile_record(now - 120, index=2)])
+                aws = case["aws"]() if "aws" in case else None
+                config = self.fleet(**({"budget": case["budget"]} if "budget" in case else {}))
+                result = self.build(observation=observation_demand(1), aws=aws, config=config).apply()
+                self.assertEqual(result["decision"], "refused")
+                self.assertIn(reason, result["reasons"])
+                self.assertNotIn("recent_launches_futile", result["reasons"])
+                self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 2, "futile": 2})
+
+    # -- plan and the record ------------------------------------------------------
+    def test_plan_and_apply_agree_on_the_same_record(self):
+        self.write_records(self.three_futile())
+        planned = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(self.aws.mutations(), [])
+        applied = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        for result in (planned, applied):
+            self.assertEqual(result["decision"], "refused")
+            self.assertEqual(result["reasons"], ["recent_launches_futile"])
+            self.assertEqual(result["launch_count"], 0)
+            self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 3})
+        self.assert_no_operation_of_its_own()
+
+    def test_plan_reports_an_unreadable_record_and_plans_as_if_open(self):
+        self.record_path().mkdir(parents=True)
+        result = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(result["decision"], "would_launch")
+        self.assertEqual(result["launch_evidence"], {"state": "unreadable", "considered": 0, "futile": 0})
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_plan_and_apply_leave_the_record_alone(self):
+        path = self.write_records(self.three_futile(), mtime=self.clock.now - 30)
+        before = (path.read_bytes(), os.stat(path).st_mtime_ns)
+        self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assertEqual((path.read_bytes(), os.stat(path).st_mtime_ns), before)
+        self.assertEqual(sorted(os.listdir(path.parent)), ["observed.json"])
+
+    def test_the_gate_reads_only_the_default_record_path(self):
+        # A record elsewhere in the state directory is not looked for.
+        write_observed(self.root / "export" / "elsewhere.json", self.three_futile(), mtime=self.clock.now)
+        self.assert_admits_as_before("missing")
+
+    # -- the ledger gates the evidence ---------------------------------------------
+    def test_workers_that_no_ledger_operation_names_are_no_evidence(self):
+        # ``export`` writes the operation tag of any owned instance that the
+        # provider lists, and reconciliation ignores a terminated instance that
+        # no operation names. The brake ignores it as well.
+        self.write_records(self.three_futile(), ledger=False)
+        result = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertNotIn("recent_launches_futile", result["reasons"])
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 0, "futile": 0})
+
+    def test_the_same_workers_hold_once_the_ledger_names_their_operations(self):
+        records = self.three_futile()
+        self.write_records(records, ledger=False)
+        before = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(before["decision"], "would_launch")
+        self.assertEqual(before["launch_evidence"], {"state": "fresh", "considered": 0, "futile": 0})
+        self.record_in_ledger(records)
+        after = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(after["decision"], "refused")
+        self.assertEqual(after["reasons"], ["recent_launches_futile"])
+        self.assertEqual(after["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 3})
+        self.assertEqual(self.aws.mutations(), [])
+
+    def test_plan_and_apply_agree_when_the_ledger_names_none_of_the_workers(self):
+        self.write_records(self.three_futile(), ledger=False)
+        planned = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        applied = self.build(observation=observation_demand(1), config=self.fleet()).apply()
+        for result, decision in ((planned, "would_launch"), (applied, "launched")):
+            with self.subTest(command=result["command"]):
+                self.assertEqual(result["decision"], decision)
+                self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 0, "futile": 0})
+
+    def test_a_worker_counts_only_under_the_instance_that_the_ledger_names(self):
+        # ``write_observed`` files the three records under ``WORKERS``.
+        first, second, _ = self.WORKERS
+        elsewhere = "i-0123456789abcdf99"
+        cases = (
+            ("the ledger names the instance of every worker", list(self.WORKERS), 3),
+            ("the ledger names no instance", [None, None, None], 3),
+            ("the ledger names another instance for one worker", [first, second, elsewhere], 2),
+        )
+        for name, named, considered in cases:
+            with self.subTest(name):
+                self.setUp()
+                records = self.three_futile()
+                self.write_records(records, ledger=False)
+                self.record_in_ledger(
+                    records,
+                    instance_ids={r["operation"]: n for r, n in zip(records, named) if n is not None},
+                )
+                result = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+                self.assertEqual(
+                    result["launch_evidence"], {"state": "fresh", "considered": considered, "futile": considered}
+                )
+                self.assertEqual(result["decision"], "refused" if considered == 3 else "would_launch")
+
+    # -- the deployment that a ledger row belongs to ---------------------------------------
+    def test_a_renamed_deployment_does_not_inherit_the_hold_of_its_predecessor(self):
+        # docs/deployment.md, "Change the deployment name": the rows of the old name
+        # stay in the ledger as history, and ``export`` keeps the records of their
+        # workers until retention drops them. Those workers are no evidence for the
+        # deployment that replaced the old one.
+        records = self.three_futile()
+        self.write_records(records, ledger=False)
+        self.record_under("test-deployment", records)
+        control = self.build(observation=observation_demand(1), config=self.fleet()).plan()
+        self.assertEqual(control["decision"], "refused")
+        self.assertEqual(control["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 3})
+        renamed = self.fleet(deployment="different-deployment")
+
+        planned = self.build(observation=observation_demand(1), config=renamed).plan()
+        applied = self.build(observation=observation_demand(1), config=renamed).apply()
+
+        for result, decision in ((planned, "would_launch"), (applied, "launched")):
+            with self.subTest(command=result["command"]):
+                self.assertEqual(result["decision"], decision)
+                self.assertNotIn("recent_launches_futile", result["reasons"])
+                self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 0, "futile": 0})
+        # The old rows stay as history, and the pass added its own row.
+        self.assertEqual(len(self.reopened().operations()), len(records) + 1)
+
+    def test_only_a_row_that_names_another_deployment_is_left_out(self):
+        # Each row is judged by the deployment in its frozen request, as the scope
+        # check judges it. A row that names none is not evidence of another
+        # deployment, so its worker still counts after a rename.
+        current, other = "test-deployment", "old-deployment"
+        cases = (
+            ("every row names the deployment", current, [current] * 3, 3),
+            ("one row names another deployment", current, [current, current, other], 2),
+            ("every row names another deployment", "different-deployment", [current] * 3, 0),
+            ("no row names a deployment and the name changed", "different-deployment", [None] * 3, 3),
+        )
+        for name, deployment, rows, considered in cases:
+            with self.subTest(name):
+                self.setUp()
+                records = self.three_futile()
+                self.write_records(records, ledger=False)
+                for record, row in zip(records, rows):
+                    if row is None:
+                        self.record_in_ledger([record])
+                    else:
+                        self.record_under(row, [record])
+                config = self.fleet(deployment=deployment)
+
+                result = self.build(observation=observation_demand(1), config=config).plan()
+
+                self.assertEqual(
+                    result["launch_evidence"], {"state": "fresh", "considered": considered, "futile": considered}
+                )
+                self.assertEqual(result["decision"], "refused" if considered == 3 else "would_launch")
+
+    # -- the record that export writes, read by the next pass ------------------------------
+    WORKERS = tuple(f"i-0123456789abcde{index:02x}" for index in range(3))
+
+    #: The fourth record that ``write_observed`` files, after the three of ``WORKERS``.
+    AHEAD_WORKER = "i-0123456789abcde03"
+
+    #: The console of a worker that registered and ran one job, and of one that
+    #: never registered, as the shipped first-boot script prints them.
+    REGISTERED_CONSOLE = (
+        "cloud-init: STEP mount-options\n"
+        "cloud-init: STEP register\n"
+        "cloud-init: bootstrap one-job completed rc=0\n"
+        "cloud-init: bootstrap exiting rc=0\n"
+    )
+    FAILED_CONSOLE = "cloud-init: STEP mount-options\ncloud-init: bootstrap exiting rc=1\n"
+
+    #: A one-job outcome that the exporter cannot have written.
+    DAMAGED_MARKERS = (["completed", 1], ["completed", "0"], ["unknown", 0], [], "completed")
+
+    #: The fields that show whether a worker registered, and that the reader requires.
+    REGISTRATION_FIELDS = ("registered", "steps", "job_process", "spot_interruption")
+
+    #: The two ways in which the first worker's record loses what shows its
+    #: registration, as the arguments of ``finished_workers``.
+    DAMAGES = (
+        *({"damaged": marker} for marker in DAMAGED_MARKERS),
+        *({"absent": field} for field in REGISTRATION_FIELDS),
+    )
+
+    def export_run(self, listed, consoles):
+        """Run the real exporter over the state directory that this controller reads.
+
+        The fake clock is not wall time, so the modification time that the run's own
+        write would carry is stated.
+        """
+        aws = FakeAws(instances=listed)
+        aws.consoles = consoles
+        result = Exporter(self.config, aws=aws, clock=self.clock).run(
+            events_file=self.root / "export" / "worker-events.ndjson",
+            metrics_file=self.root / "textfile" / "ci-burst.prom",
+            state_file=self.record_path(),
+        )
+        os.utime(self.record_path(), (self.clock.now, self.clock.now))
+        return result, aws
+
+    def exported_records(self):
+        return json.loads(self.record_path().read_text())["instances"]
+
+    def finished_workers(self, *, damaged=None, absent=None):
+        """Write the record of three ended workers, the first one damaged, and list them.
+
+        The first worker registered and ran one job, but its marker is damaged
+        (``damaged``) or its record lacks a field (``absent``), and no other field
+        of its record shows registration, so the record reads as one that never
+        registered once the loader has given a default to the marker or the field.
+        The other two never registered. The provider lists all three as terminated.
+        """
+        now = self.clock.now
+        self.config = self.fleet()
+        first = futile_record(now - 300, index=1, exit_code=0, errors=[], job_process=damaged)
+        if absent is not None:
+            del first[absent]
+        records = [
+            first,
+            futile_record(now - 240, index=2),
+            futile_record(now - 180, index=3),
+        ]
+        self.write_records(records, mtime=now - 30, ledger=False)
+        self.record_in_ledger(
+            records, instance_ids={record["operation"]: worker for worker, record in zip(self.WORKERS, records)}
+        )
+        listed = [
+            instance(worker, state="terminated", operation=record["operation"], zone="eu-central-1a")
+            for worker, record in zip(self.WORKERS, records)
+        ]
+        return records, listed
+
+    def test_a_damaged_record_is_read_again_and_cannot_turn_into_a_hold(self):
+        # The reader refuses a file with a marker that ``export`` cannot write, or
+        # with a record that lacks a field, so the gate is open. ``export`` then loads
+        # the record. A loader that replaced the marker by null, or gave a default to
+        # the field, would keep the ended worker, never read its console again and
+        # rewrite the file with a fresh heartbeat, so the next pass would hold on two
+        # real failures and one worker that registered.
+        for damage in self.DAMAGES:
+            with self.subTest(**damage):
+                self.setUp()
+                _, listed = self.finished_workers(**damage)
+                first, second, third = self.WORKERS
+                consoles = {first: self.REGISTERED_CONSOLE, second: self.FAILED_CONSOLE, third: self.FAILED_CONSOLE}
+                before = read_launch_evidence(self.record_path(), self.clock.now, ledger_holding(self.record_path()))
+                self.assertEqual(before.state, "malformed")
+
+                run, aws = self.export_run(listed, consoles)
+
+                self.assertIn("state_rebuilt", run["notes"])
+                self.assertEqual([call[1] for call in aws.calls if call[0] == "console_output"], [[first]])
+                self.assertEqual(self.exported_records()[first]["job_process"], ["completed", 0])
+                result = self.build(observation=observation_demand(1), config=self.config).apply()
+                self.assertEqual(result["decision"], "launched")
+                self.assertNotIn("recent_launches_futile", result["reasons"])
+                self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 2})
+
+    def test_a_damaged_record_of_an_instance_that_the_provider_no_longer_lists_is_no_evidence(self):
+        for damage in self.DAMAGES:
+            with self.subTest(**damage):
+                self.setUp()
+                _, listed = self.finished_workers(**damage)
+                first, second, third = self.WORKERS
+                consoles = {first: self.REGISTERED_CONSOLE, second: self.FAILED_CONSOLE, third: self.FAILED_CONSOLE}
+
+                run, aws = self.export_run(listed[1:], consoles)
+
+                self.assertIn("state_rebuilt", run["notes"])
+                self.assertEqual(aws.calls, [("owned_instances", "test-deployment")])
+                self.assertEqual(sorted(self.exported_records()), [second, third])
+                result = self.build(observation=observation_demand(1), config=self.config).apply()
+                self.assertEqual(result["decision"], "launched")
+                self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 2, "futile": 2})
+
+    def test_a_damaged_record_counts_when_its_console_still_shows_no_registration(self):
+        # The read is a new observation: a worker that really never registered is
+        # counted, so the hold rests on what the console shows now.
+        for damage in self.DAMAGES:
+            with self.subTest(**damage):
+                self.setUp()
+                _, listed = self.finished_workers(**damage)
+                consoles = {worker: self.FAILED_CONSOLE for worker in self.WORKERS}
+
+                run, _ = self.export_run(listed, consoles)
+
+                self.assertIn("state_rebuilt", run["notes"])
+                self.assertEqual(run["console_reads"], 1)
+                result = self.build(observation=observation_demand(1), config=self.config).apply()
+                self.assert_held(result)
+
+    def test_three_workers_that_never_registered_still_hold_after_an_export_run(self):
+        # The control of the tests above: nothing is damaged, so the run keeps the
+        # three ended records without reading them again, and the pass holds.
+        now = self.clock.now
+        self.config = self.fleet()
+        records = [futile_record(now - 60 - 60 * index, index=index + 1) for index in range(3)]
+        self.write_records(records, mtime=now - 30, ledger=False)
+        self.record_in_ledger(
+            records, instance_ids={record["operation"]: worker for worker, record in zip(self.WORKERS, records)}
+        )
+        listed = [
+            instance(worker, state="terminated", operation=record["operation"], zone="eu-central-1a")
+            for worker, record in zip(self.WORKERS, records)
+        ]
+
+        run, aws = self.export_run(listed, {worker: self.FAILED_CONSOLE for worker in self.WORKERS})
+
+        self.assertNotIn("state_rebuilt", run["notes"])
+        self.assertEqual(run["console_reads"], 0)
+        self.assertEqual(sorted(self.exported_records()), sorted(self.WORKERS))
+        result = self.build(observation=observation_demand(1), config=self.config).apply()
+        self.assert_held(result)
+        self.assert_no_launch_work()
+
+    # -- a record dated after the clock of the run ---------------------------------------
+    def ahead_of_the_clock(self, make_ahead):
+        """Write the records of three workers that never registered and of a fourth, dated ahead.
+
+        ``make_ahead`` builds the fourth record, which is finished and dated an hour
+        after the clock, as a backward clock correction leaves one. The reader
+        refuses a file that holds it. Return the provider's listing of the four.
+        """
+        now = self.clock.now
+        self.config = self.fleet()
+        records = [futile_record(now - 60 - 60 * index, index=index + 1) for index in range(3)]
+        records.append(make_ahead(now + 3600, index=9))
+        self.write_records(records, mtime=now - 30)
+        return [
+            instance(worker, state="terminated", operation=record["operation"], zone="eu-central-1a")
+            for worker, record in zip((*self.WORKERS, self.AHEAD_WORKER), records)
+        ]
+
+    def test_a_finished_record_dated_ahead_of_the_clock_cannot_switch_the_hold_off(self):
+        # The reader refuses the whole file for the record, and a run never reads a
+        # finished record again, so the file stayed refused until the clock caught
+        # up. The run drops the record, and the provider no longer lists its worker.
+        # That worker registered: a run that kept the record under a fresh time would
+        # make it the newest of four and lift the hold that the other three give.
+        listed = self.ahead_of_the_clock(registered_record)
+        planned = self.build(observation=observation_demand(1), config=self.config).plan()
+        self.assertEqual(planned["launch_evidence"], {"state": "malformed", "considered": 0, "futile": 0})
+
+        run, _ = self.export_run(listed[:3], {})
+
+        result = self.build(observation=observation_demand(1), config=self.config).apply()
+        self.assert_held(result)
+        self.assert_no_launch_work()
+        self.assertEqual(sorted(self.exported_records()), sorted(self.WORKERS))
+        self.assertIn("state_rebuilt", run["notes"])
+
+    def test_a_record_dated_ahead_of_the_clock_is_read_again_and_counts_by_its_console(self):
+        # The provider still lists the worker, so the run reads its console, and the
+        # file carries that read under the time of the run. The console shows that
+        # the worker registered, which the stored record did not.
+        listed = self.ahead_of_the_clock(futile_record)
+
+        run, aws = self.export_run(listed, {self.AHEAD_WORKER: self.REGISTERED_CONSOLE})
+
+        self.assertEqual([call[1] for call in aws.calls if call[0] == "console_output"], [[self.AHEAD_WORKER]])
+        self.assertEqual(self.exported_records()[self.AHEAD_WORKER]["seen"], self.clock.now)
+        result = self.build(observation=observation_demand(1), config=self.config).apply()
+        self.assertEqual(result["decision"], "launched")
+        self.assertEqual(result["launch_evidence"], {"state": "fresh", "considered": 3, "futile": 2})
+        self.assertIn("state_rebuilt", run["notes"])
+
+
 class BudgetHeadroomTests(ControllerCase):
     def headroom_config(self, *, max_instances, allowance):
         return load(
@@ -2878,8 +3671,8 @@ class CostTrackingTests(ControllerCase):
             ledger.new_operation(
                 operation_id="a",
                 client_token="ci-burst-a",
-                request={"seed": True},
-                request_sha256="0" * 64,
+                request=_ADMITTED_AT_CAP,
+                request_sha256=_sha256(_ADMITTED_AT_CAP),
                 expires_at=self.clock.now + 3600,
                 reservation_micros=200_001,
                 window_start=current_window(self.clock.now, config.budget.window_seconds),
@@ -3266,6 +4059,96 @@ class CostTrackingTests(ControllerCase):
         self.assertEqual(result["budget"]["committed"], "0.590000")
         self.assertEqual(result["decision"], "refused")
         self.assertIn("budget_allowance_exhausted", result["reasons"])
+
+    def test_an_active_row_whose_frozen_request_does_not_decode_keeps_its_reservation(self):
+        # The frozen request holds the ceiling that admission committed. When it
+        # does not decode, the lowered configuration and the accepted quote both
+        # price the remaining life below that ceiling, so the reservation that
+        # admission stored is the floor, as for a backfilled row.
+        def config(**aws):
+            path = write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 2},
+                    "aws": {"max_lifetime_seconds": 3600} | aws,
+                    "budget": {"allowance": "0.59", "incidental_per_hour": "0.05", "non_compute_allowance": "0.5"},
+                },
+            )
+            return load(path)
+
+        first = self.build(observation=observation_demand(1), config=config(max_spot_price="0.0400")).apply()
+        self.assertEqual(first["decision"], "launched")
+        self.assertEqual(first["budget"]["per_launch_reservation"], "0.590000")
+        operation_id = first["operation"]
+        self.assertEqual(self.reopened().operation(operation_id).price_micros, 20_000)
+        nested = "[" * 100_000 + "]" * 100_000
+        connection = sqlite3.connect(self.config.state.database)
+        with connection:
+            connection.execute("UPDATE operations SET request_json = ? WHERE id = ?", (nested, operation_id))
+        connection.close()
+        self.clock.advance(600)
+        lowered = self.build(
+            observation=observation_demand(1),
+            config=config(max_spot_price="0.0100"),
+            aws=FakeAws(spot_quote=quote(price_micros=10_000, clock=self.clock)),
+        )
+        result = lowered.apply()
+        self.assertEqual(result["budget"]["committed"], "0.590000")
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("budget_allowance_exhausted", result["reasons"])
+
+    def assert_a_request_without_a_usable_max_price_keeps_its_reservation(self, damage):
+        # The test above with a frozen request that still decodes: ``damage`` edits
+        # the decoded ``SpotOptions``, so the floor cannot come from a failed decode.
+        def config(**aws):
+            path = write_config(
+                self.root,
+                config={
+                    "controller": {"max_instances": 2},
+                    "aws": {"max_lifetime_seconds": 3600} | aws,
+                    "budget": {"allowance": "0.59", "incidental_per_hour": "0.05", "non_compute_allowance": "0.5"},
+                },
+            )
+            return load(path)
+
+        first = self.build(observation=observation_demand(1), config=config(max_spot_price="0.0400")).apply()
+        self.assertEqual(first["decision"], "launched")
+        self.assertEqual(first["budget"]["per_launch_reservation"], "0.590000")
+        operation_id = first["operation"]
+        request = json.loads(self.reopened().operation(operation_id).request_json)
+        damage(request["InstanceMarketOptions"]["SpotOptions"])
+        connection = sqlite3.connect(self.config.state.database)
+        with connection:
+            connection.execute(
+                "UPDATE operations SET request_json = ? WHERE id = ?", (json.dumps(request), operation_id)
+            )
+        connection.close()
+        self.clock.advance(600)
+        lowered = self.build(
+            observation=observation_demand(1),
+            config=config(max_spot_price="0.0100"),
+            aws=FakeAws(spot_quote=quote(price_micros=10_000, clock=self.clock)),
+        )
+        result = lowered.apply()
+        self.assertEqual(result["budget"]["committed"], "0.590000")
+        self.assertEqual(result["decision"], "refused")
+        self.assertIn("budget_allowance_exhausted", result["reasons"])
+
+    def test_an_active_row_whose_frozen_request_has_no_max_price_keeps_its_reservation(self):
+        self.assert_a_request_without_a_usable_max_price_keeps_its_reservation(
+            lambda spot: spot.pop("MaxPrice")
+        )
+
+    def test_an_active_row_whose_frozen_request_has_a_null_max_price_keeps_its_reservation(self):
+        self.assert_a_request_without_a_usable_max_price_keeps_its_reservation(
+            lambda spot: spot.update(MaxPrice=None)
+        )
+
+    def test_an_active_row_whose_frozen_request_has_a_malformed_max_price_keeps_its_reservation(self):
+        # "²" passes ``str.isdigit`` but ``int`` refuses it, so it must not raise while cost is reported.
+        self.assert_a_request_without_a_usable_max_price_keeps_its_reservation(
+            lambda spot: spot.update(MaxPrice="²")
+        )
 
     def test_a_lowered_configuration_does_not_reprice_an_admitted_operation(self):
         config = load(

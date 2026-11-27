@@ -42,10 +42,12 @@ from .aws import (
     is_capacity_failure,
 )
 from .config import ZoneCandidate
-from .cost import CostModel
+from .cost import CostModel, request_damaged
 from .credit import evidence as credit_evidence
 from .errors import DeadlineRefusal, PASS_DEADLINE_EXCEEDED, ProviderRefusal, Refusal, StateRefusal
+from .export import default_record_path
 from .forgejo import ForgejoObserver
+from .launch_evidence import read_launch_evidence
 from .ledger import Ledger, current_window
 from .money import format_money
 
@@ -118,11 +120,15 @@ def _frozen_deployment(operation):
     The frozen request is the immutable record, so a deployment rename is
     detected without another ledger column. ``None`` means the row carries no
     readable deployment tag: ``_request`` never writes one, so the row is
-    unbound rather than evidence of another deployment.
+    unbound rather than evidence of another deployment. A request that does not
+    decode is unbound as well: ``ValueError`` covers text that is not JSON and
+    bytes that are not UTF-8, ``TypeError`` a value that is not text, and
+    ``RecursionError`` text nested past the decoder's limit. Every pass reads
+    every row, terminal ones too, so one such row must not stop a pass.
     """
     try:
         tags = operation.request()["TagSpecifications"][0]["Tags"]
-    except (KeyError, IndexError, TypeError, ValueError):
+    except (KeyError, IndexError, TypeError, ValueError, RecursionError):
         return None
     if not isinstance(tags, list):
         return None
@@ -212,12 +218,14 @@ class Controller:
             result["decision"] = "refused"
             return result
         result["slot"] = slot
+        # Read beside the state above and before the queue call, as the state was.
+        recorded = self._recorded_operations()
         observation = self._observe_or_refuse(result)
         if observation is None:
             result["decision"] = "refused"
             return result
         result["observation"] = observation.as_dict()
-        decision, _ = self._decide(observation, slot)
+        decision, _ = self._decide(observation, slot, recorded)
         result.update(decision)
         if result["decision"] == "launch_ready":
             result["decision"] = "would_launch"
@@ -255,7 +263,7 @@ class Controller:
                 return self._deferred(result, PHASE_RECONCILE)
             try:
                 with self.ledger.transaction():
-                    slot, discrepancies = self._reconcile(instances, account, deadline=deadline)
+                    slot, discrepancies, recorded = self._reconcile(instances, account, deadline=deadline)
             except DeadlineRefusal:
                 return self._deferred(result, PHASE_RECONCILE)
             if discrepancies:
@@ -294,7 +302,7 @@ class Controller:
                 return result
             result["observation"] = observation.as_dict()
             try:
-                decision, plans = self._decide(observation, slot, deadline=deadline)
+                decision, plans = self._decide(observation, slot, recorded, deadline=deadline)
             except DeadlineRefusal:
                 return self._deferred(result, PHASE_ADMISSION)
             # Every earlier mutating phase returns on its own action and the
@@ -532,6 +540,25 @@ class Controller:
             return None
         return recorded
 
+    def _recorded_operations(self):
+        """Map each ledger operation of this deployment to its instance identifier, or ``None``.
+
+        The launch evidence reader counts a worker only when this map holds its
+        operation. A row whose frozen request names another deployment is the
+        history that a rename leaves behind: its workers are no evidence for the
+        deployment that replaced it, so the map leaves it out. A row with no
+        readable deployment tag is not evidence of another deployment
+        (``_deployment_changed``), so it stays. ``apply`` calls this inside the
+        ledger transaction of its reconciliation, after that has settled its rows.
+        """
+        if not self.ledger.available:
+            return {}
+        return {
+            operation.id: operation.instance_id
+            for operation in self.ledger.operations()
+            if self._deployment_changed(operation) is None
+        }
+
     def _observe_or_refuse(self, result):
         try:
             return self.observer.observe()
@@ -666,8 +693,12 @@ class Controller:
             if operation["state"] in COVERING_STATES and now - operation["created_at"] < grace
         )
 
-    def _decide(self, observation, slot, *, deadline=None):
-        """Return the decision block and the ordered candidate plans behind it."""
+    def _decide(self, observation, slot, recorded, *, deadline=None):
+        """Return the decision block and the ordered candidate plans behind it.
+
+        ``recorded`` is the ledger's operations of this deployment, from the
+        operation identifier to its instance identifier (``_recorded_operations``).
+        """
         self._check_deadline(deadline, PHASE_ADMISSION)
         reasons, notes = [], []
         limit = slot["limit"]
@@ -707,6 +738,22 @@ class Controller:
             reasons.append("awaiting_claim")
             return decision, ()
         requested = min(uncovered, free)
+        # A one-way brake: the record that ``export`` writes can only withhold a
+        # launch. Missing, unreadable, stale or malformed evidence keeps the gate
+        # open, and every check below still applies to a launch it lets through.
+        # A worker counts only when the ledger holds its operation under this
+        # deployment: reconciliation ignores a terminated instance that no
+        # operation names, and so does the brake. A rename leaves the old rows
+        # behind as history, and their workers are no evidence for the new name.
+        # The reader reads the clock itself, after it has taken the file's
+        # status, so a heartbeat that ``export`` refreshes in between is not
+        # judged against an older time.
+        evidence = read_launch_evidence(default_record_path(self.config.state.database), self.clock, recorded)
+        decision["launch_evidence"] = evidence.as_dict()
+        if evidence.holds:
+            decision["decision"] = "refused"
+            reasons.append("recent_launches_futile")
+            return decision, ()
         templates = self._templates(decision, deadline=deadline)
         if templates is None:
             decision["decision"] = "refused"
@@ -1123,6 +1170,14 @@ class Controller:
                 # block admission instead.
                 attempt["decision"] = "refused"
                 attempt["reasons"] = ["unresolved_intent_lifetime_short"]
+            elif request_damaged(operation):
+                # Admission froze the request, its hash and its price, and the same
+                # client token cannot carry another request. A request that has lost
+                # its MaxPrice or no longer matches its hash may not be what the
+                # provider was asked. Fail closed: keep the unresolved ownership and
+                # the reservation, send nothing and block admission instead.
+                attempt["decision"] = "refused"
+                attempt["reasons"] = ["unresolved_intent_request_damaged"]
             else:
                 self._send(operation, operation.request(), attempt, "resumed", first_attempt=False)
             record = {
@@ -1234,7 +1289,11 @@ class Controller:
         return True
 
     def _reconcile(self, instances, account, *, deadline=None):
-        """Reconcile durable operations with the complete owned inventory."""
+        """Reconcile durable operations with the complete owned inventory.
+
+        Return the slot, the discrepancies and the operations of this deployment
+        that the ledger holds, which the pass decides on.
+        """
         self._check_deadline(deadline, PHASE_RECONCILE)
         operations = {operation.id: operation for operation in self.ledger.operations()}
         nonterminal = {operation.id: operation for operation in self.ledger.nonterminal_operations()}
@@ -1347,10 +1406,11 @@ class Controller:
             instance = by_operation.get(operation.id)
             if instance is not None:
                 self._reconcile_present(operation, instance)
-        slot = self._slot_from_state(self._read_state(required=True))
+        state = self._read_state(required=True)
+        slot = self._slot_from_state(state)
         if ignored:
             slot["ignored_discrepancies"] = ignored
-        return slot, discrepancies
+        return slot, discrepancies, self._recorded_operations()
 
     def _reconcile_present(self, operation, instance):
         # Attach the identity first: an uncertain launch whose first provider

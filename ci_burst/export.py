@@ -26,15 +26,42 @@ repeat that follows a crash between publishing an event and persisting the
 dedupe record; the alternative — persisting first — would lose a failure event
 instead of repeating it.
 
+A set of export files has one writer (``docs/operations.md``, "One writer"),
+and the guarantees below hold for that writer only. The directory locks
+(``_directory_locks``) are a guard that makes an accidental second run wait;
+they attach no guarantee.
+
+The counter contract sets the order of the last writes (``_publish``). The
+cumulative counters are saved in the record, and a collector must never read a
+total that a later run lowers, so a run saves the record before it replaces the
+metrics textfile. A textfile that a run writes never carries a total that the record on disk lacks, whether it is the
+copy that the shipped unit publishes after the command exits 0 or the file that
+a collector reads from ``--metrics-file`` itself, and whether a write fails or
+the process stops. Counters fall only when
+the record is lost, damaged or unreadable: deleted, or replaced by
+``load_state`` because it cannot read or use it. The counters then start again,
+and until a run replaces the textfile, the textfile of an earlier run can hold
+more than the record.
+
 The dedupe record is derived observation, not decision state. Deleting it loses
-the emitted history and the cumulative counters; it never influences admission,
-launch or termination.
+the emitted history and the cumulative counters. It influences admission in one
+way only: ``apply`` and ``plan`` read it as a read-only brake that can withhold a
+launch after repeated futile launches (``launch_evidence``). The brake reads the
+file's modification time as a heartbeat, so every successful run advances it,
+even when nothing changed, and does it last, after the textfile is replaced. The
+record is saved under the time of the file that the run read, or under the epoch
+when it read none, so a run that fails does not advance the modification time
+and the record ages. The record never authorizes a launch and never influences
+termination.
 """
 
+import contextlib
+import fcntl
 import json
 import math
 import os
 import re
+import stat
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -140,6 +167,11 @@ DEPLOYMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 #: is not a marker: an image could print any `STEP ...` line, and the command
 #: publishes names, so the set has to be closed rather than pattern-matched.
 STEP_NAMES = frozenset({"mount-options", "register", "claim-timeout", "job"})
+
+#: The steps the shipped first-boot script prints only after the register step. A
+#: record that shows one of them proves that the worker registered, even when the
+#: registration line scrolled out of the console before the first read.
+POST_REGISTRATION_STEPS = frozenset({"claim-timeout", "job"})
 
 #: Ordered classification rules for console lines that are not a marker. The
 #: first matching rule wins, so a specific failure is named before a generic one.
@@ -303,6 +335,15 @@ def parse_console(text):
     return ConsoleFacts(tuple(steps), exit_code, tuple(errors), job_process, spot_interruption)
 
 
+def default_record_path(database):
+    """Return the observation record's default path, beside the ledger.
+
+    ``export`` writes the record here unless ``--state-file`` names another path,
+    and the launch evidence reader reads it only here.
+    """
+    return Path(database).parent / "export" / "observed.json"
+
+
 def _empty_totals():
     return {"launches": 0, "registered": 0, "unregistered": 0}
 
@@ -316,22 +357,177 @@ def _increment(counter):
     return min(counter + 1, MAX_COUNTER)
 
 
-def load_state(path):
+def _refuse_constant(constant):
+    """Refuse ``NaN``, ``Infinity`` and ``-Infinity`` while a record is decoded.
+
+    ``json`` accepts the three words, but they are not JSON and this command never
+    writes one. It is the decoder's ``parse_constant``, so it sees these words
+    only: a number that overflows, such as ``1e309``, decodes to a float infinity,
+    and the field rules drop it (``_number``, ``_counter`` and the integer
+    checks). The error is a ``ValueError``.
+    """
+    raise ValueError(f"{constant} is not a JSON value")
+
+
+def _refuse_repeated_member(pairs):
+    """Refuse a JSON object that names one member twice, at any level.
+
+    ``json`` keeps the last value of a repeated member, so a record with an invalid
+    ``steps`` followed by a valid one would pass every field rule, and a key of
+    ``instances`` that repeats would keep only its last record. This command
+    cannot write either. It serialises its record with ``json.dumps`` from
+    dictionaries whose keys are all text, the fixed field names and the instance
+    identifiers that pass ``INSTANCE_PATTERN``, and a dictionary holds a key once.
+    (``json.dumps`` can write one name twice only for keys of different types,
+    such as ``1`` and ``"1"``, and this command has none.) The error is a
+    ``ValueError``.
+
+    This is the decoder's ``object_pairs_hook`` for both readers of the record:
+    ``load_state`` and the launch evidence reader decode with it and with
+    ``_refuse_constant``, so neither keeps a value that the other refuses. The
+    reader calls the file ``malformed``. ``load_state`` takes its branch for a file
+    that does not decode, and drops the whole file.
+    """
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        raise ValueError("a JSON object names a member twice")
+    return members
+
+
+#: ``_read_record``'s content for a record that exists and cannot be read.
+UNREADABLE_RECORD = object()
+
+
+def _open_for_reading(path, flags):
+    """Open ``path`` without blocking and without following a link.
+
+    Both readers of the record open it through this function: ``load_state`` and
+    the launch evidence reader. A plain read-only open of a FIFO that has no
+    writer blocks forever, and ``apply`` reads the record while it holds the ledger
+    writer lock. ``export`` replaces the record by a rename of a regular file, so a
+    link at the path is not its output.
+    """
+    return os.open(path, flags | os.O_NONBLOCK | os.O_NOFOLLOW)
+
+
+#: ``_read_to_end`` asks the descriptor for at most this many bytes at a time.
+_READ_CHUNK_BYTES = 1024 * 1024
+
+
+def _read_to_end(descriptor):
+    """Return what ``descriptor`` holds, read with ``os.read`` until it returns no bytes.
+
+    ``_open_for_reading`` makes the descriptor non-blocking, and a read that would
+    block raises ``BlockingIOError`` here, an ``OSError``. A stream's ``read`` does
+    not: it returns ``None``, or the bytes that it had read so far, and a caller
+    would take that part for the whole file.
+    """
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, _READ_CHUNK_BYTES)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _read_record(path):
+    """Read the record at ``path`` once and return ``(content, times)``.
+
+    ``content`` is the bytes of a regular file, ``None`` when there is no file, or
+    ``UNREADABLE_RECORD`` when the path holds a link, a FIFO, a directory or
+    another entry that is not a regular file, or when the read fails. ``times`` is
+    the access and modification time, in nanoseconds, of the file that was read,
+    and ``(0, 0)`` when none was: a run saves its record under these times
+    (``_publish``), so it never gives the record a time that it did not read from
+    the record itself. Only an open that finds no file is ``None``: an error
+    after the open, ``FileNotFoundError`` included, is a read that failed, and so
+    is a read that would block, which returns no part of the file.
+    """
+    try:
+        stream = open(path, "rb", buffering=0, opener=_open_for_reading)
+    except FileNotFoundError:
+        return None, (0, 0)
+    except OSError:
+        return UNREADABLE_RECORD, (0, 0)
+    try:
+        with stream:
+            descriptor = stream.fileno()
+            status = os.fstat(descriptor)
+            if not stat.S_ISREG(status.st_mode):
+                return UNREADABLE_RECORD, (0, 0)
+            return _read_to_end(descriptor), (status.st_atime_ns, status.st_mtime_ns)
+    except OSError:
+        return UNREADABLE_RECORD, (0, 0)
+
+
+def load_state(path, *, now=None):
     """Return ``(state, note)``; an unusable record is replaced, not repaired.
 
     Nested types are validated here rather than at first use: a record that
     loads but cannot be iterated would fail the whole run, and a metrics run is
     the wrong place to fail closed on derived observation.
+
+    A file that does not decode is replaced whole, and the note is
+    ``state_rebuilt``. Besides text that is not JSON, the decoder refuses
+    ``NaN``, ``Infinity`` and ``-Infinity``, and a JSON object that names a member
+    twice, at any level. This command writes none of them, and the launch
+    evidence reader refuses the same files. A loader that kept the last value of a
+    repeat would keep a record that the reader would not read, skip the finished
+    workers in it and rewrite the file with a fresh heartbeat. The emitted history
+    and the cumulative counters start again, as they do when the file is deleted,
+    and the run reads again the consoles that it selects within
+    ``MAX_CONSOLE_READS``.
+
+    One record is dropped, and the note is ``state_rebuilt``, when what it shows of
+    registration cannot be kept (``_registration_evidence_is_damaged``): a stored
+    value that bears on registration and that the loader cannot keep, or a
+    registration key that the record of an ended worker lacks.
+    The reader decides from those values and the run does not read an ended
+    worker again, so a record that lost one of them would be written back as a
+    futile launch under a fresh heartbeat. Without the record, the run reads the
+    console again while the provider lists the instance, and an instance that it
+    no longer lists leaves no evidence. The cost is that of any dropped record:
+    the cumulative totals count the worker again, and the run emits its markers
+    again under their stable identities.
+
+    One record is dropped, and the note is ``state_rebuilt``, when it is dated
+    after ``now``, the clock of the run. The reader refuses a whole file for one
+    record dated after its own clock, and a worker that ended is not read again,
+    so a record that an earlier clock stamped ahead would keep every new file
+    ``malformed`` until the clock caught up. Without the record, the run reads the
+    console again while the provider lists the instance and stamps only what it
+    read, and an instance that it no longer lists leaves no evidence. The run
+    never gives an observation a time it did not make. The cost is that of any
+    dropped record, and the evidence that a live worker's record held from earlier
+    reads is lost with it: the record shows what the console shows now. Without
+    ``now`` no record is judged against a clock.
+
+    The file is read once, as ``_read_record`` reads it. An entry that exists and
+    cannot be read is replaced as well, and the note is ``state_rebuilt``: a link,
+    a FIFO, or a file whose read fails, even for a moment. The emitted history and
+    the cumulative counters start again, as for a deleted file. A directory at the
+    path reads the same way, and the run then fails when it saves the record.
     """
+    return _state_from(_read_record(path)[0], now)
+
+
+def _state_from(content, now):
+    """``load_state`` for the content that ``_read_record`` returned."""
     empty = {"version": STATE_VERSION, "console_reads": 0, "totals": _empty_totals(), "instances": {}}
-    try:
-        raw = Path(path).read_bytes().decode("utf-8")
-    except FileNotFoundError:
+    if content is None:
         return empty, None
-    except (OSError, UnicodeDecodeError):
+    if content is UNREADABLE_RECORD:
         return empty, "state_rebuilt"
     try:
-        payload = json.loads(raw)
+        raw = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return empty, "state_rebuilt"
+    try:
+        payload = json.loads(
+            raw,
+            parse_constant=_refuse_constant,
+            object_pairs_hook=_refuse_repeated_member,
+        )
     except (ValueError, RecursionError):
         return empty, "state_rebuilt"
     if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:
@@ -355,6 +551,11 @@ def load_state(path):
         # A record without a usable timestamp can never age out, so retention
         # would keep it forever. Drop it rather than leak it.
         if record_value["seen"] is None:
+            rebuilt = True
+            continue
+        # The reader's own comparison (``seen > now``): a record that it would
+        # refuse is not carried into a file that it would then refuse whole.
+        if now is not None and record_value["seen"] > now:
             rebuilt = True
             continue
         if changed:
@@ -442,6 +643,98 @@ def _number(value):
     return number if math.isfinite(number) else None
 
 
+def _job_process_value(value):
+    """Return ``value`` when it is the pair a record stores, else ``None``.
+
+    The launch evidence reader applies the same rule: a stored value that this
+    function does not return unchanged is one that the command cannot have
+    written.
+    """
+    if (
+        isinstance(value, list)
+        and len(value) == 2
+        and isinstance(value[0], str)
+        and type(value[1]) is int
+        and _job_process(value[0], value[1])
+    ):
+        return value
+    return None
+
+
+def _spot_interruption_value(value):
+    """Return the list a record stores for a persisted notice, else ``None``.
+
+    The stored value is the normalised triple, never the console spelling: an
+    empty string or the literal "unknown" is not a registration id this command
+    publishes, so it must not survive a rewrite. The launch evidence reader
+    applies the same rule.
+    """
+    if (
+        isinstance(value, list)
+        and len(value) == 3
+        and isinstance(value[0], str)
+        and isinstance(value[1], str)
+        and (value[2] is None or isinstance(value[2], str))
+    ):
+        normalized = _spot_interruption(value[0], value[1], value[2] or "unknown")
+        if normalized is not None:
+            return list(normalized)
+    return None
+
+
+def _lacks_registration_key(record):
+    """Return True when ``record`` lacks a key that shows whether its worker registered."""
+    return any(key not in record for key in ("registered", "steps", "job_process", "spot_interruption"))
+
+
+def _registration_evidence_is_damaged(record):
+    """Return True when what a record shows of registration cannot be kept.
+
+    The launch evidence reader decides ``registered`` or ``futile`` from
+    ``registered``, ``steps``, ``job_process`` and ``spot_interruption``, and a
+    worker whose record shows none of them never registered. A worker that ended
+    is not read again, so a loader that gave a default to a value that it cannot
+    keep, or to a key that the record lacks, would keep a record that shows no
+    registration, and the next run would write it back with a fresh heartbeat: a
+    futile launch that nobody observed. Such a record is dropped instead
+    (``load_state``), and the run reads the console again while the provider
+    still lists the instance.
+
+    Two things are damage. One is a value that is present and cannot be kept. The
+    other is a key that the record of a worker that ended lacks, as the record of
+    an older version does for a key that the version did not write yet. The record
+    of a worker that has not ended may lack a key. While the provider lists the
+    instance, the run reads its console again within its budget, and the console
+    fills the key. The loader drops the exit marker of that record as well
+    (``_sanitize_record``): the provider may list the worker as ended before that
+    read, and a marker kept beside a key that the record lost would count as a
+    futile launch that no read observed. Until a read supplies both, the reader
+    counts no such worker.
+
+    A value that the loader keeps with the evidence it carries is not damaged: a
+    Spot notice whose registration identifier it normalises, and a ``steps`` list
+    from which it drops a name it does not know. The reader decides the same
+    verdict for the two spellings. The fields that gate a verdict (``state``,
+    ``operation`` and ``exit_code``) are not here: the reader reads the value that
+    the loader drops from one of them as no evidence for that record, so the
+    repaired record cannot count as a futile launch.
+    """
+    state = record.get("state")
+    if isinstance(state, str) and state in CONSOLE_FINAL_STATES and _lacks_registration_key(record):
+        return True
+    for field, stored in (
+        ("job_process", _job_process_value),
+        ("spot_interruption", _spot_interruption_value),
+    ):
+        value = record.get(field)
+        if value is not None and stored(value) is None:
+            return True
+    steps = record.get("steps", [])
+    if not isinstance(steps, list) or not all(isinstance(name, str) for name in steps):
+        return True
+    return not isinstance(record.get("registered", False), bool)
+
+
 def _sanitize_record(record):
     """Rebuild one persisted record from an explicit schema.
 
@@ -450,8 +743,11 @@ def _sanitize_record(record):
     ``emitted`` key would suppress or forge a publication. Only the fields this
     command writes survive, and each is validated against the same closed
     vocabulary as fresh console input. Returns ``(record, changed)``, or
-    ``None`` when the record is not usable at all.
+    ``None`` when the record is not usable at all. A record whose registration
+    evidence cannot be kept is not usable (``_registration_evidence_is_damaged``).
     """
+    if _registration_evidence_is_damaged(record):
+        return None
     changed = False
     steps = record.get("steps")
     steps = [name for name in steps if isinstance(name, str)] if isinstance(steps, list) else []
@@ -467,33 +763,16 @@ def _sanitize_record(record):
     if exit_code is not None and (type(exit_code) is not int or not 0 <= exit_code <= 255):
         exit_code = None
         changed = True
-    job_process = record.get("job_process")
-    if not (
-        isinstance(job_process, list)
-        and len(job_process) == 2
-        and isinstance(job_process[0], str)
-        and type(job_process[1]) is int
-        and _job_process(job_process[0], job_process[1])
-    ):
-        job_process = None
+    if exit_code is not None and _lacks_registration_key(record):
+        # Only the record of a worker that has not ended is kept without a key. Once the
+        # provider lists the worker as ended, this marker beside the lost key would count
+        # it as futile, so the record is no evidence until a read supplies both.
+        exit_code = None
+        changed = True
+    job_process = _job_process_value(record.get("job_process"))
     if job_process != record.get("job_process"):
         changed = True
-    spot_interruption = record.get("spot_interruption")
-    normalized = None
-    if (
-        isinstance(spot_interruption, list)
-        and len(spot_interruption) == 3
-        and isinstance(spot_interruption[0], str)
-        and isinstance(spot_interruption[1], str)
-        and (spot_interruption[2] is None or isinstance(spot_interruption[2], str))
-    ):
-        normalized = _spot_interruption(
-            spot_interruption[0], spot_interruption[1], spot_interruption[2] or "unknown"
-        )
-    # The stored value is the normalised triple, never the console spelling: an
-    # empty string or the literal "unknown" is not a registration id this
-    # command publishes, so it must not survive a rewrite.
-    spot_interruption = list(normalized) if normalized is not None else None
+    spot_interruption = _spot_interruption_value(record.get("spot_interruption"))
     if spot_interruption != record.get("spot_interruption"):
         changed = True
     emitted = record.get("emitted")
@@ -602,6 +881,12 @@ class Exporter:
         self._ledger = ledger
 
     def run(self, *, events_file, metrics_file, state_file, now=None):
+        # The locks come before the clock: a run that waited would otherwise
+        # judge the records of the run before it against an older clock.
+        with _directory_locks(state_file, events_file, metrics_file):
+            return self._run(events_file, metrics_file, state_file, now)
+
+    def _run(self, events_file, metrics_file, state_file, now):
         started = self.clock()
         current = self.clock() if now is None else now
         summary = RunSummary(deployment=self.config.deployment)
@@ -620,7 +905,10 @@ class Exporter:
         if len(live) > limit:
             summary.notes.append("above_configured_limit")
 
-        state, note = load_state(state_file)
+        # The record is read once. The state and the times that the record is
+        # saved under come from the same read.
+        content, times = _read_record(state_file)
+        state, note = _state_from(content, current)
         if note is not None:
             summary.notes.append(note)
         prune_state(state, current)
@@ -678,17 +966,20 @@ class Exporter:
         summary.totals = dict(state["totals"])
         self._read_ledger(summary, current)
 
-        if events or Path(events_file).exists():
-            dropped = _append_events(events_file, events, self.config.deployment)
-            if dropped:
-                summary.notes.append("events_pruned")
+        # Read on every run, with or without new events: an event file that
+        # exists and cannot be read fails the run before it replaces a file.
+        dropped = _append_events(events_file, events, self.config.deployment)
+        if dropped:
+            summary.notes.append("events_pruned")
         summary.new_events = len(events)
 
         state["console_reads"] = min(state.get("console_reads", 0) + summary.console_reads, MAX_COUNTER)
-        _write_atomic(state_file, json.dumps(state, sort_keys=True, indent=2))
+        record_text = json.dumps(state, sort_keys=True, indent=2)
 
         summary.duration = self.clock() - started
-        _write_atomic(metrics_file, render_metrics(summary, current, state["console_reads"]))
+        # The record is saved before the textfile and its modification time
+        # advances after it: ``_publish`` has the order and the reason for it.
+        _publish(state_file, record_text, times, metrics_file, render_metrics(summary, current, state["console_reads"]))
         result = summary.as_dict()
         result["decision"] = "reported"
         return result
@@ -952,7 +1243,10 @@ def _retained_events(existing, deployment):
     dropped rather than carried forward, and the caller reports the drop.
     """
     kept, dropped = [], 0
-    for line in existing.splitlines():
+    # A line ends at LF alone, as the caller cut it: ``splitlines`` also cuts on a
+    # bare CR and on Unicode separators, so one damaged line would be republished
+    # in part. A CRLF line still parses, because JSON whitespace includes CR.
+    for line in existing.split("\n"):
         if not line.strip():
             continue
         try:
@@ -967,6 +1261,27 @@ def _retained_events(existing, deployment):
     return "".join(line + "\n" for line in kept), dropped
 
 
+def _read_event_file(path):
+    """Return the bytes of the event file at ``path``, or ``None`` when there is none.
+
+    The file is opened as the record is (``_open_for_reading``): without blocking,
+    so a FIFO with no writer cannot stop a run that holds its locks, and without
+    following a link. Only an open that raises ``FileNotFoundError`` is an
+    absent file. A link, a directory, a FIFO, another entry that is not a regular
+    file and any other error, an error after the open included, raise ``OSError``,
+    and so does a read that would block: it returns no part of the file.
+    """
+    try:
+        stream = open(path, "rb", buffering=0, opener=_open_for_reading)
+    except FileNotFoundError:
+        return None
+    with stream:
+        descriptor = stream.fileno()
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"the event path is not a regular file: {path}")
+        return _read_to_end(descriptor)
+
+
 def _append_events(path, events, deployment):
     """Publish new event lines, rotating the file when it outgrows its bound.
 
@@ -974,15 +1289,30 @@ def _append_events(path, events, deployment):
     a collector that reopens it by path sees a complete file, and the rewrite is
     what makes rotation and the size bound possible. The file is a bounded
     publication, not an unbounded WAL. Returns the number of historical lines
-    dropped because they no longer match the schema.
+    dropped because they no longer match the schema or are not UTF-8.
+
+    The file is read on every run (``_read_event_file``). Only a missing file is
+    an empty stream, and a run with no new event then writes no file. Any other
+    failure to read the file fails the run here, before it replaces a file: a
+    file that this run cannot read would otherwise be replaced by the lines of
+    this run alone. A line that is read but is not UTF-8 is damaged content: it
+    is dropped and counted, and the lines around it are kept.
     """
     path = Path(path)
+    content = _read_event_file(path)
+    if content is None and not events:
+        return 0
     lines = "".join(json.dumps(event, sort_keys=True) + "\n" for event in events)
-    try:
-        existing = path.read_bytes().decode("utf-8")
-    except (OSError, UnicodeDecodeError):
-        existing = ""
-    existing, dropped = _retained_events(existing, deployment)
+    # No multi-byte character holds the newline byte, so the split cuts none, and a
+    # line that does not decode costs only itself.
+    decoded, undecodable = [], 0
+    for raw in (content or b"").split(b"\n"):
+        try:
+            decoded.append(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            undecodable += 1
+    existing, dropped = _retained_events("\n".join(decoded), deployment)
+    dropped += undecodable
     combined = existing + lines
     encoded = combined.encode("utf-8")
     if len(encoded) > MAX_EVENTS_BYTES:
@@ -993,20 +1323,27 @@ def _append_events(path, events, deployment):
     return dropped
 
 
-def _write_atomic(path, text):
+def _write_atomic(path, content, *, times=None):
     """Replace a file atomically, in its own directory.
 
     A collector may read the file at any moment; a partial write would be a torn
-    sample, so the content is written beside it and renamed into place.
+    sample, so the content (text, or bytes that are written as they are) is
+    written beside it and renamed into place. ``times``, an access time and a
+    modification time in nanoseconds, is set on the new file before the rename,
+    so that the file is never seen under another time. The rename is synced to its
+    directory before the function returns, so a later write cannot become durable
+    ahead of it.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=".ci-burst-", suffix=".tmp")
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(text)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(content if isinstance(content, bytes) else content.encode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
+        if times is not None:
+            os.utime(temporary, ns=times)
         os.replace(temporary, path)
     except BaseException:
         try:
@@ -1014,6 +1351,67 @@ def _write_atomic(path, text):
         except OSError:
             pass
         raise
+    # Outside the handler above: the rename has moved the temporary file, so a failed
+    # sync has nothing to unlink, and the error still propagates.
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+@contextlib.contextmanager
+def _directory_locks(*paths):
+    """Hold an exclusive lock on the directory of each of ``paths`` while the block runs.
+
+    A set of export files has one writer (``docs/operations.md``, "One writer").
+    The locks are a guard that makes an accidental second run wait until the
+    first releases them; they attach no guarantee. The lock is on the directory
+    and not on a file, so a run creates no file for it and no output path can
+    replace it. The directories are created first and opened, and each is locked
+    once, in the order of its device and inode numbers, so two runs that reach
+    one directory under different paths never wait for each other in a circle.
+    The launch evidence reader takes no lock.
+    """
+    opened = {}
+    try:
+        for path in paths:
+            directory = Path(path).parent
+            directory.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            status = os.fstat(descriptor)
+            identity = (status.st_dev, status.st_ino)
+            if identity in opened:
+                os.close(descriptor)
+            else:
+                opened[identity] = descriptor
+        for identity in sorted(opened):
+            fcntl.flock(opened[identity], fcntl.LOCK_EX)
+        yield
+    finally:
+        for descriptor in opened.values():
+            os.close(descriptor)
+
+
+def _publish(state_file, record_text, times, metrics_file, metrics_text):
+    """Save the record, replace the metrics textfile, then advance the record's time.
+
+    The cumulative counters live in the record and the textfile publishes them.
+    A collector must never read a total that a later run lowers, so the record is
+    saved first: the textfile never carries a total that the record on disk
+    lacks, whether a write fails or the process stops. The record is saved under
+    ``times``, the times of the record that the run read, or the epoch when it read
+    none, because the modification time is the launch evidence heartbeat: a run
+    that fails must not advance it, and the reader takes a file with the epoch for
+    ``stale``. It is advanced last, after the textfile is replaced.
+
+    A run that cannot replace the textfile leaves the record as it saved it, under
+    those times. Its events were published before the record was saved, so the
+    next run does not emit them again.
+    """
+    _write_atomic(state_file, record_text, times=times)
+    _write_atomic(metrics_file, metrics_text)
+    os.utime(state_file)
 
 
 def render_metrics(summary, now, console_reads_total):
@@ -1119,7 +1517,7 @@ def render_metrics(summary, now, console_reads_total):
     emit(
         "ci_burst_export_last_run_timestamp_seconds",
         "gauge",
-        "Unix time of the last completed observation run.",
+        "Unix time of the last observation run that wrote this file.",
         [({}, int(now))],
     )
     emit(

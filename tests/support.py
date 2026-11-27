@@ -7,10 +7,12 @@ planning path performed no mutation.
 """
 
 import json
+import os
 from pathlib import Path
 
 from ci_burst.aws import Instance, SpotQuote, Template
 from ci_burst.errors import DeadlineRefusal
+from ci_burst.export import STATE_VERSION
 from ci_burst.forgejo import Attempt, Observation, Runners
 
 
@@ -243,6 +245,93 @@ def observation_demand(count=1):
         incompatible=0,
         duplicates=0,
     )
+
+
+def operation_hex(index):
+    """A synthetic 32-character hexadecimal operation identifier."""
+    return f"{index:032x}"
+
+
+def futile_record(seen, /, index=1, **overrides):
+    """One observation record of a worker that ended after the exit marker and never registered.
+
+    ``seen`` is positional so that an override can replace the record's own ``seen``.
+    """
+    record = {
+        "first_seen": seen - 120,
+        "seen": seen,
+        "state": "terminated",
+        "zone": "eu-central-1a",
+        "instance_type": "t4g.small",
+        "operation": operation_hex(index),
+        "steps": ["mount-options"],
+        "errors": ["register_failed"],
+        "exit_code": 1,
+        "job_process": None,
+        "spot_interruption": None,
+        "registered": False,
+        "emitted": [],
+        "counted_registered": False,
+        "counted_unregistered": True,
+    }
+    record.update(overrides)
+    return record
+
+
+def registered_record(seen, /, index=1, **overrides):
+    """One observation record of a worker that ended after it registered and ran its job."""
+    values = {
+        "steps": ["mount-options", "register", "job"],
+        "errors": [],
+        "exit_code": 0,
+        "job_process": ["completed", 0],
+        "registered": True,
+        "counted_registered": True,
+        "counted_unregistered": False,
+    }
+    values.update(overrides)
+    return futile_record(seen, index=index, **values)
+
+
+def write_observed(path, records=(), *, mtime, payload=None, raw=None):
+    """Write an observation record file and set its modification time.
+
+    The fake clock is not wall time, so the caller states the time the file
+    should carry.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if raw is None:
+        if payload is None:
+            instances = {f"i-0123456789abcde{index:02x}": record for index, record in enumerate(records)}
+            payload = {
+                "version": STATE_VERSION,
+                "console_reads": len(instances),
+                "totals": {"launches": len(instances), "registered": 0, "unregistered": 0},
+                "instances": instances,
+            }
+        raw = json.dumps(payload).encode("utf-8")
+    path.write_bytes(raw)
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def ledger_holding(path):
+    """Return the ledger operations that cover every operation the record at ``path`` names.
+
+    A reader test is about the record and not about the ledger, so it gives the
+    reader a ledger that holds each record's operation with no instance
+    identifier. A path that holds no record that parses, such as a missing file, a
+    directory or a pipe, gives no operations, which the reader never looks at
+    because it refuses the file first.
+    """
+    try:
+        if not Path(path).is_file():
+            return {}
+        records = json.loads(Path(path).read_bytes())["instances"].values()
+        return {record["operation"]: None for record in records if isinstance(record.get("operation"), str)}
+    except Exception:  # noqa: BLE001 - any file that does not parse is a file the reader refuses
+        return {}
 
 
 def write_config(tmp_path, *, config=None):

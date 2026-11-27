@@ -16,58 +16,92 @@ billed duration is floored at it, and the forward commitment prices only the
 lifetime beyond the billed duration.
 """
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass
 
-from .money import MICROS_PER_UNIT, hourly_cost_micros
+from .money import MICROS_PER_UNIT, format_money, hourly_cost_micros
 
 #: EC2 bills an instance for at least one minute even when it exits sooner.
 MINIMUM_BILLABLE_SECONDS = 60
 TERMINAL_STATES = ("terminal", "failed")
-#: ``format_money`` writes six fractional digits; a stored price may carry fewer.
-PRICE_FRACTION_DIGITS = 6
+#: A stored hourly price above one million units is no usable price, so no stored text can push the cost arithmetic
+#: or what the export renders past the interpreter's digit limit.
+MAX_STORED_PRICE_MICROS = 10**12
 
 
 def _stored_price_micros(value):
-    """Exact micros of one stored price, or zero when it is not a usable price.
+    """Exact micros of one stored price, or zero when it is not the text admission writes.
 
-    A malformed stored request must never raise while cost is reported, so an
-    unparseable price contributes nothing and the other bounds apply. A value
-    with more precision than micros rounds up, because a ceiling may over-state
-    but must not under-state.
+    Admission writes ``MaxPrice`` with ``format_money``, so a usable price is a
+    string that ``format_money`` writes back unchanged, up to ``MAX_STORED_PRICE_MICROS``.
+    Any other value, a JSON number, leading zeros, another fraction length, a
+    digit outside ASCII or a larger price included, is no usable price. A malformed stored request must never raise
+    while cost is reported, so it contributes nothing and the other bounds apply.
     """
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int):
-        return value * MICROS_PER_UNIT if value > 0 else 0
-    if isinstance(value, float):
-        if not math.isfinite(value) or value <= 0:
-            return 0
-        value = f"{value:.{PRICE_FRACTION_DIGITS}f}"
     if not isinstance(value, str):
         return 0
-    whole, dot, fraction = value.strip().partition(".")
-    if not whole.isdigit() or (dot and (not fraction or not fraction.isdigit())):
+    whole, _, fraction = value.partition(".")
+    try:
+        micros = int(whole) * MICROS_PER_UNIT + int(fraction)
+        canonical = 0 < micros <= MAX_STORED_PRICE_MICROS and format_money(micros) == value
+    except ValueError:
+        # ``int`` and ``str`` refuse a number past the interpreter's digit limit.
         return 0
-    micros = int(whole) * MICROS_PER_UNIT
-    if dot:
-        micros += int(fraction[:PRICE_FRACTION_DIGITS].ljust(PRICE_FRACTION_DIGITS, "0"))
-        if fraction[PRICE_FRACTION_DIGITS:].strip("0"):
-            micros += 1
-    return micros if micros > 0 else 0
+    return micros if canonical else 0
+
+
+def request_damaged(operation):
+    """Whether an operation's stored launch request is not the one admission froze.
+
+    Admission stores the request as canonical JSON with the sha256 of that text,
+    and writes a ``MaxPrice`` into every request. A stored request whose text no
+    longer hashes to the stored ``request_sha256``, or that carries no usable
+    ``MaxPrice``, is damaged: a resume must not send it, and its price must not
+    lower the ceiling admission committed.
+    """
+    text = operation.request_json
+    if not isinstance(text, str):
+        return True
+    try:
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    except UnicodeError:
+        return True
+    return digest != operation.request_sha256 or not _frozen_max_price_micros(text)
+
+
+#: ``_decoded_request``'s answer for a frozen request that does not decode.
+UNDECODABLE = object()
+
+
+def _decoded_request(request_json):
+    """The frozen request, or ``UNDECODABLE``.
+
+    ``ValueError`` covers text that is not JSON and bytes that are not UTF-8,
+    ``TypeError`` a value that is not text, and ``RecursionError`` text nested
+    past the decoder's limit. None of them may stop a pass that prices the rows
+    of the window, terminal ones too.
+    """
+    try:
+        return json.loads(request_json)
+    except (TypeError, ValueError, RecursionError):
+        return UNDECODABLE
 
 
 def _frozen_max_price_micros(request_json):
     """The ``MaxPrice`` frozen in an operation's request, or zero.
 
     The ceiling admission committed is already stored in the request the
-    provider received; a schema-3 row does not need a second column for it.
+    provider received; a schema-3 row does not need a second column for it. A
+    request that has no usable ``MaxPrice`` (it does not decode, or the price is
+    missing, null or malformed) gives zero here, and an operation that still
+    needs its ceiling keeps its reservation instead (``reservation_floor_micros``).
     """
+    request = _decoded_request(request_json)
     try:
-        request = json.loads(request_json)
         value = request["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"]
-    except (TypeError, ValueError, KeyError, IndexError):
+    except (TypeError, KeyError, IndexError):
         return 0
     return _stored_price_micros(value)
 
@@ -147,8 +181,17 @@ class CostModel:
         Every normally admitted row carries a zero flag and therefore no floor,
         and its commitment may fall below the reservation as its minutes are
         accepted under the ceiling.
+
+        A non-terminal row whose stored request is damaged (``request_damaged``:
+        it no longer hashes to its stored hash, or has no usable ``MaxPrice``)
+        keeps the same floor. Its price is no longer the ceiling admission
+        committed, and the configured maximum, which may since have been
+        lowered, and the accepted price would price the remaining life below that
+        ceiling. A terminal row needs no ceiling for the remaining life, so a
+        damaged request gives it no floor.
         """
-        if not operation.admitted_inputs_backfilled:
+        damaged = operation.state not in TERMINAL_STATES and request_damaged(operation)
+        if not (operation.admitted_inputs_backfilled or damaged):
             return 0
         return operation.reservation_micros or 0
 

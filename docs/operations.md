@@ -176,8 +176,7 @@ standard-library tests run without the SDK, a token or a cloud account.
 python -m ci_burst plan   --config deployment.toml   # observation only
 python -m ci_burst apply  --config deployment.toml   # may launch the configured fleet
 python -m ci_burst status --config deployment.toml   # evidence, no mutation
-python -m ci_burst export --config deployment.toml \
-                          --metrics-file /var/lib/prometheus/node-exporter/ci-burst.prom
+python -m ci_burst export --config deployment.toml --state-file PATH --events-file PATH --metrics-file PATH
 python -m ci_burst reap   --config deployment.toml   # expired resources, no launch
 python -m ci_burst reap   --config deployment.toml --apply
 ```
@@ -199,13 +198,31 @@ console of the instances this deployment owns and turns the shipped first-boot
 markers into two artefacts:
 
 ```sh
-python -m ci_burst export --config deployment.toml \
-  --metrics-file /var/lib/prometheus/node-exporter/ci-burst.prom \
-  [--events-file PATH] [--state-file PATH]
+python -m ci_burst export --config deployment.toml --state-file PATH \
+  --events-file PATH --metrics-file PATH
 ```
 
-The two optional paths default to `<ledger directory>/export/`, as
-`worker-events.ndjson` and `observed.json`.
+`--state-file` and `--events-file` default to `observed.json` and
+`worker-events.ndjson` in `<ledger directory>/export/`: the unit's files.
+
+**One writer.** A set of export files (the record, the event file, the metrics
+textfile and the collector file that the unit publishes it to) has one writer:
+the shipped unit `ci-burst-export.service`. For a manual export of that set, run
+`systemctl start ci-burst-export.service`; systemd runs one instance of the unit
+at a time, its publication step included. A `ci-burst export` command run
+outside the unit names its own `--state-file`, `--events-file` and
+`--metrics-file` and does not write the unit's collector file. Any other sharing
+is unsupported, and the guarantees of this section do not hold for it.
+
+Each run opens the directory of each of its files to lock it and to sync a
+rename into it, so the exporter must be able to read each directory as well as
+write and search it. A directory it cannot read stops the run with exit 1 before
+it reads or replaces any file.
+
+Each run reads the event file without blocking and without following a link.
+Only a missing event file is an empty stream; a run that cannot read an existing
+one, or finds a link, a FIFO or a directory there, exits 1 before it replaces
+any file.
 
 ### The event stream
 
@@ -283,9 +300,14 @@ rewrite is also what makes rotation and the size bound possible.
 
 Delivery is at least once. `id` is derived from the instance and the marker, so
 a repeat after a crash between publishing an event and saving the dedupe record
-carries the same identity and a consumer can drop it. The dedupe record keeps
-what was already emitted and is pruned after seven days; deleting it loses the
-history and the cumulative counters, never a decision.
+carries the same identity and a consumer can drop it. `export` publishes the
+events, then saves the dedupe record before it replaces the textfile. A run that
+cannot write the textfile keeps the record that it saved, so the next run does
+not emit those events again. The dedupe record keeps what was
+already emitted and is pruned after seven days; deleting it loses the history and
+the cumulative counters. It can change a decision in one way only: `apply` and
+`plan` read the record as a brake after repeated futile launches (§ Futile launch
+hold).
 
 ### The metrics textfile
 
@@ -293,14 +315,46 @@ Every series carries the deployment label. `ci_burst_worker_launches_total`,
 `ci_burst_worker_registered_total` and `ci_burst_worker_unregistered_total` are
 cumulative counters kept separately from the expiring per-instance records, so
 they do not fall when an instance ages out of the provider's record window or
-when a record is pruned. `ci_burst_worker_unregistered_total` counts workers
+when a record is pruned. `export` saves the record, which holds the totals,
+before it replaces the textfile, so a textfile never carries a total that the
+record lacks, and that holds for a collector that reads `--metrics-file` itself
+as well as for the shipped unit. Only a lost, damaged or unreadable dedupe
+record (deleted, or replaced by `export` because it cannot read or load it)
+restarts a counter. `export` reads the record once per run, without blocking and
+without following a link, and treats a read that fails, even for a moment, a
+link or a FIFO as a damaged record, which it replaces.
+After such a reset the textfile of an earlier run can hold higher totals until a
+run replaces it.
+`ci_burst_worker_unregistered_total` counts workers
 that ended without ever showing the registration marker; evidence observed once
 is never un-learned by a later empty console. `ci_burst_spend_micros`, `ci_burst_committed_micros`,
 `ci_burst_allowance_micros` and `ci_burst_remaining_micros` come from the
 read-only ledger, are gauges in micro-units, and are omitted — with a
 `ledger_omitted` note in the JSON result — when it cannot be read.
 `ci_burst_export_last_run_timestamp_seconds` is what a consumer uses to detect a
-stopped exporter.
+stopped exporter, and a consumer sees a new value only after the textfile reaches
+the collector. `export` saves the dedupe record, then replaces the textfile at
+`--metrics-file`, then advances the record's modification time, which is the
+heartbeat that `apply` reads (§ Futile launch hold). A run that cannot save the
+record exits 1 before it replaces the textfile. A run that cannot replace the
+textfile keeps the record that it saved, under the modification time of the
+record that it read, or the epoch when it read none, and exits 1. Either way the
+record is not refreshed, so it ages, and the failed unit shows it. In the shipped unit,
+`--metrics-file` is in the state directory and `ExecStartPost` publishes the
+textfile into the collector's directory. systemd runs `ExecStartPost` only after
+`export` exits 0, so a failed run publishes nothing: the collector's timestamp
+does not advance. A unit that fails at the publication has already advanced the
+record's modification time, and the collector's timestamp does not advance
+either. Where `--metrics-file` names the collector's own file (direct mode, as in
+the commands above), the collector reads each textfile as soon as `export`
+replaces it, and a textfile that it has read never carries a total that a later
+run lowers: the record already holds it. A run that read its record and then
+stops after it replaced the textfile, or cannot replace it, leaves the record
+level with the textfile or ahead of it, under the modification time that it read,
+and a later run writes totals that are not lower, even when an instance has left
+the provider's inventory in between. A run that could not read its record
+restarts the counters, as for a deleted record (see above), and saves the new
+record under the epoch.
 
 ### Bounds
 
@@ -355,11 +409,77 @@ files it also reads. An ownership tag that is not one this deployment generated
 is omitted; a record, an instance key or a historical event line that no longer matches the
 schema — or that belongs to another deployment — is dropped (`state_rebuilt` or
 `events_pruned` in the result); a record with no usable retention timestamp is
-dropped rather than kept forever;
+dropped rather than kept forever, and so is a record dated after the clock of the
+run (see the paragraph on dates below);
 a ledger state outside the ledger's own vocabulary is counted as `invalid`
 (`ledger_state_unknown`). None of those is a failure: derived evidence that
-cannot be validated is discarded, not published. The
-command never calls Forgejo and never mutates a resource, so it keeps working
+cannot be validated is discarded, not published.
+
+The same rule covers the decoding of the record. `export` refuses a record file
+that holds `NaN`, `Infinity` or `-Infinity`, or in which a JSON object names a
+member twice, at any level. It writes neither. It drops such a file whole and
+notes `state_rebuilt`, so the emitted history and the cumulative counters start
+again, as when the record is deleted, and the run reads again the consoles that
+it selects within its read budget. The launch hold reads the same file with the
+same two refusals (§ Futile launch hold), so `export` carries no record over from
+a file that the hold would call `malformed` for either reason. A loader that kept
+the last value of a repeat could keep a futile record in place of a registered
+one, skip its finished console and rewrite the file with a fresh heartbeat.
+
+The same rule covers a stored value that bears on registration. The hold decides
+`registered` or `futile` from the `registered` flag, the `steps` list,
+`job_process` and `spot_interruption`. When one of them is present and `export`
+cannot keep it, `export` drops the whole record of that instance and notes
+`state_rebuilt`. Examples are a `job_process` whose outcome and status disagree,
+a `spot_interruption` of a shape that `export` does not write, a `steps` list
+with an element that is not text, and a `registered` flag that is not true or
+false. `export` does not keep the record with the value replaced by its default.
+A worker that has ended is not read again, so the kept record would show no
+registration, and the next run would write it back under a fresh heartbeat as a
+futile launch that nobody observed.
+
+A key that is absent is the same damage. The hold refuses a record file in
+which a record lacks one of those four keys. A record file that an older
+version wrote lacks the keys that the version did not write yet. When the
+record of a worker that has ended lacks one of them, `export` drops that
+record and notes `state_rebuilt`, for the reason above. The first run that
+loads such a file drops the records of the workers that have ended, and reads
+again, within its read budget, the consoles of those that the provider still
+lists. The record of a
+worker that has not ended may lack a key. While the provider lists the
+instance, the run reads its console again within its budget, and the console
+fills the key. Until then the hold counts no such worker.
+
+The same rule covers a date. The hold refuses a record file in which one record
+is dated after the controller clock. A clock that was set back leaves such a
+record, and a worker that has ended is not read again, so the record would stay.
+Every file that `export` wrote from then on would be `malformed` for the hold
+until the clock reached that date. `export` therefore compares each record with
+the clock of its own run when it loads the record. It drops a record dated after
+that clock, whether its worker has ended or not, and notes `state_rebuilt`. A
+record dated at the clock stays. `export` never gives a record a new date: only a
+read of the console dates a record, and the date is the time of that read. A
+clock set back by more than the age of the newest records leaves every record of
+that span dated ahead, so one run drops them all, the records of live workers
+with them.
+
+A dropped record has two outcomes. While the provider still lists the instance,
+the run reads its console again within the read budget, and the record shows what
+the console shows now. When the provider no longer lists the instance, the run
+writes no record for it, so it is no evidence. The cost is the cost of any
+dropped record: the cumulative counters count that worker again, and the run
+emits its markers again under their stable identities. A worker that still runs
+also loses what earlier reads of its console found, because the record shows
+only the console of the new read.
+
+`export` keeps a record when it can keep the evidence in it. A Spot notice whose
+registration identifier it normalises, and a `steps` list from which it removes a
+name outside the vocabulary, keep the evidence that they carry. A bad `state`,
+`operation` or `exit_code` becomes null, and the record stays. The hold reads that
+value as no evidence for the record, so the repaired record cannot count as a
+futile launch.
+
+The command never calls Forgejo and never mutates a resource, so it keeps working
 when the queue or the admission path is the thing that is broken.
 
 ### Fleet snapshot
@@ -1382,8 +1502,17 @@ window for the same reason.
 
 The schema-3 upgrade marks every non-terminal row whose admitted inputs it
 backfilled with `admitted_inputs_backfilled = 1`; a terminal row keeps `0` and
-its stored settled cost. Only that stored mark makes the row's reservation the
-commitment floor. The floor is not inferred from a whole-life estimate, because
+its stored settled cost. That stored mark makes the row's reservation the
+commitment floor. So does a non-terminal row whose stored request is damaged:
+its text no longer hashes to the stored `request_sha256`, or it has no usable
+`MaxPrice` (missing, null or malformed). The controller writes a price into
+every request and stores the hash of the exact text. The hash detects a stored
+text that disagrees with its stored hash; a row whose text and hash were rewritten
+together is outside what it detects. A damaged price is no
+longer the ceiling that admission committed, and a lowered `max_spot_price` and
+the accepted price would price the remaining life below it. A terminal row needs
+no ceiling for its remaining life and keeps no such floor.
+The floor is not inferred from a whole-life estimate, because
 such an estimate includes the current configured ceiling: raising
 `max_spot_price` could then reach the reservation, switch the floor off and
 release allowance admission had committed. A row admitted normally carries a
@@ -1523,7 +1652,8 @@ launches = min(max(0, waiting jobs - recent launches), free slots, affordable wo
 
 A zero bound is not an error. No free slot waits with `slot_busy`, no demand waits
 with `no_runnable_demand`, demand that recent launches already cover waits with
-`awaiting_claim`, and no affordable worker refuses with
+`awaiting_claim`, repeated futile launches refuse with `recent_launches_futile`
+(§ Futile launch hold), and no affordable worker refuses with
 `budget_allowance_exhausted`. When the allowance allows fewer launches than both
 the uncovered demand and the free slots, the batch is capped and the decision
 carries the `budget_capped_batch` note. `plan` reports the same `demand`,
@@ -1601,7 +1731,9 @@ bootstrap; range `60..1800`; there is no off value).
   deadline deferral that holds no decision, need not carry one.
 - After the grace, a job that is still waiting can get a new worker. That is the
   recovery path for a worker that failed its bootstrap or never registered; the
-  replacement stays inside the slot limit and the allowance.
+  replacement stays inside the slot limit and the allowance. When the three most
+  recent finished workers all ended that way, the futile launch hold stops the
+  replacement until their evidence ages out (§ Futile launch hold).
 
 The grace does not change the slot limit, the allowance or the price checks, and it
 matters only when `controller.max_instances` is above `1`: one slot already stops a
@@ -1620,6 +1752,185 @@ launch for a job that `apply` holds back while an operation has no instance, and
 it counts a stored `starting` or `running` operation that reconciliation would
 turn into `terminating`, until the next `apply` reconciles the row.
 
+### Futile launch hold
+
+A persistent worker fault, such as a registration parameter the worker cannot
+read or an image that lacks a command the bootstrap needs, makes every worker end
+before it registers. The slot frees, the job still waits, and the claim grace no
+longer covers it, so each pass would launch again. The hold thins that loop.
+
+`apply` and `plan` read the record that `export` writes, at
+`<ledger directory>/export/observed.json`. They never write it. The read makes no
+provider or queue call, and the reader makes no ledger call: it needs only the
+file and the operations of this deployment that the pass reads from its open
+ledger (see below). They open the file without blocking
+and read it only when it is a regular file that is not a link, so a FIFO at the
+path cannot stall a pass.
+They take the type, the age and the size from the open file and decide before
+they read a byte: a file that is not regular is `unreadable`, a file past the
+freshness bound is `stale` whatever its size, and a file above 16 MiB is
+`malformed`. They then read the open file itself, with no buffered stream in
+between, and stop at 16 MiB plus one byte. A file that grows past 16 MiB after
+they took its size is `malformed`, and they fetch no more than 16 MiB plus one
+byte from it.
+`--state-file` moves only the export run: the controller reads the default path
+and does not look anywhere else.
+
+A worker is classified only when its record shows that the instance ended
+(`terminated` or `stopped`), it carries an operation identifier of the shape that
+this deployment generates, and the ledger holds that operation for this
+deployment (see below). It is:
+
+- registered when the record shows the registration step, a later step
+  (`job` or `claim-timeout`), a one-job process outcome or a Spot interruption
+  notice, whether or not the record shows the exit marker;
+- futile when the record shows the exit marker (`bootstrap exiting rc=<n>`) and
+  none of that registration evidence.
+
+Any other record is no evidence and is never counted: an ended worker with no
+exit marker and no registration evidence (an empty console, a hard kill before
+registration, a power-off), a worker that has not ended, a record with no
+operation identifier of this deployment, and a record whose operation the ledger
+does not hold for this deployment. A registered worker that ended without an exit
+marker, for example after a hard kill, is counted and can clear a hold. A worker
+that still runs is never counted, even when it registered.
+
+A worker counts only when the ledger holds its operation for this deployment. The
+pass reads the operation rows from the ledger that it has open. `plan` reads them
+beside its state block. `apply` reads them at the end of reconciliation, inside
+the transaction that has settled its rows and read the slot. The hold adds one
+read of the open connection, no provider call and no schema change. A row counts
+when its frozen request does not name another deployment. The deployment is the
+one that the scope check reads, the `ci-burst:deployment` tag of the frozen
+request. A row with no readable tag is unbound, as in that check, and it counts.
+`export` writes the operation tag of any owned instance that the provider lists,
+and reconciliation ignores a terminated instance that no ledger operation names.
+The hold ignores it as well. When the ledger names an
+instance for the operation, the record must be filed under that instance. When
+the ledger names none, the operation alone is enough. A record that fails this
+check is not counted, and it takes no place among the newest three. A ledger that
+is empty, or absent for `plan`, leaves no evidence, and the hold stays open.
+
+A rename does not carry the hold over. The procedure to change the deployment
+name leaves the old rows in the ledger as history (§ Durable state and
+ownership; [Change the deployment name](deployment.md#change-the-deployment-name)),
+and `export` keeps the records of their workers until its seven-day retention
+drops them. The hold leaves those rows out, so those workers are no evidence for
+the new name, and `plan` and `apply` admit under it as under any new deployment.
+The hold compares the deployment of the row and nothing else of its scope: it
+does not compare the region or the account of the row.
+
+The rule uses three fixed values. They are not configuration and there is no off
+switch.
+
+| Value | Meaning |
+| --- | --- |
+| 3 | workers that must be considered, all futile, for a hold |
+| 3600 seconds | the window: a worker is inside while the controller clock minus its record's `seen` is at most this |
+| 600 seconds | the record is evidence while its modification time is at most this old |
+
+The considered workers are the three classified workers inside the window with
+the newest `seen`, plus any other that ties the third. When at least three are
+considered and every one is futile, the decision is `refused` with the single
+reason `recent_launches_futile` and a `launch_count` of `0`. No template, price
+or budget is read for that decision, and no intent, reservation or instance is
+created. The command exits 2, as it does for any refusal. `slot_busy`,
+`no_runnable_demand`, `awaiting_claim` and an owned-state discrepancy keep
+precedence.
+
+Every decision that reaches the hold reports `launch_evidence` with the evidence
+`state` and the `considered` and `futile` counts. The counts are `0` unless the
+state is `fresh`. The states, in the order they are tested:
+
+| State | Meaning |
+| --- | --- |
+| `missing` | no file at the path |
+| `unreadable` | the file cannot be opened or read, is not a regular file (a FIFO, a directory) or is a link, or the reader failed in a way it did not foresee |
+| `stale` | the modification time is more than 600 seconds old, or after the controller clock. The reader reads the clock after it has taken the file's status from the open descriptor, so a heartbeat that `export` refreshes while the pass reads is not after the clock; the age, the record dates and the window all use that one reading |
+| `malformed` | larger than 16 MiB, not UTF-8 JSON (a `NaN`, `Infinity` or `-Infinity` constant counts as not JSON), a JSON object that names a member twice at any level (a decoder keeps only the last value, and `export` never writes one; `export` refuses a constant and a repeat in the same way when it loads its own record, § Worker evidence), another record version, or one record with a bad field the hold reads (a `seen` after the controller clock is one), an instance key that `export` rejects, or a registration marker (`job_process`, `spot_interruption`) of a shape that `export` does not write. The hold drops the whole file. When `export` loads its own record, it drops only the record that holds such a value, the record of an ended worker that lacks a registration key, and a record dated after the clock of its run (§ Worker evidence) |
+| `fresh` | the hold is evaluated |
+
+Only `fresh` evidence can hold. Every other state admits as if the hold did not
+exist, and every other admission check still applies to a launch the hold lets
+through. `export` stays optional: where it is absent, stopped or failing, the
+record turns `missing` or `stale` and admission behaves as before. The record's
+modification time is the heartbeat of the command's own work. `export` saves the
+record before it replaces the textfile, under the modification time that the
+record had, and advances that time as its last step, after the event file (when
+the run has events to add or the file exists) and the textfile, so only a run
+that completed those writes refreshes it. A refused run, or a run that fails
+before it gets there (the textfile cannot be written, for example), lets it age:
+a run that cannot replace the textfile keeps the record that it saved under the
+modification time of the record that it read, or the epoch when it read none.
+Until that time is 600 seconds old, a hold can rest on the evidence that the
+failed run read. The heartbeat does not cover publication. The shipped unit publishes the textfile
+into the collector's directory afterwards, from `ExecStartPost`, and a failure
+there leaves the record fresh: a hold still rests on the record, because the
+evidence in it was read, while the collector's copy of the textfile is not
+replaced. A run that fails earlier does not reach that step, so the collector's
+last-run timestamp does not advance either (§ The metrics textfile). `export`
+creates the record owner-only, so a `plan` run as another user than the export
+unit reads `unreadable` and plans as if the hold were open.
+
+A hold ends on its own when a registered worker joins the newest three, when the
+oldest of the three leaves the window, or when the record stops being fresh. It
+lasts at most 3600 seconds after the newest futile worker was read. A hold
+launches nothing, so a fix to the fault produces no new evidence, and admission
+still waits for the window after the fix. Evidence lags the end of a worker by
+about one export interval, so the first burst of futile launches is not
+prevented.
+
+Under a persistent fault the hold thins the waste and does not end it. At one
+slot, about three workers launch per hour: each time the oldest record ages out,
+one launch is admitted, fails, and renews the hold. With more free slots, a whole
+batch can launch each time the hold opens. The hold is not a cap on wasted
+launches and not a spend control. The configured allowance remains the only
+spend control.
+
+Known residual cases:
+
+- A worker that registered, flooded its console so the registration line
+  scrolled out, and then ended through the exit path before any later marker
+  reads as futile. Three such workers hold admission for at most one window.
+- A registered worker that still runs does not clear a hold.
+- A record that `export` dropped, for a damaged registration value or for a date
+  after the clock of its run, is rebuilt from its console alone while the
+  provider lists the instance. The first case above applies to it: a
+  registration line that has scrolled out of the console reads as futile. A
+  worker that still runs also loses what earlier reads of its console found, and
+  a clock set back by more than the age of the newest records drops the records
+  of all live workers at once.
+- A ledger operation that names no instance counts every record that carries its
+  tag. The controller launches one instance for each operation, so two such
+  records need a tag that the controller did not write.
+- Records carry no deployment name, so the hold takes the deployment from the
+  ledger row of the operation, and a rename does not mix their evidence. A row with no readable
+  deployment tag is unbound and counts for every name; the controller never
+  writes such a row. The hold does not compare the region or the account of a
+  row, so a worker that ended under another region or credential route of the
+  same deployment name still counts until it leaves the window.
+- `export` reads at most 16 consoles per run, so heavy turnover defers some
+  records to later runs.
+- Only the shipped first-boot script prints the markers. Workers of another
+  script are no evidence, and the hold never trips for them.
+- `export` bounds the record by its seven-day retention and not by size. The
+  reader accepts at most 16 MiB, which holds about 13,000 to 23,000 instances.
+  A fleet that launches more than about 77 to 138 workers per hour for seven
+  days passes that bound, and then every decision reports `malformed` and the
+  hold stays off.
+
+There is no acknowledgement command, and `status` does not report the hold,
+because it builds no admission decision. For a pass that reaches new admission,
+`plan` reports the same hold as `apply`. A pass with an unresolved launch intent
+differs: `apply` retries that intent before it reaches the gate, so a hold does
+not stop the retry, while `plan` does not resume and, with a free slot, can
+report the hold (§ Claim grace). Two levers exist, and neither is a clean resume:
+
+| Lever | Effect |
+| --- | --- |
+| Delete the record | The next pass reads `missing` and admits. The next export run rebuilds records from the consoles that it reads within its per-run budget (`MAX_CONSOLE_READS`, 16, live workers first) among the instances the provider still lists, about the last hour of ended workers, and stamps them with its own time. A surplus of ended workers waits for later runs while the provider still lists them. The hold can return for a full window. |
+| Stop the export timer | The record ages past 600 seconds and the hold opens. Worker observation stops too. This is the one blunt lever. |
+
 ## Launch decision and capacity fallback
 
 `plan` reports every configured candidate in order, each with the zone, subnet,
@@ -1634,6 +1945,10 @@ dropping a configured candidate; only an answered quote that is absent from the
 requested scope marks that candidate skipped. A configured template version that
 cannot be read or is unusable refuses the plan with `template_unusable` and
 `template_error` rather than dropping that candidate.
+
+A futile launch hold (§ Futile launch hold) is decided before the first template
+read. A held decision therefore carries no candidates, no `selected` candidate
+and no budget.
 
 `apply` admits a batch of at most `controller.max_instances` workers, sized by
 the waiting demand that no recent launch covers, free slots and affordable
@@ -1711,7 +2026,7 @@ ago (#222). Each intent stores the lifetime it was admitted under, so the
 mismatch refusal does not infer it from `expires_at` and `created_at`. All four keep the unresolved
 ownership and block admission while they remain unresolved: a later reconciliation that finds the instance settles the row, and otherwise an operator must. When more than one launch intent is unresolved,
 `apply` retries them in creation order and stops at the first intent whose age
-exceeds the client-token window or the 900-second bound, whose lifetime elapsed or differs, or whose
+exceeds the client-token window or the 900-second bound, whose lifetime elapsed or differs, whose stored request is damaged, or whose
 retry is not accepted. Intents after the deciding one are not sent and retain their existing
 ledger state for the next apply.
 
@@ -1751,6 +2066,17 @@ owned inventory does not prove that its request was never sent
 ([container.md § Rollback](container.md#rollback), step 4, covers an unresolved
 intent).
 
+A fifth refusal protects the stored request. Before `apply` sends an intent
+again, it hashes the stored request text and compares the result with the
+`request_sha256` stored with it. It also requires a usable `MaxPrice`, the price
+ceiling that admission wrote into every request. `apply` refuses an intent whose
+request hashes to another value or has no usable `MaxPrice` with
+`unresolved_intent_request_damaged`, and sends nothing for that intent. The row,
+its request, its client token and its reservation stay as they are, and the
+intent blocks admission while it remains unresolved. Reconciliation settles it
+when the provider shows its instance. Otherwise no command repairs it: keep
+cleanup running, do not edit or delete the row, and escalate.
+
 Every attempted intent produces one `resumes` record in creation order. A
 record's `expires_at` and `reservation` always come from the durable operation,
 whatever the outcome; `instance_id` is `null` until a launch is confirmed, and
@@ -1764,11 +2090,12 @@ whatever the outcome; `instance_id` is `null` until a launch is confirmed, and
 | `refused` | `["unresolved_intent_lifetime_elapsed"]` | `null` | absent | from the operation | `[]` |
 | `refused` | `["unresolved_intent_lifetime_mismatch"]` | `null` | absent | from the operation | `[]` |
 | `refused` | `["unresolved_intent_lifetime_short"]` | `null` | absent | from the operation | `[]` |
+| `refused` | `["unresolved_intent_request_damaged"]` | `null` | absent | from the operation | `[]` |
 
 Every record also carries `operation`. The top level carries the deciding
 intent's `operation`, `decision`, `expires_at` and `reservation`; its
 `instance_id` appears only when that intent was confirmed, its `reasons` only for
-the four refusals above, and its `refusal` only for an uncertain retry. The top
+the five refusals above, and its `refusal` only for an uncertain retry. The top
 level carries no `attempts` field, and a resume sends one frozen request, so a
 record's `attempts` is always empty.
 

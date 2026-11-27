@@ -869,9 +869,12 @@ enabled timer also starts at boot (`OnBootSec=30s`), so enabling it before the
 supervised burst would let a reboot begin unsupervised admission as soon as
 Step 7 sets `live-verified`. Step 8 enables it only after that burst.
 
-The observation unit is independent of admission and may be installed with it.
-It reads consoles and writes a textfile; it launches nothing, and its timer can
-be enabled immediately. Install it only if a collector reads the directory you
+The observation unit is optional and may be installed with admission. It reads
+consoles and writes a textfile and its record; it launches nothing, and its timer
+can be enabled immediately. Where it runs, `apply` reads its record as a brake
+that can withhold a launch after repeated futile launches; where it does not run,
+admission behaves as before
+([operations.md](operations.md#futile-launch-hold)). Install it only if a collector reads the directory you
 pass to `ExecStartPost` — the unit stages the textfile beside the collector's
 file and renames it into place, because the container runs as an unprivileged
 user and the collector's directory is root-owned:

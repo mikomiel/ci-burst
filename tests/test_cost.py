@@ -1,8 +1,16 @@
+import hashlib
 import json
 import unittest
 
-from ci_burst.cost import MINIMUM_BILLABLE_SECONDS, CostModel
+from ci_burst.cost import (
+    MAX_STORED_PRICE_MICROS,
+    MINIMUM_BILLABLE_SECONDS,
+    CostModel,
+    _frozen_max_price_micros,
+    request_damaged,
+)
 from ci_burst.ledger import Operation
+from ci_burst.money import format_money
 
 FROZEN_REQUEST = json.dumps(
     {
@@ -21,7 +29,12 @@ LIFETIME = 3600
 BUFFER = 50_000
 
 
+def sha(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def operation(**overrides):
+    """An operation row; its ``request_sha256`` is the hash of its request text, as admission stores it."""
     values = {
         "id": "op",
         "client_token": "ci-burst-op",
@@ -34,13 +47,15 @@ def operation(**overrides):
         "region": "eu-central-1",
         "account": "111122223333",
         "request_json": "{}",
-        "request_sha256": "0" * 64,
         "instance_id": "i-1",
         "detail": "",
         "price_micros": 100_000,
         "launch_time": 1_000_000.0,
     }
     values.update(overrides)
+    if "request_sha256" not in values:
+        text = values["request_json"]
+        values["request_sha256"] = sha(text) if isinstance(text, str) else "0" * 64
     return Operation(**values)
 
 
@@ -85,10 +100,20 @@ class AccrualTests(unittest.TestCase):
         self.assertEqual(model().accrued_micros(late, 1_000_600.0), 16_667)
 
 
+    def test_a_request_nested_past_the_json_limit_contributes_no_ceiling(self):
+        # Every pass prices the rows of the budget window, terminal ones too. A
+        # frozen request that the decoder cannot take contributes nothing, like
+        # any other that does not parse, and must not stop the pass.
+        nested = "[" * 100_000 + "]" * 100_000
+        self.assertEqual(
+            model().price_ceiling_micros(operation(request_json=nested)),
+            model().price_ceiling_micros(operation()),
+        )
+
 class CommitmentTests(unittest.TestCase):
     def test_remaining_life_is_priced_at_the_cap(self):
         # 3_000 seconds left at the configured maximum of 0.20 per hour.
-        self.assertEqual(model().remaining_micros(operation(), 1_000_600.0), 166_667)
+        self.assertEqual(model().remaining_micros(operation(request_json=FROZEN_REQUEST), 1_000_600.0), 166_667)
 
     def test_an_unresolved_intent_commits_its_whole_worst_case(self):
         intent = operation(instance_id=None, state="intent")
@@ -96,7 +121,9 @@ class CommitmentTests(unittest.TestCase):
         self.assertEqual(model().committed_micros(intent, 1_000_600.0), CAP + BUFFER)
 
     def test_a_live_operation_commits_spend_plus_remaining_plus_buffer(self):
-        self.assertEqual(model().committed_micros(operation(), 1_000_600.0), 16_667 + 166_667 + BUFFER)
+        self.assertEqual(
+            model().committed_micros(operation(request_json=FROZEN_REQUEST), 1_000_600.0), 16_667 + 166_667 + BUFFER
+        )
 
     def test_a_settled_operation_commits_exactly_its_settled_cost(self):
         settled = operation(state="terminal", settled_micros=12_345)
@@ -111,7 +138,9 @@ class CommitmentTests(unittest.TestCase):
         )
         # A row admitted under the shorter model's own basis: its flag is 0, so
         # the admitted-worst-case floor does not apply.
-        live = operation(expires_at=1_003_600.0, admitted_buffer_micros=0, reservation_micros=200_000)
+        live = operation(
+            expires_at=1_003_600.0, admitted_buffer_micros=0, reservation_micros=200_000, request_json=FROZEN_REQUEST
+        )
         self.assertEqual(shorter.lifetime_seconds(live), 3600)
         self.assertEqual(shorter.accrued_micros(live, 1_000_600.0), 16_667)
         self.assertEqual(shorter.remaining_micros(live, 1_000_600.0), 166_667)
@@ -120,7 +149,7 @@ class CommitmentTests(unittest.TestCase):
         )
 
     def test_a_shorter_stored_lifetime_bounds_a_longer_configuration(self):
-        live = operation(expires_at=1_000_060.0, reservation_micros=53_334)
+        live = operation(expires_at=1_000_060.0, reservation_micros=53_334, request_json=FROZEN_REQUEST)
         self.assertEqual(model().lifetime_seconds(live), 60)
         # The stored 60-second lifetime bounds a 3_600-second configuration.
         self.assertEqual(model().accrued_micros(live, 1_000_600.0), 1_667)
@@ -374,6 +403,44 @@ class AdmittedBasisTests(unittest.TestCase):
         self.assertGreaterEqual(far.committed_micros(backfilled, now), 590_000)
         self.assertEqual(raised.reservation_floor_micros(backfilled), 590_000)
 
+    def test_a_live_row_whose_request_no_longer_matches_its_hash_keeps_its_reservation(self):
+        # A valid but lower MaxPrice written without its hash must not price the remaining life below the ceiling.
+        lowered = FROZEN_REQUEST.replace('"0.040000"', '"0.010000"')
+        self.assertNotEqual(lowered, FROZEN_REQUEST)
+        stale = self.admitted(request_json=lowered, request_sha256=sha(FROZEN_REQUEST))
+        self.assertEqual(self.original_model().reservation_floor_micros(stale), 590_000)
+        self.assertEqual(self.original_model().reservation_floor_micros(self.admitted(request_json=lowered)), 0)
+        ended = self.admitted(request_json=lowered, request_sha256=sha(FROZEN_REQUEST), state="terminal")
+        self.assertEqual(self.original_model().reservation_floor_micros(ended), 0)
+
+    def test_a_price_admission_would_not_write_is_no_price(self):
+        for price in (
+            "²", "0.²", "0.010000²", "٣.000000", "9" * 5000, "0.01" + "0" * 5000, "0.0400001", " 0.040000",
+            "00.040000", "0.04", "1", "+0.040000", "0_0.040000", 0.04, 1,
+        ):
+            with self.subTest(price=repr(price)[:14]):
+                request = json.dumps({"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": price}}})
+                self.assertEqual(_frozen_max_price_micros(request), 0)
+        self.assertEqual(_frozen_max_price_micros(FROZEN_REQUEST), 40_000)
+        for micros, expected in ((MAX_STORED_PRICE_MICROS, MAX_STORED_PRICE_MICROS), (MAX_STORED_PRICE_MICROS + 1, 0)):
+            request = json.dumps({"InstanceMarketOptions": {"SpotOptions": {"MaxPrice": format_money(micros)}}})
+            self.assertEqual(_frozen_max_price_micros(request), expected)
+
+    def test_a_noncanonical_price_under_its_own_hash_keeps_the_reservation(self):
+        # Admission writes "0.010000"; the same price with a leading zero is not a request it froze.
+        request = FROZEN_REQUEST.replace('"0.040000"', '"00.010000"')
+        self.assertNotEqual(request, FROZEN_REQUEST)
+        self.assertEqual(self.original_model().reservation_floor_micros(self.admitted(request_json=request)), 590_000)
+
+    def test_an_oversized_price_does_not_price_the_ceiling(self):
+        # A price past any real one, even under its own hash, must not reach the arithmetic or the export.
+        huge = FROZEN_REQUEST.replace('"0.040000"', '"' + "9" * 4300 + '.000000"')
+        damaged = self.admitted(request_json=huge)
+        model = self.original_model()
+        intact_bounds = self.admitted(request_json=None)
+        self.assertEqual(model.price_ceiling_micros(damaged), model.price_ceiling_micros(intact_bounds))
+        self.assertEqual(model.settlement_price_micros(damaged), model.settlement_price_micros(intact_bounds))
+
     def test_a_malformed_frozen_request_never_raises(self):
         model = CostModel(
             price_cap_micros=100_000,
@@ -399,6 +466,22 @@ class AdmittedBasisTests(unittest.TestCase):
                 )
                 self.assertEqual(model.price_ceiling_micros(live), 100_000)
                 self.assertEqual(model.accrued_micros(live, 1_000_600.0), 16_667)
+
+    def test_a_damaged_request_whose_price_is_intact_settles_at_that_price(self):
+        # Only whitespace changed: the hash no longer matches, but the frozen 0.040000 is still the price admission
+        # committed. A row that ended with no accepted price (a migrated schema-1 row) settles at it, not at the
+        # lowered configured maximum, so its settled spend leaves no room for a replacement the cap would not pay for.
+        ended = self.admitted(
+            request_json=FROZEN_REQUEST + " ",
+            request_sha256=sha(FROZEN_REQUEST),
+            price_micros=0,
+            admitted_incidental_per_hour_micros=0,
+            state="terminal",
+            updated_at=1_003_600.0,
+        )
+        self.assertTrue(request_damaged(ended))
+        self.assertEqual(self.lowered_model().accrued_micros(ended, 1_003_600.0), 40_000)
+        self.assertEqual(self.lowered_model().committed_micros(ended, 1_003_600.0), 40_000)
 
 
 class ConfigModelTests(unittest.TestCase):

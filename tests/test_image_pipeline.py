@@ -7332,6 +7332,36 @@ class RetentionTests(PipelineCase):
         self.assertEqual(result["retention"]["deregistered"], 1)
         self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xC1), ami(0xD1)})
 
+    def a_late_snapshot_inventory(self, call):
+        """The ``call``-th snapshot read starts before the pass deadline and returns after it."""
+        calls = []
+
+        def late(arguments):
+            calls.append(arguments)
+            if len(calls) == call:
+                self.clock.advance(PASS_DEADLINE_SECONDS)
+
+        self.world.hooks["describe_snapshots"] = late
+
+    def test_a_snapshot_inventory_that_returns_after_the_deadline_deletes_nothing(self):
+        # The control above deregisters one image. Here the last read of the retention inputs (the second snapshot
+        # read of the pass, after the one of the failed-image path in reconcile) starts before the pass deadline and
+        # returns after it, so no plan is made from it and nothing is deleted.
+        self.three_usable_images(0xB1)
+        self.a_late_snapshot_inventory(2)
+        result = self.apply()
+        self.assertEqual(result["retention"], {"refused": "pass_deadline_exceeded"})
+        self.assertEqual(len(self.world.arguments("describe_snapshots")), 2)
+        self.assertEqual(set(self.world.images), {ami(0xA1), ami(0xB1), ami(0xC1), ami(0xD1)})
+        self.assertEqual(self.world.arguments("deregister_image"), [])
+        self.assertEqual(self.world.arguments("delete_snapshot"), [])
+
+    def test_a_dry_run_whose_snapshot_inventory_returns_after_the_deadline_lists_nothing(self):
+        self.three_usable_images(0xB1)
+        self.a_late_snapshot_inventory(1)
+        self.assertEqual(self.plan()["deletion"], {"refused": "pass_deadline_exceeded"})
+        self.assertEqual(len(self.world.arguments("describe_snapshots")), 1)
+
     def test_the_image_that_a_rollback_just_restored_survives_a_pass_that_reads_a_stale_file(self):
         # The file this pass reads pins version 3. The rollback replaced it with the older version 2.
         self.three_usable_images(0xE1)

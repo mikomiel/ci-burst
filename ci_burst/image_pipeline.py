@@ -1063,7 +1063,9 @@ class ImagePipeline:
     def _deletion_items(self, aws, facts, now, deadline, mode):
         """What the deletion rule selects for ``mode`` (the ``plan_deletions`` argument), from the state file's facts.
 
-        The protected set is resolved first, and a refusal of any read or of the rule passes unchanged.
+        The protected set is resolved first, and a refusal of any read or of the rule passes unchanged. A last read
+        that returns at or after ``deadline`` refuses too (``DeadlineRefusal``): no plan is made from inputs that came
+        after the cutoff, so no deletion starts after it.
         """
         protected = image_deletion.protected_set(
             aws,
@@ -1077,9 +1079,13 @@ class ImagePipeline:
             deadline=deadline,
         )
         deployment = self._config.deployment
+        images = aws.images(deployment, deadline=deadline)
+        snapshots = aws.snapshots(deployment, deadline=deadline)
+        if deadline is not None and self._clock() >= deadline:
+            raise DeadlineRefusal("the deletion inventory")
         return image_deletion.plan_deletions(
-            aws.images(deployment, deadline=deadline),
-            aws.snapshots(deployment, deadline=deadline),
+            images,
+            snapshots,
             protected,
             deployment=deployment,
             mode=mode,

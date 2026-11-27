@@ -410,6 +410,26 @@ def _open_for_reading(path, flags):
     return os.open(path, flags | os.O_NONBLOCK | os.O_NOFOLLOW)
 
 
+#: ``_read_to_end`` asks the descriptor for at most this many bytes at a time.
+_READ_CHUNK_BYTES = 1024 * 1024
+
+
+def _read_to_end(descriptor):
+    """Return what ``descriptor`` holds, read with ``os.read`` until it returns no bytes.
+
+    ``_open_for_reading`` makes the descriptor non-blocking, and a read that would
+    block raises ``BlockingIOError`` here, an ``OSError``. A stream's ``read`` does
+    not: it returns ``None``, or the bytes that it had read so far, and a caller
+    would take that part for the whole file.
+    """
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, _READ_CHUNK_BYTES)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
 def _read_record(path):
     """Read the record at ``path`` once and return ``(content, times)``.
 
@@ -420,20 +440,22 @@ def _read_record(path):
     and ``(0, 0)`` when none was: a run saves its record under these times
     (``_publish``), so it never gives the record a time that it did not read from
     the record itself. Only an open that finds no file is ``None``: an error
-    after the open, ``FileNotFoundError`` included, is a read that failed.
+    after the open, ``FileNotFoundError`` included, is a read that failed, and so
+    is a read that would block, which returns no part of the file.
     """
     try:
-        stream = open(path, "rb", opener=_open_for_reading)
+        stream = open(path, "rb", buffering=0, opener=_open_for_reading)
     except FileNotFoundError:
         return None, (0, 0)
     except OSError:
         return UNREADABLE_RECORD, (0, 0)
     try:
         with stream:
-            status = os.fstat(stream.fileno())
+            descriptor = stream.fileno()
+            status = os.fstat(descriptor)
             if not stat.S_ISREG(status.st_mode):
                 return UNREADABLE_RECORD, (0, 0)
-            return stream.read(), (status.st_atime_ns, status.st_mtime_ns)
+            return _read_to_end(descriptor), (status.st_atime_ns, status.st_mtime_ns)
     except OSError:
         return UNREADABLE_RECORD, (0, 0)
 
@@ -1246,16 +1268,18 @@ def _read_event_file(path):
     so a FIFO with no writer cannot stop a run that holds its locks, and without
     following a link. Only an open that raises ``FileNotFoundError`` is an
     absent file. A link, a directory, a FIFO, another entry that is not a regular
-    file and any other error, an error after the open included, raise ``OSError``.
+    file and any other error, an error after the open included, raise ``OSError``,
+    and so does a read that would block: it returns no part of the file.
     """
     try:
-        stream = open(path, "rb", opener=_open_for_reading)
+        stream = open(path, "rb", buffering=0, opener=_open_for_reading)
     except FileNotFoundError:
         return None
     with stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+        descriptor = stream.fileno()
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise OSError(f"the event path is not a regular file: {path}")
-        return stream.read()
+        return _read_to_end(descriptor)
 
 
 def _append_events(path, events, deployment):
@@ -1306,7 +1330,9 @@ def _write_atomic(path, content, *, times=None):
     sample, so the content (text, or bytes that are written as they are) is
     written beside it and renamed into place. ``times``, an access time and a
     modification time in nanoseconds, is set on the new file before the rename,
-    so that the file is never seen under another time.
+    so that the file is never seen under another time. The rename is synced to its
+    directory before the function returns, so a later write cannot become durable
+    ahead of it.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1325,6 +1351,13 @@ def _write_atomic(path, content, *, times=None):
         except OSError:
             pass
         raise
+    # Outside the handler above: the rename has moved the temporary file, so a failed
+    # sync has nothing to unlink, and the error still propagates.
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 @contextlib.contextmanager

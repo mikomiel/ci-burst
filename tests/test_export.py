@@ -1,6 +1,7 @@
 import io
 import contextlib
 import dataclasses
+import errno
 import fcntl
 import json
 import os
@@ -23,7 +24,11 @@ from ci_burst.export import (
     POST_REGISTRATION_STEPS,
     STATE_VERSION,
     STEP_NAMES,
+    UNREADABLE_RECORD,
     Exporter,
+    _append_events,
+    _publish,
+    _read_record,
     default_record_path,
     load_state,
     parse_console,
@@ -2736,33 +2741,44 @@ class RecordCadenceTests(ExportCase):
         self.assertEqual((self.events.read_bytes(), os.stat(self.events).st_mtime_ns), events)
 
     @contextlib.contextmanager
+    def _reads_raising(self, target, error, *arguments, after=0):
+        """Make ``os.read`` of ``target`` raise ``error(*arguments)`` once ``after`` reads of it have worked.
+
+        The code opens ``target`` as it does. The file is known by the device and
+        inode of the descriptor that is read, and every other descriptor reads as
+        usual.
+        """
+        real_read = os.read
+        status = os.stat(target)
+        identity = (status.st_dev, status.st_ino)
+        worked = 0
+
+        def read(descriptor, length):
+            nonlocal worked
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) == identity:
+                if worked >= after:
+                    raise error(*arguments)
+                worked += 1
+            return real_read(descriptor, length)
+
+        with mock.patch("os.read", read):
+            yield
+
+    @contextlib.contextmanager
     def failing_read_after_open(self, target):
-        """Open ``target`` as the code asks, then make its read raise ``FileNotFoundError``."""
-        real_open = io.open
+        """Let the code open ``target`` as it does, then make ``os.read`` of it raise ``FileNotFoundError``."""
+        with self._reads_raising(target, FileNotFoundError, 2, "injected read", str(target)):
+            yield
 
-        class FailingRead:
-            def __init__(self, stream):
-                self.stream = stream
+    @contextlib.contextmanager
+    def reads_that_would_block(self, target, *, after=0):
+        """Make ``os.read`` of ``target`` raise ``BlockingIOError`` once ``after`` reads of it have worked.
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exception):
-                self.stream.close()
-
-            def fileno(self):
-                return self.stream.fileno()
-
-            def read(self, *arguments):
-                raise FileNotFoundError(2, "injected read", str(target))
-
-        def opening(file, *arguments, **options):
-            stream = real_open(file, *arguments, **options)
-            if isinstance(file, (str, os.PathLike)) and os.fspath(file) == str(target):
-                return FailingRead(stream)
-            return stream
-
-        with mock.patch("builtins.open", opening), mock.patch("io.open", opening):
+        A file system that cannot serve a read yet does this to a non-blocking
+        descriptor.
+        """
+        with self._reads_raising(target, BlockingIOError, errno.EAGAIN, "injected read", after=after):
             yield
 
     def test_an_event_file_whose_read_fails_after_its_open_fails_the_run(self):
@@ -2780,6 +2796,45 @@ class RecordCadenceTests(ExportCase):
         # which restarts the counters with a note, and not an absent one.
         self.run_export(self.build(self.owned(), {"i-0123456789abcdef0": CLEAN_BOOT}))
         with self.failing_read_after_open(self.state_file):
+            result = self.run_export(self.build(self.owned(), {}), now=NOW + 60)
+        self.assertIn("state_rebuilt", result["notes"])
+
+    def test_an_event_file_whose_read_would_block_fails_before_it_is_replaced(self):
+        # A read that would block stops short of the end of the file. The lines read
+        # before it, or none, must not be taken for the whole history and written
+        # back over it as a run that succeeded.
+        self.run_export(self.build(self.owned(), {"i-0123456789abcdef0": CLEAN_BOOT}))
+        history = self.events_read()
+        register = next(event for event in history if event.get("step") == "register")
+        later = dict(register, id="i-0123456789abcdef1:step:register", instance="i-0123456789abcdef1")
+        before = (self.events.read_bytes(), os.stat(self.events).st_mtime_ns)
+        for worked in (0, 1):
+            with self.subTest(reads_that_worked=worked):
+                with self.reads_that_would_block(self.events, after=worked), self.assertRaises(BlockingIOError):
+                    _append_events(self.events, [later], register["deployment"])
+                self.assertEqual((self.events.read_bytes(), os.stat(self.events).st_mtime_ns), before)
+        # The same call keeps the history and adds the line when the read works.
+        _append_events(self.events, [later], register["deployment"])
+        self.assertEqual(
+            [event["id"] for event in self.events_read()],
+            [event["id"] for event in history] + [later["id"]],
+        )
+
+    def test_a_record_whose_read_would_block_is_unreadable_and_is_rebuilt(self):
+        # A read that would block is a read that failed, as an error after the open
+        # is. It must not give the part of the record that was read, or none: the run
+        # would read a cut or an absent record, and save its own under the time of
+        # the file that it read and not under the epoch.
+        self.run_export(self.build(self.owned(), {"i-0123456789abcdef0": CLEAN_BOOT}))
+        content, times = _read_record(self.state_file)
+        self.assertIsInstance(content, bytes)
+        self.assertNotEqual(times, (0, 0))
+        for worked in (0, 1):
+            with self.subTest(reads_that_worked=worked), self.reads_that_would_block(self.state_file, after=worked):
+                content, times = _read_record(self.state_file)
+                self.assertIs(content, UNREADABLE_RECORD)
+                self.assertEqual(times, (0, 0))
+        with self.reads_that_would_block(self.state_file):
             result = self.run_export(self.build(self.owned(), {}), now=NOW + 60)
         self.assertIn("state_rebuilt", result["notes"])
 
@@ -3062,6 +3117,31 @@ class PublishedCounterTests(ExportCase):
         self.assertEqual(before_the_textfile, [(2, old)])
         self.assertGreater(os.stat(self.state_file).st_mtime, old)
         self.note()
+
+    def test_the_record_is_synced_to_its_directory_before_the_textfile_is_replaced(self):
+        # Renaming the record first fixes what a reader sees, not what survives a
+        # power loss. Unless the record's rename is on disk before the textfile is
+        # replaced, the textfile could outlive a record that holds its totals.
+        calls = []
+        real_replace, real_fsync = os.replace, os.fsync
+
+        def replace(source, target, *arguments, **options):
+            calls.append(("replace", Path(target)))
+            return real_replace(source, target, *arguments, **options)
+
+        def fsync(descriptor):
+            status = os.fstat(descriptor)
+            calls.append(("fsync", stat.S_ISDIR(status.st_mode), (status.st_dev, status.st_ino)))
+            return real_fsync(descriptor)
+
+        with mock.patch("os.replace", replace), mock.patch("os.fsync", fsync):
+            _publish(self.state_file, "{}\n", (0, 0), self.metrics, "# textfile\n")
+        directory = os.stat(self.state_file.parent)
+        record_directory = ("fsync", True, (directory.st_dev, directory.st_ino))
+        replaced_record = calls.index(("replace", self.state_file))
+        replaced_textfile = calls.index(("replace", self.metrics))
+        synced = [position for position, call in enumerate(calls) if call == record_directory]
+        self.assertTrue(any(replaced_record < position < replaced_textfile for position in synced), calls)
 
     def test_a_first_run_that_cannot_write_its_textfile_leaves_a_stale_record(self):
         # With no record to read, the run saves its record under the epoch, so the

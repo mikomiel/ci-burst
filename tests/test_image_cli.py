@@ -29,14 +29,16 @@ from ci_burst.image_state import PIN_RECORD_REASON, ImageState
 from ci_burst.image_status import VERSION_NOT_FOUND
 
 from support import write_config
-from test_image_aws import ProviderError
+from test_image_aws import ACCOUNT, ProviderError
 from test_image_pipeline import (
+    BUCKET,
     DAY,
     DEPLOYMENT,
     FAILED,
     NOW,
     PIN,
     READY,
+    REGION,
     SCRIPT,
     WAITING,
     WORKER,
@@ -212,7 +214,7 @@ class CliCase(PipelineCase):
         """A verified candidate row and the version and image it names in the account.
 
         The version is a copy of ``source_pin`` with the new image, so it is clean unless ``drift``
-        changes a field of its data.
+        changes a field of its data. The row records the worker template, the Region and the pin, as a pass does.
         """
         image_id = ami(image_number)
         data = copy.deepcopy(self.world.versions[(WORKER, source_pin)]["LaunchTemplateData"])
@@ -231,6 +233,8 @@ class CliCase(PipelineCase):
             template_version_exists=1,
             drift_result="clean",
             verified_at=NOW - age + 60,
+            source_template=WORKER,
+            source_region=REGION,
             source_pin=source_pin,
             script_sha256="c" * 64,
         )
@@ -434,6 +438,23 @@ class RunApplyTests(CliCase):
         self.assertEqual((record["state"], record["reason_code"]), ("promoted", PIN_RECORD_REASON))
         self.assertEqual((record["image_state"], record["template_version_exists"]), ("available", 1))
         self.assertEqual((record["image_id"], record["verified_at"]), (ami(0xA1), self.clock()))
+
+    def test_a_gate_less_run_that_only_deletes_an_owed_archive_makes_one_provider_call_and_stamps_nothing(self):
+        key = "warm-archives/owed-cli.tar.gz"
+        self.add_build("owed-cli", "failed", archive_bucket=BUCKET, archive_key=key)
+        self.world.objects[key] = (b"archive", NOW)
+        self.configure(self.image_toml(gate=""))
+        world_mark, source_mark = len(self.world.calls), len(self.source.calls)
+        code, payload = self.invoke("image", "run", "--apply")
+        self.assertEqual((code, payload["decision"], payload["reason"]), (2, "refused", "IMAGE_GATE_REQUIRED"))
+        self.assertEqual(payload["reconcile"]["owed_archives_deleted"], 1)
+        self.assertEqual(
+            self.world.arguments("delete_object")[-1], {"Bucket": BUCKET, "Key": key, "ExpectedBucketOwner": ACCOUNT}
+        )
+        self.assertEqual(self.world.names(world_mark), ["delete_object"])
+        self.assertEqual(self.source.calls[source_mark:], [])
+        self.assertEqual(payload["pin_evidence"], {"recorded": False, "reason": "IMAGE_CLEANUP_ONLY"})
+        self.assertFalse(any(row["id"].startswith("pin-") for row in self.table("image_builds")))
 
     def test_one_pass_returns_the_build_in_flight_with_exit_zero(self):
         code, payload = self.invoke("image", "run", "--apply")

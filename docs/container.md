@@ -321,6 +321,14 @@ already planned its deletions does not read the pin again, and can remove the
 image you are about to pin. Do not widen the mount to `/etc/ci-burst`, which holds
 the credential directories.
 
+While any image command runs, do not edit a setting of the file other than the pin,
+replace or re-link the file, swap a mount or move the state directory. The one
+exception is `enabled = false`, which stops the image path. It does not stop a
+running command: follow [Rolling back an image](operations.md#rolling-back-an-image)
+and wait until no `image run --apply` runs.
+[Operator contract while an image command runs](operations.md#operator-contract-while-an-image-command-runs)
+says what ci-burst checks and what it does not promise.
+
 To promote a candidate, or to roll back, run the promotion line. Before the final
 preview, pause any scheduler of image runs and wait until no `image run --apply`
 of any kind is running, and keep it so through the write. Name the candidate with

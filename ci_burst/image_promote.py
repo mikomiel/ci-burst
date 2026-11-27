@@ -400,12 +400,13 @@ def select_candidate(state, deployment, version=None):
     return candidates[-1]
 
 
-def verify_candidate(build, image_config, now, toml_pin):
+def verify_candidate(build, image_config, now, toml_pin, toml_template, toml_region):
     """Refuse unless the record shows every item that a promotion needs.
 
     The order is the design's: the image, the version, the drift, the gate, the
-    age of the record, then the pin. A refusal names the item and the recorded
-    value, never a secret.
+    age of the record, then the template, the Region and the pin. A record that
+    does not say all three is refused too. A refusal names the item and the
+    recorded value, never a secret.
     """
     if build.image_state != AVAILABLE:
         raise ImageRefusal(PROMOTE_IMAGE_NOT_AVAILABLE, f"the record shows image state {build.image_state or 'none'}")
@@ -424,6 +425,21 @@ def verify_candidate(build, image_config, now, toml_pin):
             f"the record shows gate configured {build.gate_configured} and passed {build.gate_passed}",
         )
     check_fresh(build.verified_at, now, image_config.promote_max_age_seconds)
+    if build.source_template is None or build.source_region is None or build.source_pin is None:
+        raise ImageRefusal(
+            PIN_MOVED, "the record does not say which launch template, Region and pin it was copied from"
+        )
+    if build.source_template != toml_template:
+        raise ImageRefusal(
+            PIN_MOVED,
+            f"the file names launch template {toml_template}; "
+            f"the record was derived from launch template {build.source_template}",
+        )
+    if build.source_region != toml_region:
+        raise ImageRefusal(
+            PIN_MOVED,
+            f"the file sets Region {toml_region}; the record was derived from Region {build.source_region}",
+        )
     if build.source_pin != toml_pin:
         raise ImageRefusal(
             PIN_MOVED,
@@ -1008,7 +1024,9 @@ def _preview(snapshot, state, clock, version, rollback):
             lambda: check_directory(snapshot.target),
             lambda: check_zone_pins(snapshot.raw),
             lambda: _check_no_divergence(pending),
-            lambda: verify_candidate(build, config.image, now, snapshot.pin),
+            lambda: verify_candidate(
+                build, config.image, now, snapshot.pin, config.aws.launch_template_name, config.aws.region
+            ),
             lambda: _check_edit(snapshot, build.template_version),
         )
         return {
@@ -1119,7 +1137,9 @@ def _write(snapshot, state, clock, events, version, rollback, *, owner):
                 decision, build_id, image_id = "rolled_back", None, plan.target.image_id
             else:
                 build = select_candidate(state, config.deployment, version)
-                verify_candidate(build, config.image, now, snapshot.pin)
+                verify_candidate(
+                    build, config.image, now, snapshot.pin, config.aws.launch_template_name, config.aws.region
+                )
                 subject = {"evidence": evidence(build, now)}
                 done = _write_pin(
                     state,

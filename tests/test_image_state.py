@@ -1,17 +1,19 @@
 import hashlib
+import json
 import os
 import sqlite3
 import tempfile
 import threading
+import tomllib
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from ci_burst import image_state
-from ci_burst.config import load
+from ci_burst.config import _image_basis_paths, load
 from ci_burst.controller import Controller
-from ci_burst.errors import StateRefusal
+from ci_burst.errors import ConfigRefusal, StateRefusal
 from ci_burst.image_state import (
     PIN_RECORD_PREFIX,
     PIN_RECORD_REASON,
@@ -20,6 +22,7 @@ from ci_burst.image_state import (
     Build,
     ImageState,
     PinObservation,
+    build_file_hashes,
 )
 from ci_burst.ledger import SCHEMA_VERSION as LEDGER_SCHEMA_VERSION
 from ci_burst.ledger import Ledger, current_window
@@ -165,6 +168,498 @@ class SchemaTests(ImageStateCase):
             connection.execute("INSERT INTO control (id) VALUES (2)")
 
 
+GOOD_HASHES = {"b-file.lock": "e" * 64, "a-file.lock": "f" * 64}
+
+MARKER = "marker-path"
+#: Paths that the configuration refuses for ``image.source.basis_paths``: a control character, a ``..`` or a leading
+#: ``/``. Each holds ``MARKER``, so that a test can show that a refusal does not echo the path.
+REFUSED_PATHS = (
+    f"{MARKER}\nsecond-line.lock",
+    f"{MARKER}\r\nsecond-line.lock",
+    f"{MARKER}\x00.lock",
+    f"{MARKER}\t.lock",
+    f"{MARKER}\x1b.lock",
+    f"{MARKER}\x7f.lock",
+    f"../{MARKER}.lock",
+    f"a/../{MARKER}.lock",
+    f"{MARKER}/..",
+    f"/{MARKER}.lock",
+    f"{MARKER}..lock",
+)
+#: Paths that the configuration accepts, the ones with characters beyond ASCII included.
+ACCEPTED_PATHS = (
+    "example.lock",
+    "dir/sub/example.lock",
+    "a b.lock",
+    ".hidden",
+    "a.b.c",
+    "-dash.lock",
+    "d\u00e9j\u00e0-vu.lock",
+    "emoji-\U0001f600.lock",
+)
+#: Paths that are no text in UTF-8: a lone surrogate has no UTF-8 form. ``json.dumps`` writes each as ASCII escapes,
+#: so the text that a map of them is stored as is valid UTF-8, and ``json.loads`` gives the surrogates back. They are
+#: not in ``REFUSED_PATHS``, because the rules of ``image.source.basis_paths`` do not name them: its file is TOML, which
+#: cannot spell one. Each holds ``MARKER``.
+UNENCODABLE_PATHS = (
+    chr(0xD83D) + MARKER,  # a lone high surrogate
+    MARKER + chr(0xDE00),  # a lone low surrogate
+    MARKER + chr(0xDE00) + chr(0xD83D) + ".lock",  # a low and then a high one, which JSON does not read as a pair
+    "a-" + MARKER + chr(0xD83D) + "-b.lock",  # in the middle of a name
+)
+
+
+def configuration_accepts(*paths):
+    """Whether the configuration takes ``paths`` as ``image.source.basis_paths``."""
+    try:
+        _image_basis_paths({"basis_paths": list(paths)}, "image.source", required=True)
+    except ConfigRefusal:
+        return False
+    return True
+
+
+class ArchiveRecordTests(ImageStateCase):
+    """The schema 2 columns: where the archive goes, when it was deleted, and the hashes of the basis files."""
+
+    def end(self, build_id, state="failed", **fields):
+        with self.state.transaction():
+            return self.state.advance_build(build_id, state=state, **fields)
+
+    def test_the_new_columns_round_trip(self):
+        built = self.add_build(basis_file_hashes=GOOD_HASHES)
+        self.assertEqual((built.archive_bucket, built.archive_key, built.archive_deleted_at), (None, None, None))
+        self.assertEqual(build_file_hashes(built), GOOD_HASHES)
+        # Stored as one JSON object with sorted keys.
+        self.assertEqual(
+            built.basis_file_hashes, '{"a-file.lock": "' + "f" * 64 + '", "b-file.lock": "' + "e" * 64 + '"}'
+        )
+        with self.state.transaction():
+            staged = self.state.advance_build("build-1", archive_bucket="example-bucket", archive_key="prefix/build-1.tar.gz")
+        self.assertEqual((staged.archive_bucket, staged.archive_key), ("example-bucket", "prefix/build-1.tar.gz"))
+        self.assertEqual(self.state.build("build-1"), staged)
+        self.assertEqual(build_file_hashes(self.state.build("build-1")), GOOD_HASHES)
+
+    def test_the_hashes_are_written_at_the_insert_and_never_by_an_advance(self):
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        with self.assertRaises(ValueError):
+            with self.state.transaction():
+                self.state.advance_build("build-1", basis_file_hashes="{}")
+
+    def test_hashes_that_are_not_a_path_to_a_lower_case_sha256_are_refused_at_the_insert(self):
+        for bad in ({}, {"a.lock": "A" * 64}, {"a.lock": "e" * 63}, {"a.lock": 5}, {"": "e" * 64}, ["a.lock"], "{}"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.add_build("build-bad", basis_file_hashes=bad)
+        self.assertIsNone(self.state.build("build-bad"))
+
+    def test_a_row_without_the_hashes_gives_none_to_read(self):
+        built = self.add_build()
+        self.assertIsNone(built.basis_file_hashes)
+        with self.assertRaises(StateRefusal) as raised:
+            build_file_hashes(built)
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+
+    def test_malformed_stored_hashes_are_refused_by_row_and_never_echoed(self):
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        sentinel = "sentinel-value"
+        for stored in (
+            "not json " + sentinel,
+            "[]",
+            "null",
+            "{}",
+            '{"a.lock": "' + "E" * 64 + '"}',
+            '{"a.lock": "' + sentinel + '"}',
+            '{"a.lock": 5}',
+            b"\xff\xfe",
+        ):
+            with self.subTest(stored=stored):
+                connection = sqlite3.connect(self.state.path)
+                try:
+                    connection.execute("UPDATE image_builds SET basis_file_hashes = ? WHERE id = 'build-1'", (stored,))
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(StateRefusal) as raised:
+                    build_file_hashes(self.state.build("build-1"))
+                self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+                self.assertIn("build-1", raised.exception.detail)
+                self.assertNotIn(sentinel, raised.exception.detail)
+
+    def test_a_stored_value_nested_past_the_decoder_is_refused_by_row_and_never_echoed(self):
+        # ``json.loads`` raises ``RecursionError``, which is no ``ValueError``, for a document nested deeper than the
+        # decoder allows, and a hand-edited or damaged file can hold one. The depth is far past the limit of any
+        # interpreter, which differs by version.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        sentinel = "sentinel-value"
+        depth = 100_000
+        inner = '"' + sentinel + '"'
+        for label, stored in (
+            ("arrays", "[" * depth + inner + "]" * depth),
+            ("objects", '{"a":' * depth + inner + "}" * depth),
+            ("a hash that holds a nested value", '{"a.lock": ' + "[" * depth + inner + "]" * depth + "}"),
+        ):
+            with self.subTest(label):
+                # The premise: the decoder gives up on this value with the error that the refusal must catch.
+                with self.assertRaises(RecursionError):
+                    json.loads(stored)
+                connection = sqlite3.connect(self.state.path)
+                try:
+                    connection.execute("UPDATE image_builds SET basis_file_hashes = ? WHERE id = 'build-1'", (stored,))
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(StateRefusal) as raised:
+                    build_file_hashes(self.state.build("build-1"))
+                self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+                self.assertIn("build-1", raised.exception.detail)
+                self.assertNotIn(sentinel, raised.exception.detail)
+                self.assertNotIn(sentinel, repr(raised.exception.as_dict()))
+
+    def store_hashes(self, value, *, as_text):
+        """Write ``value`` (bytes) into the hash column of every row, as a text value or as a blob.
+
+        A file that something else damaged can hold either. A text value is cast, because SQLite stores the bytes of
+        a cast without checking that they are UTF-8.
+        """
+        expression = "CAST(? AS TEXT)" if as_text else "?"
+        connection = sqlite3.connect(self.state.path)
+        try:
+            connection.execute(f"UPDATE image_builds SET basis_file_hashes = {expression}", (value,))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def assert_sqlite_will_not_hand_the_hashes_over(self):
+        """The premise of the tests of text that is no UTF-8: it is stored as text, and Python cannot read it."""
+        connection = sqlite3.connect(self.state.path)
+        try:
+            kinds = {kind for (kind,) in connection.execute("SELECT typeof(basis_file_hashes) FROM image_builds")}
+            self.assertEqual(kinds, {"text"})
+            with self.assertRaises(sqlite3.OperationalError):
+                connection.execute("SELECT basis_file_hashes FROM image_builds").fetchall()
+        finally:
+            connection.close()
+
+    def assert_refused_by_row_and_never_echoed(self, build, marker):
+        with self.assertRaises(StateRefusal) as raised:
+            build_file_hashes(build)
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_UNREADABLE")
+        self.assertIn(build.id, raised.exception.detail)
+        self.assertNotIn(marker, raised.exception.detail)
+        self.assertNotIn(marker, repr(raised.exception.as_dict()))
+
+    def test_stored_hashes_that_are_not_utf8_text_are_refused_by_row_and_never_echoed(self):
+        # SQLite hands text to Python decoded, and raises its own error for text that is no UTF-8. The read of the row
+        # must not raise it, or the refusal of the row never gets its turn and the command line reports UNEXPECTED.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        marker = "marker-before-the-bad-byte"
+        self.store_hashes(marker.encode() + b"\xff", as_text=True)
+        self.assert_sqlite_will_not_hand_the_hashes_over()
+        self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), marker)
+
+    def test_every_reader_of_a_build_row_gives_a_row_whose_stored_hashes_are_not_utf8_text(self):
+        # The column is part of every row that a reader of the table gives, so each of them meets the damage.
+        self.add_build("owed", basis_file_hashes=GOOD_HASHES)
+        self.end("owed", "failed", archive_bucket="example-bucket", archive_key="prefix/owed.tar.gz")
+        self.add_build("candidate", basis_file_hashes=GOOD_HASHES)
+        self.end("candidate", "candidate", template_version=7)
+        with self.state.transaction():
+            self.state.record_verification(
+                "candidate", image_state="available", template_version_exists=1, drift_result="clean", verified_at=1.0
+            )
+        self.add_build("active", basis_file_hashes=GOOD_HASHES)
+        marker = "marker-before-the-bad-byte"
+        self.store_hashes(marker.encode() + b"\xff", as_text=True)
+        self.assert_sqlite_will_not_hand_the_hashes_over()
+        deployment = "example-deployment"
+        readers = {
+            "build": (lambda: [self.state.build("owed")], ["owed"]),
+            "active_build": (lambda: [self.state.active_build(deployment)], ["active"]),
+            "builds": (lambda: self.state.builds(deployment), ["owed", "candidate", "active"]),
+            "archives_owed": (lambda: self.state.archives_owed(deployment), ["owed"]),
+            "last_build": (lambda: [self.state.last_build(deployment)], ["active"]),
+            "last_failed_build": (lambda: [self.state.last_failed_build(deployment)], ["owed"]),
+            "candidate": (lambda: [self.state.candidate(deployment)], ["candidate"]),
+            "verified_candidate": (lambda: [self.state.verified_candidate(deployment)], ["candidate"]),
+            "version_owner": (lambda: [self.state.version_owner(deployment, 7)], ["candidate"]),
+        }
+        for name, (read, wanted) in readers.items():
+            with self.subTest(reader=name):
+                rows = read()
+                self.assertEqual([row.id for row in rows], wanted)
+                for row in rows:
+                    self.assert_refused_by_row_and_never_echoed(row, marker)
+
+    def test_stored_hashes_that_are_valid_utf8_text_with_non_ascii_characters_still_read(self):
+        # The control of the tests above: only text that is no UTF-8 is damage. A path with other characters is not.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        hashes = {"déjà-vu.lock": "e" * 64}
+        self.store_hashes(json.dumps(hashes, ensure_ascii=False).encode("utf-8"), as_text=True)
+        self.assertEqual(build_file_hashes(self.state.build("build-1")), hashes)
+
+    def test_hashes_stored_as_a_blob_are_refused_by_row_even_when_the_bytes_are_valid_json(self):
+        # Only text is accepted, as before: a value of another type is damage, whatever its bytes say.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        marker = "marker-path.lock"
+        self.store_hashes(json.dumps({marker: "e" * 64}).encode("utf-8"), as_text=False)
+        self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), marker)
+
+    # -- a stored map with a path the configuration could never produce, or one name twice ------------------------
+    # The map is read back as the record of the inputs of the build. A path that no ``image.source.basis_paths`` can
+    # hold would pass the digest check as a changed set of paths, which ends the row and deletes its archive, and a
+    # name that two members share is read as its last member, so that a damaged first value is never seen.
+
+    def store_text(self, text):
+        self.store_hashes(text.encode("utf-8"), as_text=True)
+
+    def test_the_refused_paths_are_the_ones_the_configuration_refuses_and_the_accepted_paths_the_ones_it_takes(self):
+        # The premise of the tests below: the rules of a stored path are the rules of the configuration.
+        for path in REFUSED_PATHS:
+            with self.subTest(refused=path):
+                self.assertFalse(configuration_accepts(path))
+        for path in ACCEPTED_PATHS:
+            with self.subTest(accepted=path):
+                self.assertTrue(configuration_accepts(path))
+
+    def test_a_stored_path_that_the_configuration_refuses_is_refused_by_row_and_never_echoed(self):
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        for path in REFUSED_PATHS:
+            for shape, hashes in (("alone", {path: "e" * 64}), ("among valid paths", {**GOOD_HASHES, path: "e" * 64})):
+                with self.subTest(path=path, shape=shape):
+                    self.store_text(json.dumps(hashes))
+                    self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_a_stored_empty_path_is_still_refused_by_row(self):
+        # The check that the rules of the configuration replace: a name is text, and JSON gives no other kind.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        for label, stored in (
+            ("alone", '{"": "' + "e" * 64 + '"}'),
+            ("among valid paths", '{"a.lock": "' + "e" * 64 + '", "": "' + "e" * 64 + '"}'),
+        ):
+            with self.subTest(label):
+                self.store_text(stored)
+                self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_a_stored_map_of_more_paths_than_the_configuration_takes_is_refused_by_row(self):
+        # The configuration takes a list of at most so many paths, so a map of more is not one that it produced. The
+        # control is the largest map that it takes, which still reads.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        for count, readable in ((32, True), (33, False)):
+            hashes = {f"file-{number:02d}.lock": "e" * 64 for number in range(count)}
+            with self.subTest(count=count):
+                self.assertEqual(configuration_accepts(*hashes), readable)
+                self.store_text(json.dumps(hashes, sort_keys=True))
+                if readable:
+                    self.assertEqual(build_file_hashes(self.state.build("build-1")), hashes)
+                else:
+                    self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_a_stored_map_that_names_a_path_twice_is_refused_by_row_and_never_echoed(self):
+        # ``json.loads`` keeps the last of the members that share a name: a first value that is no hash would pass
+        # unseen, and the map would pass for one that it is not.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        valid, invalid, other = "e" * 64, "E" * 64, "f" * 64
+        name = MARKER + ".lock"
+        for label, members in (
+            ("an invalid hash first and a valid one last", [(name, invalid), (name, valid)]),
+            ("a valid hash first and an invalid one last", [(name, valid), (name, invalid)]),
+            ("two valid hashes", [(name, valid), (name, other)]),
+            ("one hash twice", [(name, valid), (name, valid)]),
+            ("among other paths", [("a.lock", valid), (name, valid), ("b.lock", other), (name, other)]),
+        ):
+            with self.subTest(label):
+                self.store_text("{" + ", ".join(f'"{path}": "{digest}"' for path, digest in members) + "}")
+                self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_a_stored_map_that_spells_one_path_two_ways_is_refused_by_row_and_never_echoed(self):
+        # The decoder reads both names as one path, so the hook sees the same name twice.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        valid, invalid = "e" * 64, "E" * 64
+        spelled_out = "".join(f"\\u{ord(character):04x}" for character in MARKER)
+        for label, stored in (
+            ("one escaped letter", f'{{"{MARKER}": "{invalid}", "{MARKER[:-1]}\\u{ord(MARKER[-1]):04x}": "{valid}"}}'),
+            ("every letter escaped", f'{{"{MARKER}": "{invalid}", "{spelled_out}": "{valid}"}}'),
+        ):
+            with self.subTest(label):
+                premise = json.loads(stored, object_pairs_hook=lambda pairs: [path for path, _ in pairs])
+                self.assertEqual(premise, [MARKER, MARKER])
+                self.store_text(stored)
+                self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_a_lone_surrogate_is_a_path_that_the_rules_of_the_configuration_do_not_name_and_its_file_cannot_spell(self):
+        # The premise of the tests below: the rules of ``basis_paths`` take these paths, and the TOML file cannot hold
+        # them, so only a check of the stored map can say that a map which holds one is damaged.
+        for path in UNENCODABLE_PATHS:
+            with self.subTest(path=path):
+                self.assertTrue(configuration_accepts(path))
+                with self.assertRaises(UnicodeEncodeError):
+                    path.encode("utf-8")
+                text = json.dumps({path: "e" * 64})
+                self.assertTrue(text.isascii())
+                self.assertEqual(json.loads(text), {path: "e" * 64})
+        for spelled in ('"\\ud83d"', '"\\ude00"', '"\\ud83d\\ude00"'):
+            with self.subTest(toml=spelled), self.assertRaises(tomllib.TOMLDecodeError):
+                tomllib.loads(f"path = {spelled}")
+
+    def test_a_stored_path_that_is_no_text_in_utf8_is_refused_by_row_and_never_echoed(self):
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        for path in UNENCODABLE_PATHS:
+            for shape, hashes in (("alone", {path: "e" * 64}), ("among valid paths", {**GOOD_HASHES, path: "e" * 64})):
+                with self.subTest(path=path, shape=shape):
+                    self.store_text(json.dumps(hashes))
+                    self.assert_refused_by_row_and_never_echoed(self.state.build("build-1"), MARKER)
+
+    def test_stored_maps_of_distinct_paths_that_the_configuration_takes_still_read(self):
+        # The control of the tests above: nothing that a build can write changes how it reads.
+        self.add_build(basis_file_hashes=GOOD_HASHES)
+        for path in ACCEPTED_PATHS:
+            hashes = {path: "e" * 64, "z-file.lock": "f" * 64}
+            for ascii_only in (True, False):
+                with self.subTest(path=path, ascii_only=ascii_only):
+                    self.store_text(json.dumps(hashes, ensure_ascii=ascii_only, sort_keys=True))
+                    self.assertEqual(build_file_hashes(self.state.build("build-1")), hashes)
+        every_path = {path: "e" * 64 for path in ACCEPTED_PATHS}
+        self.store_text(json.dumps(every_path, sort_keys=True))
+        self.assertEqual(build_file_hashes(self.state.build("build-1")), every_path)
+
+    def test_the_insert_refuses_a_path_that_the_configuration_refuses(self):
+        for path in REFUSED_PATHS:
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError) as raised:
+                    self.add_build("build-bad", basis_file_hashes={path: "e" * 64})
+                self.assertNotIn(MARKER, str(raised.exception))
+        self.assertIsNone(self.state.build("build-bad"))
+
+    def test_the_insert_refuses_a_path_that_is_no_text_at_all(self):
+        # The insert has no type check of its own: ``_image_basis_paths`` takes only text paths. The second map names
+        # ``"1"`` once as text and once as the number 1, which ``json.dumps`` would write as one name.
+        refused = (
+            {1: "e" * 64},
+            {1: "e" * 64, "1": "e" * 64},
+            {None: "e" * 64},
+            {b"x.lock": "e" * 64},
+            {},
+        )
+        for hashes in refused:
+            with self.subTest(hashes=hashes):
+                with self.assertRaises(ValueError) as raised:
+                    self.add_build("build-bad", basis_file_hashes=hashes)
+                self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(self.state.build("build-bad"))
+
+    def test_the_insert_refuses_a_path_that_is_no_text_in_utf8_and_does_not_echo_it(self):
+        for path in UNENCODABLE_PATHS:
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError) as raised:
+                    self.add_build("build-bad", basis_file_hashes={path: "e" * 64})
+                self.assertNotIn(MARKER, str(raised.exception))
+                # ``str.encode`` raises an error that names the character, and it is not the one that leaves.
+                self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(self.state.build("build-bad"))
+
+    def test_the_insert_writes_every_accepted_path_once_and_the_row_reads_back(self):
+        for number, path in enumerate(ACCEPTED_PATHS):
+            with self.subTest(path=path):
+                hashes = {path: "e" * 64, "z-file.lock": "f" * 64}
+                built = self.add_build(f"build-{number}", basis_file_hashes=hashes)
+                # Decoded with a hook that sees every member, the stored text names each path once.
+                members = json.loads(built.basis_file_hashes, object_pairs_hook=lambda pairs: pairs)
+                self.assertEqual(sorted(name for name, _ in members), sorted(hashes))
+                self.assertEqual(build_file_hashes(self.state.build(f"build-{number}")), hashes)
+                self.end(f"build-{number}")
+
+    def test_the_insert_refuses_two_paths_that_the_json_text_would_give_one_name(self):
+        # The only way for a dict to give two members of one name: ``json.dumps`` writes a lone high surrogate that
+        # a lone low surrogate follows as the pair of one astral character, which another path is. The configuration
+        # cannot produce either of them (its file is UTF-8 and the surrogate has no UTF-8 form), and the insert refuses
+        # a path that is no text in UTF-8, so the text that it writes never names a path twice.
+        pair = chr(0xD83D) + chr(0xDE00)
+        astral = chr(0x1F600)
+        self.assertNotEqual(pair, astral)
+        hashes = {pair: "e" * 64, astral: "f" * 64}
+        self.assertEqual(json.dumps(hashes).count('"\\ud83d\\ude00"'), 2)
+        with self.assertRaises(ValueError):
+            self.add_build("build-bad", basis_file_hashes=hashes)
+        self.assertIsNone(self.state.build("build-bad"))
+
+    def test_an_archive_is_owed_by_a_finished_build_that_names_one_and_has_no_deletion_time(self):
+        self.add_build("build-1", basis_file_hashes=GOOD_HASHES)
+        self.state.advance_build("build-1", archive_bucket="example-bucket", archive_key="prefix/build-1.tar.gz")
+        # A build in flight owes nothing yet.
+        self.assertEqual(self.state.archives_owed("example-deployment"), [])
+        ended = self.end("build-1", reason_code="CONSOLE_BLIND")
+        self.assertEqual(self.state.archives_owed("example-deployment"), [ended])
+        self.assertEqual(self.state.archives_owed("another-deployment"), [])
+        self.clock.advance(60)
+        deleted = self.state.mark_archive_deleted("build-1", self.clock())
+        self.assertEqual(deleted.archive_deleted_at, self.clock())
+        # Only the deletion time changes: ``updated_at`` is the end of the build, which ``promote`` reports.
+        self.assertEqual(deleted.updated_at, ended.updated_at)
+        self.assertEqual(self.state.archives_owed("example-deployment"), [])
+
+    def test_every_terminal_state_owes_and_a_row_with_no_key_owes_nothing(self):
+        for number, state in enumerate(("failed", "candidate", "promoted")):
+            build_id = f"build-{number}"
+            self.add_build(build_id)
+            self.state.advance_build(build_id, archive_bucket="example-bucket", archive_key=f"prefix/{build_id}.tar.gz")
+            self.end(build_id, state=state)
+            self.clock.advance(1)
+        self.add_build("build-none")
+        self.end("build-none")
+        self.assertEqual([row.id for row in self.state.archives_owed("example-deployment")], ["build-0", "build-1", "build-2"])
+
+    def test_marking_an_unknown_row_is_refused(self):
+        with self.assertRaises(StateRefusal) as raised:
+            self.state.mark_archive_deleted("missing", 1.0)
+        self.assertEqual(raised.exception.reason, "IMAGE_BUILD_UNKNOWN")
+        with self.assertRaises(StateRefusal) as raised:
+            self.state.mark_archive_delete_tried("missing", 1.0)
+        self.assertEqual(raised.exception.reason, "IMAGE_BUILD_UNKNOWN")
+
+    def owed_rows(self, count=4):
+        for number in range(count):
+            build_id = f"build-{number}"
+            self.add_build(build_id)
+            self.state.advance_build(build_id, archive_bucket="example-bucket", archive_key=f"prefix/{build_id}.tar.gz")
+            self.end(build_id)
+            self.clock.advance(1)
+        return lambda: [row.id for row in self.state.archives_owed("example-deployment")]
+
+    def test_the_owed_rows_come_never_tried_first_then_by_the_place_of_their_last_attempt_then_oldest(self):
+        ids = self.owed_rows()
+        self.assertEqual(ids(), ["build-0", "build-1", "build-2", "build-3"])
+        ended = self.state.build("build-0")
+        self.assertIsNone(ended.archive_delete_seq)
+        tried = self.state.mark_archive_delete_tried("build-0", 500.0)
+        self.assertEqual((tried.archive_delete_tried_at, tried.archive_delete_seq), (500.0, 1))
+        # Only the attempt changes: ``updated_at`` is the end of the build, which ``promote`` reports.
+        self.assertEqual(tried.updated_at, ended.updated_at)
+        self.assertEqual(ids(), ["build-1", "build-2", "build-3", "build-0"])
+        self.state.mark_archive_delete_tried("build-1", 400.0)
+        self.assertEqual(ids(), ["build-2", "build-3", "build-0", "build-1"])
+        self.state.mark_archive_delete_tried("build-0", 600.0)
+        self.assertEqual(ids(), ["build-2", "build-3", "build-1", "build-0"])
+
+    def test_the_place_of_an_attempt_is_one_more_than_the_largest_whatever_the_time_says(self):
+        ids = self.owed_rows(3)
+        places = []
+        # The times go backward, and one is far in the future: the order of the attempts is the order of the calls.
+        for build_id, tried_at in (("build-2", 9e9), ("build-0", 10.0), ("build-1", -5.0), ("build-2", 1.0)):
+            row = self.state.mark_archive_delete_tried(build_id, tried_at)
+            places.append((build_id, row.archive_delete_seq, row.archive_delete_tried_at))
+        self.assertEqual(
+            places, [("build-2", 1, 9e9), ("build-0", 2, 10.0), ("build-1", 3, -5.0), ("build-2", 4, 1.0)]
+        )
+        self.assertEqual(ids(), ["build-0", "build-1", "build-2"])
+
+    def test_the_owner_of_an_archive_is_written_with_the_bucket_and_is_none_until_then(self):
+        self.add_build("build-1")
+        self.assertIsNone(self.state.build("build-1").archive_owner)
+        row = self.state.advance_build(
+            "build-1", archive_bucket="example-bucket", archive_owner="111122223333", archive_key="prefix/build-1.tar.gz"
+        )
+        self.assertEqual((row.archive_bucket, row.archive_owner), ("example-bucket", "111122223333"))
+
+
 class SingleFlightTests(ImageStateCase):
     def test_the_index_is_partial_and_keyed_on_the_deployment(self):
         connection = sqlite3.connect(self.state.path)
@@ -292,6 +787,21 @@ class LifecycleTests(ImageStateCase):
             ImageState(self.directory).connect()
         self.assertEqual(raised.exception.reason, "IMAGE_STATE_VERSION_UNSUPPORTED")
         self.assertEqual(raised.exception.detail, f"schema {SCHEMA_VERSION + 1}")
+        self.assertEqual(sha256_of(self.state.path), before)
+
+    def test_a_schema_one_file_is_refused_and_not_migrated(self):
+        self.state.close()
+        connection = sqlite3.connect(self.state.path)
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+        connection.close()
+        before = sha256_of(self.state.path)
+        with self.assertRaises(StateRefusal) as raised:
+            ImageState(self.directory).connect()
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("IMAGE_STATE_VERSION_UNSUPPORTED", "schema 1"))
+        with self.assertRaises(StateRefusal) as raised:
+            ImageState(self.directory).connect_readonly()
+        self.assertEqual(raised.exception.reason, "IMAGE_STATE_VERSION_UNSUPPORTED")
         self.assertEqual(sha256_of(self.state.path), before)
 
     def test_a_corrupt_file_is_refused_by_name(self):

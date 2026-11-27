@@ -180,12 +180,63 @@ A build MUST start only when the digest differs from the pin's tag and the minim
 - **AND** `run --apply --force` skips the interval but still applies the daily cap
 
 ### Requirement: The source archive is staged privately, bounded and deleted
-The command MUST stream the archive for the resolved sha through a hashing wrapper into a multipart upload under the configured bucket and prefix, and MUST NOT write the archive to disk. The size cap `source.max_archive_bytes` MUST abort the upload and delete the object. When a build whose row records an archive key ends, the command MUST make one delete call for it; docs MUST name the bucket lifecycle rule a backstop only. The command MUST NOT create the bucket or change its configuration.
+The command MUST stream the archive for the resolved sha through a hashing wrapper into a multipart upload under the configured bucket and prefix, never to disk. The size cap `source.max_archive_bytes` MUST abort the upload and delete the object. The row MUST record the bucket and key before the upload, and a stage done again MUST use them. A deletion MUST stay owed until it succeeds; the lifecycle rule is a backstop. The command MUST NOT create or configure the bucket.
+
+#### Scenario: The key is recorded before the upload
+- **WHEN** a pass stages the archive of a new build
+- **THEN** the row names the bucket and the key before the multipart upload is created
+- **AND** the row records `archive_sha256` only once the upload has finished
+
+#### Scenario: A pass stops after the upload and before it records it
+- **WHEN** the object is stored, the pass stops before it records the archive hash, and the next pass ends the row without staging it again (a withdrawn gate, a changed input or the build deadline)
+- **THEN** the pass deletes the object that the row names and records `archive_deleted_at`
+- **AND** no failure is counted for the deletion
+
+#### Scenario: The prefix changes after a pass stopped
+- **WHEN** the configured prefix or bucket changes between the pass that stored the object and the pass that ends the row
+- **THEN** the object at the recorded bucket and key is deleted, and the listing of the new prefix is not what finds it
+
+#### Scenario: A stage done again keeps the recorded key
+- **WHEN** a pass stages again a row that records a bucket and a key, and the configured bucket or prefix differs
+- **THEN** the upload, the presigned URL and the later delete all use the recorded bucket and key
+
+#### Scenario: The lifecycle rule is a backstop only
+- **WHEN** docs describe how a staged archive is removed
+- **THEN** they name the deletion by the pass first and the bucket lifecycle rule a backstop only
 
 #### Scenario: The delete at a terminal state is refused
 - **WHEN** a build reaches a terminal state and the provider refuses the delete of its archive
 - **THEN** the pass notes `archive:delete_failed` and the row keeps its terminal state
-- **AND** the deletion counts as unconfirmed, not as done, and the bucket lifecycle rule stays the backstop
+- **AND** the deletion stays owed, with `archive_deleted_at` empty, and the bucket lifecycle rule stays the backstop
+
+#### Scenario: A backlog of owed deletions is bounded
+- **WHEN** more archive deletions are owed than one pass may start, or refused deletions take the time that the pass leaves
+- **THEN** the pass starts at most 8 deletions after its own work, and none once the pass deadline is less than 40 seconds away (the read timeout of the SDK client plus a margin), reading the clock before each
+- **AND** the pass notes `archive:delete_deferred`, and a row whose deletion this pass attempted is not tried again in it, whatever the clock says
+
+#### Scenario: The owed deletions come after the work of the pass
+- **WHEN** a finished build owes an archive deletion that times out and the pass has a decision, a stage or a build to run
+- **THEN** the pass does that work first, so the row insert and the stage fit the pass, and the owed deletion runs on the time that is left or is deferred
+
+#### Scenario: A pass that ends on a refusal still retries the owed deletions
+- **WHEN** a pass ends on a refused provider read, such as the listing of builders of an overdue build
+- **THEN** the owed deletions still run in the tail of the pass, at the bucket and key that their rows record, and set `archive_deleted_at`
+- **AND** the refusal that ended the pass is raised unchanged, and a failure of the tail replaces neither it nor the result
+
+#### Scenario: A refused deletion takes its turn
+- **WHEN** an owed deletion is refused
+- **THEN** the row takes the next place in `archive_delete_seq`, one more than the largest place of any row, and records the attempt time (`archive_delete_tried_at`) for diagnosis only
+- **AND** the next pass tries the rows never tried first, then the rows by `archive_delete_seq`, then the oldest
+- **AND** a deletion that stays refused does not keep another owed row from being deleted, and a clock that steps back changes none of this
+
+#### Scenario: A cancellation starts no deletion
+- **WHEN** a pass is cancelled (a `BaseException` that is no `Exception`, such as `KeyboardInterrupt`) while an archive deletion is owed
+- **THEN** no owed deletion starts and the cancellation propagates unchanged
+
+#### Scenario: A refused or deferred deletion stays visible
+- **WHEN** a pass ends on a refusal, or returns, and an owed deletion was refused or deferred
+- **THEN** the pass writes an `image_reconciled` event with the counts `owed_archives_deleted`, `owed_archive_delete_failed` and `owed_archives_deferred`, and no key or bucket name
+- **AND** a refusal that ended the pass is raised unchanged
 
 #### Scenario: The archive exceeds the cap
 - **WHEN** the streamed bytes pass `source.max_archive_bytes`
@@ -196,9 +247,28 @@ The command MUST stream the archive for the resolved sha through a hashing wrapp
 - **WHEN** a part upload fails
 - **THEN** the upload is aborted and no builder is launched
 
+#### Scenario: The role moves to another account
+- **WHEN** a pass runs in an account other than the `archive_owner` of a row, or the row records no owner, and a bucket of the recorded name exists in the new account
+- **THEN** no S3 call is made about the archive of that row
+- **AND** a stage done again ends the row `failed` with `IMAGE_STAGING_OWNER_CHANGED`, counts no failure and answers `refused`
+- **AND** an owed deletion counts as failed, the row stays owed and is never marked deleted
+
+#### Scenario: A staging call is bound to the account that owns the bucket
+- **WHEN** a pass makes an S3 call against a staging bucket: the upload, its abort, a delete or a listing
+- **THEN** the call names the account of the image identity as the expected bucket owner, read once per pass from `GetCallerIdentity`, and no call goes out without it
+- **AND** the row records that account as `archive_owner` with the bucket and the key, and a stage done again and every delete of the archive name the recorded owner
+- **AND** the presigned GET of the archive signs the recorded owner, and the builder sends it as the `x-amz-expected-bucket-owner` header (`WARM_SRC_OWNER`)
+- **AND** an `AccessDenied` answer sends nothing more and gives `IMAGE_STAGING_BUCKET_DENIED`: when neither deadline has passed as it returns, a stage done again ends its row as a refused start with no failure counted and a first stage fails the build; a refused delete counts as failed and stays owed
+
+#### Scenario: The bucket does not exist
+- **WHEN** S3 answers `NoSuchBucket` to the upload of an archive, for instance because the bucket that a row recorded was removed
+- **THEN** the upload ends with `IMAGE_STAGING_BUCKET_MISSING`
+- **AND** when neither deadline has passed as the answer returns, a stage done again ends its row as a refused start with no failure counted, keeps the archive fields of the row and marks it deleted only when the delete of its archive succeeds
+- **AND** when neither deadline has passed as the answer returns, a first stage fails the build; an owed deletion at that bucket counts as failed and stays owed
+
 #### Scenario: The build ends
 - **WHEN** a build whose row records an archive key reaches `candidate` or `failed`
-- **THEN** the pass makes one delete call for that key
+- **THEN** the pass deletes the object at the recorded bucket and key and records `archive_deleted_at`
 
 ### Requirement: The archive key joins the prefix and the build id with one slash
 The archive key MUST be the configured prefix, exactly one `/` and `<build-id>.tar.gz`, whether the configured prefix ends with no slash, one slash or several. The listing of stray archives MUST use the same prefix with its one slash, so that it never reaches a sibling prefix.
@@ -216,7 +286,7 @@ The archive key MUST be the configured prefix, exactly one `/` and `<build-id>.t
 - **THEN** reconcile does not list or delete it
 
 ### Requirement: Credentials and URLs are not persisted
-The presigned archive URL, tokens, rendered user data and raw provider payloads MUST NOT appear in logs, events, the state file, command output or error messages. The command MUST NOT presign when the credential session has less remaining life than `source.presign_seconds` and MUST refuse with `IMAGE_CREDENTIAL_SHORT`. The URL MUST exist only in the rendered user data in memory.
+The presigned archive URL, tokens, rendered user data and raw provider payloads MUST NOT appear in logs, events, the state file, command output or error messages. The command MUST NOT presign when the credential session has less remaining life than `source.presign_seconds` and MUST refuse with `IMAGE_CREDENTIAL_SHORT`, unless a deadline has passed first. The URL MUST exist only in the rendered user data in memory.
 
 #### Scenario: A build runs
 - **WHEN** a pass presigns, launches and fails
@@ -328,15 +398,19 @@ At most one builder MUST exist for a deployment. A unique index keyed on the dep
 - **THEN** the AWS precheck refuses the launch
 
 ### Requirement: A refused start is not a failed build
-A refused start MUST NOT count as a failed build. The refusal itself MUST add no failure, start no cooldown and set no `blocked`, and a clearing that the trigger decision already made MUST stay. A refusal before the build row exists MUST write no row and no archive. A refusal once the row exists MUST end the row as `failed` with the refusal code and MUST try to delete its archive. Such a row MUST still count toward `max_builds_per_day` and `min_build_interval_seconds`.
+A refused start MUST NOT count as a failed build. The refusal MUST add no failure, start no cooldown and set no `blocked`, and a clearing that the trigger decision already made MUST stay. A refusal before the build row exists MUST write no row and no archive. A refusal once the row exists, with neither deadline passed, MUST end the row as `failed` with the refusal code and MUST try to delete its archive. Such a row MUST still count toward `max_builds_per_day` and `min_build_interval_seconds`.
 
 #### Scenario: A check refuses before the row exists
 - **WHEN** the session has less life than `presign_seconds`, or a builder of the deployment exists, before the build row is written
 - **THEN** the pass answers `refused` with `IMAGE_CREDENTIAL_SHORT` or `IMAGE_BUILD_ALREADY_ACTIVE`
 - **AND** it writes no build row and no archive and counts no failure
 
+#### Scenario: The session runs short after the pass deadline, before the row exists
+- **WHEN** the read of the build template of a new start ends at or after the pass deadline, and the session then has less life than `presign_seconds`
+- **THEN** the pass ends with `pass_deadline_exceeded`, not `refused`, and writes no build row and no archive
+
 #### Scenario: The template precheck refuses
-- **WHEN** the template precheck refuses a start
+- **WHEN** the template precheck refuses a start, and the read that refused it returns before the pass deadline
 - **THEN** the pass ends with that refusal, writes no build row and no archive and counts no failure
 
 #### Scenario: A clearing comes before the refusal
@@ -345,17 +419,37 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **AND** the refusal adds no failure and starts no cooldown
 
 #### Scenario: The session runs short during the upload
-- **WHEN** the build row exists and the session has less life than `presign_seconds` once the archive is staged
+- **WHEN** the build row exists and the session has less life than `presign_seconds` once the archive is staged, and neither deadline has passed when the presign refuses
 - **THEN** the row ends `failed` with `IMAGE_CREDENTIAL_SHORT`, the pass tries to delete its archive and no builder is launched
 - **AND** the pass answers `refused` and counts no failure
 
+#### Scenario: The session runs short and only the pass deadline has passed
+- **WHEN** the upload ends at or after the pass deadline and before the build deadline, and the session has less life than `presign_seconds`
+- **THEN** the launch presigns nothing and no builder is launched, and the row stays `building` with no builder and no `archive_sha256`
+- **AND** the pass counts no failure, keeps the archive, and the next pass stages the build again
+
+#### Scenario: The session runs short and the build deadline has passed
+- **WHEN** the upload ends at or after the build deadline, and the session has less life than `presign_seconds`
+- **THEN** the launch presigns nothing, no builder is launched and the row ends `failed` with `CONSOLE_BLIND`, not `IMAGE_CREDENTIAL_SHORT`
+- **AND** the pass tries to delete the archive that the row names
+
+#### Scenario: The session runs short during the checks of a resumed stage and only the pass deadline has passed
+- **WHEN** a pass stages again a build, the read of the build template ends at or after the pass deadline and before the build deadline, and the session then has less life than `presign_seconds`
+- **THEN** the pass checks no credential and launches nothing, and the row stays `building` with no builder and no `archive_sha256`, not `failed` with `IMAGE_CREDENTIAL_SHORT`
+- **AND** the pass counts no failure, deletes no archive, and the next pass stages the build again
+
+#### Scenario: The session runs short during the checks of a resumed stage and the build deadline has passed
+- **WHEN** a pass stages again a build, the read of the build template ends at or after the build deadline, whether or not the pass deadline has passed, and the session then has less life than `presign_seconds`
+- **THEN** no builder is launched and the row ends `failed` with `CONSOLE_BLIND`, not `IMAGE_CREDENTIAL_SHORT`
+- **AND** the pass counts the failure and tries to delete the archive that the row names
+
 #### Scenario: A builder appears before the launch
-- **WHEN** a builder of the deployment exists at the check before the launch call
+- **WHEN** a builder of the deployment exists at the check before the launch call, and the build deadline has not passed when that check starts
 - **THEN** the row ends `failed` with `IMAGE_BUILD_ALREADY_ACTIVE`, the pass tries to delete its archive and no builder is launched
 - **AND** the pass answers `refused`, counts no failure and leaves that builder to the next pass's reconcile
 
 #### Scenario: A resumed stage is refused
-- **WHEN** a pass stages again a build that has no builder and no staged archive, and the check before the upload refuses
+- **WHEN** a pass stages again a build that has no builder and no staged archive, the check before the upload refuses, and neither deadline has passed when the check returns
 - **THEN** the row ends `failed` with the refusal code and the pass tries to delete any archive that the row names
 - **AND** no new upload is made and no failure is counted
 
@@ -363,8 +457,73 @@ A refused start MUST NOT count as a failed build. The refusal itself MUST add no
 - **WHEN** a build row has ended by a refusal
 - **THEN** it counts toward `max_builds_per_day` and `min_build_interval_seconds` like any other row
 
+### Requirement: A deadline decides before the outcome of a call that takes time
+A deadline MUST decide before the outcome of any call that takes time. In a new start, a stage done again and the launch, the pass MUST read both deadlines again when the read of the template, the lookup of the credential, the upload, the presign, the listing of the builders or the inputs or gate check of a stage done again returns, before it inserts a row, uploads, launches or ends a row. The build deadline MUST decide first. This requirement does not decide a listing that shows a builder.
+
+#### Scenario: A late listing of a new start writes no row
+- **WHEN** the listing of the builders in the start checks of a new start shows no builder and returns at or after the pass deadline
+- **THEN** the pass ends with `pass_deadline_exceeded`, not `refused`, and writes no build row and no archive
+- **AND** no upload starts and no failure is counted
+
+#### Scenario: A late refusal of the listing in a new start
+- **WHEN** the provider refuses the listing of the builders in the start checks of a new start, and the refusal returns at or after the pass deadline
+- **THEN** the pass ends with `pass_deadline_exceeded`, not with the code of the provider, and writes no build row and no archive
+- **AND** no upload starts and no failure is counted
+
+#### Scenario: A late lookup of the credential in a new start
+- **WHEN** the lookup of the credential in the start checks of a new start returns at or after the pass deadline, whether it answers or refuses with `IMAGE_CREDENTIAL_SHORT`
+- **THEN** the pass ends with `pass_deadline_exceeded`, not `refused`, and writes no build row and no archive
+
+#### Scenario: The checks of a new start return before the pass deadline
+- **WHEN** the lookup of the credential and the listing of the builders in the start checks of a new start return before the pass deadline
+- **THEN** the checks answer as they find: the build row is written, the start is refused with `IMAGE_CREDENTIAL_SHORT`, or the pass ends with the refusal that the provider gave to the listing
+
+#### Scenario: A late listing before the upload of a resumed stage, the pass deadline only
+- **WHEN** a pass stages again a build, and the listing of the builders in the start checks returns at or after the pass deadline and before the build deadline, whether it shows no builder or the provider refuses it
+- **THEN** no upload starts and the row stays `building` with no builder and no `archive_sha256`
+- **AND** the pass counts no failure, and the next pass stages the build again
+
+#### Scenario: A late listing before the upload of a resumed stage, the build deadline
+- **WHEN** a pass stages again a build, and the listing of the builders in the start checks returns at or after the build deadline, whether it shows no builder or the provider refuses it, and whether or not the pass deadline has passed
+- **THEN** no upload starts and the row ends `failed` with `CONSOLE_BLIND`, whatever S3 would answer to the upload
+- **AND** the pass counts the failure and tries to delete the archive that the row names
+
+#### Scenario: A late lookup of the credential in a resumed stage
+- **WHEN** a pass stages again a build, and the lookup of the credential returns, with a session that has less life than `presign_seconds`, at or after a deadline
+- **THEN** at or after the build deadline the row ends `failed` with `CONSOLE_BLIND` and the pass counts the failure
+- **AND** at or after the pass deadline only, the row stays `building`, the pass counts no failure and deletes no archive
+- **AND** no upload starts and no builder is launched
+
+#### Scenario: A late presign
+- **WHEN** the lookup of the credential in the presign of the launch returns at or after a deadline, whether it answers or refuses with `IMAGE_CREDENTIAL_SHORT`
+- **THEN** no builder is launched and the listing of the builders is not asked for
+- **AND** at or after the build deadline the row ends `failed` with `CONSOLE_BLIND`
+- **AND** at or after the pass deadline only, the row stays `building` with no `archive_sha256`, and its archive is kept
+
+#### Scenario: A late refusal of the upload
+- **WHEN** the upload of a stage done again ends with a refusal that S3 gave for the bucket, at or after the build deadline
+- **THEN** the row ends `failed` with `CONSOLE_BLIND`, not with the code of the bucket, and the pass counts the failure
+
+#### Scenario: A late unsafe template in a new start
+- **WHEN** the read of the build template of a new start shows an unsafe template at or after the pass deadline
+- **THEN** the pass ends with `pass_deadline_exceeded`, not with `IMAGE_BUILD_TEMPLATE_UNSAFE`, and writes no build row and no archive
+
+#### Scenario: A late unsafe template in a resumed stage
+- **WHEN** the read of the build template of a stage done again shows an unsafe template at or after the build deadline
+- **THEN** the row ends `failed` with `CONSOLE_BLIND`, not with `IMAGE_BUILD_TEMPLATE_UNSAFE`, and the pass counts the failure
+
+#### Scenario: A late refusal of the last listing before the launch
+- **WHEN** the provider refuses the last listing of the builders before the launch call, and the refusal returns at or after a deadline
+- **THEN** no builder is launched
+- **AND** at or after the build deadline the row ends `failed` with `CONSOLE_BLIND`, not with the code of the provider, and the pass counts the failure
+- **AND** at or after the pass deadline only, the row stays `building` with no `archive_sha256`, its archive is kept and the pass counts no failure
+
+#### Scenario: The last listing before the launch is refused inside both deadlines
+- **WHEN** the provider refuses the last listing of the builders before the launch call, and the refusal returns before both deadlines
+- **THEN** no builder is launched and the row ends `failed` with the code of the provider
+
 ### Requirement: A stage done again launches only under the inputs of its row
-A pass that stages a build again MUST first recompute the digest over the basis files at the row's own commit, the warm and gate commands, `strip_components` and the script. If it differs from the row's, the pass MUST launch no builder and MUST end the row `failed` with `IMAGE_INPUTS_CHANGED` as a refused start: it tries to delete the archive and counts no failure. A pass whose deadline passes during those reads MUST leave the row for the next pass.
+The row MUST record the hash of each basis file when it is inserted. A pass that stages a build again MUST recompute the digest from those hashes, the warm and gate commands, `strip_components` and the script, and MUST read no basis file. With neither deadline passed as the check returns, a different digest or set of `basis_paths` MUST end the row `failed` with `IMAGE_INPUTS_CHANGED` as a refused start, and a row without valid hashes MUST raise `IMAGE_STATE_UNREADABLE`.
 
 #### Scenario: The gate command changes before the stage is done again
 - **WHEN** a build row is inserted with a gate command, the pass deadline ends its stage and the configuration then holds no gate command
@@ -384,30 +543,55 @@ A pass that stages a build again MUST first recompute the digest over the basis 
 - **THEN** the pass tries to delete that archive and makes no new upload
 - **AND** a refused delete is noted `archive:delete_failed` and the deletion is unconfirmed
 
-#### Scenario: The forge answers a basis path of the row's commit as missing
-- **WHEN** the raw-file read of a basis path at the row's commit answers that the path is missing
-- **THEN** the pass ends with `IMAGE_BASIS_PATH_MISSING`, ends no row and launches no builder
-- **AND** the row stays for the next pass, and its build deadline bounds the retries
+#### Scenario: A stage done again reads no basis file
+- **WHEN** a pass stages again a row whose inputs are unchanged, and the forge would refuse or delay every read of a basis file
+- **THEN** the pass reads no basis file, stages the archive of the row's commit and launches the builder
+
+#### Scenario: The digest formula is the one of the decision
+- **WHEN** the digest is computed from the recorded file hashes
+- **THEN** it equals the digest of the files that the decision hashed, so the tags of the image stay compatible
+
+#### Scenario: The set of basis paths changes
+- **WHEN** the configured `basis_paths` gained or lost a path since the row was inserted
+- **THEN** the row ends `failed` with `IMAGE_INPUTS_CHANGED` without a forge read, counts no failure and launches no builder
+- **AND** when a read before the check, such as the pin read, returned at or after the pass deadline and before the build deadline, the row stays `building` for the next pass instead
+
+#### Scenario: The row records no valid hashes
+- **WHEN** a pass stages again a row whose `basis_file_hashes` is empty or malformed, and neither deadline has passed
+- **THEN** the pass raises `IMAGE_STATE_UNREADABLE`, reads no file of the forge and leaves the row as it is
 
 #### Scenario: The branch head moves
 - **WHEN** the protected branch head moves after the row was inserted and the files at the row's commit still give its digest
 - **THEN** the pass stages the archive of the row's commit and launches the builder
 
-#### Scenario: A basis read fails
-- **WHEN** a read of a basis file ends with a refusal other than a missing path
-- **THEN** the pass ends with that refusal and the row stays `building` with no builder
-- **AND** no failure is counted and the next pass checks again
-
-#### Scenario: The pass deadline passes during the basis reads
-- **WHEN** the pass deadline passes while the basis files are read during a resumed stage, whether or not they show a changed input
-- **THEN** the row stays `building` with no builder and no `archive_sha256`, and it is not ended
-- **AND** no read of a basis file starts after the deadline
-- **AND** no failure is counted and the next pass checks again
-
 #### Scenario: The next pass decides from the current inputs
 - **WHEN** a row has ended with `IMAGE_INPUTS_CHANGED`
 - **THEN** the next pass decides from the current inputs like after any ended row
 - **AND** the ended row counts toward `max_builds_per_day` and `min_build_interval_seconds`
+
+### Requirement: Recorded hashes are valid only as the configuration could have produced them
+Valid hashes MUST name each path once, with a lower-case hex sha256, and MUST name only paths that `basis_paths` could hold: non-empty, no control character, no `..`, no leading `/`, text that UTF-8 encodes, and at most as many paths as it takes. A row whose hashes are not valid MUST raise `IMAGE_STATE_UNREADABLE`, MUST stay as it is and MUST NOT end as `IMAGE_INPUTS_CHANGED`. The insert MUST refuse hashes that are not valid. The error MUST name the row and MUST NOT name a path or a value.
+
+#### Scenario: The row records a path that `basis_paths` could never hold
+- **WHEN** a pass stages again a row whose `basis_file_hashes` names an empty path, or a path with a control character, a `..` or a leading `/`, or names more paths than `basis_paths` takes
+- **THEN** the pass raises `IMAGE_STATE_UNREADABLE` and does not end the row as `IMAGE_INPUTS_CHANGED`
+- **AND** the pass reads no file of the forge, deletes no archive, launches no builder and leaves the row as it is
+- **AND** the error names the row and never the path
+
+#### Scenario: The row records a path that is not text in UTF-8
+- **WHEN** a pass stages again a row whose `basis_file_hashes` names a path with a lone surrogate, which the TOML file of `basis_paths` cannot spell
+- **THEN** the pass raises `IMAGE_STATE_UNREADABLE` and does not end the row as `IMAGE_INPUTS_CHANGED`
+- **AND** the pass reads no file of the forge, deletes no archive, launches no builder and leaves the row as it is
+- **AND** the error names the row and never the path
+
+#### Scenario: The row records one path twice
+- **WHEN** a pass stages again a row whose `basis_file_hashes` holds two members with one name, whatever their values
+- **THEN** the pass raises `IMAGE_STATE_UNREADABLE`, launches no builder and leaves the row as it is
+- **AND** the error names the row and never a value
+
+#### Scenario: The insert refuses hashes that are not valid
+- **WHEN** a row is inserted with hashes that name a path that `basis_paths` could never hold, a path that is not text in UTF-8 included
+- **THEN** the insert is refused and no row is written
 
 ### Requirement: A run can supervise a build to completion
 Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run --apply --until-done` MUST repeat bounded passes with a fixed sleep between them until the build reaches `candidate` or `failed`, or the build deadline passes. Without `--until-done`, `run --apply` MUST run one pass. Rerunning the same command MUST resume an interrupted supervisor from the state file. `--until-done` MUST be refused without `--apply`.
@@ -425,7 +609,7 @@ Each pass MUST be bounded by the pass deadline and MUST be resumable. `image run
 - **THEN** the supervisor ends the build with `MARKER_TIMEOUT` or `CONSOLE_BLIND`
 
 #### Scenario: The pass deadline ends the staging
-- **WHEN** the pass deadline passes during the inputs check or the template precheck of a resumed stage, during the upload or before the launch call
+- **WHEN** the pass deadline passes during the checks before the upload of a resumed stage (the template precheck and the start checks), during the upload, or before the launch call, and the build deadline has not passed by then
 - **THEN** the row stays `building` with no builder and no `archive_sha256`
 - **AND** the next pass stages again under the same archive key and no failure is counted
 
@@ -465,12 +649,28 @@ Every provider read of a pass, except the read that confirms a deregistration, M
 - **WHEN** the pass deadline is reached before a deletion path, or the deletion plan of `plan`, has read what it needs
 - **THEN** it deletes nothing and its result is `refused` with `pass_deadline_exceeded`
 
+#### Scenario: The first deletion call of a run meets the deadline
+- **WHEN** a deletion path has read what it needs and the pass deadline is reached before its first deletion call starts
+- **THEN** no deletion call is made and its result is `refused` with `pass_deadline_exceeded`
+
+#### Scenario: A later item of a deletion run meets the deadline
+- **WHEN** a deletion run has made a deletion call and the pass deadline is reached before the first deletion call of a later item, an image with its snapshots or a lone snapshot
+- **THEN** that item and the items after it are not tried in that pass
+- **AND** the result counts the calls made before it
+
 #### Scenario: A read before the build is reached meets the deadline
 - **WHEN** a read of `plan` before its deletion plan, or a reconcile read or the pin read of a `run` pass, would start at or after the deadline
 - **THEN** the command refuses with `pass_deadline_exceeded`
 
+### Requirement: A cutoff is read where a provider call starts
+A provider call starts where the AWS client calls the SDK operation. The AWS client MUST read each cutoff of the call before it resolves credentials and again right before that point, and MUST NOT call the operation at or after it. In a stage, each template read, listing page, upload part, presign and launch call MUST take the earlier of the two deadlines. Signing and a credential refresh inside the SDK can delay the request after that check, and no cutoff bounds that delay.
+
+#### Scenario: A cutoff passes before the SDK operation is called
+- **WHEN** a cutoff passes while the AWS client builds its client, looks up the account, or looks up the credential for a presign that the session outlives, whether that step answers or refuses
+- **THEN** the client does not call the SDK operation and refuses with `pass_deadline_exceeded`, whichever cutoff passed
+
 ### Requirement: Basis reads are bounded by the pass deadline
-A read of a basis file MUST NOT start at or after the pass deadline: `plan`, the decision of a `run` pass and the inputs check of a stage done again MUST read the clock before each read. `plan` and the decision MUST refuse with `pass_deadline_exceeded`. The inputs check MUST leave the row for the next pass. The forge client puts no deadline on a request, so a read that has started MAY end after the deadline.
+A read of a basis file MUST NOT start at or after the pass deadline: `plan` and the decision of a `run` pass MUST read the clock before each read, and MUST refuse with `pass_deadline_exceeded`. A stage done again reads no basis file. The forge client puts no deadline on a request, so a read that has started MAY end after the deadline.
 
 #### Scenario: The deadline passes between two basis reads of a plan
 - **WHEN** the pass deadline passes during the read of one basis file and `plan` has another basis path to read
@@ -482,10 +682,9 @@ A read of a basis file MUST NOT start at or after the pass deadline: `plan`, the
 - **THEN** the command refuses with `pass_deadline_exceeded`
 - **AND** it reads no further file and writes no row
 
-#### Scenario: The deadline passes between two basis reads of a stage done again
-- **WHEN** the pass deadline passes during the read of one basis file of the inputs check, or before its first read
-- **THEN** no further file is read and the pass notes `pass_deadline_exceeded`
-- **AND** the row stays `building` with no builder, no failure is counted and the next pass checks again
+#### Scenario: Slow basis reads do not starve a stage done again
+- **WHEN** reading the basis files and uploading the archive each fit in one pass but not together
+- **THEN** a stage done again makes no basis read, so the upload has the whole pass and the build launches
 
 ### Requirement: Success requires the framed marker and the staged digest
 A build MUST succeed only when the console shows `WARM_SOURCE_SHA256` with a digest equal to the archive sha256 held in the state file, followed by the whole line `IMAGE_READY`, read through the existing framed-line discipline. A `WARM FAIL` line or a `warm exiting rc=` line MUST fail the build. The command MUST NOT guess success.
@@ -538,9 +737,19 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **AND** the failure path ends the builder
 
 #### Scenario: A resumed stage outlasts the deadline
-- **WHEN** the build deadline passes during the upload of a resumed stage, or during the reads between the upload and the launch call
-- **THEN** no builder is launched and the build fails with `CONSOLE_BLIND`
+- **WHEN** the build deadline passes during a read of the template check of a resumed stage, during its upload, or during the calls between the upload and the launch call (the presign and the listing of the builders unless it shows a builder)
+- **THEN** no later call of the stage starts, no builder is launched and the build fails with `CONSOLE_BLIND`
 - **AND** the pass tries to delete the archive that the row names
+
+#### Scenario: A resumed stage outlasts both deadlines
+- **WHEN** a call of a resumed stage ends at or after the build deadline and at or after the pass deadline: a read in the checks before the upload (the template, the credential, the listing of the builders unless it shows a builder), a wait in the stream of the upload, the completion of the upload, the presign, or the last listing of the builders before the launch call unless it shows a builder
+- **THEN** no builder is launched and the build fails with `CONSOLE_BLIND` in that pass, and the row is not left for the next pass to stage again
+- **AND** the pass tries to delete the archive that the row names
+
+#### Scenario: A resumed stage outlasts only the pass deadline
+- **WHEN** a call of a resumed stage ends at or after the pass deadline and before the build deadline: a read in the checks before the upload (the template, the credential, the listing of the builders unless it shows a builder), a wait in the stream of the upload, the completion of the upload, the presign, or the last listing of the builders before the launch call unless it shows a builder
+- **THEN** no builder is launched and the row stays `building` with no builder and no `archive_sha256`
+- **AND** the next pass stages again and no failure is counted
 
 #### Scenario: A failed build recovers
 - **WHEN** the basis digest changes or an operator runs `run --apply --force`
@@ -573,7 +782,7 @@ When no marker appears by `build_deadline_seconds`, the command MUST terminate t
 - **AND** `promote --write` refuses with `PROMOTE_GATE_NOT_PASSED` while `allow_no_gate` is false
 
 ### Requirement: A missing gate refuses a launch and does not strand a build
-The gate requirement MUST guard a launch. `plan`, and an applying pass whose state holds no build in flight, MUST refuse with `IMAGE_GATE_REQUIRED` before any client is built. An applying pass whose state holds a build in flight MUST run and settle that build. A launch that pass still reaches MUST be refused with `IMAGE_GATE_REQUIRED`, counting no failure: a new build leaves no row and no upload, and a stage done again under its row's inputs ends the row `failed` and tries to delete its archive.
+The gate requirement MUST guard a launch. `plan`, and an applying pass with no build in flight and no archive deletion owed, MUST refuse with `IMAGE_GATE_REQUIRED` before any client is built. An applying pass with either MUST run and settle it, and MUST refuse each launch with `IMAGE_GATE_REQUIRED`, counting no failure. A pass that starts with no build in flight MUST run the bounded owed deletions only, then answer `refused`.
 
 #### Scenario: A build in flight is settled with no gate command and no opt-out
 - **WHEN** a build is `building` or `imaging` and the configuration then holds no gate command and no opt-out
@@ -589,6 +798,21 @@ The gate requirement MUST guard a launch. `plan`, and an applying pass whose sta
 - **WHEN** a row is inserted under `allow_no_gate = true` with no gate command, the pass deadline ends its stage and the configuration then holds no opt-out
 - **THEN** the next pass ends the row `failed` with `IMAGE_GATE_REQUIRED`, tries to delete its archive and launches no builder
 - **AND** the pass answers `refused` and counts no failure
+
+#### Scenario: An owed archive deletion is settled with no gate command and no opt-out
+- **WHEN** no build is in flight, a finished build owes the deletion of its archive and the configuration holds no gate command and no opt-out
+- **THEN** an applying pass runs, deletes the archive and starts no build
+- **AND** the pass answers `refused` with `IMAGE_GATE_REQUIRED`, reads no file of the forge and counts no failure
+
+#### Scenario: A cleanup pass does not depend on other provider reads
+- **WHEN** no build is in flight at the start of a pass, the configuration holds no gate command and no opt-out, a finished build owes an archive deletion and the provider refuses the pin read and the listings
+- **THEN** the pass deletes the archive, records `archive_deleted_at` and answers `refused` with `IMAGE_GATE_REQUIRED`
+- **AND** it reads no pin, builders, stray archives, images, retention or forge file, and the pin fields that it did not read and `retention` are empty in the result
+- **AND** the command line stamps no pin evidence after it
+
+#### Scenario: A new build is refused under a withdrawn gate
+- **WHEN** a pass runs because a build was in flight, that build ended before the pass took the lock, and the configuration holds no gate command and no opt-out
+- **THEN** the pass answers `refused` with `IMAGE_GATE_REQUIRED`, writes no build row and makes no upload
 
 #### Scenario: The pass after the settled build is refused
 - **WHEN** the build has ended and the configuration still holds no gate command and no opt-out
@@ -658,15 +882,20 @@ A `CreateImage` call with an unknown outcome MUST NOT fail the build before the 
 - **THEN** the build fails with the code of the refusal and the failure path ends the builder
 
 ### Requirement: Reconcile runs first and cleans leaks
-Every pass MUST reconcile before any transition, and its first call MUST end the builder of an active build that is past its build deadline, an `imaging` build included. That builder MUST NOT count as a leak. Reconcile MUST terminate every other builder-tagged instance, MUST delete objects under the prefix that are not the active archive and are older than one hour, and, before any start, MUST clean the images of failed builds only under the image deletion rule.
+Every pass MUST reconcile before any transition; its first call MUST end the builder of an active build past its build deadline, as a non-leak. Reconcile MUST then terminate every other builder-tagged instance, delete objects under the prefix that are not the active archive and are older than one hour, within the bound of the next requirement, and, before any start, clean failed builds' images only under the image deletion rule. Owed archive deletions MUST run last, on the time the pass leaves.
 
 #### Scenario: A leaked builder
 - **WHEN** a builder is tagged for the deployment and the state file has no matching active build
 - **THEN** reconcile terminates it before any other step
 
 #### Scenario: A stray archive
-- **WHEN** an object older than one hour sits under the prefix and is not the active archive
+- **WHEN** an object older than one hour sits under the prefix and is not the active archive, and the sweep has not reached its bound (see the next requirement)
 - **THEN** reconcile deletes it
+
+#### Scenario: The sweep leaves an owed archive to the bounded retry
+- **WHEN** an object older than one hour sits under the prefix and a finished build owes its deletion, whether the pass retried it, it was refused or the bound deferred it
+- **THEN** the sweep does not delete it, and only the owed retry does, within its bound
+- **AND** a stray object that no row names is still deleted by the sweep
 
 #### Scenario: An overdue builder
 - **WHEN** the build deadline has passed and the active build has a builder
@@ -692,6 +921,38 @@ Every pass MUST reconcile before any transition, and its first call MUST end the
 - **WHEN** the image of a failed build is still `pending` after reconcile and is not protected
 - **THEN** the deletion rule removes it at the end of the pass under its pending-image path
 - **AND** the pass result reports that run as `retention`
+
+### Requirement: The sweep of stray archives has a bound of its own
+The sweep of stray archives runs in reconcile, before the work of the pass. A stray delete MUST NOT start once the pass is 30 seconds old by the wall clock or by elapsed time on a monotonic clock, and the AWS client MUST read both where the delete starts. The sweep then stops, notes `archive:sweep_deferred` and leaves the rest to a later pass. The bound is on the start of the deletes, not on their end. Only the pass deadline bounds the listing.
+
+#### Scenario: A late stray listing starts no delete
+- **WHEN** the listing of the prefix, or a read before it, returns when the pass is 30 seconds old or older and before the pass deadline
+- **THEN** no stray delete starts and the stray objects remain
+- **AND** the pass notes `archive:sweep_deferred`, goes on with its own work, and a later pass sweeps them
+
+#### Scenario: A listing that the pass deadline stops
+- **WHEN** the pass deadline has passed before the listing of the prefix requests a page
+- **THEN** the pass ends with `pass_deadline_exceeded`, no stray delete starts and nothing after the listing runs
+
+#### Scenario: Slow stray deletes stop at the bound
+- **WHEN** stray deletes take long and the pass becomes 30 seconds old before the sweep has ended
+- **THEN** the delete that is running ends as the provider answers and no further stray delete starts
+- **AND** the pass notes `archive:sweep_deferred` and goes on with its own work
+
+#### Scenario: A wall clock that is stepped back does not stretch the bound
+- **WHEN** the system clock is stepped back during the sweep, so that it shows the pass as younger than 30 seconds, and 30 seconds of elapsed time have passed since the pass began
+- **THEN** no further stray delete starts and the pass notes `archive:sweep_deferred`
+- **AND** the strays that remain are swept by a later pass
+
+#### Scenario: The AWS client reads both cutoffs where a delete starts
+- **WHEN** a stray delete passes the check of the pass, and before it starts the wall clock reaches the cutoff, or elapsed time on the monotonic clock reaches 30 seconds while the wall clock was stepped back and shows the pass as younger
+- **THEN** the AWS client does not call the delete, the sweep stops with `archive:sweep_deferred` and the stray object remains for a later pass
+- **AND** with neither cutoff reached, the AWS client calls the delete
+
+#### Scenario: A stray backlog ends at the bound and the owed deletion is attempted
+- **WHEN** many strays older than one hour sit under the prefix, each of their deletes takes long, a finished build owes its archive deletion, and the work of the pass, with or without a build to follow, ends before the last start of an owed deletion
+- **THEN** the sweep stops at its bound, the work runs, and the pass attempts the owed deletion at its end
+- **AND** no stray delete starts after the bound
 
 ### Requirement: Orphans are recorded and the builder has its own backstop
 A tagged image that has no state row MUST be recorded as an unverified `candidate`, in whatever state the image is, and MUST NOT be pinned. The builder's lifetime timer and terminate-on-shutdown setting MUST remain the leak backstop that does not depend on the controller.
@@ -752,7 +1013,7 @@ Each build MUST be bounded by `build_deadline_seconds`, the builder's lifetime t
 - **THEN** the output names the two ways to clear it
 
 ### Requirement: A launch-template version is created inert and drift-checked
-After the image is `available`, the command MUST create a new launch-template version from the configured pin as `SourceVersion` (never `$Latest` or the default), changing only `ImageId`, with a client token from the state file. It MUST then read back both versions and compare their full `LaunchTemplateData`. Any difference other than `ImageId` MUST yield `TEMPLATE_DRIFT`, mark the version unusable and prevent promotion.
+After the image is `available`, the command MUST create a new launch-template version from the template and pin recorded on the row before its first request, the pin as `SourceVersion` (never `$Latest` or the default), changing only `ImageId`, with a client token from the state file. It MUST then read back both versions and compare their full `LaunchTemplateData`. Any difference other than `ImageId` MUST yield `TEMPLATE_DRIFT`, mark the version unusable and prevent promotion.
 
 #### Scenario: Only the image differs
 - **WHEN** the new version equals the pin's version except for `ImageId`
@@ -802,7 +1063,7 @@ No timer and no process that holds AWS credentials MUST write the deployment TOM
 - **THEN** `promote` still completes, with or without `--write`
 
 ### Requirement: Promotion writes only a verified candidate
-`promote --write` MUST refuse unless the candidate record shows: the image `available`; the template version existing; the full `LaunchTemplateData` differing from its source pin only in `ImageId`; the offline gate configured and passed (or `allow_no_gate` recorded); a `verified_at` within `promote_max_age_seconds`; and a TOML pin equal to the record's source pin.
+`promote --write` MUST refuse unless the candidate record shows: the image `available`; the template version existing; the full `LaunchTemplateData` differing from its source pin only in `ImageId`; the offline gate configured and passed (or `allow_no_gate` recorded); a `verified_at` within `promote_max_age_seconds`; and a source template, source Region and source pin, equal to the TOML's launch template name, `aws.region` and pin.
 
 #### Scenario: An unverified candidate
 - **WHEN** the candidate record lacks any verification item
@@ -813,7 +1074,7 @@ No timer and no process that holds AWS credentials MUST write the deployment TOM
 - **THEN** `promote --write` refuses with `IMAGE_VERIFICATION_STALE` and tells the operator to run `image status --refresh`
 
 #### Scenario: The pin moved
-- **WHEN** the TOML pin differs from the record's source pin
+- **WHEN** the TOML pin, launch template name or `aws.region` differs from the record's source pin, source template or source Region, or the record lacks one of those three values
 - **THEN** `promote --write` refuses with `PIN_MOVED`
 
 #### Scenario: A foreign version
@@ -899,6 +1160,11 @@ Before the rename, `promote --write` MUST write a timestamped backup and MUST re
 - **WHEN** `[image].state_directory` (compared as written, without following a link) or `deployment` changes between the start of `promote` (with or without `--write`, `--rollback` included) and a read of the file it plans or writes from, the read under the locks of `--write` included
 - **THEN** the command refuses with `PROMOTE_STATE_CHANGED` and names no path
 - **AND** it changes no row, event, deployment file, state file or rollback journal of either state, and creates nothing in the state the file names now; only its own lock files may be created
+
+#### Scenario: A concurrent change during a command is outside the operator contract
+- **WHEN** an operator edits a non-pin setting of the deployment file other than `[image].enabled = false`, replaces or re-links the file or its `--config` path, swaps a bind mount, or moves, restores or replaces the image state directory while `image run`, `image promote` or `image status --refresh` runs
+- **THEN** the change is outside the operator contract, and the product makes no promise about it beyond the refusals that this specification already requires (this requirement names `PROMOTE_FILE_CHANGED`, `PROMOTE_FILE_STALE` and `PROMOTE_STATE_CHANGED`)
+- **AND** setting `[image].enabled = false` is the one allowed edit: it does not stop a running command, so the operator waits until no `image run --apply` runs
 
 ### Requirement: Promotion runs in an isolated operator container
 `promote` MUST run only as an operator-invoked one-off. The shipped documentation MUST give a container line that has no network, no AWS credential directory and no forge token. `promote --write` MUST refuse with `PROMOTE_DIRECTORY_NOT_DEDICATED` when the directory of the TOML holds anything other than the TOML, its `.bak.*` files, its lock file and its promote temporary file. A test MUST assert that `promote` constructs no AWS client.

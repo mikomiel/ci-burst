@@ -277,8 +277,8 @@ five profiles and must end in a profile that holds both static keys. No profile 
 the chain may name `credential_source`, `web_identity_token_file`,
 `credential_process`, `login_session` or an `sso_` key. Anything else is refused
 as `IMAGE_PROFILE_INVALID`, and a missing profile name as `IMAGE_PROFILE_MISSING`,
-before the SDK asks for a credential. The image commands build an EC2 client and
-an S3 client and no IAM client. Every pass builds a new SDK session, so a role
+before the SDK asks for a credential. The image commands build an EC2 client, an
+S3 client and an STS client (for `GetCallerIdentity` alone) and no IAM client. Every pass builds a new SDK session, so a role
 that cannot be assumed (an expired source key, a trust policy that denies it)
 fails that pass with the provider's error code, not with a stale session.
 
@@ -464,6 +464,14 @@ pin you edit by hand is not checked: the drift check and the other verification
 checks run in `promote`, and a hand-written pin bypasses them. Before a promotion,
 a rollback or a hand edit, finish or stop a running build container, and start a
 fresh one afterwards.
+
+While any image command runs, do not edit a setting of the file other than the pin,
+replace or re-link the file, swap a mount or move the state directory. The one
+exception is `enabled = false`, which stops the image path. It does not stop a
+running command: follow [Rolling back an image](operations.md#rolling-back-an-image)
+and wait until no `image run --apply` runs.
+[Operator contract while an image command runs](operations.md#operator-contract-while-an-image-command-runs)
+says what ci-burst checks and what it does not promise.
 
 ## 5. Write the deployment TOML
 
@@ -734,14 +742,43 @@ Notes on the values:
   termination, and at least one security group, none of which has an inbound rule.
   The image id of that template is the cold base image: the builder starts from it,
   never from the warm image.
-- The staging bucket and its lifecycle rule are yours: when a build ends, ci-burst
-  makes one delete call for the archive key that its row records, and the
+- The staging bucket must not have versioning enabled. A delete in a versioned bucket
+  only adds a delete marker and leaves the source archive as a noncurrent version,
+  so the deletion that ci-burst records as done would not remove the archive.
+  ci-burst does not check this setting. Suspending versioning does not remove the
+  noncurrent versions that already exist. The rule also applies to an old bucket that
+  build rows still name.
+- Every S3 call that ci-burst makes against a staging bucket names the account of the image
+  role as the bucket's expected owner (`ExpectedBucketOwner`), which it reads once per pass
+  from `sts:GetCallerIdentity` and which asks for no permission. The row of a build records
+  that account (`archive_owner`) with the bucket and the key when the archive is first
+  staged, and a stage done again and every delete of that archive name the recorded one. The
+  presigned URL of the archive signs the recorded owner too, and the builder sends it with
+  its GET (`WARM_SRC_OWNER`, see [warm-image.md](warm-image.md#inputs)). A
+  pass whose role is in another account than the one that staged the archive makes no S3
+  call about it: a stage done again ends refused with `IMAGE_STAGING_OWNER_CHANGED`, and a
+  delete counts as failed and stays owed, even where a bucket of that name exists in the new
+  account. A bucket name that was released and now belongs to another account is refused with
+  `IMAGE_STAGING_BUCKET_DENIED`, never written to or deleted from, and never retried without
+  the owner. The staging bucket must therefore be in the account of the image role. The build policy carries the same bound
+  as an `s3:ResourceAccount` condition on both S3 statements: replace `<account-id>` there
+  with that account.
+- The staging bucket and its lifecycle rule are yours: the row of a build records
+  the bucket and the key before the upload starts. When the build ends, ci-burst
+  deletes that object, and a refused delete stays owed and is retried at the end of
+  every later pass, on the time the pass leaves, so a change of `bucket` or `prefix` does not strand an object, as
+  long as the image role may still delete at the old location: its policy scopes
+  `s3:DeleteObject` to `<bucket>/<prefix>*`, and a delete that the provider refuses
+  stays owed, and is noted `archive:delete_failed` in every pass, until the grant
+  covers the old location or the lifecycle rule has removed the object. The
   lifecycle rule is a backstop only. Give each
   deployment a prefix of its own that nothing else uses: no other deployment, tool
   or person writes under it, and no prefix of another deployment is the same as
   yours, inside it or around it. Every applying pass deletes each object under the
   prefix that is more than one hour old, except the archive of the active build,
-  and it checks neither the name of the key nor who wrote the object. A prefix
+  but starts no delete once the pass is 30 seconds old (a backlog that does not fit takes
+  several passes, and a pass whose listing of the prefix returns after that time deletes
+  nothing), and it checks neither the name of the key nor who wrote the object. A prefix
   shared with another deployment, or the example prefix reused in a shared bucket,
   can delete that deployment's archive or unrelated objects.
 

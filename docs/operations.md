@@ -684,8 +684,8 @@ A refusal prevents what its reason code names: the start of a build, a promotion
 a write. It does not undo what the run did before it declined. An applying pass
 reconciles first, so before it refuses a start (`IMAGE_MIN_INTERVAL`,
 `IMAGE_DAILY_CAP` or another answer of [When a build starts](#when-a-build-starts))
-it can have ended a leftover builder, deleted a stray archive, run retention and
-written the state file, the event file and the metrics textfile. When the pass
+it can have ended a leftover builder, deleted a stray archive or the archive of
+a finished build, run retention and written the state file, the event file and the metrics textfile. When the pass
 returns its refusal as a result, the run also records the pin evidence; the
 `reconcile`, `retention` and `pin_evidence` of the result say what it did. A refusal
 that a pass raises can follow the same reconcile. On the promotion path,
@@ -712,36 +712,76 @@ Two refusals belong to the start itself and count no failure:
 `IMAGE_CREDENTIAL_SHORT` (the role session would not outlive the archive URL, or its expiry is unknown, see
 [deployment.md](deployment.md#image-build-role-and-source-identity-optional)) and
 `IMAGE_BUILD_ALREADY_ACTIVE`. A pass checks both before it writes the build row
-and again just before the launch. A wrong input is raised, not answered, and
+and again just before the launch. One rule applies in a new start, in a stage done again
+and in the launch: a deadline decides before the outcome of any call that takes time.
+These calls are the read of the build template, the lookup of the credential, the upload,
+the presign and the listing of the builders. A stage done again reaches its checks of the
+inputs and the gate after reads that took time, the pin read among them, so they count
+too. When one of them has returned, with a result
+or with a refusal, the pass reads both deadlines again before it acts on the outcome:
+before it writes the row, before it uploads, before it launches and before a refusal
+ends the row. The build deadline decides first, and a build that is out of time ends with
+`CONSOLE_BLIND` instead, a counted failure. A pass that is at or after its own deadline
+launches nothing. A build that has a row stays `building` for the next pass to stage
+again. A new start has no row yet: it writes none, and the pass ends with
+`pass_deadline_exceeded` instead of answering `refused`. So `IMAGE_CREDENTIAL_SHORT` ends
+a row only when neither deadline has passed, even when a slow call has left the role
+session too short for the archive URL. One outcome is not read this way: a listing that
+shows a builder is refused with `IMAGE_BUILD_ALREADY_ACTIVE` whenever it returns. The order
+of that refusal and a deadline is tracked in
+[#232](https://github.com/mikomiel/ci-burst/issues/232). Each read, upload part, presign and
+launch call of a stage takes the earlier of the two deadlines, so no call starts after one that
+returned at or after the build deadline. A call starts where the AWS client calls the SDK
+operation: the client reads the cutoff there, and first before it resolves credentials,
+and signing or a credential refresh inside the SDK can delay the request after that
+check. A wrong input is raised, not answered, and
 nothing is launched: the gate (`IMAGE_GATE_REQUIRED`), the forge on the branch or
 basis reads (`IMAGE_SOURCE_FORBIDDEN`, `IMAGE_BRANCH_UNPROTECTED`, `IMAGE_BASIS_PATH_MISSING`)
 or the build launch template (`IMAGE_BUILD_TEMPLATE_UNSAFE`). The gate is checked
 before the template, so an unsafe template never hides a missing gate. A stage done
 again is the exception for its input rechecks: a changed digest, a missing gate or
 opt-out, and an unsafe template verdict end its row and are answered `refused`
-(below), while a refused basis-file read is raised and leaves the row. Once those
-rechecks pass, the stage runs the same staging and launch checks as a first stage:
+(below). The recheck of the digest reads no basis file of the forge, so a slow
+or unavailable forge cannot hold the stage. Once those rechecks pass, the stage runs the same staging and launch checks as a first stage:
 a start refusal such as `IMAGE_CREDENTIAL_SHORT` ends the row `refused` without a
 failure, and a definite refusal of the archive request ends it as a failed build,
-counted, with exit `1`. A pass that
-finds a build in flight runs and settles it even without a gate; a launch that
-pass would then make is refused with `IMAGE_GATE_REQUIRED`, answered `refused`,
-and counts no failure.
+counted, with exit `1`. Both hold only when neither deadline has passed when the
+refused call returns: a deadline decides first. A pass that
+finds a build in flight, or an archive deletion that a finished build still owes,
+runs and settles it even without a gate; a launch that pass would then make is
+refused with `IMAGE_GATE_REQUIRED`, answered `refused`, and counts no failure.
+When it started with no build in flight, it is a cleanup pass: it runs the bounded
+owed deletions only and answers `refused` with `IMAGE_GATE_REQUIRED`, with no
+provider read besides them and no read of the forge.
 
 A pass deadline can end a pass after the build row is written and before the
 builder is launched. The next pass stages that build again. Past the build deadline
 it ends the build `failed` with `CONSOLE_BLIND` instead, a counted failure; before
-it, the pass first checks its inputs: the basis files at the row's own commit, the warm and gate commands,
-`strip_components` and the script must still give the row's digest. A different
-digest ends the row `failed` with `IMAGE_INPUTS_CHANGED`. The gate command is in
-the digest, so removing a configured gate ends the row this way too. A file that
+it, the pass first checks its inputs: the hashes of the basis files that the row
+recorded when it was inserted, the warm and gate commands, `strip_components` and
+the script must still give the row's digest, and the configured `basis_paths` must
+be the recorded set. A different digest or a different set of paths ends the row
+`failed` with `IMAGE_INPUTS_CHANGED`. No basis file is read again: the files at a
+commit do not change. A row whose recorded hashes are missing or malformed is
+damaged state, raised as `IMAGE_STATE_UNREADABLE` when neither deadline has passed,
+and is not read from the forge instead. Malformed includes an empty path, a path that `basis_paths` could never
+hold (a control character, a `..` or a leading `/`, or a lone surrogate, which is
+no text in UTF-8 and which the TOML file cannot spell), more paths than `basis_paths`
+takes, and a path that the stored text names twice, whatever its values. That is
+damage and not a changed input, so the row stays as it is: it is not ended and its
+archive is not deleted. The error names the row and never a path or a value, and the
+insert of a row refuses such a map too. The gate command is in the digest, so
+removing a configured gate ends the
+row with `IMAGE_INPUTS_CHANGED` too. A file that
 lost the opt-out of a row inserted under `allow_no_gate` keeps the digest and ends
 the row with `IMAGE_GATE_REQUIRED`; an unsafe build template then ends it with
 `IMAGE_BUILD_TEMPLATE_UNSAFE`. Each is answered `refused`, counts no failure, writes
-no `image_build_failed` event and tries to delete the row's archive. A refused read of a basis file, a `404` included, ends
-the pass and leaves the row for the next pass: the commit cannot have lost the
-file, so a `404` there can be an unavailable route. A pass past the build deadline
-that reaches its deadline check ends the row instead. `lifetime_seconds` and `snapshot_seconds` are not in the digest: a
+no `image_build_failed` event and tries to delete the row's archive, when neither deadline
+has passed as the checks return. Wherever a deadline cuts the stage, the rule above
+decides: at or after the build deadline the pass ends the build `failed` with
+`CONSOLE_BLIND` and tries to delete the archive, and when only the pass deadline has
+passed, the row stays and the next pass stages it again.
+`lifetime_seconds` and `snapshot_seconds` are not in the digest: a
 stage that launches renders them from the file as it reads it then.
 
 A build that has no verdict by `build_deadline_seconds` ends `failed` in a pass that
@@ -783,7 +823,8 @@ blocks the state again, so a recovered build has one attempt.
 
 A build that works ends as a candidate: an image tagged for this deployment, and a
 new version of the worker launch template (`aws.launch_template_name`) that copies
-the version the TOML pins now and changes `ImageId` only. The pass reads both
+the version the TOML pinned when the pass first asked for it and changes `ImageId`
+only. The row records that template and pin, so a retry sends the same request. The pass reads both
 versions back and compares the whole `LaunchTemplateData`. A difference in any
 field but `ImageId` ends the build `failed` with `TEMPLATE_DRIFT`; the event names
 the fields and never a value. The new version is inert. It is not the default
@@ -864,6 +905,58 @@ with `PROMOTE_FILE_STALE` when it has none, so no journal row is resolved and no
 pin is written from a stale view. A replaced file that another hard link still
 names is not detected: do not keep hard links to the deployment TOML.
 
+#### Operator contract while an image command runs
+
+ci-burst expects this of the operator while an image command runs (`image run`,
+`image promote` or `image status --refresh`). You do not:
+
+- hand-edit a setting of the deployment file other than the pin;
+- replace or re-link the deployment file or the path that `--config` names;
+- swap a bind mount;
+- move, restore or replace the image state directory.
+
+A hand edit of the pin itself follows the pause rule above: pause any scheduler of
+image runs and wait until no `image run --apply` is running before you make one.
+
+Setting `enabled = false` to stop the image path is the one edit you may make while
+a command runs. It does not stop that command: follow
+[Rolling back an image](#rolling-back-an-image) and wait until no `image run --apply` runs.
+
+ci-burst still makes these checks. The text above and the reason codes below give
+the detail:
+
+- A command that reads the deployment file to resolve a journal row, to promote or
+  to roll back refuses with `PROMOTE_FILE_STALE` when the open file has no name
+  left. When the deletion rule reads the file through a stale view, it deletes
+  nothing (`IMAGE_DELETION_UNSAFE`).
+- `promote` refuses with `PROMOTE_FILE_CHANGED` when the file changed after it was
+  read. It refuses with `PROMOTE_STATE_CHANGED` when the file names another
+  `[image].state_directory` or `deployment` than the one the command opened at its
+  start. The command compares the two values as written and follows no link on the
+  path.
+- `promote --write` commits a journal row before the rename. The next resolving
+  command settles the row from the hash of the file. A hash that matches neither
+  value refuses with `PROMOTION_JOURNAL_DIVERGED` and changes nothing.
+- The writer lock of the state file (`IMAGE_STATE_LOCKED`) and the lock file of the
+  TOML (`PROMOTE_BUSY`) keep two ci-burst commands from writing at once.
+
+ci-burst does not promise more than these checks. They run at fixed points of a
+command, and the product does not lock an operator's editor. A race with an edit of
+a file, a link, a mount or the state directory during one command is outside the
+contract, and the product makes no promise about it. Findings of that class are
+tracked in [#226](https://github.com/mikomiel/ci-burst/issues/226). They are not
+fixed one by one. Changing `aws.region` or `aws.launch_template_name`, or replacing
+the launch template under the same name, while the image state holds an unfinished
+build, candidates or promotion journal rows is outside the contract too. The record
+names the template by name and Region only: `promote` refuses a candidate recorded
+from another name or Region (`PIN_MOVED`) but cannot tell a template replaced under
+the same name, and a build pass, rollback, `status --refresh` and image deletion read
+under the Region and the name the TOML gives now. Make such a change only when no
+promotion journal row is pending: with one pending, the edit leaves the TOML matching
+neither recorded hash (`PROMOTION_JOURNAL_DIVERGED`), and there is no resolve path
+yet ([#205](https://github.com/mikomiel/ci-burst/issues/205)). After the change, run
+a new build.
+
 #### Promote reason codes
 
 A refusal names the item and the recorded value, never a secret.
@@ -886,7 +979,7 @@ plan when the file is a stale view or the journal cannot be read.
 | `PROMOTE_DRIFT_NOT_CLEAN` | the record shows a drift result other than `clean` | do not promote this candidate; find what differs, then rebuild |
 | `PROMOTE_GATE_NOT_PASSED` | the build did not pass a configured gate, or it ran with no gate and `allow_no_gate` is `false` | configure a gate and rebuild, or set `allow_no_gate` on purpose |
 | `IMAGE_VERIFICATION_STALE` | the record has no verification time, lies in the future, or is older than `promote_max_age_seconds` | `image status --refresh`, then promote again |
-| `PIN_MOVED` | the TOML pins a version other than the one this candidate was copied from | run a new build; its candidate is copied from the current pin |
+| `PIN_MOVED` | the TOML pins a version, names a launch template or sets a Region other than the one this candidate was copied from, or the record does not say which launch template, Region and pin it was copied from | run a new build; its candidate is copied from the current pin |
 | `PROMOTE_ZONE_PIN` | a zone entry carries its own `launch_template_version` | edit the file by hand and keep every pin consistent |
 | `PROMOTE_PIN_LINE_AMBIGUOUS` | the edit did not find exactly one plain `launch_template_version = <digits>` line inside `[aws]` | edit the file by hand |
 | `PROMOTE_REPARSE_FAILED` | the strict loader refused the new text, or it differs from the old in more than the pin | edit the file by hand; nothing was written |
@@ -974,7 +1067,7 @@ query string and a literal match of the recorded archive key are replaced by
 | `image_created` | `CreateImage` returned an id, or the pass found the image by its tags while creating it (an image that reconcile adopts writes `image_reconciled` instead) | `build_id`, `builder_id`, `image_id` |
 | `image_candidate_ready` | the candidate version was created and compared `clean` | `build_id`, `image_id`, `template_version`, `digest`, `duration_seconds` |
 | `image_build_failed` | a build failed and the failure was counted. A refused start or restage that ends its row `failed` (such as `IMAGE_INPUTS_CHANGED`) writes none and shows in `image_check` with `decision: refused`; a recorded orphan that is ended `failed` writes none either | `build_id`, `reason`, `image_id`, `digest`, `duration_seconds`, `drift_fields`, `framed_tail` |
-| `image_reconciled` | reconcile ended a builder, deleted an archive, recorded an image or adopted a leftover | `builders_terminated`, `archives_deleted`, `images_recorded`, `builder_adopted`, `image_adopted`, `build_id` |
+| `image_reconciled` | reconcile ended a builder, deleted an archive (a stray object or one that a finished build owed), recorded an image or adopted a leftover; the owed-deletion tail of a pass wrote it too when it deleted, was refused or deferred an archive, also in a pass that ended on a refusal (counts only, never a key or a bucket) | `builders_terminated`, `archives_deleted`, `owed_archives_deleted`, `owed_archive_delete_failed`, `owed_archives_deferred`, `images_recorded`, `builder_adopted`, `image_adopted`, `build_id` |
 | `image_pruned` | the deletion rule deregistered an image, deleted a snapshot or failed to | `deregistered`, `snapshots_deleted`, `failed`, `skipped` |
 | `image_blocked` | the failure that set `blocked` | `consecutive_failures`, `build_id` |
 | `image_promoted` | `promote --write` completed a promotion or a rollback | `old_pin`, `new_pin`, `build_id`, `image_id`, `rollback`, `file_digest` |
@@ -1114,9 +1207,10 @@ never started has no timer, and terminate-on-shutdown does not start a shutdown.
 To find such a builder, filter on both `ci-burst:image-build = true` and `ci-burst:deployment = <your deployment>`, then terminate the exact instance id.
 
 When passes do run, every applying pass reconciles before it does anything else.
-It terminates every tagged builder that is not the active build's, and the active
-build's own once its deadline has passed. It deletes any object under the archive
-prefix that is not the active archive and is older than one hour; it checks neither
+It terminates the active build's builder once its deadline has passed. It then
+terminates every tagged builder that is not the active build's. It deletes any object under the archive
+prefix that is not the active archive and is older than one hour, but starts no delete once the
+pass is 30 seconds old (see below); it checks neither
 the key name nor the writer of the object, so the prefix must belong to this
 deployment alone
 ([deployment.md](deployment.md#the-image-tables-optional)). It adopts a builder or
@@ -1126,12 +1220,104 @@ unverified candidate that is never pinned. Such a row has the reason
 `image status` can show it as `last_build`, but never as the `candidate`, and
 `promote` cannot select it. Removals of leaked resources add to
 `ci_burst_image_leaked_resources_total`; the termination of an overdue builder of an
-active build does not, so do not use the counter to account for those. The bucket lifecycle rule on the staging
-prefix is a backstop only: when a build ends, ci-burst makes one delete call for
-the archive key that its row records. A refused call is noted
-`archive:delete_failed` and leaves the deletion unconfirmed; the row keeps its
-end state. An upload that finished before its key was recorded leaves no key, and
-the reconcile sweep or the lifecycle rule removes that object.
+active build does not, so do not use the counter to account for those. The archive deletions that finished builds still owe run at the end of the pass, not
+here (see below). The bucket lifecycle rule on the staging
+prefix is a backstop only. The row of a build records the bucket and the key of its
+archive (`archive_bucket`, `archive_key`) before the upload starts, and a stage
+done again uses the recorded pair, not the configured bucket and prefix of the
+day. When a build ends, ci-burst deletes that object and records the time in
+`archive_deleted_at`. A refused call is noted `archive:delete_failed`; the row
+keeps its end state and the deletion stays owed. A finished build that names an
+archive and has no `archive_deleted_at` owes its deletion, and the reconcile of
+every applying pass retries it last: after the pass's own work, on the time that
+work leaves, at most 8 in one pass, and also when the pass ended on a refusal (an
+overdue build whose listing was denied, for example). The deletions never run before
+the work, because one delete that times out takes 30 seconds of a pass of 240, and the
+stage or the decision that follows could then miss the pass deadline. A pass whose
+work uses the pass leaves no time and notes `archive:delete_deferred`, as one that the
+bound left rows for does. If passes never leave time, the lifecycle rule of the bucket
+stays the backstop. The result of the pass counts the
+successes in `reconcile.owed_archives_deleted`, apart from the stray objects of
+`reconcile.archives_deleted`. S3 answers a delete of a key that was never written
+as done, so a row whose upload never happened settles at the first try. A delete
+that the provider refuses for good, such as one at an old bucket or prefix that the
+image role's policy no longer covers, stays owed: every pass notes
+`archive:delete_failed` for it, and a pass runs for it even without a gate. Widen the
+grant to cover the old location. Do not edit the state file by hand.
+
+The retries are bounded, so that a backlog of slow refused deletions cannot take the
+time that a stage, a decision or a build needs. A pass starts at most 8 owed deletions
+(`OWED_ARCHIVES_PER_PASS`), and none once the pass deadline is less than 40 seconds away
+(`OWED_DELETE_RESERVE_SECONDS`, the 30 second read timeout of the AWS client plus a
+margin); the clock is read before each one. A row whose delete this pass attempted,
+whatever the outcome, is not tried again in it: the pass keeps the ids of its attempts in
+memory, so a clock that moves does not decide it. When owed rows remain
+after the bound, the pass notes `archive:delete_deferred`. Each failed attempt takes the next
+place in the row's `archive_delete_seq` (one more than the largest place of any row, set with the
+attempt) and records its time (`archive_delete_tried_at`) for diagnosis only. The rows never
+tried go first, then the rows by `archive_delete_seq`, the least recently tried first, then the
+oldest, so a deletion that stays refused goes behind the other rows and cannot keep them from
+their turn, and a clock that steps back changes nothing.
+
+The row also records the account that owned its bucket when the archive was first staged
+(`archive_owner`). Every delete and every stage done again names it as the bucket's expected
+owner. When the role of the pass is in another account, or the row records no owner, no S3 call
+is made about that archive: the delete counts in `owed_archive_delete_failed`, the pass notes
+`archive:delete_failed` and `archive:owner_changed`, and the row stays owed and is never marked
+deleted. Restore the role's account, or remove the object by hand, and let the lifecycle rule
+age it out; do not edit the state file.
+
+A pass runs for an owed deletion even when the gate is withdrawn (`gate_command`
+empty and `allow_no_gate` false) and no build is in flight. That cleanup pass runs
+the bounded owed deletions and nothing else: it reads no pin, builders, stray
+archives or images of the provider, applies no retention, reads no file of the
+forge, and answers `refused` with `IMAGE_GATE_REQUIRED`. A refusal of one of those
+reads therefore cannot hide the result. The pin fields that it did not read are
+`null` in the result, as is `retention`, and the result carries `cleanup_only: true`.
+The command line then stamps no pin evidence (`pin_evidence` is
+`{"recorded": false, "reason": "IMAGE_CLEANUP_ONLY"}`), so the run makes no describe
+call either. When nothing is owed, the same file is refused before any client is built.
+
+A pass that is cancelled (`KeyboardInterrupt`, `SystemExit`, a cancelled task) starts
+no owed deletion and re-raises. A pass that ends on a refusal still runs them, and an
+owed deletion that was refused or deferred is not lost with the result: the pass
+writes an `image_reconciled` event with the counts `owed_archives_deleted`,
+`owed_archive_delete_failed` and `owed_archives_deferred`, and the result carries the
+same counts in `reconcile` when it is returned.
+
+The sweep of stray archives leaves every owed archive alone, including one that the
+bound deferred in this pass: only the owed deletion retries it, within the bound, and
+records the attempt.
+
+The sweep has a bound of its own, in time. It runs in reconcile, before the work of the pass, so it
+takes a fixed early share of the pass: no stray delete starts once the pass is 30 seconds old
+(`STRAY_SWEEP_SECONDS`). Two clocks measure that age, and the first to reach it stops the sweep:
+the wall clock, and elapsed time on a monotonic clock. The pass reads the monotonic clock before
+each delete, as an early stop, and the AWS client evaluates both where the delete starts
+([When a build starts](#when-a-build-starts)). A wall clock
+that is stepped back (a time correction, a host that resumed) cannot stretch the bound, because the
+monotonic clock still reaches it. A backlog of slow or refused deletes, or a listing that
+returns after that time, starts no delete after it. The sweep stops, the pass notes
+`archive:sweep_deferred`, and a later pass sweeps the strays that it left. Elapsed time measures this
+bound only: the pass deadline, the build deadline and the cutoff of the owed deletions are times on
+the wall clock, as every stored time is, and a wall clock that is stepped back stretches them.
+The bound is on when a delete starts, not on when the last one ends: that one can run for the
+timeouts of the AWS client, and a credential refresh inside the SDK, which ci-burst sets no
+timeout for, can add to them. The last start of an owed deletion is at 200 seconds (240 minus
+the 40 second reserve). Four limits remain:
+
+1. The listing reads every page before the first delete, and only the pass deadline bounds it. A
+   listing that returns after the 30 second cutoff is followed by no delete, and a listing that runs
+   to the pass deadline leaves nothing for the work or the owed deletions.
+2. A pass whose reads before the sweep take 30 seconds or longer sweeps nothing and, when a stray is
+   due, notes `archive:sweep_deferred`.
+3. Slow stray deletes can push the work of a pass past 200 seconds, and the pass then loses its
+   owed turn, as one whose work ends after 200 seconds does with or without strays.
+4. The sweep keeps no record of its attempts and the listing is in key order, so a stray at the
+   front whose delete times out in every pass can keep the strays behind it from being swept.
+
+Each limit costs storage only: the bucket lifecycle rule on the prefix removes the objects in the
+end ([deployment.md](deployment.md#the-image-tables-optional)).
 
 A builder that outlives its lifetime is a defect. To remove it, filter on both `ci-burst:image-build = true` and `ci-burst:deployment = <your deployment>`, then terminate the exact instance id: the
 image-build tag alone can match the builder of another deployment in the same
@@ -1187,7 +1373,7 @@ A build that ends `failed` carries one of the reasons below, in its
 `image_build_failed` event and in `reason`; the failure counts, sets the cooldown
 and moves the count toward `blocked`. A refusal that ends the stage of the archive
 or the launch of the builder ends the build in this way, whatever its code. The
-exceptions are a pass deadline, which leaves the row for the next pass; a launch
+exceptions are a pass deadline before the build deadline, which leaves the row for the next pass; a launch
 whose outcome is uncertain, which leaves the row `building` with the note
 `run_builder:uncertain` (the next pass adopts the builder, or ends the build
 `IMAGE_BUILDER_GONE` when it finds none); and the two start refusals of
@@ -1202,20 +1388,25 @@ passing plan does not rule these out.
 | `WARM_FAILED` | the builder printed a failure marker: the script failed, for example in the archive fetch, a warm command or the gate. Read the cause in the framed tail of the event or the console |
 | `IMAGE_MARKER_DIGEST_MISMATCH` | the builder reports another archive digest than the staged one |
 | `MARKER_TIMEOUT` | no ready marker by the build deadline, or the marker was first read at or after it while the builder was still running |
-| `CONSOLE_BLIND` | the console returned no text by the deadline, the provider refused the console read in a pass at or after the deadline (`notes` holds `console_read:<reason>`), or the launch fell at or after it. A console read refused before the deadline makes the pass raise, and the next pass reads again |
+| `CONSOLE_BLIND` | the console returned no text by the deadline, the provider refused the console read in a pass at or after the deadline (`notes` holds `console_read:<reason>`), or the launch fell at or after it. A stage in which a call returns at or after the build deadline ends this way too, in that pass, whichever call it is (the read of the template, the lookup of the credential, the listing of the builders when it shows none, the upload, the presign), and whether the call answered or refused: a short session, an unsafe template, a refused bucket or a listing that the provider refused does not end the row first. No later call of the stage starts after a call that returned at or after the build deadline. A console read refused before the deadline makes the pass raise, and the next pass reads again |
 | `IMAGE_BUILDER_GONE` | a pass did not see the builder as active, or no builder was recorded, while the build had no recorded image. It is not proof that the builder ended. A later applying pass asks the provider to terminate a tagged builder that it lists and that is not the active build's, and does not check the result: verify the final state yourself. Find the instance by the failed row's `builder_id` or its `ci-burst:build-id` tag, not by the deployment tags alone, which also match a newer builder ([Leaked builders and the backstop](#leaked-builders-and-the-backstop)). An image may still exist; the deletion rule handles it as the image of a failed build |
 | `IMAGE_NOT_AVAILABLE` | the image failed, or was not `available` by the deadline |
 | `TEMPLATE_DRIFT` | the candidate version differs from the pin in a field other than `ImageId`, or does not carry the build's image; `drift_fields` names them |
 | `FORGEJO_ARCHIVE_TOO_LARGE` | the forge stream of the archive passed `max_archive_bytes` while it was staged. A passing `image plan` does not rule it out, because the plan reads only the first chunk |
 | `IMAGE_ARCHIVE_TOO_LARGE`, `IMAGE_ARCHIVE_UPLOAD_FAILED` | the upload counted more than `max_archive_bytes`, or the upload failed |
+| `IMAGE_STAGING_BUCKET_DENIED` | S3 answered `AccessDenied` to the upload of a first stage. A stage done again ends as a refusal instead (second table). An answer that arrives at or after the pass deadline is not counted: the deadline decides, the row stays `building`, and the next pass stages it again |
+| `IMAGE_STAGING_BUCKET_MISSING` | S3 answered `NoSuchBucket` to the upload of a first stage: the configured bucket went away after the sweep at the start of the pass listed it. A stage done again ends as a refusal instead (second table) |
 | `IMAGE_USERDATA_TOO_LARGE` | the user data, rendered with the real presigned URL, is 16384 bytes or more. `image plan` sizes it with a synthetic URL, so a plan can pass where the run fails |
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the archive request |
 | a forge or provider code | any other refusal that ended the build as described above, such as `FORGEJO_UNAVAILABLE` or `AWS_REFUSED` |
 
 Cleanup after an oversize or failed upload is best-effort: once it has an upload
 id, ci-burst tries to abort it and delete the object, and either call can fail without
-changing the reason code. Do not assume that nothing is left. The reconcile sweep
+changing the reason code. Do not assume that nothing is left. The row names the key
+before the upload, so when the build ends its deletion is owed and retried (see
+[Leaked builders and the backstop](#leaked-builders-and-the-backstop)); the reconcile sweep
 deletes stray objects under the prefix only once they are older than one hour, and
+starts no delete once the pass is 30 seconds old, and
 an incomplete multipart upload is not an object: give the staging prefix a
 lifecycle rule that aborts incomplete multipart uploads
 ([deployment.md](deployment.md#the-image-tables-optional)).
@@ -1228,17 +1419,20 @@ and the codes of `promote` in [Promote reason codes](#promote-reason-codes).
 | Code | Meaning |
 | --- | --- |
 | `IMAGE_UNTIL_DONE_NEEDS_APPLY` | `--until-done` without `--apply` |
-| `IMAGE_GATE_REQUIRED` | `[image.warm].gate_command` is empty and `allow_no_gate` is `false`. Raised before any client is built by `image plan` and a run without `--apply`, and by an applying pass when no build is in flight; a pass that settles a build in flight answers it `refused` for the launch it would make, and a stage done again of a row inserted under `allow_no_gate` ends its row `failed` with it (a row inserted with a gate command ends as `IMAGE_INPUTS_CHANGED`) |
-| `IMAGE_INPUTS_CHANGED` | a stage done again found that the basis files at the row's commit, the warm or gate commands, `strip_components` or the script no longer give the row's digest. Answered `refused`; the row ends `failed`, the delete of its archive is attempted when it recorded one, and no failure is counted |
+| `IMAGE_GATE_REQUIRED` | `[image.warm].gate_command` is empty and `allow_no_gate` is `false`. Raised before any client is built by `image plan` and a run without `--apply`, and by an applying pass when no build is in flight and no archive deletion is owed; a pass that settles a build in flight or an owed deletion answers it `refused` for the launch it would make, or when it started with no build in flight (a cleanup pass: owed deletions only, no other provider read, no forge read), and a stage done again of a row inserted under `allow_no_gate` ends its row `failed` with it (a row inserted with a gate command ends as `IMAGE_INPUTS_CHANGED`) |
+| `IMAGE_INPUTS_CHANGED` | a stage done again found that the recorded hashes of the basis files, the warm or gate commands, `strip_components` or the script no longer give the row's digest, or that `basis_paths` is no longer the recorded set. No basis file is read. Answered `refused`; the row ends `failed`, the delete of its archive is attempted when it recorded one, and no failure is counted. A recorded path that `basis_paths` could never hold is damage and not this code: it is `IMAGE_STATE_UNREADABLE`, and the row stays |
 | `IMAGE_SOURCE_FORBIDDEN` | the forge answered `401` or `403` to the image token while the branch or a basis file was read, or, in `image plan`, the first chunk of the archive. The same answer to the archive request of a staging run ends the build `failed` (first table) |
 | `IMAGE_BRANCH_UNPROTECTED` | the configured branch is not protected on the forge |
-| `IMAGE_BASIS_PATH_MISSING` | the forge answered `404` for a `basis_paths` file, or the path escapes the repository, at the commit read (the branch head; the row's own commit on a stage done again) |
-| `IMAGE_BUILD_TEMPLATE_UNSAFE` | the build launch template or its version is missing or fails a safety check; the detail names the properties, never a value. On a stage done again the row ends `failed`, uncounted, and the pass answers `refused`. A read of the template that the provider refuses, such as a version that EC2 reports as not found, is the provider's own refusal instead: it is raised (exit `1`), and on a stage done again it leaves the row for the next pass |
+| `IMAGE_BASIS_PATH_MISSING` | the forge answered `404` for a `basis_paths` file, or the path escapes the repository, at the branch head that a decision reads |
+| `IMAGE_BUILD_TEMPLATE_UNSAFE` | the build launch template or its version is missing or fails a safety check; the detail names the properties, never a value. On a stage done again the row ends `failed`, uncounted, and the pass answers `refused`, when neither deadline has passed as the read returns (a deadline decides first, see `CONSOLE_BLIND`). A read of the template that the provider refuses, such as a version that EC2 reports as not found, is the provider's own refusal instead: it is raised (exit `1`), and on a stage done again it leaves the row for the next pass, when neither deadline has passed as the read returns. A read that returns at or after a deadline is decided by the deadline, whatever it showed or refused: a new start ends with `pass_deadline_exceeded`, a stage done again ends `CONSOLE_BLIND` at or after the build deadline, and its row stays `building` at or after the pass deadline only |
 | `IMAGE_USERDATA_TOO_LARGE` | in `image plan`: the user data, rendered with a synthetic URL, is 16384 bytes or more. In an applying run it ends the build `failed` instead (first table) |
+| `IMAGE_STAGING_BUCKET_DENIED` | S3 answered `AccessDenied` to a staging call. Every one names the account of the image role as the bucket's owner, so the bucket now belongs to another account (a released name that was reassigned), or the role may not use it. The refused call wrote and deleted nothing, and no call is made without the owner. A stage done again at the bucket that its row recorded ends the row `failed` with this code, counts no failure and answers `refused`, when neither deadline has passed as the answer returns (a deadline decides first, see `CONSOLE_BLIND`); the next pass stages under the configured bucket. As the row ends, the pass makes one delete of its archive, and the answer to that delete decides whether a deletion is owed. When S3 refuses it too (a bucket of another account, or a role that lost `s3:DeleteObject` as well), the pass notes `archive:delete_failed` and the row stays owed. That attempt does not add to `owed_archive_delete_failed`; only the retries of later passes count there. When the delete succeeds, the row records `archive_deleted_at`, the pass notes no `archive:delete_failed` and nothing is owed. It succeeds for a role that may no longer put at the old prefix but may still delete there, for example after a rotation that removed `s3:PutObject` and kept `s3:DeleteObject`. A first stage ends the build as a failure (first table), and a refused listing of the sweep refuses the pass |
+| `IMAGE_STAGING_BUCKET_MISSING` | S3 answered `NoSuchBucket` to the upload of a stage done again: the bucket that the row recorded does not exist, for example because it was removed after the earlier stage. The row ends `failed` with this code, counts no failure and the pass answers `refused`, when neither deadline has passed as the answer returns (a deadline decides first, see `CONSOLE_BLIND`); the next pass stages under the configured bucket. The row keeps its archive fields. As the row ends, the pass makes one delete of its archive, and the answer to that delete decides whether a deletion is owed. When S3 refuses it, as it does while the bucket stays missing, the pass notes `archive:delete_failed` and the row stays owed and is not marked deleted. That attempt does not add to `owed_archive_delete_failed`, because the owed deletions at the end of the pass skip a row that the pass already attempted; the retries of later passes count there. When the delete succeeds, which needs a bucket of that name again, the row records `archive_deleted_at` and nothing is owed. A first stage ends the build as a failure (first table). The sweep lists the configured bucket first, and a listing of a missing bucket refuses the pass with the provider's own reason |
+| `IMAGE_STAGING_OWNER_CHANGED` | a stage done again found that the account that owned the row's bucket when the archive was first staged (`archive_owner`) is not the account of this pass's role, or that the row records none. No S3 call is made. The row ends `failed` with this code, counts no failure and the pass answers `refused`; its delete is owed and counts as failed (see [Leaked builders and the backstop](#leaked-builders-and-the-backstop)). The next pass stages under the configured bucket |
 | `IMAGE_SCRIPT_MISSING` | the container image does not hold the shipped warm script |
 | `pass_deadline_exceeded` | the 240-second budget of a pass ran out. It is raised in `image plan` and before a decision. Elsewhere it is a `notes` entry, alone (the row waits for the next pass) or after the name of a lookup that the pass then goes without (such as `image_lookup:` or `base_image:`), or the `refused` code of the `retention` or `deletion` part |
 | `IMAGE_STATE_LOCKED` | another pass, refresh or `promote --write` holds the writer lock of the state file; an applying run also meets it when it resolves a pending journal row |
-| `IMAGE_STATE_VERSION_UNSUPPORTED`, `IMAGE_STATE_UNREADABLE` | the state file has a schema this version does not know, or cannot be opened as the state file; keep the file and do not edit it |
+| `IMAGE_STATE_VERSION_UNSUPPORTED`, `IMAGE_STATE_UNREADABLE` | the state file has a schema this version does not know, or cannot be opened as the state file, or a build row holds damage that a pass reads (the recorded `basis_file_hashes` of a row that a stage done again checks: text that is not a JSON object of hashes, a path that `basis_paths` could never hold or that is no text in UTF-8, or a path named twice); the error names the row and never the value, and the row stays as it is. Keep the file and do not edit it. Schema 2 added `archive_bucket`, `archive_deleted_at`, `archive_delete_tried_at` and `basis_file_hashes` to `image_builds` and has no migration: remove a schema 1 state file from a pre-release run, since no deployment holds one with `[image]` enabled |
 | `IMAGE_STATE_RECOVERY_NEEDED` | a process stopped inside a commit and left a rollback journal (`image-state.sqlite-journal`) that a read-only open cannot roll back; `status`, `plan`, the previews and `run` without `--apply` refuse and leave it. A writing command rolls it back: `image run --apply`, `image promote --write` (with or without `--rollback`) or `image status --refresh` takes the writer lock before its writable open, which rolls the journal back, and then does what it always does (a run resolves a pending row and runs its pass; a promotion also writes the pin). Another holder of the lock gives `IMAGE_STATE_LOCKED` with the journal left as it is. Do not delete the journal file: it holds the pages that make the file consistent |
 | `IMAGE_PROFILE_INVALID` | the image role profile is missing or breaks the profile rules of [deployment.md](deployment.md#image-build-role-and-source-identity-optional); a provider failure, exit `1` |
 | `IMAGE_DELETION_UNSAFE` | the deletion rule could not resolve the images it must protect, or read the deployment file through a stale view, so it deleted nothing. It appears inside the `retention` part of a pass result (`deletion` in a plan) and does not fail the command; that part can carry another refusal code, such as a provider code, in the same way |

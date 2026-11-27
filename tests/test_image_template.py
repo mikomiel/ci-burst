@@ -136,7 +136,8 @@ class TemplateCase(unittest.TestCase):
             "VersionDescription": "the pin",
             "LaunchTemplateData": pin_data(),
         }
-        self.aws = ImageAws(REGION, PROFILE, clients={"ec2": self.ec2}, clock=Clock(NOW), expiry=NOW + 3600)
+        self.clock = Clock(NOW)
+        self.aws = ImageAws(REGION, PROFILE, clients={"ec2": self.ec2}, clock=self.clock, expiry=NOW + 3600)
 
     def create(self, **overrides):
         values = dict(
@@ -303,17 +304,30 @@ class RetryTests(TemplateCase):
 
 
 class DeadlineTests(TemplateCase):
-    """The read-back is a read of the provider, so the pass deadline bounds it. The creation is one call."""
+    """The pass deadline bounds the start of the creation and of the read-back. A creation that started is one call."""
 
-    def test_a_read_back_that_would_start_past_the_deadline_is_refused_and_not_made(self):
+    def a_creation_that_ends_at_the_deadline(self):
+        # The creation starts before the deadline and the deadline passes while it runs.
+        self.ec2.change = lambda data: self.clock.advance(1)
+        try:
+            with self.assertRaises(DeadlineRefusal):
+                self.create(deadline=NOW + 1)
+        finally:
+            self.ec2.change = None
+
+    def test_a_creation_that_would_start_past_the_deadline_is_refused_and_not_made(self):
         with self.assertRaises(DeadlineRefusal):
             self.create(deadline=NOW)
+        self.assertEqual(self.names(), [])
+        self.assertNotIn((NAME, 5), self.ec2.versions_store)
+
+    def test_a_read_back_that_would_start_past_the_deadline_is_refused_and_not_made(self):
+        self.a_creation_that_ends_at_the_deadline()
         self.assertEqual(self.names(), ["create_launch_template_version"])
         self.assertIn((NAME, 5), self.ec2.versions_store, "the version exists, and the retry finds it by its token")
 
     def test_a_retry_after_the_deadline_refusal_gets_the_same_version_and_the_verdict(self):
-        with self.assertRaises(DeadlineRefusal):
-            self.create(deadline=NOW)
+        self.a_creation_that_ends_at_the_deadline()
         self.assertEqual(self.create(deadline=NOW + 240), {"version": 5, "drift": "clean"})
         created = sorted(number for (name, number) in self.ec2.versions_store if name == NAME)
         self.assertEqual(created, [PIN, 5], "the retry must not create a second version")
@@ -428,13 +442,15 @@ class StubAws:
     def __init__(self, *, created=7, read=(), create_error=None, read_error=None):
         self.calls = []
         self.deadlines = []
+        self.create_deadlines = []
         self.created = created
         self.read = list(read)
         self.create_error = create_error
         self.read_error = read_error
 
-    def create_template_version(self, name, source_version, image_id, description, client_token):
+    def create_template_version(self, name, source_version, image_id, description, client_token, *, deadline):
         self.calls.append(("create", name, source_version, image_id, description, client_token))
+        self.create_deadlines.append(deadline)
         if self.create_error is not None:
             raise self.create_error
         return self.created

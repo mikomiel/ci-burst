@@ -12,7 +12,7 @@ use to exercise pagination and response parsing without any SDK.
 
 ``ImageAws`` is the separate identity of the image-build path. It is built from
 one named shared-config profile, never from ``[aws].profile``, and it can reach
-only the EC2 and S3 services. The module has no IAM client. The presigned
+only the EC2, S3 and STS services (STS for ``GetCallerIdentity`` alone). The module has no IAM client. The presigned
 archive URL, user data and the full template payload are never logged, echoed in
 an error or placed in a returned summary. The module emits no log record of its
 own; it raises the level of the SDK's loggers, whose DEBUG records would print
@@ -24,6 +24,7 @@ import contextlib
 import copy
 import hashlib
 import logging
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -431,7 +432,21 @@ BUILDER_STATES = ("pending", "running", "stopping", "stopped")
 
 #: The image identity reaches only these services. There is deliberately no IAM
 #: client: the role that this path assumes is created and widened by a person.
-IMAGE_SERVICES = frozenset({"ec2", "s3"})
+#: ``sts`` is there for ``GetCallerIdentity`` alone, which asks for no permission: the account
+#: that every staging call names as the bucket's owner (``ImageAws.account_id``).
+IMAGE_SERVICES = frozenset({"ec2", "s3", "sts"})
+
+#: The reason of a staging call that S3 answered with ``AccessDenied``. Every staging call names this identity's
+#: account as the bucket's owner (``ExpectedBucketOwner``), and a bucket that another account owns now answers it,
+#: as does a role without the permission. Nothing is retried without the owner.
+IMAGE_STAGING_BUCKET_DENIED = "IMAGE_STAGING_BUCKET_DENIED"
+_S3_DENIED_CODES = frozenset({"AccessDenied", "403"})
+
+#: The reason of an archive upload that S3 answered with ``NoSuchBucket``: the bucket does not exist, for instance
+#: because a rotation removed the one that a build row recorded. Only the upload maps it
+#: (``ImageAws.put_archive``): a delete or a listing at a missing bucket keeps its generic provider reason.
+IMAGE_STAGING_BUCKET_MISSING = "IMAGE_STAGING_BUCKET_MISSING"
+_S3_MISSING_CODE = "NoSuchBucket"
 
 #: Multipart part size. S3 refuses a part below 5 MiB except the last one.
 ARCHIVE_PART_BYTES = 8 * 1024 * 1024
@@ -706,17 +721,21 @@ def _quiet_sdk_loggers():
         credentials.addFilter(_WithoutTraceback())
 
 
-def _session_expiry(session):
+def _session_expiry(session, check):
     """Epoch expiry of the session's credentials, or ``None`` when unknown.
 
     Assumed-role credentials resolve lazily and carry no expiry until the first
     refresh, so they are resolved first. The resolved secret is discarded here.
+    ``check`` reads the cutoff right before the discovery and right before the
+    refresh in this function.
     """
+    check()
     credentials = session.get_credentials()
     if credentials is None:
         return None
     freeze = getattr(credentials, "get_frozen_credentials", None)
     if callable(freeze):
+        check()
         freeze()
     expiry = getattr(credentials, "_expiry_time", None)
     return _timestamp(expiry)
@@ -746,7 +765,9 @@ class ImageAws:
     replaces the profile check, so it is the caller's to make.
     """
 
-    def __init__(self, region, profile, *, session_factory=None, clients=None, clock=time.time, expiry=None):
+    def __init__(
+        self, region, profile, *, session_factory=None, clients=None, clock=time.time, expiry=None, account=None
+    ):
         if not isinstance(profile, str) or not profile:
             raise ProviderRefusal("IMAGE_PROFILE_MISSING", "an image session needs a named profile")
         # Before any session or client exists, injected ones included: the SDK
@@ -760,6 +781,8 @@ class ImageAws:
         self._expiry = expiry
         self._session_cache = None
         self._ec2_reads = None
+        # ``account`` lets a test supply the account without an STS client.
+        self._account_cache = account
 
     # -- plumbing ---------------------------------------------------------
     def _session(self):
@@ -781,32 +804,108 @@ class ImageAws:
                 self._clients[service] = self._session().client(service, region_name=self._region, config=config)
         return self._clients[service]
 
-    def _invoke(self, service, method, *, read=False, absent=None, **arguments):
-        """Call the provider. ``absent`` is an error code that means "not there"."""
-        client = self._client(service)
+    def account_id(self, *, deadline, stop=None, detail="GetCallerIdentity"):
+        """The account of this identity, from ``GetCallerIdentity``, asked once per instance.
+
+        Every S3 call of this adapter names it as the bucket's owner. An answer that is no account number refuses,
+        so no S3 call goes out without an owner. The lookup starts at the cutoffs of the call that needs it
+        (``_check_deadline``), after the STS client is built.
+        """
+        if self._account_cache is None:
+            response = self._invoke(
+                "sts", "get_caller_identity", read=True, deadline=deadline, stop=stop, detail=detail
+            )
+            account = response.get("Account") if isinstance(response, Mapping) else None
+            if not isinstance(account, str) or not re.fullmatch(r"[0-9]{12}", account):
+                raise ProviderRefusal("AWS_ACCOUNT_UNKNOWN", "get_caller_identity returned no account", uncertain=True)
+            self._account_cache = account
+        return self._account_cache
+
+    def _bound_owner(self, owner, *, deadline, stop=None, detail=""):
+        """The account that an S3 call names as the bucket's owner.
+
+        ``owner`` is the account that a row recorded for its archive. ``None`` means this identity's own account.
+        Anything that is no account number refuses, so no S3 call goes out without an owner.
+        """
+        if owner is None:
+            return self.account_id(deadline=deadline, stop=stop, detail=detail)
+        if not isinstance(owner, str) or not re.fullmatch(r"[0-9]{12}", owner):
+            raise ProviderRefusal("AWS_ACCOUNT_UNKNOWN", "the bucket owner is no account number")
+        return owner
+
+    @contextlib.contextmanager
+    def _preparing(self, deadline, detail, stop=None):
+        """Run the steps that prepare a provider call; a refusal from one at or after a cutoff is the cutoff's.
+
+        An owner lookup, a client build and a credential check start no call of the operation they prepare, so when
+        one refuses at or after a cutoff, the cutoff decides (``DeadlineRefusal``), as for one that succeeded late.
+        A refusal before the cutoff stays the provider failure. A call that the operation itself started is not a
+        step here: its failure is the provider's, even when it ends after the cutoff (``_check_deadline``).
+        """
+        try:
+            yield
+        except ProviderRefusal:
+            self._check_deadline(deadline, detail, stop)
+            raise
+
+    def _invoke(
+        self, service, method, *, deadline, read=False, absent=None, owner=None, stop=None, detail="", **arguments
+    ):
+        """Call the provider. ``absent`` is an error code that means "not there".
+
+        An S3 call carries ``owner`` (see ``_bound_owner``) as the bucket's owner, and it is refused here, before
+        any call, when there is none. ``AccessDenied`` from S3 leaves as ``IMAGE_STAGING_BUCKET_DENIED``.
+
+        A ``deadline`` or a ``stop`` is read first, before the owner lookup or the client build can reach the
+        provider, and again once both are done, whether they succeeded or refused (``_check_deadline``): the first
+        owner check of an adapter asks STS for the account, which takes time.
+        """
+        self._check_deadline(deadline, detail, stop)
+        with self._preparing(deadline, detail, stop):
+            if service == "s3":
+                arguments["ExpectedBucketOwner"] = self._bound_owner(
+                    owner, deadline=deadline, stop=stop, detail=detail
+                )
+            client = self._client(service)
+        # Outside the ``try`` below, which would translate the refusal into a provider failure.
+        self._check_deadline(deadline, detail, stop)
         try:
             return getattr(client, method)(**arguments)
         except Exception as error:  # noqa: BLE001 - classified below
-            if absent is not None and _error_code(error) == absent:
+            code = _error_code(error)
+            if absent is not None and code == absent:
                 return None
+            if service == "s3" and code in _S3_DENIED_CODES:
+                # Refused before the operation, so nothing was written or deleted; a read cannot say more.
+                raise ProviderRefusal(IMAGE_STAGING_BUCKET_DENIED, code, uncertain=read) from None
             raise (_translate_read(error) if read else _translate(error)) from None
 
-    def _check_deadline(self, deadline, detail):
-        if deadline is not None and self._clock() >= deadline:
+    def _check_deadline(self, deadline, detail, stop=None):
+        """Refuse with ``DeadlineRefusal`` at or after either cutoff.
+
+        This is where a provider call starts, for every cutoff of this adapter: it reads them right before it calls
+        the SDK operation, and does not call it at or after one. A method reads them first too, before it resolves
+        credentials, builds a client or looks up the account. Signing and a credential refresh inside the SDK can
+        delay the request after this check, and a failure there counts as a call that started, even when it ends after
+        the cutoff: this adapter cannot tell whether the request left. ``deadline`` is a time on this adapter's clock. ``stop`` is a function of
+        the caller that says whether the call must not start: a caller that bounds its work by elapsed time on a clock
+        of its own passes it, because this adapter does not see that clock.
+        """
+        if (deadline is not None and self._clock() >= deadline) or (stop is not None and stop()):
             raise DeadlineRefusal(detail)
 
     def _pages(self, service, method, request_token, response_token, deadline, detail, absent=None, **arguments):
         """Yield every response page, refusing when the listing would be partial.
 
-        An ``absent`` error code ends the listing as empty.
+        An ``absent`` error code ends the listing as empty. With a ``deadline`` no page starts at or after it
+        (``_invoke``).
         """
         token, pages = None, 0
         while True:
-            self._check_deadline(deadline, detail)
             page = dict(arguments)
             if token:
                 page[request_token] = token
-            response = self._invoke(service, method, read=True, absent=absent, **page)
+            response = self._invoke(service, method, read=True, absent=absent, deadline=deadline, detail=detail, **page)
             if response is None:
                 return
             if not isinstance(response, Mapping):
@@ -829,7 +928,7 @@ class ImageAws:
         return self._ec2_reads
 
     # -- instances --------------------------------------------------------
-    def builders(self, deployment, *, deadline=None):
+    def builders(self, deployment, *, deadline):
         """Builders of one deployment that still exist (the single-flight precheck)."""
         filters = [
             {"Name": "tag:" + IMAGE_BUILD_TAG, "Values": ["true"]},
@@ -841,22 +940,43 @@ class ImageAws:
             items.extend(_instances(response))
         return items
 
-    def instances(self, instance_ids, *, deadline=None):
-        return self._reads().instances(instance_ids, deadline=deadline)
+    def instances(self, instance_ids, *, deadline):
+        self._check_deadline(deadline, "DescribeInstances by-id read")
+        with self._preparing(deadline, "DescribeInstances by-id read"):
+            reads = self._reads()
+        return reads.instances(instance_ids, deadline=deadline)
 
-    def console_output(self, instance_ids, *, deadline=None):
-        return self._reads().console_output(instance_ids, deadline=deadline)
+    def console_output(self, instance_ids, *, deadline):
+        self._check_deadline(deadline, "GetConsoleOutput read")
+        with self._preparing(deadline, "GetConsoleOutput read"):
+            reads = self._reads()
+        return reads.console_output(instance_ids, deadline=deadline)
 
-    def terminate(self, instance_ids):
-        return self._reads().terminate(instance_ids)
+    def terminate(self, instance_ids, *, deadline):
+        self._check_deadline(deadline, "TerminateInstances")
+        with self._preparing(deadline, "TerminateInstances"):
+            reads = self._reads()
+        self._check_deadline(deadline, "TerminateInstances")
+        return reads.terminate(instance_ids)
 
-    def run_builder(self, *, template_name, template_version, deployment, build_id, expires_at, user_data, client_token):
+    def run_builder(
+        self,
+        *,
+        template_name,
+        template_version,
+        deployment,
+        build_id,
+        expires_at,
+        user_data,
+        client_token,
+        deadline,
+    ):
         """Launch the one builder from the build launch template.
 
         The request is built from fixed parameters only: a numeric template
         version, on-demand capacity, one instance, no instance profile and the
         build tags. It has no field through which the managed tag or a profile
-        could be added.
+        could be added. No launch starts at or after ``deadline`` (``_check_deadline``).
         """
         _require_version(template_version)
         tags = [
@@ -868,6 +988,8 @@ class ImageAws:
         response = self._invoke(
             "ec2",
             "run_instances",
+            deadline=deadline,
+            detail="RunInstances",
             LaunchTemplate={"LaunchTemplateName": template_name, "Version": str(template_version)},
             MinCount=1,
             MaxCount=1,
@@ -882,10 +1004,11 @@ class ImageAws:
         return identifiers[0]
 
     # -- images and snapshots ---------------------------------------------
-    def create_image(self, instance_id, name, *, deployment, build_id, basis_digest, extra_tags=None):
+    def create_image(self, instance_id, name, *, deployment, build_id, basis_digest, deadline, extra_tags=None):
         """Image a builder without a reboot, tagging the image and its snapshots.
 
-        A reboot would rerun user data after ``cloud-init clean``.
+        A reboot would rerun user data after ``cloud-init clean``. No call starts at or after ``deadline``
+        (``_check_deadline``).
         """
         tags = {
             IMAGE_BUILD_TAG: "true",
@@ -901,6 +1024,8 @@ class ImageAws:
         response = self._invoke(
             "ec2",
             "create_image",
+            deadline=deadline,
+            detail="CreateImage",
             InstanceId=instance_id,
             Name=name,
             NoReboot=True,
@@ -911,7 +1036,7 @@ class ImageAws:
             raise ProviderRefusal("AWS_UNCERTAIN", "CreateImage returned no image id", uncertain=True)
         return image_id
 
-    def images(self, deployment, *, deadline=None):
+    def images(self, deployment, *, deadline):
         filters = [
             {"Name": "tag:" + IMAGE_BUILD_TAG, "Values": ["true"]},
             {"Name": "tag:" + DEPLOYMENT_TAG, "Values": [deployment]},
@@ -921,13 +1046,15 @@ class ImageAws:
             items.extend(_images(response))
         return items
 
-    def image(self, image_id, *, deadline=None):
+    def image(self, image_id, *, deadline):
         """One image, or ``None`` when the provider no longer knows it.
 
-        ``deadline`` is checked before the request, as the listings check it before each page.
+        No read starts at or after ``deadline`` (``_check_deadline``).
         """
         self._check_deadline(deadline, "describe_images")
-        client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
+        with self._preparing(deadline, "describe_images"):
+            client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
+        self._check_deadline(deadline, "describe_images")
         try:
             response = client.describe_images(ImageIds=[image_id], Owners=["self"])
         except Exception as error:  # noqa: BLE001 - classified below
@@ -937,7 +1064,7 @@ class ImageAws:
         found = _images(response)
         return found[0] if found else None
 
-    def snapshots(self, deployment, *, deadline=None):
+    def snapshots(self, deployment, *, deadline):
         filters = [
             {"Name": "tag:" + IMAGE_BUILD_TAG, "Values": ["true"]},
             {"Name": "tag:" + DEPLOYMENT_TAG, "Values": [deployment]},
@@ -947,9 +1074,15 @@ class ImageAws:
             items.extend(_snapshots(response))
         return items
 
-    def snapshot(self, snapshot_id):
-        """One snapshot, or ``None`` when the provider no longer knows it."""
-        client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
+    def snapshot(self, snapshot_id, *, deadline):
+        """One snapshot, or ``None`` when the provider no longer knows it.
+
+        No read starts at or after ``deadline`` (``_check_deadline``).
+        """
+        self._check_deadline(deadline, "describe_snapshots")
+        with self._preparing(deadline, "describe_snapshots"):
+            client = self._client("ec2")  # before the try, so a refusal it raises is not translated again
+        self._check_deadline(deadline, "describe_snapshots")
         try:
             response = client.describe_snapshots(SnapshotIds=[snapshot_id], OwnerIds=["self"])
         except Exception as error:  # noqa: BLE001 - classified below
@@ -959,14 +1092,14 @@ class ImageAws:
         found = _snapshots(response)
         return found[0] if found else None
 
-    def deregister_image(self, image_id):
-        self._invoke("ec2", "deregister_image", ImageId=image_id)
+    def deregister_image(self, image_id, *, deadline):
+        self._invoke("ec2", "deregister_image", deadline=deadline, detail="DeregisterImage", ImageId=image_id)
 
-    def delete_snapshot(self, snapshot_id):
-        self._invoke("ec2", "delete_snapshot", SnapshotId=snapshot_id)
+    def delete_snapshot(self, snapshot_id, *, deadline):
+        self._invoke("ec2", "delete_snapshot", deadline=deadline, detail="DeleteSnapshot", SnapshotId=snapshot_id)
 
     # -- launch templates -------------------------------------------------
-    def launch_templates(self, names, *, deadline=None):
+    def launch_templates(self, names, *, deadline):
         """Describe templates by name. A name the provider does not know gives no entry.
 
         EC2 fails a whole request when one name is unknown, so each name is
@@ -983,7 +1116,7 @@ class ImageAws:
                 items.extend(_launch_templates(response))
         return items
 
-    def template_versions(self, name, versions, *, deadline=None):
+    def template_versions(self, name, versions, *, deadline):
         """Read versions back in full, including the whole ``LaunchTemplateData``."""
         for version in versions:
             _require_version(version)
@@ -997,8 +1130,8 @@ class ImageAws:
             items.extend(_template_versions(response, name))
         return items
 
-    def template_version(self, name, version):
-        found = self.template_versions(name, [version])
+    def template_version(self, name, version, *, deadline):
+        found = self.template_versions(name, [version], deadline=deadline)
         if not found:
             raise ProviderRefusal("TEMPLATE_NOT_FOUND", f"{name} version {version}")
         if len(found) != 1 or found[0].version != version:
@@ -1006,7 +1139,7 @@ class ImageAws:
         return found[0]
 
     # -- security groups --------------------------------------------------
-    def security_groups(self, *, group_ids=(), group_names=(), deadline=None):
+    def security_groups(self, *, deadline, group_ids=(), group_names=()):
         """Read security groups by id and by name, with their inbound rule counts.
 
         Ids go in one request and names in another. EC2 fails a request that
@@ -1025,11 +1158,12 @@ class ImageAws:
                 items.extend(_security_groups(response))
         return items
 
-    def create_template_version(self, name, source_version, image_id, description, client_token):
+    def create_template_version(self, name, source_version, image_id, description, client_token, *, deadline):
         """Create a non-default version that differs from the pin only in its image.
 
         ``source_version`` is the numeric pin, never ``$Latest`` or the default.
         The request sets no default and the response is read back by the caller.
+        No call starts at or after ``deadline`` (``_check_deadline``).
         """
         _require_version(source_version)
         if not isinstance(image_id, str) or not image_id.startswith("ami-"):
@@ -1037,6 +1171,8 @@ class ImageAws:
         response = self._invoke(
             "ec2",
             "create_launch_template_version",
+            deadline=deadline,
+            detail="CreateLaunchTemplateVersion",
             LaunchTemplateName=name,
             SourceVersion=str(source_version),
             LaunchTemplateData={"ImageId": image_id},
@@ -1050,8 +1186,12 @@ class ImageAws:
         return number
 
     # -- source archive storage -------------------------------------------
-    def put_archive(self, bucket, key, chunks, *, max_bytes, part_bytes=ARCHIVE_PART_BYTES, deadline=None):
+    def put_archive(self, bucket, key, chunks, *, max_bytes, deadline, part_bytes=ARCHIVE_PART_BYTES, owner=None):
         """Stream ``chunks`` into one multipart upload, hashing the bytes as they go.
+
+        Every S3 call of the upload and of its cleanup names ``owner`` as the bucket's owner (see
+        ``_bound_owner``). A bucket that does not exist refuses with ``IMAGE_STAGING_BUCKET_MISSING``, whether the
+        first call or a later one finds it, and ``AccessDenied`` with ``IMAGE_STAGING_BUCKET_DENIED``.
 
         The archive is never written to disk. Overrunning ``max_bytes``, a failed
         part or completion, or a failing source iterator aborts the upload and
@@ -1060,19 +1200,35 @@ class ImageAws:
         iterator raises leaves here as a new one with the same reason code and a
         fixed detail, of the same class where the class can be rebuilt from its
         reason, detail and uncertainty (see ``_rebuilt_refusal``). ``deadline`` is
-        checked before the upload opens, before each chunk and each part, and
-        immediately before completion, so a stalled stream or a slow last part
-        ends the upload instead of finishing it.
+        read before the upload opens, again where the call that opens it starts (with no ``owner``, the lookup of
+        the account comes between the two and takes time), before each chunk and each part, and
+        before completion, so a stalled stream or a slow last part
+        ends the upload instead of finishing it. A deadline that ends before the opening call leaves no upload to
+        clean up.
         """
         self._check_deadline(deadline, "archive upload")
-        started = self._invoke("s3", "create_multipart_upload", Bucket=bucket, Key=key)
+        with self._preparing(deadline, "archive upload"):
+            owner = self._bound_owner(owner, deadline=deadline, detail="archive upload")
+        started = self._invoke(
+            "s3",
+            "create_multipart_upload",
+            owner=owner,
+            absent=_S3_MISSING_CODE,
+            deadline=deadline,
+            detail="archive upload",
+            Bucket=bucket,
+            Key=key,
+        )
+        if started is None:
+            # ``absent`` made the answer ``NoSuchBucket`` no response: no upload exists, so nothing needs cleaning up.
+            raise ProviderRefusal(IMAGE_STAGING_BUCKET_MISSING, _S3_MISSING_CODE)
         upload_id = started.get("UploadId")
         if not isinstance(upload_id, str) or not upload_id:
             raise ProviderRefusal("AWS_UNCERTAIN", "multipart upload returned no upload id", uncertain=True)
         try:
-            return self._stream_parts(bucket, key, upload_id, chunks, max_bytes, part_bytes, deadline)
+            return self._stream_parts(bucket, key, upload_id, chunks, max_bytes, part_bytes, deadline, owner)
         except _ArchiveTooLarge:
-            cleaned = self._discard_upload(bucket, key, upload_id)
+            cleaned = self._discard_upload(bucket, key, upload_id, owner)
             raise ProviderRefusal("IMAGE_ARCHIVE_TOO_LARGE", _cleanup_detail(f"over {max_bytes} bytes", cleaned)) from None
         except Refusal as refusal:
             # The source iterator's refusal can carry a URL or a token in its
@@ -1081,26 +1237,39 @@ class ImageAws:
             # caller that catches a ``ProviderRefusal`` or a ``DeadlineRefusal``
             # still does; the deadline refusal takes only a detail, so it is
             # rebuilt on its own line.
-            cleaned = self._discard_upload(bucket, key, upload_id)
+            cleaned = self._discard_upload(bucket, key, upload_id, owner)
             if isinstance(refusal, DeadlineRefusal):
                 raise DeadlineRefusal(_cleanup_detail("archive upload", cleaned)) from None
             raise _rebuilt_refusal(refusal, _cleanup_detail("archive source refused", cleaned)) from None
         except Exception as error:  # noqa: BLE001 - reported as a code only
-            cleaned = self._discard_upload(bucket, key, upload_id)
+            cleaned = self._discard_upload(bucket, key, upload_id, owner)
             code = (_error_code(error) or type(error).__name__)[:64]
-            raise ProviderRefusal("IMAGE_ARCHIVE_UPLOAD_FAILED", _cleanup_detail(code, cleaned)) from None
+            if code in _S3_DENIED_CODES:
+                reason = IMAGE_STAGING_BUCKET_DENIED
+            elif code == _S3_MISSING_CODE:
+                reason = IMAGE_STAGING_BUCKET_MISSING
+            else:
+                reason = "IMAGE_ARCHIVE_UPLOAD_FAILED"
+            raise ProviderRefusal(reason, _cleanup_detail(code, cleaned)) from None
         except BaseException:
-            self._discard_upload(bucket, key, upload_id)
+            self._discard_upload(bucket, key, upload_id, owner)
             raise
 
-    def _stream_parts(self, bucket, key, upload_id, chunks, max_bytes, part_bytes, deadline):
+    def _stream_parts(self, bucket, key, upload_id, chunks, max_bytes, part_bytes, deadline, owner):
         s3 = self._client("s3")
         digest, parts, buffer, total = hashlib.sha256(), [], bytearray(), 0
 
         def send(body):
             self._check_deadline(deadline, "archive upload")
             number = len(parts) + 1
-            response = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=number, Body=body)
+            response = s3.upload_part(
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+                PartNumber=number,
+                Body=body,
+                ExpectedBucketOwner=owner,
+            )
             parts.append({"ETag": response["ETag"], "PartNumber": number})
 
         for chunk in chunks:
@@ -1122,18 +1291,23 @@ class ImageAws:
         # The last part can cross the deadline while it uploads, and the per-part
         # check above ran before it: a late upload must not be completed.
         self._check_deadline(deadline, "archive upload")
-        s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts})
+        s3.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts}, ExpectedBucketOwner=owner
+        )
         return ArchiveUpload(key=key, size=total, sha256=digest.hexdigest())
 
-    def _discard_upload(self, bucket, key, upload_id):
+    def _discard_upload(self, bucket, key, upload_id, owner):
         """Abort the upload and delete the key. True only when both calls succeeded."""
         s3 = self._client("s3")
         clean = True
         # A completion whose response was lost may have created the object, so
         # the delete runs whether or not the abort found an upload.
         for call, arguments in (
-            (s3.abort_multipart_upload, {"Bucket": bucket, "Key": key, "UploadId": upload_id}),
-            (s3.delete_object, {"Bucket": bucket, "Key": key}),
+            (
+                s3.abort_multipart_upload,
+                {"Bucket": bucket, "Key": key, "UploadId": upload_id, "ExpectedBucketOwner": owner},
+            ),
+            (s3.delete_object, {"Bucket": bucket, "Key": key, "ExpectedBucketOwner": owner}),
         ):
             try:
                 call(**arguments)
@@ -1141,7 +1315,7 @@ class ImageAws:
                 clean = False
         return clean
 
-    def list_objects(self, bucket, prefix, *, deadline=None):
+    def list_objects(self, bucket, prefix, *, deadline, owner=None):
         items = []
         for response in self._pages(
             "s3",
@@ -1152,6 +1326,7 @@ class ImageAws:
             "ListObjectsV2 page",
             Bucket=bucket,
             Prefix=prefix,
+            owner=owner,
         ):
             for entry in response.get("Contents") or []:
                 key = entry.get("Key") if isinstance(entry, Mapping) else None
@@ -1161,23 +1336,39 @@ class ImageAws:
                 items.append(StoredObject(key=key, size=size, last_modified=_timestamp(entry.get("LastModified"))))
         return items
 
-    def delete_object(self, bucket, key):
-        self._invoke("s3", "delete_object", Bucket=bucket, Key=key)
+    def delete_object(self, bucket, key, *, deadline, owner=None, stop=None):
+        """Delete one object, naming ``owner`` as the bucket's owner (see ``_bound_owner``).
 
-    def credential_expiry(self):
+        A ``deadline`` and a ``stop`` are read once the S3 client is built (``_invoke``, ``_check_deadline``): the
+        first S3 call of an adapter builds its client, which takes time.
+        """
+        self._invoke(
+            "s3",
+            "delete_object",
+            owner=owner,
+            deadline=deadline,
+            stop=stop,
+            detail="archive delete",
+            Bucket=bucket,
+            Key=key,
+        )
+
+    def credential_expiry(self, *, deadline):
         """Epoch expiry of this session's credentials, or ``None`` when unknown.
 
         An assumed role is assumed here, when its credentials are first read, so
         this is where the provider refuses it (an expired source key, a trust
         policy that denies the caller). That failure leaves as a ``ProviderRefusal``
-        with the provider's error code and never its message.
+        with the provider's error code and never its message. No lookup starts at
+        or after ``deadline`` (``_check_deadline``), since it can ask STS.
         """
+        self._check_deadline(deadline, "credential lookup")
         if self._expiry is not None:
             return self._expiry() if callable(self._expiry) else self._expiry
         with _sdk_failures():
-            return _session_expiry(self._session())
+            return _session_expiry(self._session(), lambda: self._check_deadline(deadline, "credential lookup"))
 
-    def check_credential_life(self, expires_seconds):
+    def check_credential_life(self, expires_seconds, *, deadline):
         """Refuse with ``IMAGE_CREDENTIAL_SHORT`` unless the session outlives a URL of ``expires_seconds``.
 
         The signature dies with the credentials, so a URL that is meant to last
@@ -1185,7 +1376,7 @@ class ImageAws:
         expiry is a refusal, not "long enough". Nothing is presigned, so a caller
         can ask before it spends anything on the build the URL is for.
         """
-        expiry = self.credential_expiry()
+        expiry = self.credential_expiry(deadline=deadline)
         if expiry is None:
             raise ProviderRefusal("IMAGE_CREDENTIAL_SHORT", "the credential expiry is unknown")
         remaining = expiry - self._clock()
@@ -1195,18 +1386,26 @@ class ImageAws:
                 f"{max(int(remaining), 0)} seconds of credential life remain, {expires_seconds} are needed",
             )
 
-    def presign_get(self, bucket, key, expires_seconds):
+    def presign_get(self, bucket, key, expires_seconds, *, deadline, owner=None):
         """Presign a GET for one object, only if the session outlives the URL.
 
-        ``check_credential_life`` decides that. The URL is returned and never
-        logged, stored or placed in an error.
+        ``check_credential_life`` decides that, right before signing: the signature dies with the credentials, and the
+        lookup of the owner (which can ask STS) and the build of the client take time first. A ``deadline`` is read
+        before both, again before the lookup of the credential, which can ask STS, and again right before signing, as
+        ``_check_deadline`` says. The ``owner`` (see ``_bound_owner``) is signed as the bucket's expected owner: the
+        SDK signs it as the ``x-amz-expected-bucket-owner`` header, so the GET must send that header with that value.
+        The URL is returned and never logged, stored or placed in an error.
         """
-        self.check_credential_life(expires_seconds)
-        client = self._client("s3")
+        self._check_deadline(deadline, "presign")
+        with self._preparing(deadline, "presign"):
+            owner = self._bound_owner(owner, deadline=deadline, detail="presign")
+            client = self._client("s3")
+            self.check_credential_life(expires_seconds, deadline=deadline)
+        self._check_deadline(deadline, "presign")
         try:
             return client.generate_presigned_url(
                 "get_object",
-                Params={"Bucket": bucket, "Key": key},
+                Params={"Bucket": bucket, "Key": key, "ExpectedBucketOwner": owner},
                 ExpiresIn=expires_seconds,
             )
         except Exception as error:  # noqa: BLE001 - classified below

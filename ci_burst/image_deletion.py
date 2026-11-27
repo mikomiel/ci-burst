@@ -46,7 +46,7 @@ from dataclasses import InitVar, dataclass, field
 
 from .aws import BUILD_ID_TAG, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
 from .config import loads
-from .errors import ConfigRefusal, ImageRefusal, ProviderRefusal
+from .errors import ConfigRefusal, DeadlineRefusal, ImageRefusal, ProviderRefusal
 from .image_state import ACTIVE_STATES
 from .image_template import TEMPLATE_DRIFT
 
@@ -360,7 +360,7 @@ def plan_deletions(images, snapshots, protected, *, deployment, mode, now, confi
     return plan
 
 
-def apply_deletions(aws, plan, *, apply):
+def apply_deletions(aws, plan, *, apply, deadline=None):
     """Carry out a plan from ``plan_deletions``, or only describe it.
 
     ``aws`` is an ``ImageAws``. Without ``apply`` no call is made at all and
@@ -371,6 +371,15 @@ def apply_deletions(aws, plan, *, apply):
     read-back refused), deletes no snapshot and is reported, and the run goes on
     with the next item. A refused snapshot deletion is reported the same way. Only
     a provider refusal is reported: any other error propagates and stops the run.
+
+    With ``deadline`` each item (an image with its snapshots, or a lone snapshot)
+    reads it at its first deletion call, so no item starts at or after it,
+    whatever the items before it did. When no deletion call has been made yet,
+    the run starts nothing and the ``DeadlineRefusal`` propagates; otherwise the
+    run stops at that item and returns the rows before it, and the rest waits for
+    a later pass. Once an item's first call has returned, the rest of that item
+    takes no deadline, so an item that started before the cutoff can end after
+    it; the SDK's timeouts bound each call.
 
     Ownership and protection were decided by ``plan_deletions``, and nothing
     here decides them again. Instead, before any call (a dry run included), every
@@ -392,28 +401,38 @@ def apply_deletions(aws, plan, *, apply):
     deregistration was not confirmed).
     """
     report = []
+    made = False  # whether this run has made a deletion call
     for item in _decided_items(plan):
         if item["action"] == SKIP:
             report.append(_row(item, SKIP, SKIPPED, reason=item["reason"]))
             continue
         # What is left is ``deregister`` or ``delete_snapshot`` (a snapshot that no
         # image references, deleted with no deregistration before it).
-        confirmed = True
-        if item["action"] == DEREGISTER:
-            if apply:
-                result, code = _deregister(aws, item["image_id"])
-                confirmed = result == DEREGISTERED
-            else:
-                result, code = PLANNED, None
-            report.append(_row(item, DEREGISTER, result, code=code))
-        for snapshot_id in item["snapshot_ids"]:
-            if not apply:
-                result, code = PLANNED, None
-            elif not confirmed:
-                result, code = SNAPSHOT_KEPT, None
-            else:
-                result, code = _delete_snapshot(aws, snapshot_id)
-            report.append(_row(item, DELETE_SNAPSHOT, result, snapshot_id=snapshot_id, code=code))
+        start = deadline  # read by the first deletion call of this item only
+        try:
+            confirmed = True
+            if item["action"] == DEREGISTER:
+                if apply:
+                    result, code = _deregister(aws, item["image_id"], start)
+                    start, made = None, True
+                    confirmed = result == DEREGISTERED
+                else:
+                    result, code = PLANNED, None
+                report.append(_row(item, DEREGISTER, result, code=code))
+            for snapshot_id in item["snapshot_ids"]:
+                if not apply:
+                    result, code = PLANNED, None
+                elif not confirmed:
+                    result, code = SNAPSHOT_KEPT, None
+                else:
+                    result, code = _delete_snapshot(aws, snapshot_id, start)
+                    start, made = None, True
+                report.append(_row(item, DELETE_SNAPSHOT, result, snapshot_id=snapshot_id, code=code))
+        except DeadlineRefusal:
+            # Only an item's first deletion call reads the deadline, so this item made no call.
+            if not made:
+                raise
+            break
         for entry in item["skipped_snapshots"]:
             report.append(
                 _row(item, DELETE_SNAPSHOT, SKIPPED, snapshot_id=entry["snapshot_id"], reason=entry["reason"])
@@ -548,14 +567,17 @@ def _item(path, image_id, build_id, verdict, snapshot_ids, skipped_snapshots, *,
     return item
 
 
-def _deregister(aws, image_id):
-    """Deregister an image and read it back: the result and the refusal's code."""
+def _deregister(aws, image_id, deadline=None):
+    """Deregister an image and read it back: the result and the refusal's code.
+
+    ``deadline`` bounds the deregistration only; the read-back takes none.
+    """
     try:
-        aws.deregister_image(image_id)
+        aws.deregister_image(image_id, deadline=deadline)
     except ProviderRefusal as refusal:
         return DEREGISTER_FAILED, refusal.reason
     try:
-        found = aws.image(image_id)
+        found = aws.image(image_id, deadline=None)
     except ProviderRefusal as refusal:
         return DEREGISTER_UNCONFIRMED, refusal.reason
     if found is None or found.state == _DEREGISTERED_STATE:
@@ -563,9 +585,9 @@ def _deregister(aws, image_id):
     return DEREGISTER_UNCONFIRMED, None
 
 
-def _delete_snapshot(aws, snapshot_id):
+def _delete_snapshot(aws, snapshot_id, deadline=None):
     try:
-        aws.delete_snapshot(snapshot_id)
+        aws.delete_snapshot(snapshot_id, deadline=deadline)
     except ProviderRefusal as refusal:
         return SNAPSHOT_FAILED, refusal.reason
     return SNAPSHOT_DELETED, None

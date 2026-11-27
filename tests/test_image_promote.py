@@ -47,6 +47,7 @@ from test_image_pipeline import (
     NOW,
     PIN,
     READY,
+    REGION,
     SCRIPT,
     SOURCE_SHA,
     WORKER,
@@ -289,6 +290,8 @@ class PromoteCase(CliCase):
             "gate_configured": 1,
             "gate_passed": 1,
             "verified_at": self.clock() - 60,
+            "source_template": WORKER,
+            "source_region": REGION,
             "source_pin": PIN,
         }
 
@@ -901,6 +904,43 @@ class VerificationTests(PromoteCase):
         error = self.refusal(("--version", "5"), "PIN_MOVED")
         self.assertIn("version 4", error["detail"])
         self.assertIn("version 3", error["detail"])
+
+    def test_a_template_that_changed_since_the_record_was_made_is_refused(self):
+        other = "example-ci-burst-spare"
+        self.change("build-b", source_template=WORKER)  # made from WORKER's version 3, as a pass records it
+        self.edit_file(f'launch_template_name = "{WORKER}"'.encode(), f'launch_template_name = "{other}"'.encode())
+        before = self.config_path.read_bytes()  # the pin is still 3, now a version of another template
+        error = self.refusal(("--version", "5"), "PIN_MOVED")
+        self.assertEqual(
+            error["detail"],
+            f"the file names launch template {other}; the record was derived from launch template {WORKER}",
+        )
+        self.assertEqual(self.config_path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_a_region_that_changed_since_the_record_was_made_is_refused(self):
+        other = "eu-west-1"
+        self.change("build-b", source_region=other)  # made in another Region than the one the file sets now
+        before = self.config_path.read_bytes()
+        detail = f"the file sets Region {REGION}; the record was derived from Region {other}"
+        error = self.refusal(("--version", "5"), "PIN_MOVED")
+        self.assertEqual(error["detail"], detail)
+        self.assertEqual(self.config_path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+        # The preview plans the same refusal.
+        self.assertEqual(self.show("--version", "5")[1]["write_check"], {"ok": False, **error})
+
+    def test_a_record_that_does_not_say_where_it_was_copied_from_is_refused(self):
+        for column in ("source_template", "source_region", "source_pin"):
+            with self.subTest(column=column):
+                self.change("build-b", **{**self.good(), column: None})
+                before = self.config_path.read_bytes()
+                error = self.refusal(("--version", "5"), "PIN_MOVED")
+                self.assertEqual(
+                    error["detail"], "the record does not say which launch template, Region and pin it was copied from"
+                )
+                self.assertEqual(self.config_path.read_bytes(), before)
+                self.assertEqual(self.backups(), [])
 
     def test_a_version_that_no_candidate_owns_is_refused(self):
         self.refusal(("--version", "99"), "PROMOTE_VERSION_NOT_CANDIDATE")

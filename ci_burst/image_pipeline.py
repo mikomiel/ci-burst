@@ -20,14 +20,17 @@ Three entry points make up the Python API (the command line is task 6.1):
 
 A pass holds the state file's writer lock and runs, in this order:
 
-1. reconcile: terminate every builder that is not the active build's, and the
-   active build's own once its deadline has come; delete stray archives; adopt
+1. reconcile: terminate the active build's builder once its deadline has come;
+   terminate every builder that is not the active build's; delete stray archives (a
+   sweep that starts no delete once the pass is ``STRAY_SWEEP_SECONDS`` old); adopt
    what a crash left behind; record every tagged image that has no row as an
    unverified candidate and follow it; remove the images of failed builds
 2. observe the configured pin
 3. with no active build, decide and, when a build is due, start it; with one,
    advance it (``building`` to ``imaging`` to ``candidate`` or ``failed``)
 4. retention: the one deletion rule, then the telemetry files
+5. the owed archive deletions, last: after the work above, on the time it leaves,
+   also when the work ended on a refusal (``_Pass._owed_tail``)
 
 The pass that first sees the marker calls ``CreateImage`` before it does any
 other step that is not a read. The builder is terminated only after the image is
@@ -55,27 +58,87 @@ and again before the launch, when either can have changed. The pass answers
 ``refused``, drops the archive and counts no failure. A pass that runs out of
 time while it stages the archive does not fail the build either: the row stays
 ``building`` with no builder, and the next pass stages the archive again under
-the same key and launches. The build deadline still ends such a build. That pass
-checks first that the inputs still give the digest of the row: the basis files at
-the row's own commit, the warm settings and the script. Changed inputs end the
-row ``failed`` with ``IMAGE_INPUTS_CHANGED``, count no failure and launch nothing,
-and the next pass decides from the new inputs. It then runs the template check of
-a start again: an unsafe template ends the row ``failed`` and the pass answers
-``refused``, like a refused start check. The launch reads the clock again right
-before the provider call: at or after the build deadline no builder is launched,
-and the build fails ``CONSOLE_BLIND``.
+the key and the bucket that the row recorded before the first upload, whatever
+the configuration says by then, and launches. The build deadline still ends such
+a build. That pass first checks the inputs of the row (no file is read), the gate and
+the template again (``_Pass._restage``): changed inputs, a missing gate or an unsafe
+template end the row ``failed``, count no failure and launch nothing, and the pass
+answers ``refused``.
+
+One rule holds in a start, in a stage that is done again and in the launch: a deadline decides before the outcome of
+any call that takes time (``_Pass._deadline_first``). Those calls are the read of the template, the lookup of the
+credential, the upload, the presign and the listing of the builders, and in a stage done again the checks of the
+inputs and the gate, which the pass reaches after reads that took time. When one of them has returned, with a result
+or with a refusal, both deadlines are read again, before the pipeline inserts a row, uploads, launches or ends a row
+on that refusal. The build deadline decides first: the build fails ``CONSOLE_BLIND``. At or after the pass deadline
+the row is left ``building`` with no builder and no archive hash, for the next pass to stage again. Before a row
+exists only the pass deadline applies, and the pass ends on it (``DeadlineRefusal``) with no row. The reads, the
+upload and the presign of a stage hand the adapter the earlier of the two deadlines (``_Pass._cutoff``), so a call
+that returns after the build deadline is followed by no other. Two outcomes are not read this way: the answer of the
+launch call itself, because a builder that it started must be recorded, and a listing that shows a builder, which is
+refused whenever it returns (issue #232).
+
+The archive of a build is deleted when the build ends, from the bucket and the
+key its row recorded, and the row records the time (``archive_deleted_at``). A
+deletion that fails stays owed: ``ImageState.archives_owed`` lists the finished
+builds that name an archive and have no such time, and the reconcile of every
+pass retries them last (``_Pass._owed_tail``). The end of a build deletes its own
+archive at once. A pass starts at most ``OWED_ARCHIVES_PER_PASS`` of them
+after its own work, on the time that work leaves, and also when the pass ended on a
+refusal: none starts once the pass deadline is less than ``OWED_DELETE_RESERVE_SECONDS``
+away. The owner check of a delete can be the first use of the account of this session, a provider
+call that takes time, so the clock is read again after the check, and once more by the adapter where the
+delete starts (``ImageAws._check_deadline``): a delete that would start inside the reserve does not, and its row
+stays owed. A backlog
+of slow refused deletions cannot take the time that a stage, a decision
+or a build needs. If passes never leave that time, the bucket lifecycle rule stays the
+backstop. A refused
+one takes the next place in ``archive_delete_seq`` (and records its time, for diagnosis) and goes behind the
+rows not yet tried and the rows tried before it, so it cannot keep another row from its turn, whatever the
+clock does. The row also records the account that owned its bucket when it was first staged (``archive_owner``).
+Every S3 call about the archive names it, and no call is made about the archive of a row whose owner is not the
+account of this session, or is unknown: a stage done again is refused (``IMAGE_STAGING_OWNER_CHANGED``) and a
+delete counts as failed and stays owed. A stage done again that S3 refuses for the bucket is refused the same
+way, with no failure counted: ``IMAGE_STAGING_BUCKET_DENIED``, or ``IMAGE_STAGING_BUCKET_MISSING`` when the
+bucket that the row recorded no longer exists. Rows that the
+bound left are noted ``archive:delete_deferred``.
+
+The stray archives (older than an hour, named by no row) are swept in reconcile, before the work of the pass, and
+the sweep has a bound of its own: no delete starts once the pass is ``STRAY_SWEEP_SECONDS`` old. Two clocks measure
+that age, and the first to reach it stops the sweep: the wall clock, and elapsed time on a monotonic clock, which a
+wall clock that is stepped back cannot stretch. The adapter evaluates both where the delete starts
+(``ImageAws._check_deadline``, ``stop``), and the pass reads the monotonic clock before each delete too, as an early
+stop that saves the call. The sweep then stops and the pass notes ``archive:sweep_deferred``. That is the one bound
+that elapsed time measures: the pass deadline, the build deadline and the cutoff of the owed deletions are times on
+the wall clock, as every persisted time is, and a wall clock that is stepped back stretches them. The bound is a
+time, not a count, so it holds for many quick deletes and for a few slow ones. It bounds when a delete starts, not
+when the last one ends: that one can run for the timeouts of the SDK client, and a credential refresh inside the SDK
+can add to them. The work and the owed deletions run on the time that is left, and the last start of an owed
+deletion is the pass deadline minus the reserve (200 seconds). Four limits remain. (1) The listing reads every page
+before the first delete, and only the pass deadline bounds it; a listing that returns after the bound is followed by
+no delete. (2) A pass whose reads before the sweep take the bound or longer sweeps nothing. (3) Slow stray deletes
+can push the work of a pass past 200 seconds, and the pass then loses its owed turn, as one whose work ends after
+200 seconds does with or without strays. (4) The sweep keeps no record of its attempts and the listing is in key
+order, so a stray at the front whose delete times out in every pass can keep the strays behind it unswept. All four
+cost storage only: the strays wait for a later pass, and the bucket lifecycle rule stays the backstop.
 
 The gate requirement (``IMAGE_GATE_REQUIRED``: neither a gate command nor the
 opt-out ``allow_no_gate``) guards a launch, not a build that has a row. ``plan``
 and an applying pass are refused before any client is built, except an applying
-pass whose state file holds a build in flight: it settles that build, and refuses
-every launch it would make, a new build or a stage that is done again, with the
-same code and no failure counted.
+pass whose state file holds a build in flight or an archive deletion that is
+owed: it settles them, and refuses every launch it would make, a new build or a
+stage that is done again, with the same code and no failure counted. A pass that
+starts with no build in flight (it runs only because a deletion is owed) is a
+cleanup pass: it runs the bounded owed deletions, and then answers ``refused`` with
+the gate requirement. It reads nothing else, neither the pin, the builders, the
+stray archives, the images and the retention of the provider nor any file of the
+forge, so an unrelated refusal of those reads cannot hide its result. The pin
+fields that it did not read are ``None``, ``retention`` is ``None`` and the result carries ``cleanup_only: true``,
+so that the command line stamps no pin evidence.
 
 The pass deadline bounds the reads of the forge too. The forge client puts no
 deadline on a read of a basis file, so the clock is read before each request:
-none starts at or after the deadline, in ``plan``, in a decision and in the check
-of a stage that is done again.
+none starts at or after the deadline, in ``plan`` and in a decision.
 
 Secrets. The presigned archive URL and the rendered user data live in local
 variables of ``_Pass._launch`` and nowhere else: not in the state file, not in an
@@ -103,15 +166,25 @@ import re
 import time
 import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import image, image_console, image_deletion
-from .aws import BASIS_DIGEST_TAG, BUILD_ID_TAG, BUILDER_STATES, DEPLOYMENT_TAG, IMAGE_BUILD_TAG
+from .aws import (
+    BASIS_DIGEST_TAG,
+    BUILD_ID_TAG,
+    BUILDER_STATES,
+    DEPLOYMENT_TAG,
+    IMAGE_BUILD_TAG,
+    IMAGE_STAGING_BUCKET_DENIED,
+    IMAGE_STAGING_BUCKET_MISSING,
+    READ_TIMEOUT_SECONDS,
+)
 from .errors import DeadlineRefusal, ImageRefusal, ProviderRefusal, Refusal
 from .export import _label, _write_atomic
 from .forgejo import require_protected
-from .image_state import ACTIVE_STATES, BUILD_STATES, Control
+from .image_state import ACTIVE_STATES, BUILD_STATES, Control, build_file_hashes
 from .image_template import CLEAN, TEMPLATE_DRIFT, create_candidate_version
 
 #: One pass is bounded to this many seconds, and the console and the image are
@@ -127,6 +200,19 @@ SUPERVISOR_SLEEP_SECONDS = 30
 #: An object under the staging prefix that is not the active archive goes once it
 #: is strictly older than this.
 STRAY_ARCHIVE_AGE_SECONDS = 3600
+#: The sweep of stray archives starts no delete once the pass is this old, by the wall clock or by elapsed time on a
+#: monotonic clock, whichever reaches it first. The pass checks the monotonic clock before each delete, and the adapter
+#: evaluates both where the delete starts. It runs before the work of the pass, so it takes an early share of the pass.
+#: A deletion that is quick takes milliseconds, so the bound only matters when deletes are slow. It bounds the start
+#: of the deletes and nothing else; the module docstring lists the limits.
+STRAY_SWEEP_SECONDS = 30
+#: One pass starts at most this many owed archive deletions, after its own work and on the time that work leaves. A
+#: deletion starts only while the clock is before the pass deadline minus ``OWED_DELETE_RESERVE_SECONDS``: the read
+#: timeout of the SDK client, which one delete can use up, and a margin. The clock is read again after the owner
+#: check, which can ask the provider for the account first, and once more by the adapter where the delete starts. A
+#: backlog of slow refused deletions cannot take the time that a stage, a decision or a build needs.
+OWED_ARCHIVES_PER_PASS = 8
+OWED_DELETE_RESERVE_SECONDS = READ_TIMEOUT_SECONDS + 10
 
 #: EC2 can answer "no such instance" for a few seconds after ``RunInstances``. A
 #: builder that is not listed within this long of being recorded is not treated
@@ -153,12 +239,21 @@ IMAGE_CREDENTIAL_SHORT = "IMAGE_CREDENTIAL_SHORT"
 #: Nothing was launched, so it is no failure. ``_restage`` raises it as it raises ``IMAGE_BUILD_TEMPLATE_UNSAFE``, so
 #: ``START_REFUSALS``, the filter of the checks of a start, does not hold it.
 IMAGE_INPUTS_CHANGED = "IMAGE_INPUTS_CHANGED"
+#: The row records the account that owned its bucket (``archive_owner``), and this pass runs in another one, or the
+#: row records none. No S3 call is made about the archive of such a row. A stage done again is refused like
+#: ``IMAGE_STAGING_BUCKET_DENIED``; a delete counts as failed and stays owed.
+IMAGE_STAGING_OWNER_CHANGED = "IMAGE_STAGING_OWNER_CHANGED"
 
 #: The refusals that end a start without a failed build. Both are checked before anything is staged and again
 #: once the archive is up, because either can change in between. Neither counts toward the cooldown or the block.
 #: ``IMAGE_GATE_REQUIRED`` refuses a launch too, and counts no failure either, but a pass never changes its own
 #: configuration: ``_start_refusal`` returns it once, first, and this filter does not hold it.
 START_REFUSALS = (IMAGE_CREDENTIAL_SHORT, IMAGE_BUILD_ALREADY_ACTIVE)
+
+#: The refusals of the staging bucket that a row recorded, which end a stage done again as a refused start (``_stage``):
+#: S3 refuses the bucket (``IMAGE_STAGING_BUCKET_DENIED``), it no longer exists (``IMAGE_STAGING_BUCKET_MISSING``), or
+#: it was staged in another account than the one of this pass's role (``IMAGE_STAGING_OWNER_CHANGED``).
+STAGING_BUCKET_REFUSALS = (IMAGE_STAGING_BUCKET_DENIED, IMAGE_STAGING_BUCKET_MISSING, IMAGE_STAGING_OWNER_CHANGED)
 
 #: Tag keys that ``CreateImage`` adds to the ones the adapter sets. The build
 #: policy (``deploy/iam/image-build-policy.json``) allows exactly these keys, and
@@ -454,7 +549,17 @@ _EVENT_FIELDS = {
         {"build_id", "reason", "image_id", "digest", "duration_seconds", "drift_fields", "framed_tail"}
     ),
     "image_reconciled": frozenset(
-        {"builders_terminated", "archives_deleted", "images_recorded", "builder_adopted", "image_adopted", "build_id"}
+        {
+            "builders_terminated",
+            "archives_deleted",
+            "owed_archives_deleted",
+            "owed_archive_delete_failed",
+            "owed_archives_deferred",
+            "images_recorded",
+            "builder_adopted",
+            "image_adopted",
+            "build_id",
+        }
     ),
     "image_pruned": frozenset({"deregistered", "snapshots_deleted", "failed", "skipped"}),
     "image_blocked": frozenset({"consecutive_failures", "build_id"}),
@@ -691,7 +796,10 @@ class ImagePipeline:
     FRESH ``ImageAws`` and is called once per pass and once per ``plan``: the
     presigned archive URL dies with the role session, so a session is never
     reused across passes. ``source_factory()`` returns a ``ForgejoSource``.
-    ``state`` is an ``ImageState``. ``clock`` and ``sleep`` are injectable, and
+    ``state`` is an ``ImageState``. ``clock``, ``monotonic`` and ``sleep`` are
+    injectable. ``clock`` is the wall clock: every deadline and every time that is
+    written down comes from it. ``monotonic`` measures elapsed time only, and no
+    persisted time comes from it: the stray sweep is its one user (``_Pass``).
     ``script`` is the bytes of the warm script (the shipped one by default; its
     absence is ``IMAGE_SCRIPT_MISSING``).
 
@@ -703,15 +811,19 @@ class ImagePipeline:
     ``IMAGE_BASIS_PATH_MISSING``, ``IMAGE_BUILD_TEMPLATE_UNSAFE``,
     ``IMAGE_USERDATA_TOO_LARGE`` in ``plan``, ``IMAGE_STATE_LOCKED`` and every
     provider read that fails) are raised. ``IMAGE_GATE_REQUIRED`` is raised by
-    ``plan`` and by an applying pass whose state holds no build in flight: a pass
-    that settles one is not refused for it, and answers ``refused`` with that code
-    only when a launch is asked of it. The answers of the trigger rules, and
-    the two refusals of a start (``START_REFUSALS``), are returned as the
-    decision ``refused`` with a ``reason``. So are ``IMAGE_BUILD_TEMPLATE_UNSAFE``
-    and ``IMAGE_INPUTS_CHANGED`` when a pass stages again a build that has a row:
-    the row ends and counts no failure. A build that ends badly is returned
-    as the decision ``failed`` with the reason code of the failure. A result
-    holds ids, 12-character digests, counts and codes only.
+    ``plan`` and by an applying pass whose state holds no build in flight and no
+    archive deletion that is owed. A pass that settles either is not refused for
+    it. One that starts with no build in flight (a cleanup pass, for an owed
+    deletion) runs the deletions and answers ``refused`` with that code. One that
+    starts with a build in flight answers the verdict of that build, and answers
+    ``refused`` with that code only for a launch it would make: a stage done
+    again. The answers of the trigger rules, and the two refusals of a start
+    (``START_REFUSALS``), are returned as the decision ``refused`` with a
+    ``reason``. So are ``IMAGE_BUILD_TEMPLATE_UNSAFE`` and
+    ``IMAGE_INPUTS_CHANGED`` when a pass stages again a build that has a row:
+    the row ends and counts no failure. A build that ends badly is returned as
+    the decision ``failed`` with the reason code of the failure. A result holds
+    ids, 12-character digests, counts and codes only.
     """
 
     def __init__(
@@ -723,6 +835,7 @@ class ImagePipeline:
         source_factory,
         state,
         clock=time.time,
+        monotonic=time.monotonic,
         sleep=time.sleep,
         script=None,
     ):
@@ -733,6 +846,7 @@ class ImagePipeline:
         self._source_factory = source_factory
         self._state = state
         self._clock = clock
+        self._monotonic = monotonic
         self._sleep = sleep
         self._script = script
 
@@ -742,16 +856,21 @@ class ImagePipeline:
         warm = self._image.warm
         return not warm.gate_command and not warm.allow_no_gate
 
-    def _build_in_flight(self):
-        """Whether the state file holds a build of this deployment that is not over. It reads and creates nothing.
+    def _settlement_pending(self):
+        """Whether the state file holds work that only an applying pass can settle. It reads and creates nothing.
 
-        A state that the caller opened (the command line opens it for writing and holds the writer lock) is read as
-        it is and left open. A closed one is opened for reading only, for this one read. An absent file holds no build.
+        That is a build of this deployment that is not over, or the deletion of an archive that a finished build
+        still owes (``ImageState.archives_owed``). A state that the caller opened (the command line opens it for
+        writing and holds the writer lock) is read as it is and left open. A closed one is opened for reading only,
+        for this one read. An absent file holds neither.
         """
         opened = not self._state.available
         present = self._state.connect_readonly() if opened else True
         try:
-            return present and self._state.active_build(self._config.deployment) is not None
+            if not present:
+                return False
+            deployment = self._config.deployment
+            return self._state.active_build(deployment) is not None or bool(self._state.archives_owed(deployment))
         finally:
             if opened:
                 self._state.close()
@@ -760,12 +879,19 @@ class ImagePipeline:
         """The checks that need no network, then the warm script's bytes.
 
         The gate requirement guards a new launch. A missing gate refuses every entry point except an applying pass
-        that finds a build in flight: that pass settles the build and launches nothing new (``_Pass._start_refusal``).
+        that finds a build in flight or an archive deletion owed: that pass settles them and launches nothing new
+        (``_Pass._start_refusal``, and ``_Pass._run`` for a pass with no build).
         """
-        if self._gate_missing() and not (apply and self._build_in_flight()):
-            raise ImageRefusal(
-                IMAGE_GATE_REQUIRED, "image.warm.gate_command is empty and image.warm.allow_no_gate is false"
-            )
+        if self._gate_missing():
+            if not (apply and self._settlement_pending()):
+                raise ImageRefusal(
+                    IMAGE_GATE_REQUIRED, "image.warm.gate_command is empty and image.warm.allow_no_gate is false"
+                )
+            # A cleanup pass needs no script, so the pass reads it only when it settles a build (``_Pass._run``).
+            return self._script
+        return self._load_script()
+
+    def _load_script(self):
         if self._script is None:
             self._script = image.shipped_script()
         return self._script
@@ -789,9 +915,13 @@ class ImagePipeline:
         return files
 
     def _digest(self, files, script):
+        return self._digest_from_hashes(image.file_hashes(files), script)
+
+    def _digest_from_hashes(self, hashes, script):
+        """The digest of the basis-file hashes, the warm settings and the script as this process reads them."""
         warm = self._image.warm
         strip = self._image.source.strip_components
-        return image.basis_digest(files, warm.commands, warm.gate_command, strip, script)
+        return image.basis_digest_from_hashes(hashes, warm.commands, warm.gate_command, strip, script)
 
     def _pin_facts(self, aws, deadline):
         """The image behind the configured pin and that image's ``ci-burst:basis-digest`` tag."""
@@ -925,15 +1055,17 @@ class ImagePipeline:
                 close()
 
     def _user_data_bytes(self, script):
-        """The size of the user data of a build, with a URL as long as a real presigned one."""
+        """The size of the user data of a build, with a URL as long as a real presigned one and an owner."""
         url = "https://" + "x" * (SYNTHETIC_URL_CHARS - len("https://"))
-        text = image.render_user_data(script, image.warm_exports(self._image, url, "0" * 64))
+        text = image.render_user_data(script, image.warm_exports(self._image, url, "0" * 64, "0" * 12))
         return len(text.encode("utf-8"))
 
     def _deletion_items(self, aws, facts, now, deadline, mode):
         """What the deletion rule selects for ``mode`` (the ``plan_deletions`` argument), from the state file's facts.
 
-        The protected set is resolved first, and a refusal of any read or of the rule passes unchanged.
+        The protected set is resolved first, and a refusal of any read or of the rule passes unchanged. A last read
+        that returns at or after ``deadline`` refuses too (``DeadlineRefusal``): no plan is made from inputs that came
+        after the cutoff. The first deletion call of a run reads the deadline again (``apply_deletions``).
         """
         protected = image_deletion.protected_set(
             aws,
@@ -947,9 +1079,13 @@ class ImagePipeline:
             deadline=deadline,
         )
         deployment = self._config.deployment
+        images = aws.images(deployment, deadline=deadline)
+        snapshots = aws.snapshots(deployment, deadline=deadline)
+        if deadline is not None and self._clock() >= deadline:
+            raise DeadlineRefusal("the deletion inventory")
         return image_deletion.plan_deletions(
-            aws.images(deployment, deadline=deadline),
-            aws.snapshots(deployment, deadline=deadline),
+            images,
+            snapshots,
             protected,
             deployment=deployment,
             mode=mode,
@@ -973,11 +1109,18 @@ class ImagePipeline:
 
         With ``apply`` the pass takes the state file's writer lock (a pass that
         is already running gives ``IMAGE_STATE_LOCKED``) and releases it at the
-        end. Once the inputs are validated, the lock and the connection end together,
-        even for a state that the caller opened; a refusal before that point
-        (such as ``IMAGE_GATE_REQUIRED``) leaves a caller's state to its caller. Without a gate command or the opt-out the pass is refused
-        (``IMAGE_GATE_REQUIRED``) before any client is built, unless the state holds
-        a build in flight: the pass then settles that build and starts no other.
+        end. Once the inputs are validated, the lock and the connection end
+        together, even for a state that the caller opened; a refusal before that
+        point (such as ``IMAGE_GATE_REQUIRED``) leaves a caller's state to its
+        caller. Without a gate command or the opt-out the pass is refused
+        (``IMAGE_GATE_REQUIRED``) before any client is built, unless the state
+        holds a build in flight or an archive deletion that a finished build
+        owes. The pass then settles what the state holds and starts no build.
+        With no build in flight at its start it is a cleanup pass: it runs the
+        owed deletions and answers ``refused`` (``cleanup_only``). With a build
+        in flight at its start it answers the verdict of that build (``building``,
+        ``imaging``, ``candidate`` or ``failed``). It answers ``refused`` only for
+        a launch it would make: a stage done again.
         """
         if not self._image.enabled:
             return {"decision": DISABLED}
@@ -1031,6 +1174,10 @@ class _Pass:
         self.clock = pipeline._clock
         self.sleep = pipeline._sleep
         self.started_at = self.clock()
+        #: The elapsed time of the pass, for the stray sweep only (``_reconcile``). A reading means nothing alone, and
+        #: no deadline and no persisted time comes from it.
+        self.monotonic = pipeline._monotonic
+        self.started_monotonic = self.monotonic()
         self.deadline = self.started_at + PASS_DEADLINE_SECONDS
         self.poll_until = self.deadline - CLEANUP_RESERVE_SECONDS
         self.tele = _Telemetry(self.s.directory, self.dep, self.clock)
@@ -1046,20 +1193,52 @@ class _Pass:
         #: The reason a check refused the start of a build, else ``None``. The pass then answers ``refused``.
         self.refused = None
         self.check = {}
+        #: The reconcile summary of the result, which the owed tail adds its count to. It is not the result's until
+        #: reconcile has made it.
+        self.summary = self._reconcile_summary()
+        #: True once the owed deletions ran: the cleanup-only pass runs them inside its own work.
+        self.owed_done = False
+        #: The ids of the rows whose archive delete this pass has attempted, whatever the outcome: the end of a build
+        #: records its own, and ``_delete_owed`` skips them. The persisted ``archive_delete_seq`` orders the
+        #: rows (``ImageState.archives_owed``).
+        self.delete_attempted = set()
 
     def run(self):
         try:
             result = self._run()
-        except BaseException:
-            # The counters and the metrics also describe a pass that raised. A
-            # failure of their own must not hide the failure that ended the pass.
+        except BaseException as error:
+            # The owed deletions, the counters and the metrics also belong to a pass that raised. A failure of
+            # their own must not hide the failure that ended the pass. A cancellation (``KeyboardInterrupt``,
+            # ``SystemExit``, ``CancelledError``: a ``BaseException`` that is no ``Exception``) starts no delete.
             try:
+                if isinstance(error, Exception):
+                    self._owed_tail()
                 self._publish(checked=False)
             except Exception:  # noqa: BLE001 - the original error is re-raised below
                 pass
             raise
+        self._owed_tail()
         self._publish(checked=True)
         return result
+
+    def _owed_tail(self):
+        """The last step of every pass: the owed archive deletions, on the time that the pass's own work left.
+
+        It runs after the work whether that returned or raised an ``Exception``, so a pass that ended on a refusal (an
+        overdue build whose listing is denied, say) still retries them. A cancellation does not reach it (``run``).
+        The counts of what it did, refused or deferred are written as an event, so they stay visible when no result
+        is returned. It never changes the result or the error of the work: the
+        count and the notes join the result that was built (``self.summary`` and ``self.notes`` are the objects
+        in it), and a failure of its own is noted and goes no further. The cleanup-only pass ran its own.
+        """
+        if self.owed_done or self.aws is None:
+            return
+        try:
+            self._delete_owed(self.summary)
+        except Exception:  # noqa: BLE001 - the tail must not replace the result or the error of the pass
+            self._note("archive:delete_tail_failed")
+        finally:
+            self._owed_event(self.summary)
 
     def _publish(self, *, checked):
         """Write the check time (after a pass that finished), the counters and the metrics."""
@@ -1070,15 +1249,25 @@ class _Pass:
         self.tele.write_metrics(self.s, now)
 
     def _run(self):
+        cleanup_only = self.p._gate_missing() and self.s.active_build(self.dep) is None
+        if self.script is None and not cleanup_only:
+            self.script = self.p._load_script()
         self.aws = self.p._aws_factory()
+        if cleanup_only:
+            return self._cleanup_only()
         reconcile = self._reconcile()
+        self.summary = reconcile
         pin = self.p._pin_facts(self.aws, self.deadline)
         if pin.image_id is not None:
             self.s.pin_observe(pin.version, pin.image_id)
         self.tele.data["pin_image_created_at"] = pin.created_at
         build = self.s.active_build(self.dep)
         verdict = None
-        if build is None:
+        if build is None and self.p._gate_missing():
+            # The build that let this pass run without a gate is over by now (``ImagePipeline._inputs``), and a new
+            # build needs a gate: the pass answers with the requirement and reads no forge file.
+            self.refused = IMAGE_GATE_REQUIRED
+        elif build is None:
             verdict, build = self._decide(pin)
         if build is not None and build.state in ACTIVE_STATES and not self.hold:
             build = self._advance(build)
@@ -1104,6 +1293,37 @@ class _Pass:
             "notes": self.notes,
         }
 
+    def _cleanup_only(self):
+        """The pass that runs without a gate and with no build in flight, only because a deletion is owed.
+
+        It runs the bounded owed deletions and answers ``refused`` with ``IMAGE_GATE_REQUIRED``. It reads nothing
+        else from the provider (no pin, no builders, no stray archives, no images, no retention) and nothing from the
+        forge, so an unrelated refusal of those reads cannot hide the result. Without a gate, a pass with nothing in
+        flight was refused before any client was built, so skipping them loses nothing. The result keeps its shape:
+        the pin fields that were not read are ``None``, ``retention`` is ``None`` and ``cleanup_only`` is true.
+        """
+        summary = self._reconcile_summary()
+        try:
+            self._delete_owed(summary)
+        finally:
+            self._owed_event(summary)
+        pin = _Pin(self.p._config.aws.launch_template_version, None, None, None)
+        self.refused = IMAGE_GATE_REQUIRED
+        self._check_event(REFUSED, IMAGE_GATE_REQUIRED, None, pin)
+        return {
+            "decision": REFUSED,
+            "reason": IMAGE_GATE_REQUIRED,
+            "forced": self.force,
+            "build": None,
+            "pin": _pin_summary(pin),
+            "reconcile": summary,
+            "retention": None,
+            "control": _control_summary(self.s.control_get()),
+            "notes": self.notes,
+            #: Tells the caller that no pin was read: the command line stamps no pin evidence after this pass.
+            "cleanup_only": True,
+        }
+
     def _check_event(self, decision, reason, build, pin):
         self.tele.event(
             "image_check",
@@ -1117,22 +1337,25 @@ class _Pass:
         )
 
     # -- reconcile ---------------------------------------------------------------
+    def _sweep_over(self):
+        """True once the pass is ``STRAY_SWEEP_SECONDS`` old by elapsed time on the monotonic clock.
+
+        The adapter calls it where a stray delete starts (``ImageAws._check_deadline``), next to the wall-clock cutoff
+        that it is given, so the one injected clock of the pass decides in both places.
+        """
+        return self.monotonic() - self.started_monotonic >= STRAY_SWEEP_SECONDS
+
     def _reconcile(self):
         """Clean up first, before any transition. Nothing here depends on the forge."""
         s, aws, dep = self.s, self.aws, self.dep
         now = self.clock()
-        summary = {
-            "builders_terminated": 0,
-            "archives_deleted": 0,
-            "images_recorded": 0,
-            "builder_adopted": False,
-            "image_adopted": False,
-            "failures": [],
-        }
+        summary = self._reconcile_summary()
         active = s.active_build(dep)
         # The first step of the pass, before any read that can fail: the builder of a build that is past its
         # deadline goes. The state machine below ends the build itself, with the code of the deadline.
         self._end_overdue(active, now, summary)
+        # The archives that finished builds still owe are not deleted here: a delete that times out would take
+        # 30 seconds of the work that follows. ``_owed_tail`` runs them after it.
         # Builders. The state machine owns the active build's builder. Every
         # other builder is terminated. A builder tagged with the active build's
         # id that the row does not know yet is the one a crash between
@@ -1151,20 +1374,36 @@ class _Pass:
                 summary["builder_adopted"] = True
                 self._end_overdue(active, now, summary)
         if foreign:
-            aws.terminate(foreign)
+            # A termination ends spending, so no deadline holds it back (here and in ``_end_overdue``, ``_fail``).
+            aws.terminate(foreign, deadline=None)
             summary["builders_terminated"] += len(foreign)
             self.terminated_foreign = len(foreign)
             self.tele.leak("builder", len(foreign))
-        # Stray archives: not the active archive, and older than an hour.
+        # Stray archives: not the active archive, not one that a finished build still owes (whether or not the
+        # bound reached it in this pass: its retries and their timestamps belong to ``_delete_owed``), and older
+        # than an hour. The listing is bounded by the pass deadline and ends before the first delete, so the deletes
+        # have a bound of their own: none starts once the pass is ``STRAY_SWEEP_SECONDS`` old, whether the listing
+        # returned late or the deletes before it were slow. Two clocks measure that age, and the first to reach it
+        # stops the sweep: the wall clock (``sweep_until``) and elapsed time on the monotonic clock (``_sweep_over``),
+        # because a wall clock that is stepped back would stretch the first. The adapter evaluates both where each
+        # delete starts (``stop``), because time passes between this loop and that point; the read here is an early
+        # stop that saves the call. A stray that the bound leaves is swept by a later pass.
         storage = self.cfg.storage
         keep = {active.archive_key} if active is not None and active.archive_key else set()
+        keep.update(row.archive_key for row in s.archives_owed(dep) if row.archive_bucket == storage.bucket)
+        sweep_until = self.started_at + STRAY_SWEEP_SECONDS
         for stored in aws.list_objects(storage.bucket, _archive_prefix(storage.prefix), deadline=self.deadline):
             if stored.key in keep or stored.last_modified is None:
                 continue
             if now - stored.last_modified <= STRAY_ARCHIVE_AGE_SECONDS:
                 continue
             try:
-                aws.delete_object(storage.bucket, stored.key)
+                if self._sweep_over():
+                    raise DeadlineRefusal("the stray sweep")
+                aws.delete_object(storage.bucket, stored.key, deadline=sweep_until, stop=self._sweep_over)
+            except DeadlineRefusal:
+                self._note("archive:sweep_deferred")
+                break
             except ProviderRefusal as refusal:
                 summary["failures"].append(refusal.reason)
             else:
@@ -1206,6 +1445,7 @@ class _Pass:
         if (
             summary["builders_terminated"]
             or summary["archives_deleted"]
+            or summary["owed_archives_deleted"]
             or summary["images_recorded"]
             or summary["builder_adopted"]
             or summary["image_adopted"]
@@ -1214,12 +1454,97 @@ class _Pass:
                 "image_reconciled",
                 builders_terminated=summary["builders_terminated"],
                 archives_deleted=summary["archives_deleted"],
+                owed_archives_deleted=summary["owed_archives_deleted"],
                 images_recorded=summary["images_recorded"],
                 builder_adopted=summary["builder_adopted"],
                 image_adopted=summary["image_adopted"],
                 build_id=active.id if active is not None else None,
             )
         return summary
+
+    @staticmethod
+    def _reconcile_summary():
+        return {
+            "builders_terminated": 0,
+            "archives_deleted": 0,
+            "owed_archives_deleted": 0,
+            "owed_archive_delete_failed": 0,
+            "owed_archives_deferred": 0,
+            "images_recorded": 0,
+            "builder_adopted": False,
+            "image_adopted": False,
+            "failures": [],
+        }
+
+    def _delete_owed(self, summary):
+        """Retry the owed archive deletions, within the bound of the pass.
+
+        At most ``OWED_ARCHIVES_PER_PASS`` start, and none once the pass deadline is less than
+        ``OWED_DELETE_RESERVE_SECONDS`` away. The clock is read before each one, and again after its owner check
+        (``_delete_archive``), which can be the first use of the account and so take time, and once more by the
+        adapter after it built its S3 client. ``ImageState.archives_owed`` lists the rows never tried first, then the
+        least recently tried, so a deletion that stays refused cannot keep a newer row from its turn. A row whose
+        delete this pass attempted (``delete_attempted``) is not tried again in it. The rows that the bound left, and
+        the row whose owner check or client build ended inside the reserve, stay owed and are noted as
+        ``archive:delete_deferred``.
+        """
+        self.owed_done = True
+        # A row whose delete was attempted in this pass already, for instance at the end of its own build, is not
+        # tried again. The set lives in memory, so a clock that moved does not decide it.
+        rows = [row for row in self.s.archives_owed(self.dep) if row.id not in self.delete_attempted]
+        cutoff = self.deadline - OWED_DELETE_RESERVE_SECONDS
+        started = 0
+        for index, owed in enumerate(rows):
+            outcome = None
+            if started < OWED_ARCHIVES_PER_PASS and self.clock() < cutoff:
+                started += 1
+                outcome = self._delete_archive(owed, not_after=cutoff)
+            if outcome is None:
+                # No delete started: the bound is met, or the owner check or the client build of this row ended inside
+                # the reserve.
+                self._note("archive:delete_deferred")
+                summary["owed_archives_deferred"] += len(rows) - index
+                break
+            # Each outcome is counted as its attempt ends, so that a later attempt that raises (a state write that
+            # fails, say) leaves the counts of the earlier ones for ``_owed_event``.
+            if outcome:
+                summary["owed_archives_deleted"] += 1
+                self.tele.leak("archive", 1)
+            else:
+                summary["owed_archive_delete_failed"] += 1
+
+    def _owed_event(self, summary):
+        """The event of the owed deletions: counts only, never a key or a bucket. Nothing is written for none.
+
+        It runs in a ``finally`` after the deletions, so it never raises: a failure of its own is noted, and cannot
+        replace the error that the deletions or the pass ended on.
+        """
+        counts = (
+            summary["owed_archives_deleted"],
+            summary["owed_archive_delete_failed"],
+            summary["owed_archives_deferred"],
+        )
+        if not any(counts):
+            return
+        try:
+            self.tele.event(
+                "image_reconciled",
+                builders_terminated=0,
+                archives_deleted=0,
+                owed_archives_deleted=counts[0],
+                owed_archive_delete_failed=counts[1],
+                owed_archives_deferred=counts[2],
+                images_recorded=0,
+                builder_adopted=False,
+                image_adopted=False,
+                build_id=None,
+            )
+        except Exception:  # noqa: BLE001 - see the docstring
+            self._note("archive:delete_tail_failed")
+
+    def _note(self, note):
+        if note not in self.notes:
+            self.notes.append(note)
 
     def _end_overdue(self, build, now, summary):
         """Terminate the builder of an active build whose deadline has come, once per pass.
@@ -1229,7 +1554,7 @@ class _Pass:
         if build is None or build.builder_id is None or build.builder_id in self.ended or now < build.deadline_at:
             return
         try:
-            self.aws.terminate([build.builder_id])
+            self.aws.terminate([build.builder_id], deadline=None)
         except ProviderRefusal as refusal:
             summary["failures"].append(refusal.reason)
             return
@@ -1267,7 +1592,8 @@ class _Pass:
         """Read the forge, apply the trigger rules and, when a build is due, start it."""
         now = self.clock()
         sha, files = self.p._read_basis(self._source(), self.deadline)
-        digest = self.p._digest(files, self.script)
+        hashes = image.file_hashes(files)
+        digest = self.p._digest_from_hashes(hashes, self.script)
         facts = _read_facts(self.s, self.dep, now)
         # A builder that reconcile just terminated still counts as active for this
         # pass: the next pass starts clean, and a lost state file cannot start a
@@ -1278,20 +1604,25 @@ class _Pass:
             self.s.control_set(blocked=False, cooldown_until=None)
         if not decision["start"]:
             return decision, None
-        return decision, self._start(sha, digest)
+        return decision, self._start(sha, digest, hashes)
 
-    def _start(self, sha, digest):
+    def _start(self, sha, digest, hashes):
         """The start sequence. The checks that can refuse come first and the row before any provider call that costs.
 
-        The result is the build, or ``None`` when a check refused the start: nothing was written then.
+        The result is the build, or ``None`` when a check refused the start: nothing was written then. ``hashes`` are
+        the hashes of the basis files that gave ``digest``: the row keeps them, so a stage that is done again reads
+        no file. ``_run`` never starts a build without a gate, so ``_start_refusal`` holds the gate requirement only
+        as the guard of every launch.
+
+        A deadline decides before the outcome of any call that took time (``_deadline_first``), here as in the
+        restage and the launch: the template read, the lookup of the credential and the listing of the builders each
+        take time, and the session ages during them. No row exists yet, so only the pass deadline can have passed, and
+        the pass ends on it (``DeadlineRefusal``) instead of answering ``refused`` for a credential that a late call
+        aged, and instead of inserting a row on a listing that came back after the deadline.
         """
         s, aws, cfg = self.s, self.aws, self.cfg
-        if self.p._gate_missing():
-            # Before the template check too: a pass that settled a build in flight runs without a gate, and the
-            # refusal a new build owes it is the gate requirement, not whatever the template shows.
-            self.refused = IMAGE_GATE_REQUIRED
-            return None
-        self.p._check_build_template(aws, self.deadline)
+        with self._deadline_first():
+            self.p._check_build_template(aws, self.deadline)
         reason = self._start_refusal()
         if reason is not None:
             self.refused = reason
@@ -1304,112 +1635,156 @@ class _Pass:
             client_token=token,
             basis_digest=digest,
             source_sha=sha,
+            basis_file_hashes=hashes,
             deadline_at=image.build_deadline(now, cfg),
             script_sha256=image.script_sha256(self.script),
             gate_configured=int(bool(cfg.warm.gate_command)),
         )
         return self._stage(build)
 
-    def _start_refusal(self):
+    def _start_refusal(self, build=None):
         """The reason a launch is refused now, or ``None``. None of the checks reads the forge or spends anything.
 
         The gate requirement is the first. A pass that settles a build in flight runs without a gate command or the
         opt-out (``ImagePipeline._inputs``), and a launch needs one of them, whether the build is new or a stage that
         is done again.
+
+        The lookup of the credential and the listing of the builders take time, so a deadline decides before their
+        outcome (``_deadline_first``, ``_check_no_builder``): a deadline that has passed is raised instead of a reason
+        (a listing that shows a builder excepted), and ``None`` means that neither had passed when the last check
+        returned. ``build`` is the row of a stage that is done again, or ``None`` before a row exists, when only the
+        pass deadline applies.
         """
         if self.p._gate_missing():
             return IMAGE_GATE_REQUIRED
         try:
-            self.aws.check_credential_life(self.cfg.source.presign_seconds)
-            self._check_no_builder()
+            with self._deadline_first(build):
+                self.aws.check_credential_life(self.cfg.source.presign_seconds, deadline=self._cutoff(build))
+            self._check_no_builder(build)
         except Refusal as refusal:
             if refusal.reason in START_REFUSALS:
                 return refusal.reason
             raise
         return None
 
-    def _check_no_builder(self):
-        """Single-flight at the provider: refuse while any builder of this deployment exists."""
-        if self.aws.builders(self.dep, deadline=self.deadline):
-            raise ImageRefusal(IMAGE_BUILD_ALREADY_ACTIVE)
+    def _check_no_builder(self, build=None):
+        """Single-flight at the provider: refuse while any builder of this deployment exists.
 
-    def _stage(self, build):
-        """Stage the archive and launch the builder, and settle every way that can end short of a launch."""
+        A listing that shows a builder is refused (``IMAGE_BUILD_ALREADY_ACTIVE``) whenever it returns: the order of
+        that refusal and a deadline is open (issue #232). The other outcomes of the listing took time like any call, so
+        both deadlines are read before the pipeline acts on them (``_refuse_past_a_deadline``). An empty listing
+        inserts no row, uploads nothing and launches no builder after a deadline, and a refusal of the listing (the
+        provider's, or the pass deadline's) ends no row and no pass with its own code after one.
+        """
+        try:
+            found = self.aws.builders(self.dep, deadline=self._cutoff(build))
+        except Refusal:
+            self._refuse_past_a_deadline(build)
+            raise
+        if found:
+            raise ImageRefusal(IMAGE_BUILD_ALREADY_ACTIVE)
+        self._refuse_past_a_deadline(build)
+
+    def _stage(self, build, restage=False):
+        """Stage the archive and launch the builder, and settle every way that can end short of a launch.
+
+        A staging bucket that S3 refuses (``IMAGE_STAGING_BUCKET_DENIED``: the bucket is owned by another account,
+        or the role may not use it) or that does not exist (``IMAGE_STAGING_BUCKET_MISSING``) ends a restage as a
+        refused start: the row records the bucket of its earlier stage, which a rotation may have released or
+        removed, and the next pass inserts a row for the configured one. For a new row it is a failed build and
+        counts, so that a configured bucket that is refused or missing ends in the cooldown and the block instead
+        of in one row per pass.
+
+        The pass deadline ends the stage without ending the build, unless the build deadline has passed too
+        (``_settle_a_cut_stage``).
+        """
         try:
             return self._stage_and_launch(build)
         except DeadlineRefusal:
-            # The pass ran out of time, not the build. The row stays ``building`` with no builder and no staged
-            # archive, and the next pass stages it again (``_restage``).
-            self.notes.append("pass_deadline_exceeded")
-            self.hold = True
-            return self.s.build(build.id)
+            return self._settle_a_cut_stage(build)
         except Refusal as refusal:
-            if refusal.reason in START_REFUSALS:
+            if refusal.reason in START_REFUSALS or (restage and refusal.reason in STAGING_BUCKET_REFUSALS):
                 return self._end_refused(build, refusal.reason)
             # Nothing was launched: a launch whose outcome is unknown is handled inside ``_stage_and_launch`` and
             # does not come here.
             return self._fail(build, refusal.reason, builder_alive=False)
 
-    def _restage(self, build):
-        """Stage again a build that has no builder and no staged archive, because the pass deadline ended its stage.
+    def _settle_a_cut_stage(self, build):
+        """Settle a build whose stage the pass deadline cut before a builder was launched.
 
-        The key is the same, so the new archive replaces whatever the earlier stage left. The build deadline still
-        bounds the build: past it the build fails with the code of a console that never showed anything, and
-        ``_fail`` deletes the archive the row names. The deadline is checked here on entry and again in ``_launch``,
-        right before the provider call, because the upload and the reads in between take time.
-
-        The inputs are checked first: the basis files at the row's own commit, the warm settings and the script, as
-        this pass reads them, must give the digest that the row was inserted under, because that digest is what tags
-        the image. Changed inputs end the row as a refused start check does: ``failed`` with ``IMAGE_INPUTS_CHANGED``,
-        no failure counted, and the pass answers ``refused``. The next pass decides from the new inputs.
-
-        The template check of a start runs again, because the template and the rules of its groups can change
-        between two passes. An unsafe template ends the row the same way, with its own code. The pass deadline inside
-        either check leaves the row as it is for the next pass; any other refusal of a read is raised and leaves it
-        too.
-
-        The gate requirement runs between the two, before the template is read. The file can lose its gate command
-        and the opt-out while the row waits, and the digest does not hold the opt-out: a row inserted under it gives
-        the same digest once it is gone. That row ends with ``IMAGE_GATE_REQUIRED`` and no failure, and no builder is
-        launched. The other checks of a launch (``_start_refusal``) run last.
+        The cut can fall wherever a call of the stage has returned (``_deadline_first``) or the adapter refused to start
+        one. The row stays ``building`` with no builder and no staged archive, and the next pass stages it again
+        (``_restage``). A build that is out of time ends here instead, in the pass that sees it: ``CONSOLE_BLIND``, and
+        ``_fail`` deletes the archive that the row names. The pass deadline never decides before the build deadline.
         """
         if self.clock() >= build.deadline_at:
             return self._fail(build, image_console.CONSOLE_BLIND, builder_alive=False)
+        self.notes.append("pass_deadline_exceeded")
+        self.hold = True
+        return self.s.build(build.id)
+
+    def _restage(self, build):
+        """Stage again a build that has no builder and no staged archive, because the pass deadline ended its stage.
+
+        The key and the bucket are the recorded ones (``_stage_and_launch``), so the new archive replaces whatever the
+        earlier stage left, even when the configured prefix or bucket has changed since.
+
+        Three checks of a start run again first, because each can have changed since the row was written. The inputs
+        (``_check_inputs_unchanged``) must still give the digest that the row was inserted under, because that digest
+        tags the image. The gate requirement comes next, before the template is read, so that no template refusal masks
+        it: the digest does not hold the opt-out, so a row inserted under it gives the same digest once it is gone. The
+        build template is read last, because the rules of its groups can change between two passes. Changed inputs, a
+        missing gate or an unsafe template end the row as a refused start (``_end_refused``): ``failed`` with its code,
+        no failure counted, and the next pass decides from the new inputs. Damaged recorded hashes are raised
+        (``IMAGE_STATE_UNREADABLE``) and leave the row. The other checks of a launch (``_start_refusal``) run last.
+
+        The pass reaches these checks after reads that took time, the pin read of ``_run`` among them, so all three run
+        inside ``_deadline_first``: a deadline that has passed when they return decides before their outcome. At or
+        after the build deadline the build fails ``CONSOLE_BLIND`` and ``_fail`` deletes the archive that the row names;
+        at or after the pass deadline the row stays for the next pass (``_settle_a_cut_stage``). The reads of the
+        template take the earlier deadline (``_cutoff``). A listing that shows a builder is the exception: it is refused
+        whenever it returns (``_check_no_builder``, issue #232).
+        """
         try:
-            self._check_inputs_unchanged(build)
-            if self.p._gate_missing():
-                # Before the template read: a withdrawn opt-out is the refusal this row owes, and an unsafe template
-                # or a refused read of its groups would otherwise mask it.
-                raise ImageRefusal(IMAGE_GATE_REQUIRED)
-            self.p._check_build_template(self.aws, self.deadline)
+            with self._deadline_first(build):
+                self._check_inputs_unchanged(build)
+                if self.p._gate_missing():
+                    raise ImageRefusal(IMAGE_GATE_REQUIRED)
+                self.p._check_build_template(self.aws, self._cutoff(build))
         except DeadlineRefusal:
-            self.notes.append("pass_deadline_exceeded")
-            self.hold = True
-            return self.s.build(build.id)
+            return self._settle_a_cut_stage(build)
         except ImageRefusal as refusal:
+            if refusal.reason == image_console.CONSOLE_BLIND:
+                # The build deadline had passed when the checks returned, and it decides before any of their refusals.
+                return self._fail(build, refusal.reason, builder_alive=False)
             return self._end_refused(build, refusal.reason)
-        reason = self._start_refusal()
+        try:
+            reason = self._start_refusal(build)
+        except DeadlineRefusal:
+            return self._settle_a_cut_stage(build)
+        except ImageRefusal as refusal:
+            # The build deadline (``_start_refusal`` returns the refusals of a start): ``_stage`` ends it the same way.
+            return self._fail(build, refusal.reason, builder_alive=False)
         if reason is not None:
             return self._end_refused(build, reason)
-        return self._stage(build)
+        return self._stage(build, restage=True)
 
     def _check_inputs_unchanged(self, build):
         """Refuse with ``IMAGE_INPUTS_CHANGED`` unless the inputs of ``build`` still give the digest of its row.
 
-        ``_decide`` hashed the files at the branch head, the warm settings and the script into that digest. This is the
-        same digest over the files at the commit of the row, since the head can have moved, with the settings and the
-        script as this pass reads them. A basis path that the forge answers as missing (a 404) is not proof that the
-        inputs changed: the commit is immutable and held every path when the row was written, and a 404 can come from
-        an unavailable route too. That refusal is raised like any other, the row stays for the next pass, and the
-        build deadline bounds the retries. The forge client puts no deadline on a read, so ``_basis_files`` reads the clock before each request
-        and this reads it once more once the files are in, because the last read can pass the deadline too: a pass
-        whose deadline passed during the reads ends no row, whatever they showed. Any other refusal of a read is
-        raised, and the row stays for the next pass.
+        ``_decide`` hashed the files at the branch head, the warm settings and the script into that digest, and the
+        row kept the hash of each file. The files at that commit never change, so this reads none: it takes the
+        recorded hashes, and it gives the digest again with the settings and the script as this pass reads them.
+        The paths are compared first, because the hashes cannot show a path that the configuration has gained or
+        lost since: a changed set of basis paths counts as changed inputs.
+
+        A row with no valid recorded hashes is damaged state (``IMAGE_STATE_UNREADABLE``, raised by
+        ``build_file_hashes``), never read from the forge instead: every row that a build made has them.
         """
-        files = self.p._basis_files(self._source(), build.source_sha, self.deadline)
-        if self.clock() >= self.deadline:
-            raise DeadlineRefusal("the basis files")
-        if self.p._digest(files, self.script) != build.basis_digest:
+        hashes = build_file_hashes(build)
+        if set(hashes) != set(self.cfg.source.basis_paths):
+            raise ImageRefusal(IMAGE_INPUTS_CHANGED, "the basis paths changed since the row was written")
+        if self.p._digest_from_hashes(hashes, self.script) != build.basis_digest:
             raise ImageRefusal(IMAGE_INPUTS_CHANGED, "the inputs of the build changed since its row was written")
 
     def _end_refused(self, build, reason):
@@ -1425,12 +1800,34 @@ class _Pass:
 
     def _stage_and_launch(self, build):
         s, aws, cfg = self.s, self.aws, self.cfg
-        key = f"{_archive_prefix(cfg.storage.prefix)}{build.id}.tar.gz"
-        chunks = self._source().archive(build.source_sha, cfg.source.max_archive_bytes, deadline=self.deadline)
-        try:
-            upload = aws.put_archive(
-                cfg.storage.bucket, key, chunks, max_bytes=cfg.source.max_archive_bytes, deadline=self.deadline
+        if not (build.archive_key and build.archive_bucket):
+            # The first stage of the row. The bucket, the key and the account that owns the bucket (the account of
+            # this identity) go into the row before the upload starts, so that a pass that stops anywhere after it
+            # leaves an object that the row names. A stage that is done again finds them in the row and uses them,
+            # whatever the configuration says by then.
+            build = s.advance_build(
+                build.id,
+                archive_bucket=cfg.storage.bucket,
+                archive_owner=aws.account_id(deadline=self._cutoff(build)),
+                archive_key=f"{_archive_prefix(cfg.storage.prefix)}{build.id}.tar.gz",
             )
+        else:
+            self._check_archive_owner(build, deadline=self._cutoff(build))
+        chunks = self._source().archive(build.source_sha, cfg.source.max_archive_bytes, deadline=self._cutoff(build))
+        try:
+            # The upload takes time, and so does the refusal that S3 or the forge can end it with. Both deadlines are
+            # read once it has returned (``_deadline_first``): a deadline that has passed decides before the outcome,
+            # and the launch begins only when neither has. The row has no archive hash yet, so a stage that a deadline
+            # cut here is not staged.
+            with self._deadline_first(build):
+                upload = aws.put_archive(
+                    build.archive_bucket,
+                    build.archive_key,
+                    chunks,
+                    max_bytes=cfg.source.max_archive_bytes,
+                    deadline=self._cutoff(build),
+                    owner=build.archive_owner,
+                )
         finally:
             close = getattr(chunks, "close", None)
             if close is not None:
@@ -1440,16 +1837,14 @@ class _Pass:
         # the row, the gate command among them, so this writes the value the row already has, and repairs a row that
         # lost it.
         build = s.advance_build(
-            build.id,
-            archive_key=upload.key,
-            archive_sha256=upload.sha256,
-            gate_configured=int(bool(cfg.warm.gate_command)),
+            build.id, archive_sha256=upload.sha256, gate_configured=int(bool(cfg.warm.gate_command))
         )
         try:
             instance_id = self._launch(build, upload)
         except DeadlineRefusal:
             # The pass ran out of time before the launch call, so no builder was launched: the row goes back to
-            # "not staged" and the next pass stages again. The key stays, so the end of the build deletes the object.
+            # "not staged" and the next pass stages again (``_stage`` ends it instead when the build is out of time
+            # too). The key stays, so the end of the build deletes the object.
             s.advance_build(build.id, archive_sha256=None)
             raise
         if instance_id is None:
@@ -1468,6 +1863,68 @@ class _Pass:
         )
         return build
 
+    def _check_archive_owner(self, build, *, deadline=None):
+        """Refuse with ``IMAGE_STAGING_OWNER_CHANGED`` unless the row's owner is the account of this session.
+
+        The recorded bucket name may exist in the account that this identity is in now, and it is not the bucket
+        that the row staged to. A row with no recorded owner is refused too. The detail holds no account number. A
+        lookup of the account does not start at or after ``deadline`` (``ImageAws.account_id``).
+        """
+        if build.archive_owner != self.aws.account_id(deadline=deadline):
+            raise ProviderRefusal(
+                IMAGE_STAGING_OWNER_CHANGED, "the account of the archive's bucket is not the account of this session"
+            )
+
+    def _refuse_past_a_deadline(self, build=None):
+        """Refuse a step that would start, or an outcome that would be acted on, at or after either deadline.
+
+        The build deadline decides first. At or after it the refusal is ``CONSOLE_BLIND``, the code of a console that
+        never showed anything: ``_stage`` and ``_restage`` end the build with it, and ``_fail`` deletes the archive that
+        the row names. Otherwise, at or after the pass deadline, it is a ``DeadlineRefusal``: with a row the stage was
+        cut and no builder was launched, so the row waits for the next pass to stage it again
+        (``_settle_a_cut_stage``), and before a row exists the pass ends on the deadline. ``build`` is ``None`` before a
+        row exists, and only the pass deadline applies then. One reading of the clock decides both.
+        """
+        now = self.clock()
+        if build is not None and now >= build.deadline_at:
+            raise ImageRefusal(image_console.CONSOLE_BLIND)
+        if now >= self.deadline:
+            raise DeadlineRefusal("the start of a build")
+
+    def _cutoff(self, build=None):
+        """The deadline that a call of a stage hands the adapter: the earlier of the pass and the build deadline.
+
+        A call that returns after the build deadline is then followed by no later call of the stage, and
+        ``_deadline_first`` ends the build ``CONSOLE_BLIND``. Before a row exists only the pass deadline applies.
+        """
+        return self.deadline if build is None else min(self.deadline, build.deadline_at)
+
+    @contextmanager
+    def _deadline_first(self, build=None):
+        """Run a call that can take time, then read both deadlines before the pipeline acts on what it produced.
+
+        This is the one rule of the start, the restage and the launch. A call that returns late (a read of the
+        template, a lookup of the credential, the upload, the presign) took time that the checks before it did not see,
+        so what it produced is the answer of a pass, or of a build, that can be out of time. The deadlines are read
+        again once the call has returned (``_refuse_past_a_deadline``, the build deadline first), whether it returned a
+        result or a refusal: a deadline that has passed decides, and the refusal of the call
+        (``IMAGE_CREDENTIAL_SHORT``, an unsafe template, a bucket that S3 refused) is not acted on, as a result is not
+        either. With no deadline passed, a refusal goes on as it was raised.
+
+        Three things are not read this way, because nothing is gained by it. The answer of the launch call itself: a
+        builder that it started must be recorded, and a refusal of it ends the row by the provider's code. The result
+        of a listing that shows a builder (``_check_no_builder``). The lookup of the account that owns the bucket
+        (``account_id``): every lookup takes the cutoffs of the call that needs it (``ImageAws._check_deadline``), the
+        listing of the stray archives in reconcile, which every pass runs before it can stage, looks it up first, and
+        the adapter keeps the answer, so the lookup takes no time here.
+        """
+        try:
+            yield
+        except Refusal:
+            self._refuse_past_a_deadline(build)
+            raise
+        self._refuse_past_a_deadline(build)
+
     def _launch(self, build, upload):
         """Presign, render, check the tags and launch. The URL and the user data live only here.
 
@@ -1475,18 +1932,29 @@ class _Pass:
         with an unknown outcome: the builder may exist, and the next pass adopts
         it by its build-id tag or fails the build.
 
-        The clock is read after the last read and right before the call, and no builder is launched at or after
-        the build deadline: the call is refused with ``CONSOLE_BLIND``, the code of a console that never showed
-        anything.
+        A deadline decides before the outcome of any call that took time, here as in ``_start`` and ``_restage``
+        (``_deadline_first``). The presign takes time, and the session can age during it so that it refuses
+        ``IMAGE_CREDENTIAL_SHORT``, which would end the row as a refused start (``_stage``). So both deadlines are read
+        when the presign has returned, whether it answered or refused, and again when the listing of the builders that
+        follows has returned (``_check_no_builder``), right before the launch call, and the adapter reads the earlier
+        of the two where the launch call starts (``ImageAws._check_deadline``). At or after the build deadline the
+        launch is refused with ``CONSOLE_BLIND``; at or after the pass deadline with ``DeadlineRefusal``, and the row
+        waits for the next pass (``_settle_a_cut_stage``). A build that is out of time when the presign returns starts
+        no listing. The answer of the launch call is never read this way: a builder that it started is recorded, and a
+        refusal ends the row by its own code.
         """
         aws, cfg = self.aws, self.cfg
-        url = aws.presign_get(cfg.storage.bucket, upload.key, cfg.source.presign_seconds)
-        user_data = image.render_user_data(self.script, image.warm_exports(cfg, url, upload.sha256))
-        self._check_no_builder()
-        if self.clock() >= build.deadline_at:
-            # The upload and the reads before this call take time. ``_stage`` ends the build with this code and
-            # ``_fail`` deletes the archive that the row names.
-            raise ImageRefusal(image_console.CONSOLE_BLIND)
+        with self._deadline_first(build):
+            url = aws.presign_get(
+                build.archive_bucket,
+                upload.key,
+                cfg.source.presign_seconds,
+                deadline=self._cutoff(build),
+                owner=build.archive_owner,
+            )
+        exports = image.warm_exports(cfg, url, upload.sha256, build.archive_owner)
+        user_data = image.render_user_data(self.script, exports)
+        self._check_no_builder(build)
         try:
             return aws.run_builder(
                 template_name=cfg.build.launch_template_name,
@@ -1496,6 +1964,7 @@ class _Pass:
                 expires_at=build.deadline_at,
                 user_data=user_data,
                 client_token=build.client_token,
+                deadline=self._cutoff(build),
             )
         except ProviderRefusal as refusal:
             if refusal.uncertain:
@@ -1589,8 +2058,9 @@ class _Pass:
         unlisted is refused by the provider as a duplicate name. That refusal is as uncertain as any other, and the
         next pass looks again: the name is never changed.
 
-        The clock is read after the last read and right before the call, and the call is never made at or after the
-        build deadline. The build then fails as a marker that came too late, and ``_fail`` ends the builder.
+        The clock is read after the last read, and again by the adapter where the call starts
+        (``ImageAws._check_deadline``), and the call is never made at or after the build deadline. The build then
+        fails as a marker that came too late, and ``_fail`` ends the builder.
         """
         found = self._find_image(build)
         if found is not None:
@@ -1611,8 +2081,11 @@ class _Pass:
                 deployment=self.dep,
                 build_id=build.id,
                 basis_digest=build.basis_digest,
+                deadline=build.deadline_at,
                 extra_tags=tags,
             )
+        except DeadlineRefusal:
+            return self._fail(build, image_console.MARKER_TIMEOUT, console)
         except ProviderRefusal as refusal:
             # An unknown outcome may have made the image, so before the deadline the row stays as it is. The next
             # pass adopts the image when the provider lists it, and else asks again under the same name, which the
@@ -1689,12 +2162,28 @@ class _Pass:
         if build.builder_id is not None:
             found = self.aws.instances([build.builder_id], deadline=self.deadline)
             if any(item.instance_id == build.builder_id and item.state in BUILDER_STATES for item in found):
-                self.aws.terminate([build.builder_id])
+                self.aws.terminate([build.builder_id], deadline=None)
+        if build.source_template is None or build.source_region is None or build.source_pin is None:
+            # The token of the version is the build's, so every request under it names the template and the pin
+            # recorded here, and the row records the Region that the first one goes to. A template, Region or pin
+            # that changed later leaves the candidate refused at promotion (``PIN_MOVED``). The values are recorded
+            # only while the pass deadline has not passed, so a pass out of time records nothing. The record must
+            # precede the first request, so a stop between the two can still leave values with no request sent; a
+            # pin moved after that ends in ``PIN_MOVED`` and a new build, so that state fails closed.
+            if self.clock() >= self.deadline:
+                raise DeadlineRefusal("the first version request")
+            settings = self.p._config.aws
+            build = self.s.advance_build(
+                build.id,
+                source_template=settings.launch_template_name,
+                source_region=settings.region,
+                source_pin=settings.launch_template_version,
+            )
         try:
             outcome = create_candidate_version(
                 self.aws,
-                template_name=self.p._config.aws.launch_template_name,
-                source_pin=self.p._config.aws.launch_template_version,
+                template_name=build.source_template,
+                source_pin=build.source_pin,
                 image_id=build.image_id,
                 build_id=build.id,
                 basis_digest=build.basis_digest,
@@ -1739,7 +2228,6 @@ class _Pass:
                 gate_configured=gate,
                 gate_passed=gate,
                 verified_at=now,
-                source_pin=self.p._config.aws.launch_template_version,
             )
             self._write_control(image.record_success(s.control_get()))
         self._delete_archive(build)
@@ -1763,7 +2251,7 @@ class _Pass:
         s, now = self.s, self.clock()
         if builder_alive and build.builder_id is not None and build.builder_id not in self.ended:
             try:
-                self.aws.terminate([build.builder_id])
+                self.aws.terminate([build.builder_id], deadline=None)
             except ProviderRefusal:
                 # The build is over either way. The builder is no longer the
                 # active build's, so the next pass's reconcile terminates it.
@@ -1797,14 +2285,54 @@ class _Pass:
             blocked=control.blocked,
         )
 
-    def _delete_archive(self, build):
-        """Delete the archive at a terminal state. A failure here is a stray object, not a failed build."""
-        if not build.archive_key:
-            return
+    def _delete_archive(self, build, *, not_after=None):
+        """Delete the archive that the row names, at the bucket and the key it recorded, and record the deletion.
+
+        The result says whether the object is gone: ``True`` when it is, ``False`` when the delete failed, and ``None``
+        when it did not start (``not_after``). A failure here is no failed build: the row stays owed
+        (``ImageState.archives_owed``) and ``_reconcile`` of every later pass tries again. S3 answers a delete of a
+        key that was never written as a success, so a row whose upload never happened settles at the first try.
+
+        The owner check can be the first use of the account in this session, a provider call that takes time, and the
+        first S3 call of the session builds its client, which takes time too. With ``not_after`` set, the adapter reads
+        it where the lookup starts, the clock is read once the check has returned (with an answer or a refusal), and the
+        adapter reads it again where the delete starts (``ImageAws._check_deadline``): a lookup or a delete that would
+        start at or after it does not start. The row is then left as it was (not tried, still owed) for a later pass.
+        """
+        if not build.archive_key or not build.archive_bucket:
+            return False
+        # Before the call: an attempt that ends in an error that is no refusal is an attempt too.
+        self.delete_attempted.add(build.id)
         try:
-            self.aws.delete_object(self.cfg.storage.bucket, build.archive_key)
-        except ProviderRefusal:
-            self.notes.append("archive:delete_failed")
+            # No call is made about the archive of a row that another account owns, or that records no owner.
+            try:
+                self._check_archive_owner(build, deadline=not_after)
+                refused = None
+            except ProviderRefusal as refusal:
+                refused = refusal
+            # One reading of the clock decides either outcome of the lookup: one that returns at or after the cutoff,
+            # with an answer or a refusal, started no delete and leaves the row as it was.
+            if not_after is not None and self.clock() >= not_after:
+                self.delete_attempted.discard(build.id)
+                return None
+            if refused is not None:
+                raise refused
+            self.aws.delete_object(
+                build.archive_bucket, build.archive_key, owner=build.archive_owner, deadline=not_after
+            )
+        except DeadlineRefusal:
+            # The client of the first STS or S3 call was built, or failed to build, after the cutoff, so the adapter
+            # did not call the lookup or the delete: it never started, as in the check above.
+            self.delete_attempted.discard(build.id)
+            return None
+        except ProviderRefusal as refusal:
+            self.s.mark_archive_delete_tried(build.id, self.clock())
+            self._note("archive:delete_failed")
+            if refusal.reason == IMAGE_STAGING_OWNER_CHANGED:
+                self._note("archive:owner_changed")
+            return False
+        self.s.mark_archive_deleted(build.id, self.clock())
+        return True
 
     # -- retention -----------------------------------------------------------------
     def _retention(self):
@@ -1819,7 +2347,11 @@ class _Pass:
             plan = self.p._deletion_items(self.aws, facts, now, self.deadline, mode)
         except Refusal as refusal:
             return {"refused": refusal.reason}
-        report = image_deletion.apply_deletions(self.aws, plan, apply=True)
+        try:
+            report = image_deletion.apply_deletions(self.aws, plan, apply=True, deadline=self.deadline)
+        except DeadlineRefusal as refusal:
+            # The first deletion call would have started at or after the cutoff, so nothing was deleted.
+            return {"refused": refusal.reason}
         orphans = {row.image_id for row in facts.builds if row.reason_code == IMAGE_ORPHAN_RECORDED and row.image_id}
         counts, leaked = _deletion_counts(report, orphans)
         for kind, count in leaked.items():

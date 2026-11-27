@@ -77,6 +77,7 @@ front of the script ([step 3](#3-render-the-user-data)).
 |---|---|---|
 | `WARM_SRC_URL` | yes | `https` URL of a `.tar.gz` source archive that the builder can fetch without credentials. |
 | `WARM_SRC_SHA256` | yes | The archive's sha256, 64 hex digits. The script refuses to run without it and stops when the fetched bytes differ. |
+| `WARM_SRC_OWNER` | no | A 12-digit account that the fetch sends as the `x-amz-expected-bucket-owner` header. A URL that signs that header needs it, and S3 then refuses the GET when another account owns the bucket. |
 | `WARM_COMMANDS` | yes | The warm commands, one per line. Blank lines and lines that start with `#` are ignored. At least one is required. |
 | `WARM_GATE_COMMAND` | no | One command that tests that the warm layer is enough, run after the warm commands in the same account, environment and network. The script does not forbid downloads: the command must, with its tool's offline switch ([Examples](#examples)). The script tests only the command's final exit status, so join steps that must all succeed with `&&`, never `;`. |
 | `WARM_LIFETIME_SECONDS` | no | Builder lifetime bound, 600 to 14400, default 5400. |
@@ -193,8 +194,15 @@ command. This section owns the workflow.
    version and changes `ImageId` only, reads both versions back and compares them.
    A difference in any other field fails the build (`TEMPLATE_DRIFT`). Otherwise the
    image and the new version are a candidate. Once the build is a candidate or has
-   failed, the pass makes one delete call for the archive if the row records an
-   archive key (a refused call is noted `archive:delete_failed`). The version is inert: it is not the
+   failed, the pass deletes the archive from the bucket and the key that its row
+   recorded before the upload started, and records the time of the deletion in
+   the row (`archive_deleted_at`). A refused call is noted `archive:delete_failed`
+   and the deletion stays owed: every later pass tries again, last, after its own
+   work and on the time that work leaves, until it succeeds, whatever the configured
+   bucket and prefix are by then, and even when the gate is withdrawn in between.
+   A pass starts a bounded number of these retries, and a deletion that stays
+   refused goes behind the others
+   ([operations.md](operations.md#leaked-builders-and-the-backstop)). The version is inert: it is not the
    default version, and no worker launches from it.
 5. A person reads the evidence and promotes the candidate with
    `image promote --write`, which edits one line of the deployment TOML. Nothing

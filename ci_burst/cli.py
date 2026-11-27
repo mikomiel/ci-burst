@@ -243,7 +243,11 @@ def _apply(config, arguments, pipeline, sessions, state):
         else:
             result = pipeline.run_pass(apply=True, force=arguments.force)
         result["journal_resolved"] = resolved
-        result["pin_evidence"] = _stamp_pins(config, state, sessions)
+        if result.get("cleanup_only"):
+            # A pass that only deleted owed archives read no pin: stamping would add describe calls it never made.
+            result["pin_evidence"] = {"recorded": False, "reason": "IMAGE_CLEANUP_ONLY"}
+        else:
+            result["pin_evidence"] = _stamp_pins(config, state, sessions)
         return result
     finally:
         state.close()

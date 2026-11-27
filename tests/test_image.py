@@ -207,6 +207,25 @@ class BasisDigestTests(unittest.TestCase):
                 )
                 self.assertEqual(digest, expected)
 
+    def test_the_digest_from_the_file_hashes_is_the_digest_of_the_files(self):
+        hashes = image.file_hashes(self.FILES)
+        self.assertEqual(hashes, {path: sha256_hex(content) for path, content in self.FILES.items()})
+        digest = image.basis_digest_from_hashes(hashes, self.COMMANDS, self.GATE, self.STRIP, self.SCRIPT)
+        self.assertEqual(digest, self.VECTOR)
+        self.assertEqual(digest, self.digest())
+        # The order of the hashes does not matter: the lines are sorted.
+        reversed_hashes = dict(reversed(list(hashes.items())))
+        self.assertEqual(
+            image.basis_digest_from_hashes(reversed_hashes, self.COMMANDS, self.GATE, self.STRIP, self.SCRIPT), digest
+        )
+
+    def test_the_file_hashes_refuse_a_path_with_a_control_character(self):
+        for path in ("a\nb", "a\0b"):
+            with self.subTest(path=path), self.assertRaises(ConfigRefusal):
+                image.file_hashes({path: b"x"})
+            with self.subTest(path=path, source="hashes"), self.assertRaises(ConfigRefusal):
+                image.basis_digest_from_hashes({path: "e" * 64}, self.COMMANDS, self.GATE, self.STRIP, self.SCRIPT)
+
     def test_a_path_or_command_with_a_control_character_is_refused(self):
         for label, arguments in (
             ("a path with a line feed", {"files": {"a\nb": b"x"}}),
@@ -479,8 +498,8 @@ def payload_of(text):
 class WarmExportsTests(unittest.TestCase):
     def test_the_names_are_the_inputs_the_script_reads(self):
         read = set(re.findall(r"(?m)^(WARM_[A-Z0-9_]+)=\$\{\1:?-", SCRIPT.read_text(encoding="utf-8")))
-        self.assertEqual(len(read), 7)
-        self.assertEqual(set(image.warm_exports(load_image(), SENTINEL_URL, "ab" * 32)), read)
+        self.assertEqual(len(read), 8)
+        self.assertEqual(set(image.warm_exports(load_image(), SENTINEL_URL, "ab" * 32, "210987654321")), read)
 
     def test_the_values_come_from_the_configuration_and_the_two_build_facts(self):
         values = image.warm_exports(load_image(), SENTINEL_URL, "ab" * 32)

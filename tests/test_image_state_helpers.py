@@ -169,7 +169,8 @@ class SchemaVersionTests(ImageStateCase):
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         self.assertEqual(tables - {"sqlite_sequence"}, {"image_builds", "pin_log", "promotion_journal", "control"})
         self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, 1)
+        # Schema 2 added the archive and basis-hash columns to image_builds; the helpers add none of their own.
+        self.assertEqual(SCHEMA_VERSION, 2)
 
 
 class PinLogTests(ImageStateCase):

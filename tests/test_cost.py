@@ -2,7 +2,13 @@ import hashlib
 import json
 import unittest
 
-from ci_burst.cost import MAX_STORED_PRICE_MICROS, MINIMUM_BILLABLE_SECONDS, CostModel, _frozen_max_price_micros
+from ci_burst.cost import (
+    MAX_STORED_PRICE_MICROS,
+    MINIMUM_BILLABLE_SECONDS,
+    CostModel,
+    _frozen_max_price_micros,
+    request_damaged,
+)
 from ci_burst.ledger import Operation
 from ci_burst.money import format_money
 
@@ -426,20 +432,6 @@ class AdmittedBasisTests(unittest.TestCase):
         self.assertNotEqual(request, FROZEN_REQUEST)
         self.assertEqual(self.original_model().reservation_floor_micros(self.admitted(request_json=request)), 590_000)
 
-    def test_a_damaged_price_does_not_raise_the_ceiling(self):
-        # Only the stored text changed; its hash is still the one admission stored for the 0.040000 request.
-        for price in ("9.040000", "0.000001"):
-            with self.subTest(price=price):
-                text = FROZEN_REQUEST.replace('"0.040000"', '"' + price + '"')
-                damaged = self.admitted(request_json=text, request_sha256=sha(FROZEN_REQUEST))
-                trusted = self.admitted(request_json=None)
-                for model in (self.original_model(), self.lowered_model()):
-                    self.assertEqual(model.price_ceiling_micros(damaged), model.price_ceiling_micros(trusted))
-        # The reservation stays the floor of the live row, so the commitment never falls below what was admitted.
-        raised = FROZEN_REQUEST.replace('"0.040000"', '"9.040000"')
-        live = self.admitted(request_json=raised, request_sha256=sha(FROZEN_REQUEST))
-        self.assertEqual(self.lowered_model().reservation_floor_micros(live), 590_000)
-
     def test_an_oversized_price_does_not_price_the_ceiling(self):
         # A price past any real one, even under its own hash, must not reach the arithmetic or the export.
         huge = FROZEN_REQUEST.replace('"0.040000"', '"' + "9" * 4300 + '.000000"')
@@ -474,6 +466,22 @@ class AdmittedBasisTests(unittest.TestCase):
                 )
                 self.assertEqual(model.price_ceiling_micros(live), 100_000)
                 self.assertEqual(model.accrued_micros(live, 1_000_600.0), 16_667)
+
+    def test_a_damaged_request_whose_price_is_intact_settles_at_that_price(self):
+        # Only whitespace changed: the hash no longer matches, but the frozen 0.040000 is still the price admission
+        # committed. A row that ended with no accepted price (a migrated schema-1 row) settles at it, not at the
+        # lowered configured maximum, so its settled spend leaves no room for a replacement the cap would not pay for.
+        ended = self.admitted(
+            request_json=FROZEN_REQUEST + " ",
+            request_sha256=sha(FROZEN_REQUEST),
+            price_micros=0,
+            admitted_incidental_per_hour_micros=0,
+            state="terminal",
+            updated_at=1_003_600.0,
+        )
+        self.assertTrue(request_damaged(ended))
+        self.assertEqual(self.lowered_model().accrued_micros(ended, 1_003_600.0), 40_000)
+        self.assertEqual(self.lowered_model().committed_micros(ended, 1_003_600.0), 40_000)
 
 
 class ConfigModelTests(unittest.TestCase):

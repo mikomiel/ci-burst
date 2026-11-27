@@ -142,8 +142,7 @@ instance identifiers and 32-character hexadecimal operation identifiers.
   hashes to its stored hash, or the price is missing, null or malformed), as
   for a backfilled row: without it, a lowered configured maximum and the
   accepted price would price the remaining life below the ceiling that admission
-  committed. A terminal row keeps the tolerance. A damaged price raises no
-  ceiling (`_committed_max_price_micros`).
+  committed. A terminal row keeps the tolerance.
 - [x] 1.19 State once in `docs/operations.md`, in the `design.md` shared-files
   row and in the worker-observation spec that a set of export files has one
   writer, the shipped unit.
